@@ -71,7 +71,11 @@ impl StageInputOperation {
         blake3: [u8; 32],
         serving: ServingNode,
     ) -> Self {
-        let InputSource::S3 { bucket, key, .. } = &input.source;
+        // An inline input is refused before staging, so it names no object here.
+        let (bucket, key) = match &input.source {
+            InputSource::S3 { bucket, key, .. } => (bucket.as_str(), key.as_str()),
+            InputSource::Inline { .. } => ("", ""),
+        };
         // Only ingress owns the bucket/key/version identity; any other holder has a
         // registered copy, asked by content hash when the version is not its own.
         let ingress = record
@@ -83,8 +87,8 @@ impl StageInputOperation {
             created_by: record.created_by,
             source_node: input.source_node_id,
             ingress,
-            bucket: bucket.clone(),
-            key: key.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
             version,
             blake3,
             serving,

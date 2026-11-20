@@ -75,6 +75,9 @@ type InputJob = LegacyJob<ExportRoCrateSpec, ExportRoCrateResult, LegacyProgress
 
 /// The current record of an older row; every byte of the row must be used.
 fn upgraded(value: &[u8]) -> Option<JobRecord> {
+    if let Some(record) = super::compute::old_job(value) {
+        return Some(record);
+    }
     // The round trip keeps a row of another shape from reading as one of alpha.134.
     if let Ok(old) = postcard::from_bytes::<InputJob>(value)
         && postcard::to_allocvec(&old).is_ok_and(|bytes| bytes == value)
@@ -87,7 +90,7 @@ fn upgraded(value: &[u8]) -> Option<JobRecord> {
     if let Ok(staging) = session_refs::decode::<StagingJob>(value, &[]) {
         return Some(staging.into());
     }
-    for layout in [session_refs::NO_LOGIN, session_refs::NO_NAME] {
+    for layout in [super::compute::LOGIN_JOBS, super::compute::NAME_JOBS] {
         let record = session_refs::decode::<JobRecord>(value, layout)
             .or_else(|_| session_refs::decode::<StagingJob>(value, layout).map(Into::into))
             .or_else(|_| session_refs::decode::<LegacyJob>(value, layout).map(Into::into));
@@ -600,6 +603,7 @@ where
             report_digest: legacy.report_digest,
             retention_ms: legacy.retention_ms,
             locally_exhausted: legacy.locally_exhausted,
+            local_admission: None,
         }
     }
 }
@@ -804,6 +808,12 @@ mod tests {
     }
 
     /// `bytes` with the one occurrence of `from` replaced by `to`.
+    /// `record` as releases before the local admission stored it: without that last field.
+    fn unadmitted(record: &JobRecord) -> Vec<u8> {
+        let bytes = record.to_bytes().unwrap();
+        bytes[..bytes.len() - 1].to_vec()
+    }
+
     fn splice(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
         let at = bytes
             .windows(from.len())
@@ -814,8 +824,9 @@ mod tests {
 
     #[test]
     fn rewrites_old_sessions() {
-        // Sessions stored without the display name, or without the linked login, gain empty
-        // fields; the plan digest and the dedup row follow the rewritten payload.
+        // Sessions stored without the display name, or without the linked login, in records of
+        // those releases without the local admission, gain empty fields; the plan digest and the
+        // dedup row follow the rewritten payload.
         use aruna_core::keyspaces::DEDUP_INDEX_KEYSPACE;
         use aruna_core::structs::execution::job::local::{encode_dedup_value, parse_dedup_value};
         use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
@@ -841,7 +852,7 @@ mod tests {
             let old_payload = splice(&payload, &full, &full[..kept]);
             let old_digest = *blake3::hash(&old_payload).as_bytes();
             record.plan_digest = Some(old_digest);
-            let stored = splice(&record.to_bytes().unwrap(), &full, &full[..kept]);
+            let stored = splice(&unadmitted(&record), &full, &full[..kept]);
             jobs.push((job_record_key(job_id).to_vec(), stored));
             dedup.push((vec![seed], encode_dedup_value(job_id, old_digest)));
             record.plan_digest = Some(record.payload.plan_digest());
@@ -899,6 +910,7 @@ mod tests {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         }
     }
 
@@ -947,7 +959,7 @@ mod tests {
         // Alpha.134 lacked the trailing pause byte and wrote each input in its older shape.
         let progress = postcard::to_allocvec(&record.progress).unwrap();
         let unpaused = &progress[..progress.len() - 1];
-        let stored = splice(&record.to_bytes().unwrap(), &progress, unpaused);
+        let stored = splice(&unadmitted(&record), &progress, unpaused);
         let new_input = postcard::to_allocvec(&input).unwrap();
         let stored = splice(
             &stored,
@@ -1013,7 +1025,7 @@ mod tests {
             record.result = result;
             let progress = postcard::to_allocvec(&record.progress).unwrap();
             let unpaused = &progress[..progress.len() - 1];
-            let stored = splice(&record.to_bytes().unwrap(), &progress, unpaused);
+            let stored = splice(&unadmitted(&record), &progress, unpaused);
             rows.push((job_record_key(job_id), stored));
             records.push(record);
         }

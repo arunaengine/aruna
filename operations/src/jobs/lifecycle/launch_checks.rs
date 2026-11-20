@@ -15,8 +15,10 @@ use aruna_core::node::state::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::family::{LaunchIntent, LogicalJobSpec};
-use aruna_core::structs::execution::job::input::{CapturedInput, InputSource};
+use aruna_core::structs::execution::job::family::{JobFamilyId, LaunchIntent, LogicalJobSpec};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputSource, object_count, tagged,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::{
@@ -30,10 +32,12 @@ use ulid::Ulid;
 use super::plan::{REALM_STAGING, network_access};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicySets, compiled_policies, policy_reads, read_policies};
+use crate::jobs::lifecycle::screen::{AdmitTask, ScreenError, ScreenTask};
 use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::placement::policy::resolve_set::{
     PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
 };
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// What a check answers: the capability that runs the launch, or why this target refuses it.
@@ -130,7 +134,10 @@ impl LocalCapabilityOperation {
         let capability = document
             .executors
             .iter()
-            .find(|capability| capability.kind == self.intent.target.executor_kind)
+            .find(|capability| {
+                let target = &self.intent.target;
+                capability.backend == target.backend && capability.kind == target.executor_kind
+            })
             .cloned()
             .ok_or(LaunchDecline::Unauthorized)?;
         if capability.policy_draining {
@@ -142,10 +149,9 @@ impl LocalCapabilityOperation {
                 .executor_constraint
                 .as_deref()
                 .is_some_and(|kind| kind.trim() != capability.kind.trim())
+            || (spec.payload.backend.as_deref())
+                .is_some_and(|name| name.trim() != capability.backend)
             || !capability.supports(REALM_STAGING)
-            || (job_request::session_of(&spec.payload).is_some()
-                && network_access(spec) != NetworkAccess::Open
-                && !capability.session)
             || !capability.limits.fits(&spec.resources)
         {
             return Err(LaunchDecline::Unauthorized);
@@ -219,6 +225,9 @@ pub(crate) enum CheckError {
     Io(#[from] IoError),
     #[error("the governed-data gate is unavailable: {0}")]
     Gate(String),
+    /// A plugin task's work is not adopted yet, or its install cannot be checked now.
+    #[error("{0}")]
+    Task(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -226,6 +235,7 @@ enum CheckStep {
     Capability,
     Gate,
     Grant,
+    Task,
     RequestPolicies,
     Policies,
 }
@@ -304,6 +314,24 @@ impl LaunchChecksOperation {
         evaluator.evaluate(&request).is_ok()
     }
 
+    /// A plugin task passes the receiver's task check instead of group WRITE: its install, its
+    /// account, the grants and the work row that adopted this launch's family.
+    fn task(&mut self) -> CheckNext {
+        let spec = &self.check.spec;
+        let config = std::sync::Arc::new(self.check.config.clone());
+        let screen = ScreenTask::new(
+            config,
+            (&spec.payload, spec.created_by, spec.ingress_node_id),
+        );
+        let family = JobFamilyId {
+            submission_id: spec.submission_id,
+            request_digest: spec.request_digest,
+        };
+        let admit = AdmitTask::new(screen, (self.check.local, family));
+        self.step = CheckStep::Task;
+        Ok(Next::Call(IoCall::child(admit)))
+    }
+
     /// Checks every pin against the stored spec, then resolves the policies it names. Refs of
     /// an input this target cannot resolve yet are enforced again when the bytes are staged.
     fn policies(&mut self) -> CheckNext {
@@ -372,6 +400,7 @@ impl Operation for LaunchChecksOperation {
                         Ok(Next::Done(Err(LaunchDecline::Draining)))
                     }
                     Err(error) => Err(CheckError::Gate(error.to_string())),
+                    Ok(_) if tagged(&self.check.spec.payload).is_some() => self.task(),
                     Ok(_) => self.grant(),
                 }
             }
@@ -393,6 +422,14 @@ impl Operation for LaunchChecksOperation {
                 }
                 self.policies()
             }
+            CheckStep::Task => match result.child::<PluginInstall, ScreenError>()? {
+                Ok(_) => self.policies(),
+                // A launch before its work is adopted is asked again, never declined for good.
+                Err(error @ (ScreenError::Pending | ScreenError::Unavailable(_))) => {
+                    Err(CheckError::Task(error.to_string()))
+                }
+                Err(_) => Ok(Next::Done(Err(LaunchDecline::Unauthorized))),
+            },
             CheckStep::Policies => {
                 let policies = result.child::<Resolutions, PolicySetError>()?;
                 let policies = policies.unwrap_or_default();
@@ -409,13 +446,15 @@ fn pinned_policies(
     intent: &LaunchIntent,
     local: NodeId,
 ) -> Result<(Vec<Vec<PlacementPolicyRef>>, Vec<PlacementPolicyRef>), LaunchDecline> {
-    let inputs_count = spec.payload.inputs.len();
-    if intent.inputs.len() != inputs_count || spec.captured_inputs.len() != inputs_count {
+    let objects = object_count(&spec.payload.inputs);
+    if intent.inputs.len() != objects || spec.captured_inputs.len() != objects {
         return Err(LaunchDecline::Unauthorized);
     }
     let mut inputs: Vec<Vec<PlacementPolicyRef>> = Vec::new();
     for input in &spec.payload.inputs {
-        let InputSource::S3 { version_id, .. } = &input.source;
+        let InputSource::S3 { version_id, .. } = &input.source else {
+            continue;
+        };
         let pin = intent
             .inputs
             .iter()

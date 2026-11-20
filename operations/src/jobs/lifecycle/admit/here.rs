@@ -69,6 +69,9 @@ pub(in crate::jobs::lifecycle) fn admission_error(error: LifecycleError) -> Subm
         }
         LifecycleError::QuotaDenied(reason) => SubmitJobError::QuotaDenied(reason),
         LifecycleError::GroupWrite(error) => SubmitJobError::GroupWrite(error),
+        error @ LifecycleError::AdmissionClosed => {
+            SubmitJobError::InvalidWorkspace(error.to_string())
+        }
         error => SubmitJobError::PlacementUnavailable(error.to_string()),
     }
 }
@@ -317,6 +320,7 @@ impl AdmitHereOperation {
             now_ms: admission.now_ms,
             quota_refusal,
             quota_revision,
+            admit_by: admission.request.admit_by,
         });
         Ok(Next::Call(IoCall::child(admit)))
     }
@@ -483,6 +487,7 @@ mod tests {
             captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             input_pages: None,
+            admit_by: None,
         };
         LocalAdmission {
             identity: request.identity().expect("identity derives"),
@@ -622,6 +627,7 @@ mod tests {
             executions: Vec::new(),
             outputs: OutputSet::new(Vec::new()).expect("empty outputs"),
             cancel_requested: false,
+            expiry_reason: None,
         }
     }
 

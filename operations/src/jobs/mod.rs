@@ -5,11 +5,15 @@
 use std::time::Duration;
 
 pub mod backend_import;
+pub mod backend_record;
 pub mod command;
 pub mod copy;
 pub mod demand;
+pub mod device_admission;
+pub mod discard;
 pub mod drain;
 pub mod export;
+pub mod fence;
 pub mod handed_imports;
 pub mod harvest;
 pub mod import;

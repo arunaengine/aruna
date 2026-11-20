@@ -30,8 +30,8 @@ use super::outgoing::outgoing;
 use super::peer::{ask_peer, peer_answer};
 use super::secret_use::{ReleaseFailure, ReleaseSecret};
 use super::unavailable;
-use super::work::{RequestContext, WorkRow};
 use crate::realm::mutate_placement::is_management;
+use aruna_core::install_work::{RequestContext, WorkRow};
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 /// The fields of a release that brought them; one that names a held value is refused.

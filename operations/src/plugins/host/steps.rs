@@ -27,13 +27,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use ulid::Ulid;
 
-use super::super::check::{Authorize, CallError, CheckCall, RunScope, matching};
+use super::super::check::{CallError, CheckCall, RunScope, authorize_call, matching};
 use super::super::creates::write_outcome;
 use super::super::dataset::{
     content_urls, dataset_change, dataset_crate, dataset_of, file_entities, parse_document,
     same_revision,
 };
-use super::super::grants::{install_scope, parse_grants, patterns_for, restricted_account};
+use super::super::grants::{install_scope, restricted_account};
 use super::super::install::{
     InstallError, config_answer, config_call, pick_version, read_manifest,
 };
@@ -44,9 +44,12 @@ use super::super::outgoing::{outgoing, request_context};
 use super::super::rate::{take_call, taken};
 use super::super::rows::StoreError;
 use super::super::submit::WorkRequest;
+use super::super::task::start::{StartTask, TaskRequest};
 use super::super::unavailable;
-use super::super::work::RequestContext;
 use super::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
+use crate::auth::install_access::Authorize;
+use crate::auth::install_access::{parse_grants, patterns_for};
+use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::ExportMetadataRequest;
@@ -60,6 +63,7 @@ use crate::metadata::forward::write::MetadataWriteError;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_core::install_work::RequestContext;
 use aruna_core::metadata::api::{
     CreateDocumentPayload, ExportMetadataResult, RoCrateExportView, UpdateDocumentMutation,
 };
@@ -471,7 +475,7 @@ impl ListDatasets {
             let check = Authorize::call(&install, permission, &path, &patterns);
             self.current = Some(id);
             self.phase = ListPhase::Checking(install);
-            return Next::Call(IoCall::child(check));
+            return Next::Call(authorize_call(check));
         }
         Next::Done(Listing {
             resources: std::mem::take(&mut self.resources),
@@ -1404,6 +1408,13 @@ impl Operation for CheckReply {
     }
 }
 
+/// What a native call starts: work with its minted ids, or a container task.
+#[derive(Debug, PartialEq)]
+enum NativeWork {
+    Work(WorkRequest, (u64, Ulid), ServingNode),
+    Task(Box<TaskRequest>, IngressNode),
+}
+
 #[derive(Debug, PartialEq)]
 enum NativePhase {
     Begin,
@@ -1418,9 +1429,7 @@ enum NativePhase {
 pub struct NativeCall {
     scope: RunScope,
     intent: CallIntent,
-    request: Option<WorkRequest>,
-    minted: (u64, Ulid),
-    serving: ServingNode,
+    work: Option<NativeWork>,
     phase: NativePhase,
 }
 
@@ -1434,18 +1443,37 @@ impl NativeCall {
         Self {
             scope: scope.clone(),
             intent,
-            request: Some(request),
-            minted,
-            serving,
+            work: Some(NativeWork::Work(request, minted, serving)),
+            phase: NativePhase::Begin,
+        }
+    }
+
+    /// Starts the container task of `request` through the run's call history.
+    pub fn task(
+        scope: &RunScope,
+        intent: CallIntent,
+        request: TaskRequest,
+        node: IngressNode,
+    ) -> Self {
+        Self {
+            scope: scope.clone(),
+            intent,
+            work: Some(NativeWork::Task(Box::new(request), node)),
             phase: NativePhase::Begin,
         }
     }
 
     fn start(&mut self) -> Result<Next<String>, CallFailure> {
-        let request = self.request.take().ok_or(IoError::Unfinished)?;
-        let start = StartWork::new(&self.scope, request, self.minted, self.serving);
+        let start = match self.work.take().ok_or(IoError::Unfinished)? {
+            NativeWork::Work(request, minted, serving) => {
+                IoCall::child(StartWork::new(&self.scope, request, minted, serving))
+            }
+            NativeWork::Task(request, node) => {
+                IoCall::child(StartTask::new(&self.scope, *request, node))
+            }
+        };
         self.phase = NativePhase::Start;
-        Ok(Next::Call(IoCall::child(start)))
+        Ok(Next::Call(start))
     }
 }
 

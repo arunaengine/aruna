@@ -38,8 +38,12 @@ pub(crate) fn candidate(node_id: NodeId, kind: &str) -> TargetCandidate {
 }
 
 pub(crate) fn candidate_at(node_id: NodeId, kind: &str, location: &str) -> TargetCandidate {
-    let mut capability = ExecutorCapability::new(kind.to_string(), subject(node_id, location))
-        .expect("subject is valid");
+    let mut capability = ExecutorCapability::new(
+        kind.to_string(),
+        kind.to_string(),
+        subject(node_id, location),
+    )
+    .expect("subject is valid");
     capability.file_staging = true;
     TargetCandidate {
         node_id,
@@ -100,7 +104,9 @@ pub(crate) fn request(inputs: Vec<ResolvedInput>) -> PlanRequest {
             max_walltime_ms: 60_000,
             preemptible: false,
         },
+        group_id: Ulid::from_bytes([3u8; 16]),
         executor_constraint: None,
+        backend: None,
         required_labels: Vec::new(),
         staging: StagingMode::Files,
         network: NetworkAccess::Isolated,

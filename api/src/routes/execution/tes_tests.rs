@@ -232,7 +232,12 @@ fn maps_submit_errors() {
     // must keep the status the native submit surface answers with.
     use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
     use aruna_core::job_request::SubmitJobError;
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+        SubmissionId,
+    };
     use aruna_core::structs::execution::job::input::CompositionError;
+    use aruna_core::structs::execution::job::local::{JobProgress, OutputObject, WorkspaceMode};
     use aruna_core::structured_id::clock_health::ClockHealthError;
 
     let cases = [
@@ -627,7 +632,9 @@ fn rejects_unsupported_fields() {
     task.inputs[0].kind = TesFileType::Directory;
     let (spec, _) =
         map_execution_spec(&task, None, ExecutionTarget::Realm).expect("directory maps");
-    let InputSource::S3 { key, .. } = &spec.inputs[0].source;
+    let InputSource::S3 { key, .. } = &spec.inputs[0].source else {
+        panic!("the input names an object");
+    };
     assert!(key.ends_with('/') && spec.inputs[0].dest_key.ends_with('/'));
     task.inputs[0].kind = TesFileType::File;
     task.executors[0].stdout = Some("/logs/out".to_string());
@@ -844,6 +851,7 @@ fn maps_states() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1008,11 +1016,6 @@ fn view_projections() {
 /// The replicated family behind one succeeded distributed task.
 fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
-    use aruna_core::structs::execution::job::family::{
-        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
-        SubmissionId,
-    };
-    use aruna_core::structs::execution::job::local::{JobProgress, OutputObject, WorkspaceMode};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_operations::jobs::lifecycle::report::FamilyReport;
@@ -1041,6 +1044,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1090,6 +1094,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
             state: JobState::Succeeded,
             attempts: 2,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 10,
             updated_at_ms: 20,
             finished_at_ms: Some(20),
@@ -1193,7 +1198,6 @@ fn family_pins_inputs() {
 #[test]
 fn family_preserves_versions() {
     // TES preserves canonical output versions and reports none before canonical success.
-    use aruna_core::structs::execution::job::family::LogicalJobState;
 
     let report = family_fixture();
     let version_id = Ulid::from_bytes([9u8; 16]);
@@ -1255,6 +1259,7 @@ fn derives_family_tags() {
     report.plan = Some(PlanEstimate {
         target: Some(ExecutionTargetId {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         }),
         scheduler_node_id: None,
@@ -1424,6 +1429,19 @@ fn rejects_derived_tag() {
 }
 
 #[test]
+fn rejects_plugin_tag() {
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.tags.insert(
+        "aruna-engine.org/plugin-work".to_string(),
+        Ulid::nil().to_string(),
+    );
+
+    let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code.as_deref(), Some("reserved_tag"));
+}
+
+#[test]
 fn projects_full_command() {
     // Docker runs entrypoint + command together; the projection shows both.
     let mut spec = ExecutionSpec {
@@ -1438,6 +1456,7 @@ fn projects_full_command() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1908,6 +1927,7 @@ fn projects_input_identity() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1977,4 +1997,20 @@ fn projects_input_identity() {
             version_id: Some(version.to_string()),
         }
     );
+}
+
+#[test]
+fn maps_backend_tag() {
+    // The compute backend tag names the backend a task runs on and is reported back.
+    let group = Ulid::from_bytes([5u8; 16]);
+    let mut task = sample_task(group);
+    task.tags.insert(
+        "aruna-engine.org/compute-backend".to_string(),
+        "lab".to_string(),
+    );
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.backend.as_deref(), Some("lab"));
+    let projected = project_tags(&spec);
+    let tag = projected.get("aruna-engine.org/compute-backend");
+    assert_eq!(tag.map(String::as_str), Some("lab"));
 }

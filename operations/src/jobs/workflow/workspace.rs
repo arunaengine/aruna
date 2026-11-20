@@ -51,7 +51,10 @@ pub(super) fn source_object(input: &InputSelection) -> Result<SourceObject, JobE
         bucket,
         key,
         version_id,
-    } = &input.source;
+    } = &input.source
+    else {
+        return Err(JobError::permanent("an inline input names no object"));
+    };
     ensure_confined_path(Path::new(key))
         .map_err(|error| JobError::permanent(format!("invalid input key: {error}")))?;
     let path = input
@@ -435,7 +438,9 @@ mod tests {
         AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::structs::execution::job::identity::JobId;
-    use aruna_core::structs::execution::job::input::{InputMode, JobPayload};
+    use aruna_core::structs::execution::job::input::{
+        CapturedInput, ExecutionSpec, InputMode, JobPayload,
+    };
     use aruna_core::structs::execution::job::local::{JobErrorKind, OutputCommitIntent};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -451,7 +456,6 @@ mod tests {
 
     use aruna_core::calls::Next;
     use aruna_core::operation::Operation;
-    use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec};
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::storage::blob::bucket_permission_path;
     use aruna_core::structs::storage::distribution::source_root::RootEntry;
@@ -536,6 +540,7 @@ mod tests {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),

@@ -61,6 +61,8 @@ const TES_VERSION: &str = "1.1.0";
 const GROUP_TAG_KEY: &str = "aruna-engine.org/group";
 /// Optional tag pinning a backend executor kind.
 const EXECUTOR_TAG_KEY: &str = "aruna-engine.org/executor";
+/// Names the compute backend a task runs on, next to the executor kind.
+const BACKEND_TAG_KEY: &str = "aruna-engine.org/compute-backend";
 /// Optional tag carrying the submission idempotency key.
 const IDEMPOTENCY_TAG_KEY: &str = "aruna-engine.org/idempotency-key";
 /// Optional tag choosing where the task runs: `realm` or `local`.
@@ -584,8 +586,8 @@ naming a different one; a bearer token requires that tag.
 - Exactly one executor whose `command` is the full argv.
 - `id`, `state`, `logs` and `creation_time` are read only, as are the derived tags
   `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind`
-  and `aruna-engine.org/estimated-transfer-bytes`; naming one is refused with error code
-  `reserved_tag`.
+  and `aruna-engine.org/estimated-transfer-bytes`; naming one, or any tag starting with
+  `aruna-engine.org/plugin-` (set only on plugin tasks), is refused with error code `reserved_tag`.
 - Input urls must be `s3://bucket/key` or a versioned object ARN, output urls `s3://bucket/key`;
   container paths must be absolute, canonical and
   may not overlap between inputs and outputs; at most 1024 outputs, the same bound the immutable
@@ -715,9 +717,8 @@ pub async fn create_task(
         };
         let context = state.get_ctx();
         return match drive(
-            aruna_operations::jobs::node_inputs::local_run(
+            aruna_operations::jobs::local_run::LocalRunOperation::new(
                 config,
-                &context.compute_limits(),
                 context.node_and_realm(),
             ),
             context.as_ref(),
@@ -1300,6 +1301,7 @@ fn map_execution_spec(
         env: executor.env.clone(),
         resources,
         executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
+        backend: task.tags.get(BACKEND_TAG_KEY).cloned(),
         inputs,
         file_outputs,
         workspace_outputs: Vec::new(),
@@ -1325,6 +1327,13 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
         return Err(TesError::coded(
             StatusCode::BAD_REQUEST,
             format!("tag `{key}` is derived at read time and read-only"),
+            "reserved_tag",
+        ));
+    }
+    if let Some(key) = aruna_core::structs::execution::job::input::plugin_tag(&task.tags) {
+        return Err(TesError::coded(
+            StatusCode::BAD_REQUEST,
+            format!("tag `{key}` is reserved for plugin tasks"),
             "reserved_tag",
         ));
     }
@@ -1530,16 +1539,18 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
     // A directory names a key prefix, which admission expands into its objects.
     let mut dest_key = input.path[1..].to_string();
     if input.kind == TesFileType::Directory {
-        let InputSource::S3 {
+        if let InputSource::S3 {
             key, version_id, ..
-        } = &mut source;
-        if version_id.is_some() {
-            return Err(TesError::bad_request(
-                "a directory input names an s3:// prefix, not one version",
-            ));
-        }
-        if !key.ends_with('/') {
-            key.push('/');
+        } = &mut source
+        {
+            if version_id.is_some() {
+                return Err(TesError::bad_request(
+                    "a directory input names an s3:// prefix, not one version",
+                ));
+            }
+            if !key.ends_with('/') {
+                key.push('/');
+            }
         }
         dest_key.push('/');
     }
@@ -1692,6 +1703,7 @@ fn tes_state(record: &JobRecord) -> TesState {
             _ => TesState::SystemError,
         },
         JobState::Cancelled => TesState::Canceled,
+        JobState::NotRun => TesState::SystemError,
     }
 }
 
@@ -1800,7 +1812,11 @@ fn input_url(record: &JobRecord, input: &InputSelection, realm_id: RealmId) -> S
         bucket,
         key,
         version_id,
-    } = &input.source;
+    } = &input.source
+    else {
+        // Only plugin tasks carry inline bytes; they have no url to show.
+        return String::new();
+    };
     let captured =
         (record.captured_inputs.iter()).find(|captured| captured.destination_key == input.dest_key);
     let pinned = match captured {
@@ -1978,6 +1994,10 @@ fn project_tags(spec: &ExecutionSpec) -> BTreeMap<String, String> {
     if let Some(constraint) = &spec.executor_constraint {
         tags.entry(EXECUTOR_TAG_KEY.to_string())
             .or_insert_with(|| constraint.clone());
+    }
+    if let Some(backend) = &spec.backend {
+        tags.entry(BACKEND_TAG_KEY.to_string())
+            .or_insert_with(|| backend.clone());
     }
     tags
 }
@@ -2315,6 +2335,11 @@ impl TesError {
                 code: None,
             },
             JobRouteError::Internal(message) => Self::internal(message),
+            JobRouteError::Pruned => Self {
+                status: StatusCode::GONE,
+                message: "TES task was pruned after its retention".to_string(),
+                code: None,
+            },
         }
     }
 }

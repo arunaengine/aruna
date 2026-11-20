@@ -17,12 +17,12 @@ use aruna_core::user::id::UserId;
 use aruna_plugin_types::trigger::TriggerKind;
 use ulid::Ulid;
 
-use super::grants::covers;
 use super::journal::JOURNAL_PAGE;
 use super::rows::{
     Row, Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, unexpected,
 };
+use crate::auth::install_access::covers;
 
 /// An active install with event triggers, as the matcher sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]

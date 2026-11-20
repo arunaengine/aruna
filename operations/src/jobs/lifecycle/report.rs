@@ -16,6 +16,8 @@ use aruna_core::structs::execution::job::family::{
 };
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::local::OutputObject;
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::types::Key;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
@@ -28,8 +30,6 @@ use aruna_core::keyspaces::DEADLINE_INDEX_KEYSPACE;
 use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::record_keys::submission_prefix;
-use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 
 /// Sibling families of one submission a conflict count may scan.
@@ -444,6 +444,7 @@ mod tests {
             executions: Vec::new(),
             outputs: OutputSet::try_from(Vec::new()).expect("no outputs"),
             cancel_requested: false,
+            expiry_reason: None,
         }
     }
 

@@ -23,7 +23,8 @@ use super::rows::{
     Row, Scan, StoreError, decode, delete_call, done, encode, mapped_child, read_call, row, values,
 };
 use super::runs::{Admission, RunError, audit_rows, event_run, read_run};
-use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_scan, work_state};
+use super::work::{work_scan, work_state};
+use aruna_core::install_work::{Found, WorkKind, WorkLookup, WorkRow, WorkState};
 
 /// Marks a settled work notified, with the `job_finished` run it starts admitted in the same
 /// transaction; `false` when the work is gone or notified already.

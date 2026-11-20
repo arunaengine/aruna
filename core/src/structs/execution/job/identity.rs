@@ -110,13 +110,16 @@ pub enum JobState {
     Cancelled,
     /// Parked until every bucket key it needs is unlocked; holds no claim and no schedule entry.
     AwaitingKey,
+    /// A replicated job whose open work all belongs to nodes that left the realm. Shown at
+    /// read time only; no local record is ever stored in this state.
+    NotRun,
 }
 
 impl JobState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobState::Succeeded | JobState::Failed | JobState::Cancelled
+            JobState::Succeeded | JobState::Failed | JobState::Cancelled | JobState::NotRun
         )
     }
 
@@ -134,6 +137,7 @@ impl JobState {
             JobState::Failed => "failed",
             JobState::Cancelled => "cancelled",
             JobState::AwaitingKey => "awaiting_key",
+            JobState::NotRun => "not_run",
         }
     }
 }

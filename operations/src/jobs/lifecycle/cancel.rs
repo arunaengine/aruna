@@ -11,10 +11,11 @@ use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{
-    CancelAuthority, ExecutionClaim, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobProjection,
-    JobRecordEnvelope, JobRecordKind, LogicalJobSpec,
+    CancelAuthority, ExecutionClaim, ExpiryReason, JobCancelRecord, JobFamilyId, JobFamilyRecord,
+    JobProjection, JobRecordEnvelope, JobRecordKind, LogicalJobSpec,
 };
 use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::tagged;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::{debug, warn};
@@ -259,6 +260,19 @@ impl PublishCancelOperation {
         }
     }
 
+    /// Cancels a family without an outcome in the submitter's name. Only a holder does; another
+    /// node publishes nothing.
+    pub fn expiry(
+        spec: LogicalJobSpec,
+        reason: ExpiryReason,
+        serving: ServingNode,
+        now_ms: u64,
+    ) -> Self {
+        let auth = AuthContext::new(spec.created_by, spec.realm_id);
+        let authority = CancelAuthority::Expiry(reason);
+        Self::new(spec, &auth, authority, serving, now_ms)
+    }
+
     fn node(
         &self,
     ) -> Result<(NodeId, aruna_core::structs::identity::realm::RealmId), JobRouteError> {
@@ -276,6 +290,9 @@ impl PublishCancelOperation {
             .ok_or_else(|| unavailable("job family holder view unavailable"))?;
         if view.holds(local) {
             return self.sign();
+        }
+        if matches!(self.authority, CancelAuthority::Expiry(_)) {
+            return Ok(Next::Done(()));
         }
         // A forwarded cancel names no deletion, so only a holder records one.
         if self.authority == CancelAuthority::Deletion {
@@ -460,6 +477,7 @@ impl Operation for PublishDeletionOperation {
 
     fn first(&mut self) -> PublishNext {
         let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let read = read.for_reader(self.auth.user_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -504,6 +522,12 @@ struct CancelTarget {
     spec: LogicalJobSpec,
 }
 
+/// Whether `from` may speak for a spec's submitter. A plugin task's account has no credential
+/// of its own, so only its receiver, the ingress that admission checked, speaks for it.
+pub(crate) fn submitter_from(spec: &LogicalJobSpec, from: NodeId) -> bool {
+    tagged(&spec.payload).is_none() || from == spec.ingress_node_id
+}
+
 /// Cancels one external job through its family; `None` means the alias names no family here, so
 /// the caller keeps its ordinary local cancellation. Every known active execution is asked to
 /// stop; a partitioned one may still finish and stays visible as a late completion.
@@ -513,6 +537,8 @@ pub struct CancelFamilyOperation {
     job_id: JobId,
     token: Option<AuthToken>,
     serving: ServingNode,
+    /// The node that asked; `None` for a caller on this node.
+    peer: Option<NodeId>,
     now_ms: u64,
     step: CancelStep,
 }
@@ -532,9 +558,16 @@ impl CancelFamilyOperation {
             job_id,
             token,
             serving,
+            peer: None,
             now_ms,
             step: CancelStep::Alias,
         }
+    }
+
+    /// A cancel another node asked for.
+    pub fn from_peer(mut self, peer: Option<NodeId>) -> Self {
+        self.peer = peer;
+        self
     }
 
     fn projected(&mut self, family: JobFamilyId, read: Option<FamilyView>) -> CancelNext {
@@ -553,10 +586,14 @@ impl CancelFamilyOperation {
         });
         // The submitter is checked by every holder again; a group admin's permission is
         // checked here and the signature is that statement.
-        if self.auth.user_id == target.spec.created_by {
-            return self.publish(target, CancelAuthority::Submitter);
-        }
         let (local, _) = self.serving.ok_or(JobRouteError::Forbidden)?;
+        if self.auth.user_id == target.spec.created_by {
+            // A plugin task's account speaks only through its receiver, never as a group writer.
+            return match submitter_from(&target.spec, self.peer.unwrap_or(local)) {
+                true => self.publish(target, CancelAuthority::Submitter),
+                false => Err(JobRouteError::Forbidden),
+            };
+        }
         let check = GroupWriteOperation::new(&self.auth, target.spec.group_id, local);
         self.step = CancelStep::Authority(target);
         Ok(Next::Call(IoCall::child(check)))
@@ -614,6 +651,7 @@ impl Operation for CancelFamilyOperation {
                 };
                 self.step = CancelStep::Projection(family);
                 let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+                let read = read.for_reader(self.auth.user_id);
                 Ok(Next::Call(IoCall::child(read)))
             }
             CancelStep::Projection(family) => {
@@ -798,6 +836,32 @@ mod tests {
         ));
     }
 
+    // An expiry is signed by a holder in the submitter's name; any other node publishes nothing.
+    #[test]
+    fn expiry_names_submitter() {
+        let family = Family::new([1; 32]);
+        let spec = family.spec();
+        let reason = ExpiryReason::Retention;
+        let serving = Some((node(1), REALM));
+        let mut holder = PublishCancelOperation::expiry(spec.clone(), reason, serving, 5);
+        holder.first().expect("the config is read");
+        let next = holder.next(config(&family));
+        let Ok(Next::Call(IoCall::Effect(effect))) = &next else {
+            panic!("{next:?}");
+        };
+        let Effect::Net(NetEffect::ExecutionSign(claim)) = effect.as_ref() else {
+            panic!("not a signing effect: {effect:?}");
+        };
+        let JobFamilyRecord::Cancel(record) = &claim.record else {
+            panic!("not a cancel record");
+        };
+        let named = (record.requested_by, record.authority);
+        assert_eq!(named, (spec.created_by, CancelAuthority::Expiry(reason)));
+        let mut outsider = PublishCancelOperation::expiry(spec, reason, Some((node(9), REALM)), 5);
+        outsider.first().expect("the config is read");
+        assert_eq!(outsider.next(config(&family)), Ok(Next::Done(())));
+    }
+
     // A forwarded cancel tries the next holder until one answers for the family.
     #[test]
     fn forward_tries_holders() {
@@ -827,6 +891,17 @@ mod tests {
         cancel.first().expect("the alias is read");
         let none = child(Ok::<Option<JobFamilyId>, JobRouteError>(None));
         assert_eq!(cancel.next(none), Ok(Next::Done(None)));
+    }
+
+    // A plugin task's account cancels only through the receiver that admission checked.
+    #[test]
+    fn task_needs_receiver() {
+        let mut spec = Family::new([1; 32]).spec();
+        assert!(submitter_from(&spec, node(9)));
+        let work = "aruna-engine.org/plugin-work".to_string();
+        spec.payload.tags.insert(work, Ulid::nil().to_string());
+        assert!(submitter_from(&spec, spec.ingress_node_id));
+        assert!(!submitter_from(&spec, node(9)));
     }
 
     // Only the submitter may delete the record of a run.

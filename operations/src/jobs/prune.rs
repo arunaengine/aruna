@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{ARTIFACT_TOMBSTONE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
@@ -22,6 +23,8 @@ use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 
+use super::lifecycle::LifecycleError;
+use super::lifecycle::held::HeldReservations;
 use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::{
     self, SchedulePage, artifact_tombstone_key, job_entry_deletes, preserve_artifact_tombstone,
@@ -152,6 +155,8 @@ impl Operation for PruneDueOperation {
 
 #[derive(Debug, PartialEq)]
 enum PruneStep {
+    /// A job whose reservation is not released yet stays, so its terminal settlement can finish.
+    Held,
     Page,
     Record(Key),
     Cleanup(Box<JobRecord>),
@@ -207,7 +212,7 @@ impl PruneJobsOperation {
             processed: 0,
             rows: Vec::new(),
             next_page: None,
-            step: PruneStep::Page,
+            step: PruneStep::Held,
         }
     }
 
@@ -368,12 +373,19 @@ impl Operation for PruneJobsOperation {
     type Error = PruneError;
 
     fn first(&mut self) -> PruneNext {
-        let after = self.next_page.take();
-        self.page(after)
+        self.call(PruneStep::Held, IoCall::child(HeldReservations::all()))
     }
 
     fn next(&mut self, result: IoResult) -> PruneNext {
         match std::mem::replace(&mut self.step, PruneStep::Page) {
+            PruneStep::Held => {
+                let held = result.child::<Vec<JobReservationRecord>, LifecycleError>()?;
+                let held = held.map_err(|error| PruneError(error.to_string()))?;
+                self.kept
+                    .extend(held.iter().map(|reservation| reservation.job_id));
+                let after = self.next_page.take();
+                self.page(after)
+            }
             PruneStep::Page => {
                 let (mut rows, next) = result.child::<SchedulePage, JobMutationError>()??;
                 if rows.is_empty() {
@@ -535,6 +547,8 @@ pub(crate) mod tests {
     fn future_row_ends() {
         let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new());
         assert!(is_child(&prune.first()));
+        let held = child(Ok::<_, LifecycleError>(Vec::<JobReservationRecord>::new()));
+        assert!(is_child(&prune.next(held)));
         let page = page_of(vec![prune_key(25, JobId::from_bytes([1u8; 16]))]);
         assert!(is_child(&prune.next(page)));
         assert_eq!(prune.step, PruneStep::Deletes);
@@ -569,6 +583,37 @@ pub(crate) mod tests {
         assert!(is_child(&prune.cleanup_clear(record)));
         assert_eq!(prune.step, PruneStep::Deletes);
         assert_eq!(prune.outcome.pruned, 0);
+    }
+
+    // A finished job whose reservation is not released yet stays like a kept one.
+    #[test]
+    fn reserved_job_kept() {
+        use aruna_core::structs::execution::job::family::EffectiveResources;
+        let job_id = JobId::from_bytes([4u8; 16]);
+        let reservation = JobReservationRecord {
+            execution_id: Ulid::from_bytes([5u8; 16]),
+            job_id,
+            logical_job_id: job_id,
+            resources: EffectiveResources {
+                cpu_cores: 1,
+                ram_bytes: 512,
+                disk_bytes: 0,
+                max_walltime_ms: 1_000,
+                preemptible: false,
+            },
+            created_at_ms: 5,
+            subject_generation: 1,
+            subject_digest: [0u8; 32],
+            config_clock: Default::default(),
+            backend: "default".to_string(),
+            config_generation: 0,
+            config_digest: [0; 32],
+        };
+        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new());
+        prune.first().unwrap();
+        let held = child(Ok::<_, LifecycleError>(vec![reservation]));
+        assert!(is_child(&prune.next(held)));
+        assert!(prune.kept.contains(&job_id));
     }
 
     // A missing record drops its index row and tombstone, and counts as pruned.
@@ -677,6 +722,7 @@ pub(crate) mod tests {
                 env: Default::default(),
                 resources: ComputeResources::default(),
                 executor_constraint: None,
+                backend: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),

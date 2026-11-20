@@ -62,13 +62,16 @@ impl InputCaller {
     }
 }
 
+/// The object an input names; an inline input names none and never reaches a walk.
 pub(super) fn source_parts(input: &InputSelection) -> (&str, &str, Option<&str>) {
-    let InputSource::S3 {
-        bucket,
-        key,
-        version_id,
-    } = &input.source;
-    (bucket, key, version_id.as_deref())
+    match &input.source {
+        InputSource::S3 {
+            bucket,
+            key,
+            version_id,
+        } => (bucket, key, version_id.as_deref()),
+        InputSource::Inline { .. } => ("", "", None),
+    }
 }
 
 pub(super) fn reference_of(input: &InputSelection) -> String {

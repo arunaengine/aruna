@@ -20,6 +20,7 @@ use aruna_core::structs::execution::job::input::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
     InputSource, OutputDestination, OutputSelection, WorkspaceOutput,
 };
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
@@ -34,8 +35,10 @@ use aruna_operations::jobs::lifecycle::family_reads::{FamilyReportOperation, Ses
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
-use aruna_operations::jobs::local_run::{LocalExecutionConfig, LocalExecutionError};
-use aruna_operations::jobs::node_inputs::{ingress_node, local_run};
+use aruna_operations::jobs::local_run::{
+    LocalExecutionConfig, LocalExecutionError, LocalRunOperation,
+};
+use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::session::SessionOperation;
 use ulid::Ulid;
@@ -45,7 +48,6 @@ use crate::error::ServerError;
 use crate::error::ServerResult;
 use crate::server::state::ServerState;
 use aruna_core::jobs::JobStatusView;
-use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use serde::Deserialize;
@@ -160,6 +162,7 @@ impl JobRequestError {
                 Self::Conflict(error.to_string())
             }
             LocalExecutionError::Unsupported(_)
+            | LocalExecutionError::Refused(_)
             | LocalExecutionError::InputNotLocal { .. }
             | LocalExecutionError::InputRefused { .. } => {
                 Self::BadRequestMessage(error.to_string())
@@ -176,7 +179,8 @@ impl JobRequestError {
         match error {
             JobRouteError::Unauthorized => Self::Unauthorized,
             JobRouteError::Forbidden => Self::Forbidden,
-            JobRouteError::NotFound => Self::NotFound,
+            // A session whose family was pruned is gone for good, like an unknown one.
+            JobRouteError::NotFound | JobRouteError::Pruned => Self::NotFound,
             JobRouteError::Unavailable(_) => {
                 Self::ServiceUnavailableReason("job_read_unavailable".to_string())
             }
@@ -202,6 +206,11 @@ pub(crate) async fn admit_execution(
                 .map(|bearer| bearer.expires_at_secs().saturating_mul(1_000)),
         )
         .map_err(|error| JobRequestError::BadRequestMessage(error.to_string()))?;
+    if let Some(key) = aruna_core::structs::execution::job::input::plugin_tag(&command.tags) {
+        return Err(JobRequestError::BadRequestMessage(format!(
+            "tag `{key}` is reserved for plugin tasks"
+        )));
+    }
     let target = command.target.unwrap_or_default();
     let auth = match target {
         ExecutionTarget::Realm => {
@@ -291,6 +300,7 @@ pub(crate) async fn admit_execution(
             preemptible: false,
         },
         executor_constraint: command.executor_constraint,
+        backend: command.backend,
         inputs,
         file_outputs,
         workspace_outputs,
@@ -361,7 +371,7 @@ async fn local_submit(
         retention_ms: state.rocrate_limits().artifact_retention_ms,
     };
     let result = drive(
-        local_run(config, &context.compute_limits(), context.node_and_realm()),
+        LocalRunOperation::new(config, context.node_and_realm()),
         context.as_ref(),
     )
     .await
@@ -775,6 +785,9 @@ pub struct JobInputResponse {
 #[schema(as = JobPlacementCandidateResponse)]
 pub struct JobCandidateResponse {
     pub node_id: String,
+    /// The compute backend's node-local name. Absent where the report names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
     /// `selected`, `ranked` or `rejected`.
@@ -792,6 +805,9 @@ pub struct JobCandidateResponse {
 /// Only a local planning round supplies `alternatives`, `rejected`, and `omitted` counts.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobPlacementResponse {
+    /// The compute backend's node-local name on the target node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executor_kind: Option<String>,
     /// The node the execution was planned to run on.
@@ -912,6 +928,10 @@ pub struct JobStatusResponse {
     pub state: String,
     pub attempts: u32,
     pub cancel_requested: bool,
+    /// Present when a holder cancelled the job because it expired without an outcome:
+    /// `retention`, `stale_spec` or `budget_used`. It is not a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -972,6 +992,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
         state: job.state.name().to_string(),
         attempts: job.attempts,
         cancel_requested: job.cancel_requested,
+        expiry_reason: job.expiry_reason.map(|reason| reason.name().to_string()),
         created_at: rfc3339(job.created_at_ms),
         updated_at: rfc3339(job.updated_at_ms),
         finished_at: job.finished_at_ms.map(rfc3339),
@@ -1060,6 +1081,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
         locally_exhausted: report.locally_exhausted,
         cancel_requested: report.cancel_requested,
         placement: report.plan.as_ref().map(|plan| JobPlacementResponse {
+            backend: plan.target.as_ref().map(|target| target.backend.clone()),
             executor_kind: plan
                 .target
                 .as_ref()
@@ -1090,6 +1112,7 @@ pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
                 .iter()
                 .map(|candidate| JobCandidateResponse {
                     node_id: candidate.node_id.to_string(),
+                    backend: candidate.backend.clone(),
                     executor_kind: candidate.executor_kind.clone(),
                     verdict: candidate.verdict.name().to_string(),
                     rank: candidate.rank,
@@ -1165,5 +1188,8 @@ pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
             ServerError::ServiceUnavailableReason("job_read_unavailable".to_string())
         }
         JobRouteError::Internal(error) => ServerError::InternalError(error.into()),
+        JobRouteError::Pruned => {
+            ServerError::Gone("the job was pruned after its retention".to_string())
+        }
     }
 }

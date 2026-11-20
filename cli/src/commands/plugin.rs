@@ -588,6 +588,20 @@ fn summary_lines(summary: &Value) -> Vec<String> {
             lines.push(format!("  answers of service {name} are stored in buckets"));
         }
     }
+    for line in summary["tasks"].as_array().into_iter().flatten() {
+        let (name, image) = (text(&line["name"]), text(&line["image"]));
+        let cpu = line["cpu"].as_u64().unwrap_or_default();
+        let memory = line["memory_bytes"].as_u64().unwrap_or_default() >> 20;
+        let minutes = line["time_secs"].as_u64().unwrap_or_default() / 60;
+        lines.push(format!(
+            "  task {name}: {image}, {cpu} CPU, {memory} MiB, {minutes} min"
+        ));
+        if line["open_network"].as_bool() == Some(true) {
+            lines.push(format!(
+                "  task {name} has an open network: it can send anything it reads anywhere"
+            ));
+        }
+    }
     lines
 }
 

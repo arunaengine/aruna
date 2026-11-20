@@ -47,7 +47,7 @@ pub mod paths;
 pub mod placement;
 pub mod revocation;
 mod snapshot;
-mod targets;
+pub mod targets;
 
 use paths::{
     GROUP_DELETED_PATH, USER_NAME_PATH, event_observes_dot, operation_paths, role_definition_value,

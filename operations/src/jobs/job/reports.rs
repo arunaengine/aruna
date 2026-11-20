@@ -301,6 +301,7 @@ impl ReportRouteOperation {
         });
         self.step = RouteStep::Route;
         let route = FamilyRouteOperation::new(job_id, request, node, self.now_ms);
+        let route = route.for_reader(self.auth.user_id);
         Ok(Next::Call(IoCall::child(route)))
     }
 

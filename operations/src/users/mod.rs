@@ -6,6 +6,7 @@ pub mod account_status;
 pub mod admin_audit;
 pub mod get_oidc;
 pub mod get_user;
+pub mod install_account;
 pub mod list_users;
 pub mod merge;
 pub mod oidc_user;

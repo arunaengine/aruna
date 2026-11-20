@@ -3,7 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-import { cancel, copy, download, get as status, outputs, upload } from "aruna:plugin/jobs@0.3.0";
+import {
+  cancel,
+  copy,
+  download,
+  get as status,
+  outputs,
+  startTask,
+  upload,
+} from "aruna:plugin/jobs@0.3.0";
 import { log } from "aruna:plugin/log@0.3.0";
 import { create } from "aruna:plugin/metadata-create@0.3.0";
 import { files, get, list, summary } from "aruna:plugin/metadata-read@0.3.0";
@@ -117,6 +125,13 @@ export default {
     const { query, headers, version, fileField } = request;
     const sent = { ...request, query: fields(query), headers: fields(headers), fields: fields(request.fields) };
     return call(() => upload({ ...sent, version: some(version), fileField: some(fileField) }));
+  },
+
+  jobTask(request) {
+    const inputs = request.inputs.map(([path, source, version]) => ({ path, source, version: some(version) }));
+    const files = request.files.map(([path, content]) => ({ path, content }));
+    const sent = { ...request, parameters: fields(request.parameters), outputs: fields(request.outputs) };
+    return call(() => startTask({ ...sent, inputs, files }));
   },
 
   jobGet(id) {

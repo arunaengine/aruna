@@ -73,7 +73,7 @@ fn with_backend(context: &DriverContext, backend: &Arc<dyn ExecutorBackend>) -> 
     let held = (context.compute_handle.as_ref())
         .is_some_and(|registry| registry.get(&backend.kind()).is_some());
     if !held {
-        let registry = ExecutorRegistry::new().with_backend(backend.clone());
+        let registry = ExecutorRegistry::new().with_backend("docker", backend.clone());
         context.compute_handle = Some(Arc::new(registry));
     }
     context
@@ -98,7 +98,8 @@ fn attempt_scope(
     Arc::new(AttemptScope {
         job_id,
         token,
-        kind: backend.kind(),
+        // The registry of `with_backend` holds the test backend under this name.
+        backend: "docker".to_string(),
         fence: fence.clone(),
         spec: Arc::new(spec.clone()),
         bucket: bucket.to_string(),
@@ -608,6 +609,9 @@ async fn ready_with_intent(context: &DriverContext) -> (JobRecord, ulid::Ulid, A
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
     let record = record_attempt_intent(context, job_id, token, intent, None, None, 5)
         .await
@@ -1115,7 +1119,7 @@ async fn session_context(
     Arc<ExecutorRegistry>,
 ) {
     let (context, net) = net_context(storage).await;
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(backend));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", backend));
     let mut context = context;
     Arc::get_mut(&mut context).unwrap().compute_handle = Some(registry.clone());
     (context, net, registry)
@@ -1650,9 +1654,12 @@ async fn recovery_reuses_credential() {
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
     backend.mounts.store(true, Ordering::Relaxed);
-    let registry = ExecutorRegistry::new()
-        .with_backend(backend.clone())
-        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    let workspace = aruna_compute::registry::WorkspaceEndpoint {
+        endpoint: Some("http://s3.test".to_string()),
+        region: String::new(),
+        session_endpoint: None,
+    };
+    let registry = ExecutorRegistry::new().with_workspace("docker", backend.clone(), workspace);
     Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
     let (record, token, attempt) = ready_with_intent(&context).await;
     let local = net.node_id();
@@ -1733,9 +1740,12 @@ async fn workspace_run_credential() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
-    let registry = ExecutorRegistry::new()
-        .with_backend(backend.clone())
-        .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
+    let workspace = aruna_compute::registry::WorkspaceEndpoint {
+        endpoint: Some("http://s3.test".to_string()),
+        region: String::new(),
+        session_endpoint: None,
+    };
+    let registry = ExecutorRegistry::new().with_workspace("docker", backend.clone(), workspace);
     Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
     let (record, _token, _attempt) = ready_with_intent(&context).await;
     let local = net.node_id();
@@ -1882,7 +1892,12 @@ fn carries_network_access() {
 
 /// Writes the receipted reservation and the node subject a fenced start
 /// compares against.
-async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, digest: [u8; 32]) {
+async fn store_site(
+    context: &DriverContext,
+    job_id: JobId,
+    (generation, digest): (u64, [u8; 32]),
+    config_digest: [u8; 32],
+) {
     use aruna_core::compute::quota::JobReservationRecord;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
@@ -1903,6 +1918,10 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
         created_at_ms: 1,
         subject_generation: generation,
         subject_digest: digest,
+        config_clock: Default::default(),
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest,
     };
     let _ = context
         .storage_handle
@@ -1935,7 +1954,12 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
 
 fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
     let mut registry = aruna_compute::registry::ExecutorRegistry::new();
-    registry.register(StubBackend::new(StubReconcile::NotFound));
+    let workspace = aruna_compute::registry::WorkspaceEndpoint::default();
+    registry.register(
+        "docker",
+        StubBackend::new(StubReconcile::NotFound),
+        workspace,
+    );
     Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -1970,7 +1994,7 @@ async fn drifted_site_refuses() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let job_id = job_id();
-    store_site(&context, job_id, 99, [7u8; 32]).await;
+    store_site(&context, job_id, (99, [7u8; 32]), [0; 32]).await;
 
     let Err(error) = resolve_backend(&ctx, &execution_spec(), job_id).await else {
         panic!("a drifted subject must refuse the start");
@@ -1988,7 +2012,7 @@ async fn drift_requeues_attempt() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let (record, token, _) = ready_with_intent(&context).await;
-    store_site(&context, record.job_id, 99, [7u8; 32]).await;
+    store_site(&context, record.job_id, (99, [7u8; 32]), [0; 32]).await;
     let Err(error) = resolve_backend(&ctx, &execution_spec(), record.job_id).await else {
         panic!("a drifted subject must refuse the start");
     };
@@ -2010,7 +2034,7 @@ async fn drift_requeues_attempt() {
 
 #[tokio::test]
 async fn stored_site_starts() {
-    // The exact stored generation and digest still admit the start.
+    // The exact stored generation, subject digest and backend config still admit the start.
     use aruna_compute::registry::ExecutorRegistry;
     use aruna_core::compute::ExecutorCapability;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
@@ -2031,20 +2055,17 @@ async fn stored_site_starts() {
     })
     .unwrap()
     .subject;
-    let registry = ExecutorRegistry::new().with_backend(StubBackend::new(StubReconcile::NotFound));
+    let stub = StubBackend::new(StubReconcile::NotFound);
+    let registry = ExecutorRegistry::new().with_backend("docker", stub);
     let capability: ExecutorCapability = registry
         .capabilities(&subject, false)
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    store_site(
-        &context,
-        job_id,
-        capability.subject.generation,
-        capability.subject_digest,
-    )
-    .await;
+    let site = (capability.subject.generation, capability.subject_digest);
+    let config = registry.config_digest("docker").unwrap();
+    store_site(&context, job_id, site, config).await;
 
     assert!(
         resolve_backend(&ctx, &execution_spec(), job_id)
@@ -2066,8 +2087,9 @@ async fn claimed_execution(
 ) {
     let (context, net) = net_context(context.storage_handle.clone()).await;
     let mut context = context;
-    Arc::get_mut(&mut context).unwrap().compute_handle =
-        Some(Arc::new(ExecutorRegistry::new().with_backend(backend)));
+    Arc::get_mut(&mut context).unwrap().compute_handle = Some(Arc::new(
+        ExecutorRegistry::new().with_backend("docker", backend),
+    ));
 
     let job_id = job_id();
     let record = JobRecord::new(

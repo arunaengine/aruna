@@ -171,7 +171,7 @@ pub struct RunScriptInput {
     pub target: Option<ExecutionTarget>,
     /// Extra tags recorded on the run, for example who started it. A key under
     /// `aruna-engine.org/label/` demands a matching target label. The runtime
-    /// sets its own network tag and keeps it.
+    /// sets its own network tag and keeps it; `aruna-engine.org/plugin-` keys are refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<std::collections::BTreeMap<String, String>>,
 }
@@ -400,6 +400,7 @@ impl McpServer {
             ram_bytes: input.ram_bytes,
             max_walltime_ms: None,
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             output_prefixes: Vec::new(),
@@ -1178,6 +1179,7 @@ fn build_script(input: RunScriptInput, run_id: &str) -> Result<ScriptPlan, CallT
             ram_bytes: input.ram_bytes,
             max_walltime_ms: input.max_walltime_ms,
             executor_constraint: None,
+            backend: None,
             inputs,
             outputs: input.outputs.unwrap_or_default(),
             output_prefixes: Vec::new(),

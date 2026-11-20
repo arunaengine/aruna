@@ -25,6 +25,7 @@ fn config(expected: Option<u64>) -> InstallEntryConfig {
         expected,
         install: Some(install),
         audit: None,
+        proven: BTreeSet::new(),
     }
 }
 
@@ -81,4 +82,49 @@ fn drains_after_commit() {
             calls: drain
         }
     );
+}
+
+#[test]
+fn removed_path_refused() {
+    let none = BTreeSet::new();
+    assert_eq!(entry_admits(&InstallEntry::Absent, true, &none), Ok(()));
+    let deleted = InstallEntry::Settled(None);
+    // A delayed retry with the original id finds the deletion and writes nothing.
+    assert_eq!(
+        entry_admits(&deleted, true, &none),
+        Err(RecordError::Retired)
+    );
+    let live = InstallEntry::Settled(Some(Box::new(sample_install(Ulid::from_parts(1, 1)))));
+    assert_eq!(entry_admits(&live, true, &none), Ok(()));
+}
+
+#[test]
+fn conflict_resolves_deletion() {
+    let (a, mut b) = (
+        sample_install(Ulid::from_parts(1, 1)),
+        sample_install(Ulid::from_parts(1, 1)),
+    );
+    b.group_id = Ulid::from_bytes([8; 16]);
+    let conflict = InstallEntry::Conflict {
+        deletion: true,
+        installs: vec![a.clone(), b.clone()],
+    };
+    // No write may settle the replacement over the deletion.
+    let all = BTreeSet::from([a.group_id, b.group_id]);
+    assert_eq!(
+        entry_admits(&conflict, true, &all),
+        Err(RecordError::Retired)
+    );
+    // The resolving deletion needs every candidate group proven.
+    let one = BTreeSet::from([a.group_id]);
+    assert_eq!(
+        entry_admits(&conflict, false, &one),
+        Err(RecordError::Unproven)
+    );
+    assert_eq!(entry_admits(&conflict, false, &all), Ok(()));
+    let values = InstallEntry::Conflict {
+        deletion: false,
+        installs: vec![a, b],
+    };
+    assert_eq!(entry_admits(&values, true, &BTreeSet::new()), Ok(()));
 }

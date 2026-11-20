@@ -10,7 +10,7 @@ use std::time::Duration;
 use aruna_core::alpn::Alpn;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::offer::BackendLimits;
 use aruna_core::document::ShardTransportMessage;
 use aruna_core::federation::PUBLISH_INTERVAL;
 use aruna_core::git::GitNode;
@@ -52,6 +52,7 @@ use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperati
 use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
 use crate::jobs::node_inputs::witness_node;
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
+use crate::jobs::records::prune::pass::PruneFamiliesOperation;
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::repository::link_queue::LinkRunOperation;
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
@@ -64,6 +65,7 @@ use crate::metadata::prune_queue::GRAPH_RETRY_AFTER;
 use crate::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperation};
 use crate::metadata::serve::ServedReply;
 use crate::node::applied_drain::AppliedDrainOperation;
+use crate::node::catch_up::{CATCH_UP_REFRESH, CatchUpOperation, next_pass};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
 use crate::node::peer_metadata::{MetadataNode, MetadataPeerOperation};
@@ -166,7 +168,7 @@ pub struct TimerInput {
     /// The fresh heartbeats this node holds, filled like `facts`.
     pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
     /// What each local executor backend advertises, filled like `heartbeats`.
-    pub limits: BTreeMap<String, ResourceEnvelope>,
+    pub limits: BackendLimits,
     /// This node's ROCrate limits, such as the artifact retention and the holder refresh.
     pub rocrate_limits: RoCrateLimits,
 }
@@ -280,6 +282,8 @@ pub enum TimerOperation {
     DrainCaptures(CaptureDrainOperation),
     SettleJobTerminals(SettleTerminalsOperation),
     PruneJobs(PruneKeepingWork),
+    PruneFamilies(PruneFamiliesOperation),
+    ConfigCatchUp(CatchUpOperation),
     DrainMirrorRepair(DrainRepairsOperation),
     PublishUsageSnapshots(PublishUsageOperation),
     PublishNodeInfo(InfoTimerOperation),
@@ -391,6 +395,15 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::PruneJobs => Some(TimerOperation::PruneJobs(PruneKeepingWork::new(
             JOB_PRUNE_PAGE,
         ))),
+        TaskKey::PruneFamilies => Some(TimerOperation::PruneFamilies(PruneFamiliesOperation::new(
+            input.serving,
+        ))),
+        TaskKey::ConfigCatchUp => Some(match input.serving {
+            Some((local, realm_id)) => {
+                TimerOperation::ConfigCatchUp(CatchUpOperation::new(local, realm_id))
+            }
+            None => TimerOperation::Wait(WaitOperation::after(Some(CATCH_UP_REFRESH))),
+        }),
         TaskKey::DrainMirrorRepair => Some(match input.local_node {
             Some(node_id) => TimerOperation::DrainMirrorRepair(DrainRepairsOperation::new(node_id)),
             None => TimerOperation::Wait(WaitOperation::after(Some(REPAIR_RETRY_AFTER))),
@@ -519,6 +532,8 @@ macro_rules! each_timer {
             TimerOperation::DrainCaptures($operation) => $body,
             TimerOperation::SettleJobTerminals($operation) => $body,
             TimerOperation::PruneJobs($operation) => $body,
+            TimerOperation::PruneFamilies($operation) => $body,
+            TimerOperation::ConfigCatchUp($operation) => $body,
             TimerOperation::DrainMirrorRepair($operation) => $body,
             TimerOperation::PublishUsageSnapshots($operation) => $body,
             TimerOperation::PublishNodeInfo($operation) => $body,
@@ -777,20 +792,39 @@ impl TimerRun for SettleTerminalsOperation {
     }
 }
 
+/// More due rows run at once; otherwise the next due row runs at its time, at most after the
+/// poll interval. A failed run retries soon.
+fn prune_plan(result: Result<(bool, Option<Duration>), String>) -> Result<TimerPlan, TimerFailure> {
+    let (has_more, next_due_after) = result.map_err(|reason| TimerFailure {
+        retry_after: PRUNE_RETRY_AFTER,
+        reason,
+    })?;
+    let poll = |due: Duration| due.min(PRUNE_POLL_AFTER);
+    let after = match has_more {
+        true => Duration::ZERO,
+        false => next_due_after.map_or(PRUNE_POLL_AFTER, poll),
+    };
+    Ok(TimerPlan::from(Some(after)))
+}
+
 impl TimerRun for PruneKeepingWork {
-    /// More due jobs run at once; otherwise the next due job runs at its time, at most after the
-    /// poll interval. A failed run retries soon.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
-        let outcome = result.map_err(|error| TimerFailure {
-            retry_after: PRUNE_RETRY_AFTER,
-            reason: error.to_string(),
-        })?;
-        let poll = |due: Duration| due.min(PRUNE_POLL_AFTER);
-        let after = match outcome.has_more {
-            true => Duration::ZERO,
-            false => outcome.next_due_after.map_or(PRUNE_POLL_AFTER, poll),
-        };
-        Ok(TimerPlan::from(Some(after)))
+        let result = result.map_err(|error| error.to_string());
+        prune_plan(result.map(|outcome| (outcome.has_more, outcome.next_due_after)))
+    }
+}
+
+impl TimerRun for PruneFamiliesOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let result = result.map_err(|error| error.to_string());
+        prune_plan(result.map(|outcome| (outcome.has_more, outcome.next_due_after)))
+    }
+}
+
+impl TimerRun for CatchUpOperation {
+    /// A caught-up node passes again after the refresh spacing, any other after the retry spacing.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(Some(next_pass(&result))))
     }
 }
 

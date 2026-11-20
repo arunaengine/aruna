@@ -18,7 +18,7 @@ use aruna_plugin_types::calls::{
 use aruna_plugin_types::permission::Permission;
 use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{
-    Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobTask, JobUpload, MetadataCreate,
     MetadataPatch, SendRequest, StatePut, StateRemove,
 };
 use aruna_plugins::host::wit::aruna::plugin::types::{
@@ -59,6 +59,9 @@ struct Transfer {
     path: String,
     state: String,
     reply: Option<(u16, Vec<u8>)>,
+    /// A task's report and the objects it wrote.
+    report: Option<String>,
+    outputs: Vec<String>,
 }
 
 #[derive(Default)]
@@ -108,6 +111,8 @@ impl State {
             path,
             state: "queued".into(),
             reply: None,
+            report: None,
+            outputs: Vec::new(),
         };
         self.transfers.entry(id.clone()).or_insert(transfer);
         id
@@ -192,6 +197,28 @@ impl Group {
             .into_values()
             .map(|transfer| transfer.call)
             .collect()
+    }
+
+    /// Ends task `id` in `state` with its report and the objects it wrote.
+    fn finish_task(&self, id: &str, state: &str, (report, outputs): (Option<Value>, &[&str])) {
+        self.with(|group| {
+            let task = group.transfers.get_mut(id).unwrap();
+            task.state = state.into();
+            task.report = report.map(|report| report.to_string());
+            task.outputs = outputs.iter().map(|path| path.to_string()).collect();
+            for path in outputs {
+                let version = Version {
+                    id: format!("{id}-out"),
+                    content: b"bam".to_vec(),
+                    marked: false,
+                };
+                group
+                    .objects
+                    .entry(path.to_string())
+                    .or_default()
+                    .push(version);
+            }
+        });
     }
 
     /// Ends job `id` in `state` with an upload's `reply`; a download that succeeded wrote its
@@ -533,6 +560,45 @@ impl Broker for Group {
         }))
     }
 
+    async fn jobs_start_task(&self, cx: &CallContext, task: JobTask) -> Result<String, HostError> {
+        let pairs = |fields: &[Field]| -> Vec<String> {
+            (fields.iter())
+                .map(|field| format!("{}={}", field.name, field.value))
+                .collect()
+        };
+        let inputs: Vec<String> = (task.inputs.iter())
+            .map(|(path, source, _)| format!("{path}={source}"))
+            .collect();
+        let files: Vec<String> = (task.files.iter())
+            .map(|(path, content)| format!("{path}={}", String::from_utf8_lossy(content)))
+            .collect();
+        let call = format!(
+            "task {} {} {} {} {}",
+            task.task,
+            pairs(&task.parameters).join(","),
+            inputs.join(","),
+            files.join(","),
+            pairs(&task.outputs).join(",")
+        );
+        Ok(self.with(|state| state.transfer(cx, &task.intent, call, ("task", String::new()))))
+    }
+
+    async fn jobs_outputs(
+        &self,
+        _: &CallContext,
+        id: &str,
+        cursor: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        let outputs = self.with(|state| state.transfers.get(id).map(|task| task.outputs.clone()));
+        let outputs =
+            outputs.ok_or_else(|| HostError::new(ErrorKind::NotFound, format!("no job {id}")))?;
+        let infos: Vec<ObjectInfo> = (outputs.iter())
+            .map(|path| info(self.version(path, None).unwrap()))
+            .collect();
+        let (objects, cursor) = paged(&infos, cursor);
+        Ok(ObjectPage { objects, cursor })
+    }
+
     /// As on the node, a source the install may not send is not found.
     async fn jobs_upload(&self, cx: &CallContext, upload: JobUpload) -> Result<String, HostError> {
         let (_, source) = self.version(&upload.source, upload.version.as_deref())?;
@@ -566,8 +632,8 @@ impl Broker for Group {
                 reply_headers: status.map(|_| headers).unwrap_or_default(),
                 reply_status: status,
                 reply_body: body,
-                exit_code: None,
-                report: None,
+                exit_code: (transfer.kind == "task").then_some(0),
+                report: transfer.report,
             });
         }
         let copy = self.with(|state| state.copies.get(id).cloned());
@@ -1340,4 +1406,64 @@ async fn zenodo_deposit() {
     let marked = manual(json!({ "dataset": "D1", "file": "raw/run-7/m.fq" }));
     assert!(example.run(&group, json!({}), marked).await.is_err());
     assert_eq!(group.transfers().len(), 2, "a marked version is not sent");
+}
+
+#[tokio::test]
+async fn map_reads() {
+    // The reads below a bucket path and a sample sheet go to one task; its outputs are linked to
+    // the dataset and its report's numbers recorded, or left out without a report.
+    let example = example("map-reads").await;
+    let settings = json!({ "results": "results" });
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    group.object("raw/run-7/a.fastq.gz", "v1", b"@a");
+    group.object("raw/run-7/notes.txt", "v1", b"notes");
+    let form = |reference: &str| {
+        manual(json!({ "dataset": "D1", "reads": "raw/run-7/", "reference": reference }))
+    };
+    let wrong = example.run(&group, settings.clone(), form("hg38")).await;
+    assert_eq!(wrong.unwrap_err().kind, FailureKind::InvalidInput);
+    let started = example
+        .run(&group, settings.clone(), form("GCF_000005845.2"))
+        .await;
+    assert_eq!(started.unwrap(), json!({ "job": "job-1", "reads": 1 }));
+    let results = "results/D1/GCF_000005845.2/";
+    let task = format!(
+        "task map reference=GCF_000005845.2 /in/reads/=raw/run-7/ \
+         /in/samples.tsv=a.fastq.gz\tRun 7\n /out/results/={results}"
+    );
+    assert_eq!(group.transfers(), [task]);
+    let output = format!("{results}a.bam");
+    let report = json!({ "reads": 1000, "mapped_percent": 97.5 });
+    group.finish_task("job-1", "succeeded", (Some(report), &[output.as_str()]));
+    let recorded = example
+        .run(&group, settings.clone(), event("job_finished", "job-1", ""))
+        .await;
+    assert_eq!(recorded.unwrap(), Value::Null);
+    let entity = group.entity("D1");
+    let mapping = json!({ "reference": "GCF_000005845.2", "reads": 1000, "mappedPercent": 97.5 });
+    assert_eq!(entity["mapping"], mapping);
+    let files = group.files("D1");
+    assert_eq!(files[0]["contentUrl"], json!(format!("s3://{output}")));
+    assert_eq!(group.value("job/job-1"), None);
+    // Without a report the task is still recorded, with a warning.
+    let again = example
+        .run(&group, settings.clone(), form("GCF_000001405.40"))
+        .await;
+    assert_eq!(again.unwrap()["job"], "job-2");
+    group.finish_task("job-2", "succeeded", (None, &[]));
+    let recorded = example
+        .run(&group, settings, event("job_finished", "job-2", ""))
+        .await;
+    assert_eq!(recorded.unwrap(), Value::Null);
+    assert_eq!(
+        group.entity("D1")["mapping"],
+        json!({ "reference": "GCF_000001405.40" })
+    );
+    let lines = group.with(|state| state.lines.clone());
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("report was left out"))
+    );
 }

@@ -31,7 +31,8 @@ use super::rows::{
     Row, Rows, Scan, StoreError, Writes, decode, delete_call, done, encode, page_call, page_of,
     read_call, row, unexpected, values, writes,
 };
-use super::work::{WorkRow, work_scan};
+use super::work::work_scan;
+use aruna_core::install_work::WorkRow;
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RunError {

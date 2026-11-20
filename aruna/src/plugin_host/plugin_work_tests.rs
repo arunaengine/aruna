@@ -197,10 +197,10 @@ async fn marked_source_refused() {
     use aruna_plugins::broker::Broker;
 
     use crate::plugin_host::broker::RunBroker;
+    use aruna_core::install_work::WorkKind;
     use aruna_drivers::driver::drive;
     use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
-    use aruna_operations::plugins::work::WorkKind;
     use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
     use aruna_plugin_types::calls::Intent;
     use aruna_plugins::broker::JobCopy;
@@ -253,9 +253,9 @@ async fn small_reads_unmarked() {
     use aruna_plugins::broker::{Broker, CallContext};
 
     use crate::plugin_host::broker::RunBroker;
+    use aruna_core::install_work::WorkKind;
     use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
-    use aruna_operations::plugins::work::WorkKind;
     let fixture = Fixture::new().await;
     let (_root, blob, install, _) = ready_copy(&fixture).await;
     let broker = RunBroker::new(Arc::new(blob.clone()), scope(&fixture, &install));
@@ -312,10 +312,10 @@ async fn versioned_info() {
     use aruna_plugins::broker::{Broker, CallContext};
 
     use crate::plugin_host::broker::RunBroker;
+    use aruna_core::install_work::WorkKind;
     use aruna_drivers::driver::drive;
     use aruna_operations::plugins::marks::{Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
-    use aruna_operations::plugins::work::WorkKind;
     use aruna_operations::s3::object::put::PutObjectOperation;
     use aruna_operations::testing_objects::put_config;
     let fixture = Fixture::new().await;

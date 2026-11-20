@@ -547,6 +547,7 @@ pub enum NetEvent {
     /// The asked peers a topic lacks, `None` without the topic's state here, or why it is
     /// unreadable.
     MissingTopicPeers(Result<Option<Vec<crate::id::NodeId>>, String>),
+    ConfigCatchUp(CatchUpEvent),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
     /// A local signal or change was taken; nothing is read back.
@@ -591,6 +592,19 @@ pub enum ShardNetEvent {
     Root(Result<[u8; 32], String>),
     Proof(crate::structs::placement::transition::CompletionProof),
     Manifest(Result<Box<crate::document::ShardManifest>, String>),
+}
+
+/// The answer to one realm config catch-up step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchUpEvent {
+    /// The round ran to its end; the topic's stored clock after it is the round target.
+    Counted { target: irokle::ActorClock },
+    /// The round stopped at its page budget (`WouldBlock`), so it counts for nothing.
+    Partial,
+    /// The management node did not answer, or the round failed.
+    Failed(String),
+    /// Whether the applied cursor covers every round target.
+    Applied { covered: bool },
 }
 
 /// Why sync topics did not take the requested peers.
@@ -778,6 +792,12 @@ pub enum JobRecordRejection {
     Unauthorized,
     /// The record failed contract validation, such as budget or chain rules.
     Invalid,
+    /// The responder holds no accepted spec of the family; offer the record again with its spec.
+    SpecNeeded,
+    /// The record's spec is older than the horizon, so the family can never start here.
+    StaleFamily,
+    /// The record's spec belongs to a family the responder pruned.
+    FamilyPruned,
 }
 
 /// The placement detail one decline may carry. Decoding rejects an oversized
@@ -839,6 +859,12 @@ pub enum LaunchDecline {
     /// This node already runs, or already ran successfully, an execution of the
     /// same family. Retryable: another target may still take the launch.
     AlreadyRunning,
+    /// The launch window passed on the target's clock, so no target accepts this launch any
+    /// more. A new launch may still be accepted.
+    Expired,
+    /// None of the target's membership intervals the launch cites is still open, so the launch
+    /// belongs to an interval that ended.
+    WrongInterval,
 }
 
 /// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an
@@ -1086,6 +1112,7 @@ impl Event {
                     Shard,
                     TopicPeers,
                     MissingTopicPeers,
+                    ConfigCatchUp,
                     DeletePlanSigned,
                     Notification,
                     InboxWoken,

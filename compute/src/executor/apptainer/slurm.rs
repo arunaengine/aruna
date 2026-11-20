@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+use aruna_core::compute::backend::RuntimeDestination;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
     ExecutorKind, FenceContext, GrantedResources, LogLimits, LogTails, OutputMatcher,
@@ -220,6 +221,12 @@ fn several_jobs(ids: &[String]) -> BackendError {
 impl ExecutorBackend for SlurmBackend {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Slurm
+    }
+
+    fn destination(&self) -> Option<RuntimeDestination> {
+        Some(RuntimeDestination::Slurm {
+            state_root: self.config.state_root.display().to_string(),
+        })
     }
 
     fn capabilities(&self) -> BackendCaps {

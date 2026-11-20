@@ -6,10 +6,10 @@
 use std::collections::BTreeMap;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::offer::BackendLimits;
 use aruna_core::heartbeat::{HeldHeartbeat, Here};
 use aruna_core::id::NodeId;
-use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
+use aruna_core::jobs::{ClosureAnswer, LaunchClosureAnswer, SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection};
@@ -19,6 +19,9 @@ use aruna_core::structs::storage::routing::NodeRouting;
 use ulid::Ulid;
 
 use crate::jobs::lifecycle::admit::forwarded::AdmitForwardedOperation;
+use crate::jobs::lifecycle::closure::{
+    AnswerClosureOperation, ClosureError, ServeClosureOperation,
+};
 use crate::jobs::lifecycle::serve_inputs::ServeInputsOperation;
 use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::pages::{PageReadError, ServePageOperation};
@@ -39,7 +42,7 @@ pub struct MetadataNode {
     pub metadata_bytes: u64,
     pub here: Option<Here>,
     pub routing: Option<NodeRouting>,
-    pub limits: BTreeMap<String, ResourceEnvelope>,
+    pub limits: BackendLimits,
     pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
     /// The execution id a launch offer starts with, drawn by the shell.
     pub execution_id: Ulid,
@@ -75,6 +78,10 @@ enum Asked {
     Plugin(PluginAnswer),
     Record,
     Submission,
+    /// A holder asks whether a launch's interval is closed.
+    Closure,
+    /// A holder asks this receiver about a task submission's claim.
+    Claim,
     Inputs,
     Page,
     Serve,
@@ -151,6 +158,18 @@ impl MetadataPeerOperation {
                     AdmitForwardedOperation::new(peer, auth_token, submission_id, *request, node);
                 self.ask(Asked::Submission, admit)
             }
+            Message::QueryLaunchClosure { launch } => {
+                let answer = AnswerClosureOperation::new(*launch, serving, Some(peer));
+                self.ask(Asked::Closure, answer)
+            }
+            Message::QuerySubmissionClaim {
+                submission_id,
+                admit_by,
+            } => {
+                let question = (submission_id, admit_by);
+                let serve = ServeClosureOperation::new(self.local.1, peer, question);
+                self.ask(Asked::Claim, serve)
+            }
             Message::ResolveJobInputs {
                 auth_token,
                 request,
@@ -222,6 +241,15 @@ impl Operation for MetadataPeerOperation {
             Asked::Submission => Message::ForwardedJobSubmission {
                 result: result.child::<SubmissionAck, SubmissionRefusal>()?,
             },
+            Asked::Closure => match result.child::<LaunchClosureAnswer, ClosureError>()? {
+                Ok(answer) => Message::LaunchClosureAnswered { answer },
+                Err(ClosureError::Outsider) => Message::Reject(ClosureError::Outsider.to_string()),
+                Err(ClosureError::Undecided(_)) => Message::ForwardedWriteUnavailable,
+            },
+            Asked::Claim => Message::SubmissionClaimAnswered {
+                answer: (result.child::<ClosureAnswer, IoError>()?)
+                    .unwrap_or(ClosureAnswer::Undecided),
+            },
             Asked::Inputs => Message::ResolvedJobInputs {
                 result: result
                     .child::<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal>()?,
@@ -287,6 +315,57 @@ mod tests {
         let failed = IoResult::Child(ChildOutcome::new(failed));
         let reply = MetadataTransportMessage::InputPageResult { page: None };
         assert_eq!(run.next(failed), Ok(Next::Done((reply, None))));
+    }
+
+    // A claim question goes to this receiver's closure answer; a run that broke off decides
+    // nothing.
+    #[test]
+    fn claim_query_answered() {
+        let (submission_id, admit_by) = (SubmissionId([4; 32]), 9);
+        let query = MetadataTransportMessage::QuerySubmissionClaim {
+            submission_id,
+            admit_by,
+        };
+        let mut run = operation(query.clone(), false);
+        let serve = ServeClosureOperation::new(local().1, peer(), (submission_id, admit_by));
+        assert_eq!(run.first(), Ok(Next::Call(IoCall::child(serve))));
+        let absent = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(ClosureAnswer::Absent)));
+        let answer = ClosureAnswer::Absent;
+        let reply = MetadataTransportMessage::SubmissionClaimAnswered { answer };
+        assert_eq!(run.next(absent), Ok(Next::Done((reply, None))));
+        let mut broken = operation(query, false);
+        broken.first().unwrap();
+        let failed = Err::<ClosureAnswer, _>(IoError::Unfinished);
+        let failed = IoResult::Child(ChildOutcome::new(failed));
+        let answer = ClosureAnswer::Undecided;
+        let reply = MetadataTransportMessage::SubmissionClaimAnswered { answer };
+        assert_eq!(broken.next(failed), Ok(Next::Done((reply, None))));
+    }
+
+    // A launch closure answer goes back as is; an outsider is rejected and an undecided answer
+    // is unavailable, so the holder asks again.
+    #[test]
+    fn closure_answer_replied() {
+        let reply = |answer: Result<LaunchClosureAnswer, ClosureError>| {
+            let mut run = operation(MetadataTransportMessage::ForwardedWriteUnavailable, false);
+            run.asked = Some(Asked::Closure);
+            match run.next(IoResult::Child(ChildOutcome::new(answer))) {
+                Ok(Next::Done((reply, None))) => reply,
+                other => panic!("a closure answer is a reply: {other:?}"),
+            }
+        };
+        let never = LaunchClosureAnswer::NeverAccepted;
+        let answered = MetadataTransportMessage::LaunchClosureAnswered {
+            answer: never.clone(),
+        };
+        assert_eq!(reply(Ok(never)), answered);
+        let outsider = MetadataTransportMessage::Reject(ClosureError::Outsider.to_string());
+        assert_eq!(reply(Err(ClosureError::Outsider)), outsider);
+        let undecided = Err(ClosureError::Undecided("down".to_string()));
+        assert_eq!(
+            reply(undecided),
+            MetadataTransportMessage::ForwardedWriteUnavailable
+        );
     }
 
     // A request no plugin or job operation takes is served by the metadata domain, and a run

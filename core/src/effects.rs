@@ -808,6 +808,21 @@ impl IterEnd {
     }
 }
 
+/// The realm config catch-up a node runs after every start, one step at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchUpEffect {
+    /// One sync round of the realm config topic with one management node.
+    Round {
+        topic: irokle::TopicId,
+        peer: NodeId,
+    },
+    /// Whether this node applied the topic up to every round target.
+    Applied {
+        topic: irokle::TopicId,
+        targets: Vec<irokle::ActorClock>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
@@ -899,6 +914,9 @@ pub enum NetEffect {
         topic: irokle::TopicId,
         peers: Vec<NodeId>,
     },
+    /// One step of catching up with the realm config after a start; answers
+    /// `NetEvent::ConfigCatchUp`.
+    ConfigCatchUp(Box<CatchUpEffect>),
     /// Signs this node's statement that it is ready for a group deletion plan; answers
     /// `NetEvent::DeletePlanSigned`.
     SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),

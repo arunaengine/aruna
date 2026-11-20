@@ -2,20 +2,32 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use std::time::Duration;
+
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{
+    Event, GroupEvent, GroupResult, JobRecordRejection, MetadataAnswer, NetEvent,
+};
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::family::JobFamilyRecord;
+use aruna_core::structs::execution::job::family::{
+    ExpiryReason, JobFamilyRecord, JobRecordEnvelope, JobRecordKind,
+};
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::{Key, Value};
 
-use super::{DrainOutboxOperation, scan};
+use super::{DrainOutboxOperation, bound_spec, scan};
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::cancel::PublishCancelOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
+use crate::jobs::route::JobRouteError;
 use crate::tests::records::{Family, REALM, actor, node};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 
 type Step = Result<Next<bool>, LifecycleError>;
 
@@ -194,4 +206,196 @@ fn rejects_unfit_result() {
         drain.next(IoResult::Woke),
         Err(LifecycleError::UnexpectedEvent { .. })
     ));
+}
+
+fn stored_entry() -> IoResult {
+    let entry = OutboxEntry {
+        queued_at_ms: 1,
+        delivered: Vec::new(),
+        next_holder: 0,
+        rejections: 0,
+    };
+    let stored = to_bytes(&entry).expect("entry encodes");
+    IoResult::Values(vec![Some(Value::from(stored.as_slice()))])
+}
+
+/// The holders' answer that they hold no spec of the family.
+fn spec_needed(holders: usize) -> IoResult {
+    refusal(JobRecordRejection::SpecNeeded, holders)
+}
+
+/// The same refusal from each of `holders`.
+fn refusal(reason: JobRecordRejection, holders: usize) -> IoResult {
+    let reply = MetadataTransportMessage::ForwardedJobRecord {
+        result: Err(reason),
+    };
+    let answer = || MetadataAnswer {
+        peer: node(2),
+        elapsed: Duration::ZERO,
+        result: Ok(encode_message(&reply).expect("reply encodes")),
+    };
+    let results = (0..holders)
+        .map(|_| {
+            GroupResult::Done(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
+                answer(),
+            )))))
+        })
+        .collect();
+    IoResult::Group(GroupEvent::Finished { results })
+}
+
+// A holder without the spec makes the pass read the family's specs and offer the record again
+// with the one it binds.
+#[test]
+fn offers_bound_spec() {
+    let family = Family::new([6u8; 32]);
+    let spec = family.sign(
+        &family.holder,
+        JobFamilyRecord::Spec(Box::new(family.spec())),
+    );
+    let claim = family.sign(
+        &family.holder,
+        JobFamilyRecord::Claim(family.claim(&family.spec())),
+    );
+    let key = record_key(&claim.key());
+    let row = Value::from(to_bytes(&claim).expect("record encodes").as_slice());
+    let mut drain = scanning(&family, None);
+    drain.next(page(vec![key], None)).expect("record read");
+    drain
+        .next(IoResult::Values(vec![Some(row)]))
+        .expect("outbox read");
+    let Ok(Next::Call(IoCall::Group(group))) = drain.next(stored_entry()) else {
+        panic!("the claim is offered");
+    };
+    let holders = group.members.len();
+    let kept = drain.next(spec_needed(holders));
+    assert!(matches!(kept, Ok(Next::Call(IoCall::Write(_)))));
+    let specs = LoadFamilyOperation::kind(family.family(), JobRecordKind::Spec);
+    assert_eq!(
+        drain.next(IoResult::Done),
+        Ok(Next::Call(IoCall::child(specs)))
+    );
+    let loaded = Ok::<_, FamilyReadError>(vec![spec.clone()]);
+    let reread = drain.next(IoResult::Child(ChildOutcome::new(loaded)));
+    assert!(matches!(reread, Ok(Next::Call(IoCall::Read(_)))));
+    let Ok(Next::Call(IoCall::Group(group))) = drain.next(stored_entry()) else {
+        panic!("the claim is offered again");
+    };
+    let Effect::Net(NetEffect::MetadataRequest(request)) = &group.members[0] else {
+        panic!("a record publish");
+    };
+    let message = decode_message(&request.frame).expect("publish decodes");
+    let MetadataTransportMessage::ForwardJobRecord { attached, .. } = message else {
+        panic!("a record publish");
+    };
+    let attached: Vec<JobRecordEnvelope> = attached
+        .into_iter()
+        .map(|frame| frame.into_inner())
+        .collect();
+    assert_eq!(attached, vec![spec]);
+}
+
+// A record names its spec by digest; an update names none and takes the family's spec.
+#[test]
+fn picks_bound_spec() {
+    let family = Family::new([7u8; 32]);
+    let spec = family.spec();
+    let signed = family.sign(
+        &family.holder,
+        JobFamilyRecord::Spec(Box::new(spec.clone())),
+    );
+    let mut other = spec.clone();
+    other.spec_digest = [9; 32];
+    let other = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(other)));
+    let specs = vec![other.clone(), signed.clone()];
+    let claim = family.sign(&family.holder, JobFamilyRecord::Claim(family.claim(&spec)));
+    let bound = bound_spec(&claim, specs.clone()).map(|frame| frame.into_inner());
+    assert_eq!(bound, Some(signed.clone()));
+    let update = family.run(
+        1,
+        0,
+        aruna_core::structs::execution::job::family::PhysicalExecutionState::Failed,
+    )[6]
+    .clone();
+    assert!(matches!(update.record, JobFamilyRecord::Update(_)));
+    let bound = bound_spec(&update, specs).map(|frame| frame.into_inner());
+    assert_eq!(bound, Some(other));
+    assert_eq!(bound_spec(&signed, vec![signed.clone()]), None);
+}
+
+fn row_of(envelope: &JobRecordEnvelope) -> IoResult {
+    let bytes = to_bytes(envelope).expect("record encodes");
+    IoResult::Values(vec![Some(Value::from(bytes.as_slice()))])
+}
+
+// A queued receipt goes with the launch it binds and that scheduler's budget.
+#[test]
+fn bundles_receipt_records() {
+    let family = Family::new([8u8; 32]);
+    let run = family.run(
+        1,
+        0,
+        aruna_core::structs::execution::job::family::PhysicalExecutionState::Failed,
+    );
+    let (budget, launch, receipt) = (&run[2], &run[3], &run[4]);
+    let key = record_key(&receipt.key());
+    let mut drain = scanning(&family, None);
+    drain.next(page(vec![key], None)).expect("record read");
+    assert_eq!(
+        drain.next(row_of(receipt)),
+        record_read(&record_key(&launch.key()))
+    );
+    assert_eq!(
+        drain.next(row_of(launch)),
+        record_read(&record_key(&budget.key()))
+    );
+    let outbox = drain.next(row_of(budget));
+    assert!(matches!(outbox, Ok(Next::Call(IoCall::Read(_)))));
+    let Ok(Next::Call(IoCall::Group(group))) = drain.next(stored_entry()) else {
+        panic!("the receipt is offered");
+    };
+    let Effect::Net(NetEffect::MetadataRequest(request)) = &group.members[0] else {
+        panic!("a record publish");
+    };
+    let message = decode_message(&request.frame).expect("publish decodes");
+    let MetadataTransportMessage::ForwardJobRecord { attached, .. } = message else {
+        panic!("a record publish");
+    };
+    let attached: Vec<JobRecordEnvelope> = attached
+        .into_iter()
+        .map(|frame| frame.into_inner())
+        .collect();
+    assert_eq!(attached, vec![launch.clone(), budget.clone()]);
+}
+
+// An own spec refused as stale is cancelled with an expiry, then the pass goes on.
+#[test]
+fn expires_stale_spec() {
+    let family = Family::new([9u8; 32]);
+    let mut spec = family.spec();
+    spec.origin_node_id = node(1);
+    let envelope = family.sign(
+        &family.holder,
+        JobFamilyRecord::Spec(Box::new(spec.clone())),
+    );
+    let key = record_key(&envelope.key());
+    let mut drain = scanning(&family, None);
+    drain.next(page(vec![key], None)).expect("record read");
+    drain.next(row_of(&envelope)).expect("outbox read");
+    let Ok(Next::Call(IoCall::Group(group))) = drain.next(stored_entry()) else {
+        panic!("the spec is offered");
+    };
+    let stale = refusal(JobRecordRejection::StaleFamily, group.members.len());
+    assert!(matches!(
+        drain.next(stale),
+        Ok(Next::Call(IoCall::Delete(_)))
+    ));
+    let reason = ExpiryReason::StaleSpec;
+    let cancel = PublishCancelOperation::expiry(spec, reason, Some((node(1), REALM)), 0);
+    assert_eq!(
+        drain.next(IoResult::Done),
+        Ok(Next::Call(IoCall::child(cancel)))
+    );
+    let published = IoResult::Child(ChildOutcome::new(Ok::<_, JobRouteError>(())));
+    assert_eq!(drain.next(published), cursor_write(None));
 }

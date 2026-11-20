@@ -175,6 +175,7 @@ fn execution_spec(group_id: GroupId) -> ExecutionSpec {
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -220,6 +221,9 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
             executor_kind: "docker".to_string(),
             pinned_image: "alpine@sha256:digest".to_string(),
             attempt_epoch: 0,
+            backend: "docker".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("docker", None),
         },
         None,
         None,
@@ -235,7 +239,9 @@ async fn seed_execution(harness: &Harness, spec: ExecutionSpec) -> (JobRecord, A
 async fn capture_inputs(harness: &Harness, spec: &ExecutionSpec) -> Vec<CapturedInput> {
     let mut captured = Vec::with_capacity(spec.inputs.len());
     for input in &spec.inputs {
-        let InputSource::S3 { version_id, .. } = &input.source;
+        let InputSource::S3 { version_id, .. } = &input.source else {
+            panic!("the input names an object");
+        };
         let version = version_id
             .as_deref()
             .map(|version| Ulid::from_string(version).unwrap());
@@ -459,11 +465,11 @@ async fn capture_outputs(
     (node_id, cancel): (NodeId, &CancellationToken),
 ) -> Result<Vec<OutputObject>, JobError> {
     let mut driver = driver.clone();
-    let registry = ExecutorRegistry::new().with_backend(backend.clone());
+    let registry = ExecutorRegistry::new().with_backend("docker", backend.clone());
     driver.compute_handle = Some(Arc::new(registry));
     let realm_id = driver.serving_realm(record.created_by.realm_id);
     let capture = CaptureOutputsOperation::new(CaptureScope {
-        kind: backend.kind(),
+        backend: "docker".to_string(),
         fence: fence.clone(),
         spec: Arc::new(spec.clone()),
         record: Arc::new(record.clone()),

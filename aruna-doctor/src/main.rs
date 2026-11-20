@@ -22,6 +22,7 @@ use crate::migrate::migrate;
 use crate::migrate::topic_purge::purge_topic;
 use crate::portal::update_portal;
 use crate::reclaim::{print_status as reclaim_status, seed_backend};
+use crate::report::print_report;
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_bootstrap_token, create_oidc_token, recover_initial_admin, view_token};
 use clap::Parser;
@@ -36,6 +37,7 @@ mod iroh_check;
 mod migrate;
 mod portal;
 mod reclaim;
+mod report;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -170,6 +172,7 @@ async fn main() -> Result<(), CliError> {
             bucket,
             target_path,
         } => export_bucket(database_path, bucket, target_path).await?,
+        Commands::Report { database_path } => print_report(database_path).await?,
         Commands::Migrate {
             database_path,
             sync_path,

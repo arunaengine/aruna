@@ -20,7 +20,9 @@ use super::host::steps::{AdmitCall, NativeCall};
 use super::job_work::CancelWork;
 use super::state::{ReadState, read_state};
 use super::submit::WorkRequest;
+use super::task::start::TaskRequest;
 use super::work::calls::JobOutputs;
+use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::records::pages::ServingNode;
 
 /// The call an admitted host call makes for the checked install at the run's time, and the error
@@ -215,6 +217,30 @@ impl AdmitPlan for NativeAsk {
             self.intent,
             self.request,
             self.place,
+        ))
+    }
+}
+
+/// A container task the run starts through its call history, once the run may call.
+#[derive(Debug, PartialEq)]
+pub struct TaskAsk {
+    pub scope: RunScope,
+    pub intent: CallIntent,
+    pub request: TaskRequest,
+    /// This node as the submission sees it.
+    pub node: IngressNode,
+}
+
+impl AdmitPlan for TaskAsk {
+    type Call = NativeCall;
+    type Error = CallFailure;
+
+    fn call(self, _: &PluginInstall, _: u64) -> Result<NativeCall, CallFailure> {
+        Ok(NativeCall::task(
+            &self.scope,
+            self.intent,
+            self.request,
+            self.node,
         ))
     }
 }

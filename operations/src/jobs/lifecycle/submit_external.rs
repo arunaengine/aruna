@@ -161,6 +161,7 @@ impl SubmitExternalOperation {
             captured_inputs: Vec::new(),
             output_policies: Vec::new(),
             input_pages: None,
+            admit_by: None,
         }
     }
 
@@ -255,7 +256,8 @@ impl SubmitExternalOperation {
         manifest: Option<PageManifest>,
     ) -> SubmitNext {
         if manifest.is_some() {
-            request.spec.inputs.clear();
+            // Inline inputs carry no capture, so they stay in the spec beside the pages.
+            request.spec.inputs.retain(|input| input.source.is_inline());
             request.captured_inputs.clear();
         }
         request.input_pages = manifest;

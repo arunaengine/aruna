@@ -286,6 +286,34 @@ interface jobs {
 
   /// Starts an upload with PUT or POST and answers its job id; it needs read on the source.
   upload: func(request: upload-request) -> result<string, host-error>;
+
+  /// An object a task reads at a container path; a source ending in `/` gives every object
+  /// below it.
+  record task-input {
+    path: string,
+    source: string,
+    version: option<string>,
+  }
+
+  /// A small file the plugin writes for a task; all of a task's files hold at most 64 KiB.
+  record task-file {
+    path: string,
+    content: list<u8>,
+  }
+
+  /// A container task the manifest declares: values for its `{name}` parameters, what it
+  /// reads, and the container directories it writes below bucket path prefixes.
+  record task-request {
+    task: string,
+    parameters: list<field>,
+    inputs: list<task-input>,
+    files: list<task-file>,
+    outputs: list<field>,
+  }
+
+  /// Starts a task and answers its job id; it needs read on every input and write on every
+  /// output.
+  start-task: func(request: task-request) -> result<string, host-error>;
   /// Any job of the install.
   get: func(id: string) -> result<status, host-error>;
   /// One page of the objects a task wrote.

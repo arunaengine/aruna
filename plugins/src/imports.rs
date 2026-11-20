@@ -9,7 +9,7 @@ use aruna_plugin_types::calls::{self, Intent};
 use aruna_plugin_types::permission::Permission;
 
 use crate::broker::{
-    Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobTask, JobUpload, MetadataCreate,
     MetadataPatch, SendRequest, StatePut, StateRemove,
 };
 use crate::host::wit::aruna::plugin::jobs::Status as JobStatus;
@@ -474,6 +474,66 @@ impl jobs::Host for Session {
             effect,
             Needs::Transfer(Permission::TransfersUpload, &service),
             |broker, cx| async move { broker.jobs_upload(&cx, upload).await },
+            String::len,
+        )
+        .await
+    }
+
+    async fn start_task(
+        &mut self,
+        request: jobs::TaskRequest,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let inputs: Vec<(String, String, Option<String>)> = (request.inputs.into_iter())
+            .map(|input| (input.path, input.source, input.version))
+            .collect();
+        let files: Vec<(String, Vec<u8>)> = (request.files.into_iter())
+            .map(|file| (file.path, file.content))
+            .collect();
+        let input_bytes: Vec<u8> = (inputs.iter())
+            .flat_map(|(path, source, version)| {
+                let version = version.as_deref().unwrap_or_default();
+                let parts = [path.as_bytes(), source.as_bytes(), version.as_bytes()];
+                parts.map(|part| [part, b"\0"].concat()).concat()
+            })
+            .collect();
+        let file_bytes: Vec<u8> = (files.iter())
+            .flat_map(|(path, content)| {
+                let length = (content.len() as u64).to_le_bytes();
+                [path.as_bytes(), b"\0", &length, content].concat()
+            })
+            .collect();
+        let (parameters, outputs) = (
+            node_fields(request.parameters),
+            node_fields(request.outputs),
+        );
+        let size = request.task.len()
+            + fields_len(&parameters)
+            + input_bytes.len()
+            + file_bytes.len()
+            + fields_len(&outputs);
+        let parts: [&[u8]; 6] = [
+            b"task",
+            request.task.as_bytes(),
+            &field_bytes(&parameters),
+            &input_bytes,
+            &file_bytes,
+            &field_bytes(&outputs),
+        ];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let effect = Effect::Write(intent.clone());
+        let task = JobTask {
+            task: request.task,
+            parameters,
+            inputs,
+            files,
+            outputs,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::JobsRun),
+            |broker, cx| async move { broker.jobs_start_task(&cx, task).await },
             String::len,
         )
         .await

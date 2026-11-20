@@ -635,6 +635,8 @@ impl OperationsTaskHandler {
                 self.drain_job_queue().await;
             }),
             TaskKey::PruneJobs => Box::pin(self.run_trigger(key)),
+            TaskKey::PruneFamilies => Box::pin(self.run_trigger(key)),
+            TaskKey::ConfigCatchUp => Box::pin(self.run_trigger(key)),
             TaskKey::DrainMirrorRepair => Box::pin(self.run_trigger(key)),
             TaskKey::SweepHiddenBlobs => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCleanupQueue => Box::pin(self.run_trigger(key)),

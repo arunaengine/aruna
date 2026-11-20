@@ -11,9 +11,10 @@ use aruna_core::secrets::SecretFields;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::job::input::UploadForm;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::records::pages::ServingNode;
 use aruna_operations::plugins::admitted::{
-    Admitted, CancelAsk, ChangeAsk, InfoAsk, ListAsk, NativeAsk, OutputsAsk, StateAsk,
+    Admitted, CancelAsk, ChangeAsk, InfoAsk, ListAsk, NativeAsk, OutputsAsk, StateAsk, TaskAsk,
 };
 use aruna_operations::plugins::check::RunScope;
 use aruna_operations::plugins::creates::{CreatePlan, stored_created};
@@ -33,13 +34,15 @@ use aruna_operations::plugins::rows::write_rows;
 use aruna_operations::plugins::send_calls::{SendCall, Transfer, TransferCall};
 use aruna_operations::plugins::state::MAX_STATE_KEY;
 use aruna_operations::plugins::submit::{CopyRequest, WorkRequest};
+use aruna_operations::plugins::task::start::TaskRequest;
+use aruna_operations::plugins::unavailable;
 use aruna_plugin_types::calls::{
     Created, Document, Entry, ErrorKind, Field, FilePage, HostError, Intent, JobStatus, Listing,
     ObjectInfo, ObjectPage, Response,
 };
 use aruna_plugin_types::permission::Permission;
 use aruna_plugins::broker::{
-    Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobTask, JobUpload, MetadataCreate,
     MetadataPatch, SendRequest, StatePut, StateRemove,
 };
 use async_trait::async_trait;
@@ -437,6 +440,39 @@ impl Broker for RunBroker {
         let held_by = (&self.scope, self.holder);
         let call = TransferCall::new(held_by, Self::ask(&request), parts, self.minted());
         let started = drive(call, &self.ctx).await;
+        started.map_err(|failure| self.failed(failure))
+    }
+
+    async fn jobs_start_task(&self, _cx: &CallContext, task: JobTask) -> Result<String, HostError> {
+        let mut inputs = Vec::with_capacity(task.inputs.len());
+        for (path, source, version) in task.inputs {
+            let version = version.as_deref().map(version_id).transpose()?;
+            inputs.push((path, self.expand(&source)?, version));
+        }
+        let mut outputs = Vec::with_capacity(task.outputs.len());
+        for output in task.outputs {
+            outputs.push((output.name, self.expand(&output.value)?));
+        }
+        let request = TaskRequest {
+            task: task.task,
+            parameters: (task.parameters.into_iter())
+                .map(|field| (field.name, field.value))
+                .collect(),
+            inputs,
+            files: task.files,
+            outputs,
+            ordinal: task.intent.ordinal,
+        };
+        let fresh = self.ctx.fresh_heartbeats();
+        let node = ingress_node(self.ctx.node_and_realm(), fresh, unix_timestamp_millis())
+            .ok_or_else(|| unavailable("this node serves no network"))?;
+        let ask = TaskAsk {
+            scope: self.scope.clone(),
+            intent: call_intent(&task.intent),
+            request,
+            node,
+        };
+        let started = drive(Admitted::new(&self.scope, None, ask), &self.ctx).await;
         started.map_err(|failure| self.failed(failure))
     }
 

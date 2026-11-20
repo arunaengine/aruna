@@ -15,6 +15,7 @@ use aruna_core::events::Event;
 use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{MAX_MESSAGE_BYTES, tail_str};
+use aruna_core::structs::execution::job::input::{PLUGIN_REPORT_TAG, tagged};
 use aruna_core::structs::execution::job::local::{
     AttemptControl, JobError, JobErrorKind, JobProgress, JobRecord, JobResultPayload, OutputObject,
 };
@@ -37,6 +38,7 @@ use crate::jobs::store::job_calls::{
 };
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::{read_attempt_control, read_job_record};
+use crate::jobs::workflow::task_report::KeepReport;
 
 /// What a run is being finalized for.
 #[derive(Debug, PartialEq)]
@@ -59,6 +61,8 @@ enum Task {
     Export {
         until_stop: bool,
     },
+    /// Keeps a plugin task's report before any export can see the container's files.
+    PluginReport,
     Control,
     Collect,
     Merge,
@@ -211,13 +215,16 @@ impl FinalizeOperation {
 
     /// Plans the end of an attempt whose status is known and whose job is not being cancelled.
     fn plan_status(&mut self, status: AttemptStatus) -> FinalNext {
-        use Task::{Check, Collect, Control, Export, Finish as End, Logs, Merge, Store};
+        use Task::{
+            Check, Collect, Control, Export, Finish as End, Logs, Merge, PluginReport, Store,
+        };
         match status.phase {
             AttemptPhase::Exited { code: 0 } => {
                 self.exit_code = Some(0);
                 // Export first: inventory attributes only versions this execution already
                 // reserved, so the reservations must be durable before it.
                 self.plan = VecDeque::from([
+                    PluginReport,
                     Export { until_stop: true },
                     Control,
                     Collect,
@@ -238,7 +245,8 @@ impl FinalizeOperation {
                     "Container exited non-zero"
                 );
                 let error = JobError::permanent(exit_message(code, detail));
-                self.plan = VecDeque::from([Control, Collect, Logs, End(Finish::Fail(error))]);
+                let end = End(Finish::Fail(error));
+                self.plan = VecDeque::from([PluginReport, Control, Collect, Logs, end]);
             }
             AttemptPhase::Failed { reason } => {
                 let error = JobError::permanent(format!("backend failure: {reason}"));
@@ -365,6 +373,19 @@ impl FinalizeOperation {
                 }
                 let read = read_job_record(scope.job_id);
                 self.call(Step::ExportRecord { until_stop }, IoCall::child(read))
+            }
+            Task::PluginReport => {
+                let path = scope.spec.tags.get(PLUGIN_REPORT_TAG);
+                let (Some(path), Some(Ok(task))) = (path, tagged(&scope.spec)) else {
+                    return self.next_task();
+                };
+                let request = ComputeRequest::FetchOutput {
+                    path: path.clone(),
+                    until_stop: false,
+                };
+                let ids = (task.install_id, task.work_id);
+                let keep = KeepReport::new(ids, scope.backend(request));
+                self.call(Step::Report, IoCall::child(keep))
             }
             Task::Control => {
                 let epoch = scope.fence.attempt_epoch;

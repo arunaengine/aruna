@@ -46,7 +46,9 @@ fn family_report_fixture() -> FamilyReport {
         EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
         SubmissionId,
     };
-    use aruna_core::structs::execution::job::input::ExecutionSpec;
+    use aruna_core::structs::execution::job::input::{
+        ExecutionSpec, SessionReportDetail, SessionReportRow,
+    };
     use aruna_core::structs::execution::job::local::OutputObject;
     use aruna_core::structs::placement::record::PlacementRef;
 
@@ -72,6 +74,7 @@ fn family_report_fixture() -> FamilyReport {
         env: BTreeMap::new(),
         resources: aruna_core::structs::execution::job::input::ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -86,6 +89,7 @@ fn family_report_fixture() -> FamilyReport {
             state: JobState::Indeterminate,
             attempts: 2,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 10,
             updated_at_ms: 20,
             finished_at_ms: None,
@@ -292,8 +296,6 @@ fn report_row(entry_key: &str) -> ImportReportRow {
 
 #[test]
 fn decodes_session_report() {
-    use aruna_core::structs::execution::job::input::{SessionReportDetail, SessionReportRow};
-
     let row = SessionReportRow {
         entry_key: "input/0000".to_string(),
         detail: SessionReportDetail::Input {
@@ -859,6 +861,7 @@ async fn delete_job_rules() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1064,6 +1067,7 @@ fn local_request() -> SubmitExecutionRequest {
         ram_bytes: None,
         max_walltime_ms: None,
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         output_prefixes: Vec::new(),
@@ -1145,6 +1149,33 @@ async fn device_checks_group() {
 }
 
 #[tokio::test]
+async fn refuses_plugin_tags() {
+    // Only the plugin host tags the jobs of plugin tasks; REST and MCP share this check.
+    let (_dir, state) = build_state().await;
+    let mut request = local_request();
+    request.target = None;
+    request.tags.insert(
+        "aruna-engine.org/plugin-install".to_string(),
+        Ulid::nil().to_string(),
+    );
+
+    let result = submit_job(
+        State(state),
+        Extension(auth_for(user(2))),
+        Extension(None),
+        Json(request),
+    )
+    .await;
+
+    match result {
+        Err(ServerError::BadRequestMessage(message)) => {
+            assert!(message.contains("reserved for plugin tasks"), "{message}");
+        }
+        other => panic!("expected a refusal, got {:?}", other.err()),
+    }
+}
+
+#[tokio::test]
 async fn local_refuses_stranger() {
     let (_dir, state) = build_state().await;
     enroll_device(&state, user(2)).await;
@@ -1198,6 +1229,7 @@ async fn rejects_huge_ram() {
             ram_bytes: Some(ram_bytes),
             max_walltime_ms: None,
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             output_prefixes: Vec::new(),
@@ -1451,4 +1483,42 @@ fn mount_path_checked() {
         mount_permission_path(bucket.clone(), "raw/2024/"),
         format!("{bucket}/raw/2024")
     );
+}
+
+#[test]
+fn reports_placed_backend() {
+    // The placement and every candidate name the backend next to the executor kind.
+    use aruna_core::compute::ExecutionTargetId;
+    use aruna_core::scheduling::{CandidateVerdict, PlanCandidate};
+    use aruna_operations::jobs::lifecycle::report::PlanEstimate;
+    let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+    let mut report = family_report_fixture();
+    report.plan = Some(PlanEstimate {
+        target: Some(ExecutionTargetId {
+            node_id: node,
+            backend: "lab".to_string(),
+            executor_kind: "docker".to_string(),
+        }),
+        scheduler_node_id: None,
+        estimated_transfer_bytes: 0,
+        estimated_transfer_ms: 0,
+        alternatives: 0,
+        rejected: 0,
+        omitted: 0,
+        stored_at_ms: 1,
+        inputs: Vec::new(),
+        candidates: vec![PlanCandidate {
+            node_id: node,
+            backend: Some("lab".to_string()),
+            executor_kind: Some("docker".to_string()),
+            verdict: CandidateVerdict::Selected,
+            rank: None,
+            reason: None,
+        }],
+    });
+    let placement = family_response(&report)
+        .placement
+        .expect("a plan was stored");
+    assert_eq!(placement.backend.as_deref(), Some("lab"));
+    assert_eq!(placement.candidates[0].backend.as_deref(), Some("lab"));
 }

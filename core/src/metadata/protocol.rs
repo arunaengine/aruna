@@ -309,6 +309,8 @@ pub enum MetadataTransportMessage {
     ForwardJobRecord {
         placement: PlacementRef,
         record: Box<JobRecordFrame>,
+        /// Records sent along, such as the spec the record binds.
+        attached: Vec<JobRecordFrame>,
     },
     /// `Ok` means the holder durably accepted or already had the record.
     ForwardedJobRecord {
@@ -738,6 +740,22 @@ pub enum MetadataTransportMessage {
     /// that asked, and it never crosses the wire.
     ExportAnswer {
         result: Result<Box<crate::metadata::api::ExportMetadataResult>, MetadataReadError>,
+    },
+    /// Asks a node a plugin task's submission was sent to whether it admitted it; past
+    /// `admit_by` it closes the submission when it holds no claim. Appended to keep indices.
+    QuerySubmissionClaim {
+        submission_id: SubmissionId,
+        admit_by: u64,
+    },
+    SubmissionClaimAnswered {
+        answer: crate::jobs::ClosureAnswer,
+    },
+    /// A holder asks a launch's target whether it ever accepted the signed launch it carries.
+    QueryLaunchClosure {
+        launch: Box<LaunchFrame>,
+    },
+    LaunchClosureAnswered {
+        answer: crate::jobs::LaunchClosureAnswer,
     },
 }
 
@@ -1267,7 +1285,11 @@ pub fn transport_message_kind(message: &MetadataTransportMessage) -> &'static st
         MetadataTransportMessage::CheckNodeSecret { .. } => "check_node_secret",
         MetadataTransportMessage::NodeSecretChecked { .. } => "node_secret_checked",
         MetadataTransportMessage::ForwardedGraphPending { .. } => "forwarded_graph_pending",
+        MetadataTransportMessage::QueryLaunchClosure { .. } => "query_launch_closure",
+        MetadataTransportMessage::LaunchClosureAnswered { .. } => "launch_closure_answered",
         MetadataTransportMessage::ExportAnswer { .. } => "export_answer",
+        MetadataTransportMessage::QuerySubmissionClaim { .. } => "query_submission_claim",
+        MetadataTransportMessage::SubmissionClaimAnswered { .. } => "submission_claim_answered",
     }
 }
 

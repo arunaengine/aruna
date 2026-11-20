@@ -50,6 +50,7 @@ pub mod settings;
 pub mod state;
 pub mod submit;
 pub mod sweep;
+pub mod task;
 pub mod transfer_steps;
 pub mod waiting;
 pub mod work;

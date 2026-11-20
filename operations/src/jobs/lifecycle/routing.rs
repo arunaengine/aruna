@@ -69,6 +69,7 @@ pub(crate) fn status_view(
         state: local_state(projection.state),
         attempts: projection.executions.len() as u32,
         cancel_requested: projection.cancel_requested,
+        expiry_reason: projection.expiry_reason,
         created_at_ms: spec.created_at_ms,
         updated_at_ms,
         finished_at_ms: local_state(projection.state)
@@ -139,6 +140,7 @@ fn local_state(state: LogicalJobState) -> JobState {
         LogicalJobState::Succeeded => JobState::Succeeded,
         LogicalJobState::Cancelled => JobState::Cancelled,
         LogicalJobState::Failed => JobState::Failed,
+        LogicalJobState::NotRun => JobState::NotRun,
     }
 }
 

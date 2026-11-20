@@ -13,13 +13,13 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use tracing::warn;
 
 /// The documents read, and whether a read failed.
-pub(super) type Advertised = (BTreeMap<NodeId, NodeInfoDocument>, bool);
+pub(crate) type Advertised = (BTreeMap<NodeId, NodeInfoDocument>, bool);
 
 /// Node-info documents of every sync-eligible realm member that has one. An unread
 /// advertisement may hold the only legal target, so a caller must not conclude from a partial
 /// read.
 #[derive(Debug, PartialEq)]
-pub(super) struct AdvertisementsOperation {
+pub(crate) struct AdvertisementsOperation {
     /// Members still to read, the next one last.
     members: Vec<NodeId>,
     asked: Option<NodeId>,
@@ -30,7 +30,7 @@ pub(super) struct AdvertisementsOperation {
 type AdvertisedNext = Result<Next<Advertised>, IoError>;
 
 impl AdvertisementsOperation {
-    pub(super) fn new(config: &RealmConfigDocument) -> Self {
+    pub(crate) fn new(config: &RealmConfigDocument) -> Self {
         let members = config.sync_eligible_nodes();
         let unread = members.is_err();
         let mut members: Vec<NodeId> = members.into_iter().flatten().collect();

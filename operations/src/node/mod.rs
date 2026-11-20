@@ -4,6 +4,7 @@
 
 pub mod api_state;
 pub mod applied_drain;
+pub mod catch_up;
 pub mod contacts;
 pub mod counter_check;
 pub mod finish_batch;

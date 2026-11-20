@@ -3,19 +3,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::ExecutionTargetId;
-use crate::structs::execution::job::family::JobRecordEnvelope;
+use crate::structs::execution::job::family::{
+    ExecutionOutputRecord, ExecutionReceipt, JobFamilyRecord, JobRecordEnvelope, LaunchIntent,
+    OutputSet, SubmissionId,
+};
+use crate::structs::execution::job::identity::JobId;
+use crate::structs::execution::job::local::OutputObject;
 use crate::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 /// Test fixture shared with the event frames: one signed output record whose
 /// encoded size grows with the output count and key width.
 pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::execution::job::family::{
-        ExecutionOutputRecord, JobFamilyRecord, OutputSet, SubmissionId,
-    };
-    use crate::structs::execution::job::identity::JobId;
-    use crate::structs::execution::job::local::OutputObject;
-
     let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
     let execution_id = Ulid::from_bytes([7u8; 16]);
     let outputs = (0..objects)
@@ -46,8 +45,6 @@ pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvel
 
 /// One signed launch whose encoded size grows with the executor-kind width.
 pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::execution::job::family::{JobFamilyRecord, LaunchIntent, SubmissionId};
-    use crate::structs::execution::job::identity::JobId;
     use crate::structs::placement::record::PlacementRef;
 
     let secret = iroh::SecretKey::from_bytes(&[4u8; 32]);
@@ -65,6 +62,7 @@ pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
         holder_generation: 3,
         target: ExecutionTargetId {
             node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            backend: "default".to_string(),
             executor_kind: "d".repeat(kind_bytes),
         },
         inputs: Vec::new(),
@@ -73,15 +71,13 @@ pub(crate) fn sized_launch(kind_bytes: usize) -> JobRecordEnvelope {
         plan_digest: [6u8; 32],
         spec_digest: [7u8; 32],
         created_at_ms: 1,
+        config_clock: Default::default(),
     }));
     JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
 }
 
 /// One signed receipt whose encoded size grows with the executor-kind width.
 pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::execution::job::family::{ExecutionReceipt, JobFamilyRecord, SubmissionId};
-    use crate::structs::execution::job::identity::JobId;
-
     let secret = iroh::SecretKey::from_bytes(&[6u8; 32]);
     let record = JobFamilyRecord::Receipt(Box::new(ExecutionReceipt {
         execution_id: Ulid::from_bytes([8u8; 16]),
@@ -94,6 +90,7 @@ pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
         executor_node_id: secret.public(),
         target: ExecutionTargetId {
             node_id: secret.public(),
+            backend: "default".to_string(),
             executor_kind: "d".repeat(kind_bytes),
         },
         spec_digest: [7u8; 32],
@@ -101,6 +98,9 @@ pub(crate) fn sized_receipt(kind_bytes: usize) -> JobRecordEnvelope {
         subject_generation: 5,
         subject_digest: [8u8; 32],
         accepted_at_ms: 1,
+        config_clock: Default::default(),
+        config_generation: 0,
+        config_digest: [0u8; 32],
     }));
     JobRecordEnvelope::sign(RealmId([6u8; 32]), record, &secret).expect("record signs")
 }

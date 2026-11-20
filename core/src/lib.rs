@@ -40,6 +40,7 @@ pub mod heartbeat;
 pub mod id;
 pub mod id_mint;
 pub mod injection;
+pub mod install_work;
 pub mod job_request;
 pub mod jobs;
 pub mod join_request;

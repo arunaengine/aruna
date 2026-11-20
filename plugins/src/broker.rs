@@ -48,6 +48,20 @@ pub struct JobUpload {
     pub intent: Intent,
 }
 
+/// A container task a run starts: object paths as the plugin gave them; the ordinal names the
+/// job across reruns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobTask {
+    pub task: String,
+    pub parameters: Vec<Field>,
+    /// Container path, object path and an optional pinned version.
+    pub inputs: Vec<(String, String, Option<String>)>,
+    pub files: Vec<(String, Vec<u8>)>,
+    /// Container directory and object path prefix.
+    pub outputs: Vec<Field>,
+    pub intent: Intent,
+}
+
 /// Identity of the run that issued a host call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallContext {
@@ -253,6 +267,17 @@ pub trait Broker: Send + Sync {
         ))
     }
     /// The status of a job of the install; a broker that runs no jobs refuses it.
+    /// Starts a container task; a broker that runs no jobs refuses it.
+    async fn jobs_start_task(
+        &self,
+        _cx: &CallContext,
+        _task: JobTask,
+    ) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
     async fn jobs_get(&self, _cx: &CallContext, _id: &str) -> Result<JobStatus, HostError> {
         Err(HostError::new(
             ErrorKind::Unavailable,

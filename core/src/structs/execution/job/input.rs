@@ -5,6 +5,7 @@
 use super::identity::{JobExecutionClass, JobId, RETENTION_MS};
 use super::local::AttemptIntent;
 use super::*;
+use crate::plugin_installs::{InstallState, PluginInstall};
 
 /// How an input is exposed to the task. Reference modes stage a copy today; the
 /// non-copying durable binding waits on native reference reads.
@@ -73,7 +74,9 @@ pub fn plan_composition(
 }
 
 fn validate_input_version(input: &InputSelection) -> Result<(), CompositionError> {
-    let InputSource::S3 { version_id, .. } = &input.source;
+    let InputSource::S3 { version_id, .. } = &input.source else {
+        return Ok(());
+    };
     match input.mode {
         InputMode::ExactReference if version_id.is_none() => {
             Err(CompositionError::MissingVersion(input.dest_key.clone()))
@@ -88,7 +91,10 @@ fn validate_input_version(input: &InputSelection) -> Result<(), CompositionError
     }
 }
 
-/// Where an input comes from. v1 supports internal S3 objects only.
+/// Inline bytes one plugin task job may carry, all inputs together.
+pub const MAX_INLINE_BYTES: usize = 64 * 1024;
+
+/// Where an input comes from: an internal S3 object, or bytes a plugin wrote into the spec.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputSource {
     S3 {
@@ -96,6 +102,22 @@ pub enum InputSource {
         key: String,
         version_id: Option<String>,
     },
+    /// Only plugin tasks carry it; it is never resolved, captured or transferred.
+    Inline { bytes: Vec<u8> },
+}
+
+impl InputSource {
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::Inline { .. })
+    }
+}
+
+/// How many inputs name an object; only those are resolved, captured and planned.
+pub fn object_count(inputs: &[InputSelection]) -> usize {
+    inputs
+        .iter()
+        .filter(|input| !input.source.is_inline())
+        .count()
 }
 
 /// One declared input and where it lands in the workspace bucket.
@@ -151,6 +173,74 @@ pub struct ComputeResources {
     pub preemptible: bool,
 }
 
+/// Tags only the plugin host sets, on the jobs of plugin tasks; every job ingress refuses them.
+pub const PLUGIN_TAG_PREFIX: &str = "aruna-engine.org/plugin-";
+/// The plugin install a task job runs for.
+pub const PLUGIN_INSTALL_TAG: &str = "aruna-engine.org/plugin-install";
+/// The work row on the install's receiver that names the task job.
+pub const PLUGIN_WORK_TAG: &str = "aruna-engine.org/plugin-work";
+/// The container file the node reads into the work's report; never exported.
+pub const PLUGIN_REPORT_TAG: &str = "aruna-engine.org/plugin-report";
+
+/// The first tag of `tags` only the plugin host may set.
+pub fn plugin_tag(tags: &BTreeMap<String, String>) -> Option<&str> {
+    tags.keys()
+        .find(|key| key.starts_with(PLUGIN_TAG_PREFIX))
+        .map(String::as_str)
+}
+
+/// The install and work a task job names in its reserved tags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tagged {
+    pub install_id: Ulid,
+    pub work_id: Ulid,
+}
+
+/// Why the tags of a task job, or the install they name, do not let it run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum TagError {
+    #[error("the plugin task tags are malformed")]
+    Malformed,
+    /// No output names a path its `jobs.run` grant is checked on.
+    #[error("a plugin task needs at least one output")]
+    NoOutput,
+    #[error("the plugin install is {0}")]
+    Install(&'static str),
+}
+
+/// The install and work of a tagged spec; `None` for an ordinary job.
+pub fn tagged(spec: &ExecutionSpec) -> Option<Result<Tagged, TagError>> {
+    let install = spec.tags.get(PLUGIN_INSTALL_TAG);
+    let work = spec.tags.get(PLUGIN_WORK_TAG);
+    if install.is_none() && work.is_none() {
+        return None;
+    }
+    let parse = |value: Option<&String>| Ulid::from_string(value?).ok();
+    Some(match (parse(install), parse(work)) {
+        _ if spec.file_outputs.is_empty() => Err(TagError::NoOutput),
+        (Some(install_id), Some(work_id)) => Ok(Tagged {
+            install_id,
+            work_id,
+        }),
+        _ => Err(TagError::Malformed),
+    })
+}
+
+/// The install of `installs` a tagged job names, when it is active and not paused.
+pub fn named_install(
+    installs: &[PluginInstall],
+    tagged: Tagged,
+) -> Result<&PluginInstall, TagError> {
+    let install = (installs.iter())
+        .find(|install| install.install_id == tagged.install_id)
+        .ok_or(TagError::Install("removed or conflicting"))?;
+    match (install.state, install.paused) {
+        (InstallState::Active, false) => Ok(install),
+        (_, true) => Err(TagError::Install("paused")),
+        (state, _) => Err(TagError::Install(state.as_str())),
+    }
+}
+
 /// The container plan carried by a `JobPayload::Execution`. Bounded per spec 16.2.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSpec {
@@ -177,6 +267,8 @@ pub struct ExecutionSpec {
     pub output_prefixes: Vec<String>,
     /// How a claimed destination key is resolved while composing the workspace.
     pub collision_policy: CollisionPolicy,
+    /// Node-local backend name the run is pinned to; target admission sets it.
+    pub backend: Option<String>,
 }
 
 /// Exact source details resolved at ingress and carried into the stored job

@@ -625,7 +625,10 @@ async fn stopped_prompt_restored() {
     let restored = crate::tasks::task_persistence::restore_task_timers(&storage, &booted, None);
     assert!(restored.await.is_ok());
     let after = armed_after(&booted, key, PUBLISH_INTERVAL).await;
-    assert!(after <= Duration::from_secs(5), "the prompt deadline is restored");
+    assert!(
+        after <= Duration::from_secs(5),
+        "the prompt deadline is restored"
+    );
 }
 
 // The backend import pass armed at start stays armed in memory when its row cannot be stored,

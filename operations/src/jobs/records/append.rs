@@ -13,27 +13,30 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::{Key, Value};
-use tracing::debug;
-
-use super::admit::{
-    Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_append,
-    relayable,
-};
-use super::verify::{EvidencePlan, FamilyView};
-use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::prune::{FamilyTombstone, TOMBSTONE_RETENTION_MS};
 use aruna_core::structs::execution::job::record_keys::{
-    alias_key, conflict_key, family_prefix, kind_prefix, record_key,
+    alias_key, conflict_key, family_prefix, kind_prefix, prune_rows_at, record_key,
 };
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes,
 };
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::types::{GroupId, Key, Value};
+use tracing::debug;
+
+use super::admit::{
+    Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_bundle,
+    relayable,
+};
+use super::verify::{EvidencePlan, FamilyView};
+use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
 
 type Step = Result<Next<AppendOutcome>, RecordStoreError>;
 
@@ -89,6 +92,9 @@ pub struct AppendRecordOperation {
     asked: Vec<Key>,
     outcome: Option<AppendOutcome>,
     state: AppendState,
+    /// Records that travel with the candidate, such as the spec it binds.
+    attached: Vec<JobRecordEnvelope>,
+    tombstone: Option<FamilyTombstone>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +124,34 @@ impl AppendRecordOperation {
             asked: Vec::new(),
             outcome: None,
             state: AppendState::ReadConfig,
+            attached: Vec::new(),
+            tombstone: None,
         }
+    }
+
+    /// Adds the records a peer sent along with the candidate; they are admitted before it. A
+    /// record of another family is ignored.
+    pub fn attach(mut self, attached: Vec<JobRecordEnvelope>) -> Self {
+        let family = self.family();
+        self.attached = (attached.into_iter())
+            .filter(|envelope| envelope.family() == family)
+            .collect();
+        self
+    }
+
+    fn attached_spec(&self) -> Option<&JobRecordEnvelope> {
+        (self.attached.iter()).find(|envelope| matches!(envelope.record, JobFamilyRecord::Spec(_)))
+    }
+
+    /// The group of the spec this append may start the family with.
+    fn spec_group(&self) -> Option<GroupId> {
+        [Some(self.envelope()), self.attached_spec()]
+            .into_iter()
+            .flatten()
+            .find_map(|envelope| match &envelope.record {
+                JobFamilyRecord::Spec(spec) => Some(spec.group_id),
+                _ => None,
+            })
     }
 
     fn envelope(&self) -> &JobRecordEnvelope {
@@ -165,15 +198,20 @@ impl AppendRecordOperation {
                 FAMILY_PROJECTION_KEYSPACE.to_string(),
                 family_prefix(&self.family()),
             ),
+            // Read in this transaction, so the append after the last page sees the finished mark.
+            (
+                FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+                family_prefix(&self.family()),
+            ),
         ];
-        if let JobFamilyRecord::Spec(spec) = &self.envelope().record {
-            reads.push(crate::groups::fence::group_fence_key(spec.group_id));
+        if let Some(group_id) = self.spec_group() {
+            reads.push(crate::groups::fence::group_fence_key(group_id));
         }
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    /// Keeps the candidate's own row and the projection cache, and checks that a spec's
-    /// group still accepts writes.
+    /// Keeps the candidate's own row, the projection cache and the family tombstone, and checks
+    /// that a spec's group still accepts writes.
     fn keep_row(&mut self, values: Vec<Option<Value>>) -> Result<(), RecordStoreError> {
         let mut values = values.into_iter();
         let row = values
@@ -183,7 +221,10 @@ impl AppendRecordOperation {
         if let Some(Some(value)) = values.next() {
             self.cache = ProjectionCache::decode(&value);
         }
-        if matches!(self.envelope().record, JobFamilyRecord::Spec(_)) {
+        if let Some(Some(value)) = values.next() {
+            self.tombstone = Some(from_bytes::<FamilyTombstone>(&value)?);
+        }
+        if self.spec_group().is_some() {
             let Some(value) = values.next() else {
                 return Err(RecordStoreError::EvidenceIncomplete);
             };
@@ -240,6 +281,11 @@ impl AppendRecordOperation {
     fn read_evidence(&mut self) -> Step {
         let mut plan = EvidencePlan::default();
         plan.extend(&self.envelope().record);
+        for envelope in &self.attached {
+            plan.extend(&envelope.record);
+        }
+        // Whether this node holds an accepted spec decides the admission rules.
+        plan.kinds.insert(JobRecordKind::Spec);
         for (_, row) in &self.retained {
             plan.extend(&row.envelope.record);
         }
@@ -326,9 +372,11 @@ impl AppendRecordOperation {
             stored: &self.stored,
             local: self.config.local.as_ref(),
             now_ms: self.config.now_ms,
+            tombstone: self.tombstone.as_ref(),
         };
+        let candidate = self.envelope().clone();
         let (admission, plan) =
-            plan_append(&state, &self.retained, self.envelope().clone(), relayed);
+            plan_bundle(&state, &self.retained, candidate, &self.attached, relayed);
         let writes = self.batch_writes(&plan)?;
         self.plan = Some(plan);
         let outcome = self.settle(admission);
@@ -387,6 +435,19 @@ impl AppendRecordOperation {
                 FAMILY_CONFLICT_KEYSPACE.to_string(),
                 conflict_key(key, &row.envelope.digest()?),
                 Value::from(to_bytes(row)?.as_slice()),
+            ));
+        }
+        if !plan.admitted.is_empty() || !plan.pending.is_empty() {
+            // A pending row keeps its first sight across re-arrivals, so it bounds the due time.
+            let kept = (self.retained.iter())
+                .filter(|(key, _)| !plan.cleared.contains(key))
+                .chain(plan.pending.iter());
+            let expiry =
+                kept.map(|(_, row)| row.first_seen_ms.saturating_add(TOMBSTONE_RETENTION_MS));
+            let written = self.config.now_ms.saturating_add(RETENTION_MS);
+            writes.extend(prune_rows_at(
+                &self.family(),
+                expiry.fold(written, u64::min),
             ));
         }
         if !plan.admitted.is_empty() {

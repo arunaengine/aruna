@@ -976,11 +976,10 @@ mod tests {
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordEnvelope};
-    use aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION;
     use aruna_core::structs::execution::job::record_rows::{
-        ConflictRecord, PendingNeed, PendingRecord,
+        ConflictRecord, OutboxEntry, PROJECTION_CACHE_VERSION, PendingNeed, PendingRecord,
+        ProjectionCache,
     };
-    use aruna_core::structs::execution::job::record_rows::{OutboxEntry, ProjectionCache};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::node_state::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1206,6 +1205,10 @@ mod tests {
             created_at_ms: 21,
             subject_generation: 3,
             subject_digest: [9u8; 32],
+            config_clock: Default::default(),
+            backend: "default".to_string(),
+            config_generation: 0,
+            config_digest: [0u8; 32],
         };
         let decoded = decode_entry(
             JOB_RESERVATION_KEYSPACE,
@@ -1247,6 +1250,8 @@ mod tests {
                 omitted: 0,
             },
             declined: Vec::new(),
+            deferred: Vec::new(),
+            answer: None,
             overlapping: false,
             stored_at_ms: 23,
         };

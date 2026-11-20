@@ -349,7 +349,9 @@ impl RecordCrateOperation {
     ) -> Self {
         let inputs = (spec.inputs.iter())
             .filter_map(|input| {
-                let InputSource::S3 { bucket, key, .. } = &input.source;
+                let InputSource::S3 { bucket, key, .. } = &input.source else {
+                    return None;
+                };
                 let captured = (parent.captured_inputs.iter())
                     .find(|captured| captured.destination_key == input.dest_key)?;
                 Some(CrateInput {
@@ -702,7 +704,8 @@ fn env_entity(name: &str) -> String {
     format!("#env-{}", utf8_percent_encode(name, NON_ALPHANUMERIC))
 }
 
-/// Granted limits and the working directory as PropertyValues; unbounded dimensions are omitted.
+/// Granted limits, the working directory and the compute backend as PropertyValues; unbounded
+/// dimensions are omitted.
 fn launch_properties(launch: &LaunchRecord) -> Vec<serde_json::Value> {
     let resources = &launch.resources;
     let cores = resources
@@ -734,6 +737,11 @@ fn launch_properties(launch: &LaunchRecord) -> Vec<serde_json::Value> {
             "working-directory",
             "Working directory",
             launch.workdir.clone(),
+        ),
+        (
+            "compute-backend",
+            "Compute backend",
+            Some(launch.backend.clone()).filter(|backend| !backend.is_empty()),
         ),
     ];
     values
@@ -991,7 +999,9 @@ fn build_crate_jsonld(
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
     for input in &spec.inputs {
-        let InputSource::S3 { bucket, key, .. } = &input.source;
+        let InputSource::S3 { bucket, key, .. } = &input.source else {
+            continue;
+        };
         let name = input.name.clone().unwrap_or_else(|| input.dest_key.clone());
         let captured = record
             .captured_inputs
@@ -1405,6 +1415,7 @@ mod pure_tests {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
+            backend: None,
             inputs: vec![InputSelection {
                 source: InputSource::S3 {
                     bucket: "src".to_string(),
@@ -1442,6 +1453,9 @@ mod pure_tests {
             executor_kind: "kubernetes".to_string(),
             pinned_image: format!("docker.io/aruna/tool@sha256:{}", "a".repeat(64)),
             attempt_epoch: 7,
+            backend: "kubernetes".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("kubernetes", None),
         });
         record.workspace_bucket = Some("workspace-sample-one".to_string());
         record.result = Some(JobResultPayload::Execution {
@@ -2214,6 +2228,7 @@ mod tests {
         LaunchRecord {
             node_id: iroh::SecretKey::from_bytes(&[9; 32]).public(),
             executor_kind: "kubernetes".to_string(),
+            backend: "default".to_string(),
             location: "giessen".to_string(),
             resources: aruna_core::compute::GrantedResources {
                 nano_cpus: Some(1_500_000_000),

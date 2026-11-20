@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use aruna_core::compute::quota::ComputeQuota;
 use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
@@ -17,9 +18,7 @@ use aruna_plugin_types::permission::{Grant, Permission};
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Granted resource patterns: `read` and `write` as the installer scoped them, and the paths of
-/// the services and readable secrets the manifest declares.
-pub type Grants = BTreeMap<Grant, BTreeSet<String>>;
+use crate::auth::install_access::{Grants, accesses, covers, patterns_for};
 
 pub const READ_ROLE: &str = "plugin-read";
 pub const WRITE_ROLE: &str = "plugin-write";
@@ -65,10 +64,18 @@ impl InstallScope {
     }
 }
 
-/// Refuses what this version of Aruna cannot run yet: container work.
-pub(crate) fn check_supported(manifest: &Manifest) -> Result<(), GrantError> {
-    if manifest.requested().contains(&Permission::JobsRun) {
-        return Err(GrantError::Unsupported("jobs.run cannot be granted yet"));
+/// Refuses a task whose resources no job of the group may have: above the per-job CPU, RAM or
+/// walltime limit of the group's compute quota.
+pub(crate) fn check_supported(manifest: &Manifest, quota: &ComputeQuota) -> Result<(), GrantError> {
+    for recipe in manifest.recipes.values() {
+        let over = quota.job_cpu_cores.is_some_and(|cpu| recipe.cpu > cpu)
+            || quota.job_ram_bytes.is_some_and(|ram| recipe.memory > ram)
+            || (quota.job_walltime_ms).is_some_and(|time| recipe.time.saturating_mul(1000) > time);
+        if over {
+            return Err(GrantError::Unsupported(
+                "a task asks for more CPU, memory or time than the group's jobs may have",
+            ));
+        }
     }
     Ok(())
 }
@@ -164,28 +171,6 @@ fn resource_grants(
         .collect()
 }
 
-/// The granted patterns a call of `permission` may use.
-pub(crate) fn patterns_for(grants: &Grants, permission: Permission) -> BTreeSet<String> {
-    (permission.grants().iter())
-        .filter_map(|grant| grants.get(grant))
-        .flatten()
-        .cloned()
-        .collect()
-}
-
-/// Whether a granted pattern, an exact path or a `<base>/**` subtree, covers `target`.
-pub fn covers(pattern: &str, target: &str) -> bool {
-    match pattern.strip_suffix("/**") {
-        Some(base) => {
-            target == base
-                || target
-                    .strip_prefix(base)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        }
-        None => pattern == target,
-    }
-}
-
 /// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
 pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
     let (base, subtree) = match pattern.strip_suffix("/**") {
@@ -214,22 +199,6 @@ pub fn within(pattern: &str, root: &str) -> bool {
             _ => !glob,
         }
     })
-}
-
-/// The accesses a permission's actions need on its patterns, as the plan's table checks them.
-pub(crate) fn accesses(permission: Permission) -> &'static [Access] {
-    match permission {
-        Permission::ObjectsCopy => &[Access::READ, Access::WRITE],
-        Permission::MetadataWrite
-        | Permission::MetadataCreate
-        | Permission::TransfersDownload
-        | Permission::JobsRun => &[Access::WRITE],
-        Permission::MetadataRead
-        | Permission::ObjectsRead
-        | Permission::TransfersUpload
-        | Permission::ConnectionsSend
-        | Permission::SecretsValue => &[Access::READ],
-    }
 }
 
 /// The access the role needs on a grant's patterns.
@@ -287,15 +256,6 @@ pub(crate) fn carry_grants(
 pub fn stored_grants(grants: &Grants) -> BTreeMap<String, Vec<String>> {
     (grants.iter())
         .map(|(grant, patterns)| (grant.to_string(), patterns.iter().cloned().collect()))
-        .collect()
-}
-
-/// Grants read back from an install record; names this version does not know are dropped.
-pub fn parse_grants(stored: &BTreeMap<String, Vec<String>>) -> Grants {
-    (stored.iter())
-        .filter_map(|(name, patterns)| {
-            Some((name.parse().ok()?, patterns.iter().cloned().collect()))
-        })
         .collect()
 }
 

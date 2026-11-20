@@ -2,11 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::compute::effect::BackendFacts;
+use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::{AdoptableEvidence, ResumePoint, TombstoneEvidence};
+use aruna_core::structs::execution::job::local::LocalAdmission;
 
 use super::super::fixtures::{
     EPOCH, PINNED, artifact, child, claimed, compute, control, facts, intent, job, node, prepared,
-    record, scope, spec, status, token,
+    record, reservation, scope, spec, status, token,
 };
 use super::*;
 
@@ -98,10 +101,10 @@ fn intentless_attempt_released() {
 #[test]
 fn adopted_attempt_scoped() {
     let mut adopt = adopt();
-    let kind = ExecutorKind::Docker;
+    let backend = "docker".to_string();
     assert_eq!(
         adopt.next(adopted(with_intent())),
-        Ok(Next::Call(compute_call(ComputeEffect::Facts { kind })))
+        Ok(Next::Call(compute_call(ComputeEffect::Facts { backend })))
     );
     let mut expected = AttemptScope::clone(&scope());
     expected.fence.attempt = AttemptRef::new(job().to_string().to_lowercase(), 1);
@@ -127,6 +130,22 @@ fn missing_backend_handoff() {
     );
     let failed = child(Err::<ReleaseOutcome, _>(JobMutationError::NotFound));
     assert_eq!(adopt.next(failed), Ok(Next::Done(Adoption::Done)));
+}
+
+// A backend of that name that moved to another home cannot observe the attempt either.
+#[test]
+fn moved_backend_handoff() {
+    let mut adopt = adopt();
+    adopt.next(adopted(with_intent())).unwrap();
+    let moved = BackendFacts {
+        home_digest: [9; 32],
+        ..facts()
+    };
+    let handoff = handoff_external_attempt(job(), token(), NOW);
+    assert_eq!(
+        adopt.next(compute(ComputeAnswer::Facts(moved))),
+        Ok(Next::Call(IoCall::child(handoff)))
+    );
 }
 
 fn settle_of(job: JobRecord) -> SettleAdoptedOperation {
@@ -187,20 +206,27 @@ fn fenced_cancel_finalizes() {
     );
 }
 
-// A live attempt goes back to supervision, and an absent one is submitted under its name.
+// A live attempt goes back to supervision, and an absent one is submitted under its name once
+// no start fence holds; behind the fence it is handed back free.
 #[test]
 fn unfinished_attempt_resumes() {
-    let cases = [
-        (adoptable(running(None)), AttemptPhase::Running),
-        (ReconcileEvidence::Absent, AttemptPhase::Submitted),
-    ];
-    for (found, phase) in cases {
+    let mut live = reconciling(in_state(JobState::Running));
+    let supervised = Ok(Next::Done(AdoptedEnd::Resume(AttemptPhase::Running)));
+    assert_eq!(live.next(evidence(adoptable(running(None)))), supervised);
+    let absent = || {
         let mut settle = reconciling(in_state(JobState::Running));
-        assert_eq!(
-            settle.next(evidence(found)),
-            Ok(Next::Done(AdoptedEnd::Resume(phase)))
-        );
-    }
+        let fence = settle.next(evidence(ReconcileEvidence::Absent));
+        assert_eq!(fence, Ok(Next::Call(fence_read())));
+        settle
+    };
+    let submitted = Ok(Next::Done(AdoptedEnd::Resume(AttemptPhase::Submitted)));
+    assert_eq!(absent().next(IoResult::Values(vec![None])), submitted);
+    let fenced = IoResult::Values(vec![Some(aruna_core::types::Value::from(&[][..]))]);
+    let handoff = handoff_external_attempt(job(), token(), NOW);
+    let mut held = absent();
+    assert_eq!(held.next(fenced), Ok(Next::Call(IoCall::child(handoff))));
+    let released = child(Ok::<_, JobMutationError>(ReleaseOutcome::Skipped));
+    assert_eq!(held.next(released), Ok(Next::Done(AdoptedEnd::Settled)));
 }
 
 // Start evidence is stored first; losing that write parks the attempt.
@@ -354,9 +380,11 @@ fn current(job: JobRecord) -> IoResult {
     child(Ok::<_, JobMutationError>(Some(job)))
 }
 
-/// A resume of a never started attempt, waiting for its preparation.
+/// A resume of a never started attempt past its fence, waiting for its preparation.
 fn preparing(job: JobRecord) -> ResumeAttemptOperation {
     let mut resume = resume_of(job.clone(), AttemptPhase::Submitted);
+    let fence = IoCall::child(RecoveryFence::new(&scope()));
+    assert_eq!(resume.next(current(job.clone())), Ok(Next::Call(fence)));
     let scope = scope();
     let held = Arc::new(job.clone());
     let prepare = PrepareAttemptOperation::new(
@@ -366,11 +394,66 @@ fn preparing(job: JobRecord) -> ResumeAttemptOperation {
         None,
         false,
     );
-    assert_eq!(
-        resume.next(current(job)),
-        Ok(Next::Call(IoCall::child(prepare)))
-    );
+    let fenced = child(Ok::<(), JobError>(()));
+    assert_eq!(resume.next(fenced), Ok(Next::Call(IoCall::child(prepare))));
     resume
+}
+
+// A resubmit its backend no longer takes is parked; a device job rechecks its admission.
+#[test]
+fn resubmit_fenced() {
+    let mut resume = resume_of(record(), AttemptPhase::Submitted);
+    resume.next(current(record())).unwrap();
+    let error = JobError::retryable("compute backend docker is not available here");
+    let park = ParkAttemptOperation::new(job(), token(), error.clone(), scope().settle(NOW));
+    let parked = resume.next(child(Err::<(), _>(error)));
+    assert_eq!(parked, Ok(Next::Call(IoCall::child(park))));
+    let mut device = record();
+    device.local_admission = Some(LocalAdmission {
+        backend: "docker".to_string(),
+        config_generation: 1,
+        config_digest: [0; 32],
+        home_digest: [0; 32],
+        subject: None,
+    });
+    let mut resume = resume_of(device.clone(), AttemptPhase::Submitted);
+    let recheck = RecheckAdmission::of_job(&device, token(), scope().spec.clone()).unwrap();
+    let call = Ok(Next::Call(IoCall::child(recheck)));
+    assert_eq!(resume.next(current(device)), call);
+}
+
+/// The fence of the test attempt, answered with the offer of `docker` changed by `adjust`.
+fn fenced(adjust: impl FnOnce(&mut BackendCaps)) -> (RecoveryFence, ExecutorOffer) {
+    let mut caps = BackendCaps::default();
+    adjust(&mut caps);
+    let offer = ExecutorOffer::new(("docker".to_string(), "docker".to_string()), [0; 32], caps);
+    let mut fence = RecoveryFence::new(&scope());
+    assert_eq!(
+        fence.first(),
+        Ok(Next::Call(compute_call(ComputeEffect::Offers)))
+    );
+    let offers = compute(ComputeAnswer::Offers(vec![offer.clone()]));
+    let held = IoCall::child(HeldReservations::of_job(job()));
+    assert_eq!(fence.next(offers), Ok(Next::Call(held)));
+    (fence, offer)
+}
+
+// A receipt whose backend config changed, or a backend that refuses the job, stays retryable.
+#[test]
+fn fence_checks_receipt() {
+    let held = |reservations| child(Ok::<_, LifecycleError>(reservations));
+    let mut receipted = reservation(0);
+    let (mut fence, offer) = fenced(|_| {});
+    receipted.config_digest = offer.config_digest();
+    assert_eq!(fence.next(held(vec![receipted])), Ok(Next::Done(())));
+    let (mut changed, _) = fenced(|_| {});
+    let message =
+        "compute backend docker changed its config since the receipt (stored generation 1)";
+    let refused = changed.next(held(vec![reservation(0)]));
+    assert_eq!(refused, Err(JobError::retryable(message)));
+    let (mut short, _) = fenced(|caps| caps.max_walltime_ms = Some(1));
+    let refused = short.next(held(Vec::new())).unwrap_err();
+    assert_eq!(refused.kind, JobErrorKind::Retryable);
 }
 
 fn supervised() -> Next<()> {

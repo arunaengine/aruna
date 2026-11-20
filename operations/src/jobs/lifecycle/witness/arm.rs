@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::super::LifecycleError;
+use super::deferred::{DeferKind, DeferredTarget};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::verify::FamilyView;
@@ -46,6 +47,10 @@ pub struct WitnessExplain {
     pub sequence: u32,
     pub plan: ExecutionPlan,
     pub declined: Vec<ExecutionTargetId>,
+    /// Targets whose receipt wait ended after only temporary answers.
+    pub deferred: Vec<DeferredTarget>,
+    /// The last temporary answer to the current launch.
+    pub answer: Option<DeferKind>,
     /// The previous launch was never confirmed, so this one may overlap it.
     pub overlapping: bool,
     pub stored_at_ms: u64,
@@ -99,14 +104,14 @@ fn jitter_ms(family: &JobFamilyId, node: NodeId, base_delay_ms: u64) -> u64 {
     u64::from(u16::from_be_bytes([key[0], key[1]])) % spread
 }
 
-pub(in crate::jobs::lifecycle) fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
+pub(crate) fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
     let mut bytes = Vec::with_capacity(DEADLINE_KEY_BYTES);
     bytes.extend_from_slice(&due_at_ms.to_be_bytes());
     bytes.extend_from_slice(&family.to_bytes());
     Key::from(bytes.as_slice())
 }
 
-pub(in crate::jobs::lifecycle) fn deadline_index_key(family: &JobFamilyId) -> Key {
+pub(crate) fn deadline_index_key(family: &JobFamilyId) -> Key {
     Key::from(family.to_bytes().as_slice())
 }
 
