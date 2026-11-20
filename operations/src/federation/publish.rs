@@ -510,13 +510,25 @@ mod tests {
         let skipped = drive(PublishSoonOperation::new(config.realm_id, other), &context).await;
         assert_eq!(skipped, Ok(false));
         assert_eq!(read_timer(storage, &key).await.unwrap(), None);
-        // Without a task handle the runner still persists the due time before it refuses.
-        let armed = drive(
+        // Without a task handle no admission arms the wake, so the run errs and writes no row.
+        let refused = drive(
             PublishSoonOperation::new(config.realm_id, reporter()),
             &context,
         )
         .await;
-        assert!(matches!(armed, Err(PublishError::Timer(_))));
+        assert!(matches!(refused, Err(PublishError::Timer(_))));
+        assert_eq!(read_timer(storage, &key).await.unwrap(), None);
+        // With one, the shorten arms a new wake and persists its due time.
+        let scheduled = DriverContext {
+            task_handle: Some(aruna_tasks::TaskHandle::new()),
+            ..context.clone()
+        };
+        let armed = drive(
+            PublishSoonOperation::new(config.realm_id, reporter()),
+            &scheduled,
+        )
+        .await;
+        assert_eq!(armed, Ok(true));
         let due = read_timer(storage, &key).await.unwrap().unwrap();
         let limit = (unix_timestamp_secs() + PUBLISH_SOON.as_secs() + 1) * 1000;
         assert!(due.due_unix_millis <= limit);
