@@ -620,7 +620,7 @@ impl<P: Operation> Drive for ParentRun<'_, P> {
     fn start(&mut self) -> Effects {
         let entropy = clock::next_entropy();
         let now = clock::stamp_time();
-        self.1 = recorder::begin(type_name::<CallRun<P>>(), now, &*self.0);
+        self.1 = recorder::begin(type_name::<CallRun<P>>(), now, &*self.0, entropy);
         self.0.stamp(now);
         self.0.seed(entropy);
         self.0.start()
@@ -650,7 +650,7 @@ impl Drive for SubRun<'_> {
         let entropy = clock::next_entropy();
         let now = clock::stamp_time();
         let name = type_name_of_val(&*self.0);
-        self.1 = recorder::begin(name, now, &*self.0);
+        self.1 = recorder::begin(name, now, &*self.0, entropy);
         self.0.stamp(now);
         self.0.seed(entropy);
         self.0.start()
@@ -3566,9 +3566,66 @@ mod test {
         }
     }
 
+    /// Mints one id from the runner's stamp and entropy and ends with it.
+    #[derive(Debug, Default)]
+    struct Minter {
+        now_ms: u64,
+        ids: aruna_core::id_mint::IdMint,
+    }
+
+    impl Operation for Minter {
+        type Output = ulid::Ulid;
+        type Error = IoError;
+
+        fn first(&mut self) -> Result<Next<ulid::Ulid>, IoError> {
+            Ok(Next::Done(self.ids.mint(self.now_ms)))
+        }
+
+        fn next(&mut self, _: IoResult) -> Result<Next<ulid::Ulid>, IoError> {
+            Err(IoError::Unfinished)
+        }
+
+        fn stamp(&mut self, now_ms: u64) {
+            self.now_ms = now_ms;
+        }
+
+        fn seed(&mut self, entropy: u128) {
+            self.ids = aruna_core::id_mint::IdMint::new(entropy);
+        }
+    }
+
+    /// The recorder is global, so its tests take turns.
+    static RECORDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn recorded_ids_reproduce() {
+        use crate::recorder::{Entry, RecordLimits};
+        let _turn = RECORDING.lock().await;
+        let limits = RecordLimits {
+            total_bytes: 1 << 20,
+            entry_bytes: 4096,
+        };
+        crate::recorder::enable(limits);
+        let minted = drive(Minter::default(), &bare_context()).await.unwrap();
+        crate::recorder::disable();
+        // Other tests may record at the same time, so only this run's header counts.
+        let header = crate::recorder::take().records.into_iter().find_map(|record| {
+            match record.entry {
+                Entry::Started {
+                    operation, entropy, ..
+                } if operation.contains("::Minter>") => Some((record.at_ms, entropy)),
+                _ => None,
+            }
+        });
+        let (at_ms, entropy) = header.expect("the run was recorded");
+        let again = aruna_core::id_mint::IdMint::new(entropy).mint(at_ms);
+        assert_eq!(again, minted, "the header gives the run's ids again");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn recording_keeps_order() {
         use crate::recorder::{Entry, RecordLimits};
+        let _turn = RECORDING.lock().await;
         let limits = RecordLimits {
             total_bytes: 1 << 20,
             entry_bytes: 4096,
