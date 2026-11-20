@@ -975,7 +975,8 @@ pub(super) fn observe_cleanup(
         (
             CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
             StorageEvent::Error {
-                error: StorageError::TransactionConflict
+                error:
+                    StorageError::TransactionConflict
                     | StorageError::TransactionNotFound
                     | StorageError::RolledBack(_),
             },

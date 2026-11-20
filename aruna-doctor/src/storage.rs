@@ -254,9 +254,17 @@ mod tests {
             .unwrap();
         let mut state = ImportKeyspaceState::new(keyspace);
         state.insert(&db, b"a".to_vec(), vec![0; 16]).unwrap();
-        assert!(state.pending_txn.is_some(), "a small value waits for its batch");
-        state.insert(&db, b"b".to_vec(), vec![0; TXN_BYTE_LIMIT]).unwrap();
-        assert!(state.pending_txn.is_none(), "the batch committed on its bytes");
+        assert!(
+            state.pending_txn.is_some(),
+            "a small value waits for its batch"
+        );
+        state
+            .insert(&db, b"b".to_vec(), vec![0; TXN_BYTE_LIMIT])
+            .unwrap();
+        assert!(
+            state.pending_txn.is_none(),
+            "the batch committed on its bytes"
+        );
     }
 
     #[tokio::test]

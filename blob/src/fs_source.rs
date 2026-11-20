@@ -488,7 +488,10 @@ pub(crate) mod tests {
         let mut seen = 0;
         let wide = local_children(&root, ("", &resolved), (None, &mut seen, 3));
         assert!(matches!(wide, Err(StagingSourceError::InvalidListing(_))));
-        assert_eq!(seen, 4, "the scan stopped at the first entry over the bound");
+        assert_eq!(
+            seen, 4,
+            "the scan stopped at the first entry over the bound"
+        );
         let mut seen = 0;
         let rest = local_children(&root, ("", &resolved), (Some("d"), &mut seen, 10)).unwrap();
         let mut names: Vec<String> = rest.into_iter().map(|child| child.name).collect();
@@ -537,7 +540,12 @@ pub(crate) mod tests {
             if !truncated {
                 break;
             }
-            after = paged.last().unwrap().split('/').map(ToOwned::to_owned).collect();
+            after = paged
+                .last()
+                .unwrap()
+                .split('/')
+                .map(ToOwned::to_owned)
+                .collect();
         }
         assert_eq!(whole, ["a/f.txt", "m.txt", "z/f.txt"]);
         assert_eq!(paged, whole);

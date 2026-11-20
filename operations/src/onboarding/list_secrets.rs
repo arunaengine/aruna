@@ -216,7 +216,10 @@ mod tests {
         let mut early = ListSecretsOperation::new(None);
         early.first().unwrap();
         let refused = early.next(IoResult::Values(Vec::new()));
-        assert!(matches!(refused, Err(ListSecretsError::UnexpectedEvent { .. })));
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
         let mut twice = ListSecretsOperation::new(None);
         twice.first().unwrap();
         let page = || IoResult::Page {
@@ -225,7 +228,10 @@ mod tests {
         };
         twice.next(page()).unwrap();
         let refused = twice.next(page());
-        assert!(matches!(refused, Err(ListSecretsError::UnexpectedEvent { .. })));
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
     }
 
     #[test]

@@ -538,7 +538,10 @@ fn rollback_told_distinctly() {
         error: StorageError::RolledBack(cause.clone()),
     };
     assert!(operation.step(Event::Storage(rolled)).is_empty());
-    assert!(operation.operation.rolled_back, "a rolled back commit is told");
+    assert!(
+        operation.operation.rolled_back,
+        "a rolled back commit is told"
+    );
     let rolled = IoError::Storage(StorageError::RolledBack(cause));
     assert_eq!(operation.finalize(), Err(rolled));
 }

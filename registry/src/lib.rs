@@ -110,9 +110,7 @@ impl IntoResponse for RegistryError {
             | Self::BadCursor
             | Self::BadUrl
             | Self::BadDescriptor(_)
-            | Self::BadTotals(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            | Self::BadTotals(_) => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Store(StoreError::NotFound) => StatusCode::NOT_FOUND,
             Self::Signature(_) => StatusCode::FORBIDDEN,

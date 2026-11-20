@@ -67,7 +67,9 @@ mod pure_tests {
     // Only arming an audit retry runs from memory; its failed cancellation is reported.
     #[test]
     fn audit_arming_kept() {
-        use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+        use aruna_core::structs::storage::key_audit::{
+            AuditAction, AuditOutcome, BucketAuditRecord,
+        };
         let record = BucketAuditRecord {
             event_id: ulid::Ulid::from_parts(5, 1),
             bucket_id: ulid::Ulid::from_bytes([2; 16]),

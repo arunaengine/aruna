@@ -221,7 +221,10 @@ mod tests {
             .await
             .expect("restores");
         let after = armed_after(&task_handle, &postponed, probe).await;
-        assert!(after > Duration::from_secs(60), "armed at the new deadline: {after:?}");
+        assert!(
+            after > Duration::from_secs(60),
+            "armed at the new deadline: {after:?}"
+        );
     }
 
     // A firing deletes only the row its stamp names: a replacement written while it waited to start

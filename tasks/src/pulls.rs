@@ -72,7 +72,9 @@ impl PullRegistry {
         }
         let progress = PullProgress::default();
         let bytes_done = Arc::downgrade(&progress.0);
-        pulls.tasks.insert(key, PullTask::Running { bytes_done, total });
+        pulls
+            .tasks
+            .insert(key, PullTask::Running { bytes_done, total });
         Ok(progress)
     }
 
@@ -186,7 +188,11 @@ mod tests {
         let start = Instant::now();
         drop(registry.claim(vec![1], 10, start));
         drop(registry.claim(vec![2], 10, start + Duration::from_secs(1)));
-        assert_eq!(registry.pulls().tasks.len(), 2, "no sweep within the interval");
+        assert_eq!(
+            registry.pulls().tasks.len(),
+            2,
+            "no sweep within the interval"
+        );
         drop(registry.claim(vec![3], 10, start + SWEEP_EVERY));
         assert_eq!(registry.pulls().tasks.len(), 1, "the next interval sweeps");
     }

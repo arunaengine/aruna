@@ -518,7 +518,10 @@ mod tests {
         let raced = dir.path().join("raced");
         std::fs::create_dir(&raced).unwrap();
         let refused = super::publish_dir(&staging, &raced);
-        assert!(matches!(refused, Err(super::SnapshotError::TargetPathExists(_))));
+        assert!(matches!(
+            refused,
+            Err(super::SnapshotError::TargetPathExists(_))
+        ));
         assert!(staging.is_dir() && raced.is_dir());
 
         let source_root = dir.path().join("source");

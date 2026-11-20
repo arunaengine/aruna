@@ -325,7 +325,10 @@ impl SchedulerState {
 
             if matches!(self.timers_by_key.get(&key), Some(entry) if entry.id == timer_id && entry.deadline == deadline)
             {
-                let stamp = self.timers_by_key.remove(&key).and_then(|entry| entry.stamp);
+                let stamp = self
+                    .timers_by_key
+                    .remove(&key)
+                    .and_then(|entry| entry.stamp);
 
                 if self.in_flight_keys.contains_key(&key) {
                     self.refire_requested.insert(key, stamp);
@@ -2316,9 +2319,15 @@ mod decision_tests {
         state.reset_timer((key.clone(), None), Duration::ZERO, start);
         let (tx, _rx) = mpsc::channel(1);
         state.dispatch_due_timers(start, &tx.downgrade());
-        assert!(state.refire_requested.contains_key(&key), "the firing waits");
+        assert!(
+            state.refire_requested.contains_key(&key),
+            "the firing waits"
+        );
         state.cancel_timer(key.clone());
-        assert!(!state.refire_requested.contains_key(&key), "no run follows the cancel");
+        assert!(
+            !state.refire_requested.contains_key(&key),
+            "no run follows the cancel"
+        );
     }
 
     #[test]

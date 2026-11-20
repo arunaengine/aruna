@@ -258,7 +258,11 @@ pub fn secret_expiry_key(expires_at: u64, enrollment_id: Ulid) -> ByteView {
 /// The expiry index row of `record`, written in the transaction that writes the record.
 pub(crate) fn expiry_entry(record: &OnboardingSecretRecord) -> (String, Key, Value) {
     let key = secret_expiry_key(record.expires_at, record.enrollment_id);
-    (ONBOARDING_KEYSPACE.to_string(), key, ByteView::from(Vec::new()))
+    (
+        ONBOARDING_KEYSPACE.to_string(),
+        key,
+        ByteView::from(Vec::new()),
+    )
 }
 
 #[cfg(test)]
