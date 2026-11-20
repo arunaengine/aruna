@@ -1075,6 +1075,7 @@ async fn restore_registration_timer(
         key: TaskKey::PublishRegistration,
         after: aruna_core::federation::PUBLISH_INTERVAL,
     };
+    let _held = hold_change(&effect).await;
     if let Err(message) = persist_task_effect(storage, &effect).await {
         warn!(message = %message, "Failed to persist registry publication timer");
     }

@@ -193,6 +193,30 @@ mod tests {
         assert_eq!(*observed.lock().await, Some(key));
     }
 
+    // A fired timer removes only a due row: a replacement written for the key after the firing
+    // stays, so a restart still finds the accepted wakeup.
+    #[tokio::test]
+    async fn fired_keeps_replacement() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = |after| TaskEffect::ResetTimer {
+            key: key.clone(),
+            after,
+        };
+        let later = reset(Duration::from_secs(3600));
+        persist_task_effect(&storage, &later).await.expect("timer persists");
+
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
+        assert!(read_timer(&storage, &key).await.expect("timer reads").is_some());
+
+        let due = reset(Duration::ZERO);
+        persist_task_effect(&storage, &due).await.expect("timer persists");
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
+        assert!(read_timer(&storage, &key).await.expect("timer reads").is_none());
+    }
+
     // A cancellation whose row could not be deleted fails, so no caller acknowledges it while the
     // row would schedule the work again at the next restart.
     #[tokio::test]

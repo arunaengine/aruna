@@ -182,7 +182,7 @@ use aruna_operations::sync::shard_placement::{
     DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
 use aruna_operations::triggers::{TimerInput, timer_operation};
-use aruna_storage::task_timers::{delete_persisted_timer, persist_task_effect};
+use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_task_effect};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 pub(crate) mod drained;
@@ -698,6 +698,7 @@ impl OperationsTaskHandler {
             key: key.clone(),
             after,
         };
+        let _held = hold_change(&effect).await;
         if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
             warn!(task_id = ?key, message = %message, "Failed to persist timer re-arm");
             return false;
@@ -726,6 +727,7 @@ impl OperationsTaskHandler {
             key: key.clone(),
             after,
         };
+        let _held = hold_change(&effect).await;
         if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
             warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
         }
