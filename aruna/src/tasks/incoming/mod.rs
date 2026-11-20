@@ -118,7 +118,7 @@ use aruna_operations::sync::outbox::rotation::OutboxRotation;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
-    TimerInput, TimerMemory, TimerPlan, timer_needs, timer_operation,
+    TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
 };
 use aruna_storage::task_timers::delete_persisted_timer;
 use folder_pass::{restore_publish_timer, restore_sync_timers};
@@ -459,7 +459,11 @@ impl OperationsTaskHandler {
     /// Re-arms a timer in memory even when storage cannot persist it, so an outage does not end
     /// the retries; the persisted copy is best effort.
     async fn keep_retrying(&self, key: TaskKey, after: std::time::Duration) {
-        let effect = TaskEffect::ResetTimer { key, after };
+        self.rearm_live(TaskEffect::ResetTimer { key, after }).await;
+    }
+
+    /// Applies a timer arming in memory even when storage cannot persist it.
+    async fn rearm_live(&self, effect: TaskEffect) {
         let storage = &self.context.storage_handle;
         let task_handle = self.context.task_handle.as_ref();
         if let Event::Task(TaskEvent::Error { key, message }) =
@@ -617,7 +621,11 @@ impl OperationsTaskHandler {
             return;
         };
         // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
-        self.keep_retrying(key, after).await;
+        let effect = match keeps_earlier(&key) {
+            true => TaskEffect::ShortenTimer { key, after },
+            false => TaskEffect::ResetTimer { key, after },
+        };
+        self.rearm_live(effect).await;
     }
 
     /// What a timer kept from its last run, empty for its first run since the start.

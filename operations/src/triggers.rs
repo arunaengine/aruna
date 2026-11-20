@@ -180,6 +180,12 @@ pub struct TimerNeeds {
     pub cores: bool,
 }
 
+/// Whether the timer of `key` rearms with a shorten after a run, so a wake armed while it ran,
+/// such as the prompt publication of a settings change, is never postponed.
+pub fn keeps_earlier(key: &TaskKey) -> bool {
+    matches!(key, TaskKey::PublishRegistration)
+}
+
 /// The costly inputs the timer of `key` reads.
 pub fn timer_needs(key: &TaskKey) -> TimerNeeds {
     let routing = matches!(
