@@ -102,24 +102,50 @@ fn receive_backup(
     Ok((bytes, reader.stats()))
 }
 
-/// Builds a new storage directory from a backup: the node database at `target`, document sync
-/// in `document-sync`, the metadata store in `craqle/store` and the Git repositories in `git`.
-/// It is built in `<target>.partial` and moved to `target` only after the whole file checked.
+/// Builds a new storage directory from a backup: the node database at `target`, `document-sync`,
+/// `craqle/store` and `git`. It grows in an owner-only staging folder beside `target`, uniquely
+/// named so a crashed restore blocks no other, and is published once the whole file checked.
 pub fn restore_backup(backup: &Path, target: &Path) -> Result<SnapshotStats, SnapshotError> {
     ensure_target_path(target)?;
-    let mut partial = target.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    ensure_target_path(&partial)?;
     let mut reader = SnapshotReader::new(BufReader::new(File::open(backup)?))?;
-    std::fs::create_dir(&partial)?;
-    let restored = restore_into(&mut reader, &partial)
-        .and_then(|()| std::fs::rename(&partial, target).map_err(SnapshotError::from));
-    if let Err(error) = restored {
-        let _ = std::fs::remove_dir_all(&partial);
-        return Err(error);
-    }
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    // Every error drops the staging directory, which removes it.
+    let staging = staging_dir(parent)?;
+    restore_into(&mut reader, staging.path())?;
+    publish_dir(staging.path(), target)?;
+    let _published = staging.keep();
     Ok(reader.stats())
+}
+
+/// An empty directory in `parent` that only its owner may enter.
+fn staging_dir(parent: &Path) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".restore-");
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    builder.tempdir_in(parent)
+}
+
+/// Moves the finished `staging` directory to `target`, refusing even an empty directory that
+/// appeared there meanwhile; Windows refuses to rename over a directory by itself.
+fn publish_dir(staging: &Path, target: &Path) -> Result<(), SnapshotError> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let moved = {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, staging, CWD, target, RenameFlags::NOREPLACE).map_err(Into::into)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let moved = std::fs::rename(staging, target);
+    match moved {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(SnapshotError::TargetPathExists(target.to_path_buf()))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Writes all records into the new directory `target` and closes its databases again.
@@ -342,7 +368,7 @@ mod tests {
         let stats = restore_backup(&file, &target).unwrap();
         assert_eq!(stats.created_unix_seconds, 11);
 
-        assert!(!dir.path().join("restored.partial").exists());
+        assert!(!staging_left(dir.path()), "no staging directory is left");
         let main = OptimisticTxDatabase::builder(&target).open().unwrap();
         assert_eq!(read_test_value(main.inner()), b"main");
         let queued = read_value(main.inner(), CHECK_QUEUE_KEYSPACE, "photos");
@@ -446,6 +472,40 @@ mod tests {
         );
     }
 
+    /// Whether a restore left a staging directory in `dir`.
+    fn staging_left(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            name.to_string_lossy().starts_with(".restore-")
+        })
+    }
+
+    // A target that appeared after the check survives, a crashed restore's leftover blocks
+    // nothing, and the restored directory stays owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn restore_never_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let raced = dir.path().join("raced");
+        std::fs::create_dir(&raced).unwrap();
+        let refused = super::publish_dir(&staging, &raced);
+        assert!(matches!(refused, Err(super::SnapshotError::TargetPathExists(_))));
+        assert!(staging.is_dir() && raced.is_dir());
+
+        let source_root = dir.path().join("source");
+        let bytes = backup_bytes(&source_root, &open_source(&source_root));
+        let file = dir.path().join("node.backup");
+        std::fs::write(&file, bytes).unwrap();
+        let target = dir.path().join("restored");
+        std::fs::create_dir(dir.path().join("restored.partial")).unwrap();
+        restore_backup(&file, &target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     #[test]
     fn rejects_unsafe_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -474,6 +534,6 @@ mod tests {
         let target = dir.path().join("restored");
         assert!(restore_backup(&file, &target).is_err());
         assert!(!target.exists());
-        assert!(!dir.path().join("restored.partial").exists());
+        assert!(!staging_left(dir.path()), "no staging directory is left");
     }
 }
