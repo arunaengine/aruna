@@ -102,12 +102,13 @@ impl RotationRunOperation {
         let Some(invocation) = self.invocation.take() else {
             return Err(IoError::Unfinished);
         };
-        let records = invocation.records;
-        if records >= self.limits.records || invocation.pages >= self.limits.pages {
+        // Read rows bound the invocation, as filtered pages publish nothing.
+        let scanned = invocation.scanned;
+        if scanned >= self.limits.records || invocation.pages >= self.limits.pages {
             return self.finish(invocation);
         }
         let serving = self.serving.ok_or(IoError::Unfinished)?;
-        let limit = OUTBOX_DRAIN_SIZE.min(self.limits.records.saturating_sub(records));
+        let limit = OUTBOX_DRAIN_SIZE.min(self.limits.records.saturating_sub(scanned));
         self.before = Some(invocation.clone());
         let page = DrainPageOperation::new(
             serving,
@@ -337,5 +338,31 @@ mod tests {
         };
         assert_eq!(plan.after, None);
         assert_eq!(plan.memory.rotation, OutboxRotation::default());
+    }
+
+    // Rows read on skipped pages end the invocation, though none of them was admitted.
+    #[test]
+    fn skipped_rows_count() {
+        let mut input = input(serving(), 0);
+        input.memory.rotation.boundary = Some(b"z".to_vec());
+        input.outbox.records = 4;
+        let mut run = RotationRunOperation::new(&input);
+        run.first().unwrap();
+        let page = run.next(IoResult::Values(vec![None]));
+        assert!(matches!(page, Ok(Next::Call(IoCall::Child(_)))));
+        let mut invocation = DrainInvocation::new(&input.memory.rotation);
+        (invocation.pages, invocation.scanned) = (1, 4);
+        invocation.cursor = Some(b"k".to_vec());
+        let page = DrainedPage {
+            invocation,
+            end: PageEnd::Skip,
+            published: Vec::new(),
+            deleted: Vec::new(),
+        };
+        let drained = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(page)));
+        let Ok(Next::Done(plan)) = run.next(drained) else {
+            panic!("the read rows end the invocation");
+        };
+        assert_eq!(plan.memory.rotation.cursor, Some(b"k".to_vec()));
     }
 }
