@@ -1,4 +1,4 @@
-//! The node library: settings, identity, startup phases, shutdown ordering and telemetry.
+//! The node library: startup phases, shutdown ordering, background tasks and telemetry.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -10,15 +10,11 @@ pub mod application;
 pub mod backup;
 pub mod bootstrap;
 pub mod compute_setup;
-pub mod config;
 pub mod default_env;
-pub mod identity;
 pub mod inbound;
 mod inbound_frames;
-pub mod limits;
 pub mod plugin_host;
 pub mod portal;
-pub mod settings;
 pub mod shutdown;
 pub mod startup;
 pub mod tasks;

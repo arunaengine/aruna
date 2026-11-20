@@ -30,3 +30,4 @@ pub mod remote;
 pub mod repo;
 pub mod rocrate;
 pub mod s3;
+mod walk;

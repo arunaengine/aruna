@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::walk::{Child, Step, Walk};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::offered_directory::{
@@ -13,7 +14,7 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use bytes::Bytes;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use tokio::io::AsyncSeekExt;
@@ -103,16 +104,18 @@ pub(crate) async fn head_local(
     .map_err(|error| StagingSourceError::ReadError(error.to_string()))?
 }
 
+/// One page of a local listing in walk order, after the cursor names in `after`.
 pub(crate) async fn list_local(
     access: &ResolvedSourceAccess,
-    offset: usize,
+    after: Vec<String>,
     limit: usize,
     recursive: bool,
     files_only: bool,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let (root, path) = access_parts(access)?;
     tokio::task::spawn_blocking(move || {
-        list_entries(&root, &path, offset, limit, recursive, files_only)
+        let walk = Walk::new(&path, after, recursive);
+        walk_entries(&root, walk, (limit, files_only), MAX_LOCAL_EXAMINED)
     })
     .await
     .map_err(|error| StagingSourceError::ListError(error.to_string()))?
@@ -120,121 +123,110 @@ pub(crate) async fn list_local(
 
 /// Entries one local listing page may examine, skipped ones included.
 const MAX_LOCAL_EXAMINED: usize = 250_000;
-/// Directories one local listing page may hold queued at once.
-const MAX_LOCAL_QUEUED: usize = 50_000;
 
-/// How much raw traversal one local listing page may do before it fails.
-#[derive(Clone, Copy)]
-struct WalkBounds {
-    examined: usize,
-    queued: usize,
-}
+/// A listed local entry: where it resolves inside the root and its metadata there.
+type LocalChild = Child<cap_std::fs::Metadata>;
 
-fn list_entries(
-    root: &str,
-    path: &str,
-    offset: usize,
-    limit: usize,
-    recursive: bool,
-    files_only: bool,
-) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
-    let bounds = WalkBounds {
-        examined: MAX_LOCAL_EXAMINED,
-        queued: MAX_LOCAL_QUEUED,
-    };
-    walk_entries(root, path, (offset, limit), (recursive, files_only), bounds)
-}
-
-/// One page of a local walk; exhausting `bounds` fails the page instead of walking on.
+/// One page of a local walk; examining more than `examined` entries fails the page instead of
+/// walking on.
 fn walk_entries(
     root: &str,
-    path: &str,
-    (offset, limit): (usize, usize),
-    (recursive, files_only): (bool, bool),
-    bounds: WalkBounds,
+    mut walk: Walk<cap_std::fs::Metadata>,
+    (limit, files_only): (usize, bool),
+    examined: usize,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let root = OfferedRoot::open(root)?;
-    let start = root.resolve(path)?;
-    // Resolved directories already queued. A link to an ancestor inside the
-    // offered root would otherwise walk in circles forever.
-    let mut visited = HashSet::from([start.clone()]);
-    let mut queue = VecDeque::from([(start, path.to_string())]);
+    // Directories already listed. A link to an ancestor inside the offered root would otherwise
+    // walk in circles forever.
+    let mut visited = HashSet::new();
+    let mut seen = 0usize;
     let mut entries = Vec::new();
-    let mut skipped = 0usize;
-    let mut examined = 0usize;
+    loop {
+        let (path, child) = match walk.step() {
+            Step::List(directory) => {
+                let children = local_children(&root, &directory, &mut visited, &mut seen)?;
+                if seen > examined {
+                    return Err(StagingSourceError::InvalidListing(format!(
+                        "a local listing page examines at most {examined} entries; list a \
+                         narrower path"
+                    )));
+                }
+                walk.listed(children);
+                continue;
+            }
+            Step::Entry { path, child } => (path, child),
+            Step::Done => return Ok((entries, false)),
+        };
+        if child.is_dir && files_only {
+            continue;
+        }
+        if entries.len() == limit {
+            return Ok((entries, true));
+        }
+        let kind = match child.is_dir {
+            true => SourceEntryKind::Directory,
+            false => SourceEntryKind::File,
+        };
+        let metadata = child.value;
+        entries.push(SourceEntry {
+            name: child.name,
+            path,
+            kind,
+            size: (kind == SourceEntryKind::File).then_some(metadata.len()),
+            modified: metadata.modified().ok().map(|time| time.into_std()),
+            etag: None,
+            // The listing carries the same stat the serve path reads, so an
+            // observation and a later read agree on one identity.
+            stat: Some(entry_stat(&metadata)),
+        });
+    }
+}
 
-    while let Some((directory, prefix)) = queue.pop_front() {
-        let reader = root
-            .directory
-            .read_dir(&directory)
-            .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
-        for entry in reader {
-            let entry = entry.map_err(|error| StagingSourceError::ListError(error.to_string()))?;
-            examined += 1;
-            if examined > bounds.examined {
-                return Err(StagingSourceError::InvalidListing(format!(
-                    "a local listing page examines at most {} entries; list a narrower path",
-                    bounds.examined
-                )));
-            }
-            let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
-                continue;
-            };
-            // This node's bookkeeping lives only in the reserved directory,
-            // so a file the owner named `.aruna-notes` stays theirs.
-            if name == RESERVED_DIR {
-                continue;
-            }
-            let relative = join_relative(&prefix, &name);
-            // A link out of the offered directory is skipped, not an error: one
-            // stray link must not make the whole listing unusable.
-            let Ok(resolved) = root.resolve(&relative) else {
-                continue;
-            };
-            let Ok(metadata) = root.directory.metadata(&resolved) else {
-                continue;
-            };
-            let kind = if metadata.is_dir() {
-                if recursive && visited.insert(resolved.clone()) {
-                    if queue.len() >= bounds.queued {
-                        return Err(StagingSourceError::InvalidListing(format!(
-                            "a local listing page queues at most {} directories; list a narrower path",
-                            bounds.queued
-                        )));
-                    }
-                    queue.push_back((resolved, relative.clone()));
-                }
-                if files_only {
-                    continue;
-                }
-                SourceEntryKind::Directory
-            } else if metadata.is_file() {
-                SourceEntryKind::File
-            } else {
-                continue;
-            };
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            if entries.len() == limit {
-                return Ok((entries, true));
-            }
-            entries.push(SourceEntry {
+/// The files and directories of one local directory; a directory already listed has none.
+fn local_children(
+    root: &OfferedRoot,
+    directory: &str,
+    visited: &mut HashSet<PathBuf>,
+    seen: &mut usize,
+) -> Result<Vec<LocalChild>, StagingSourceError> {
+    let resolved = root.resolve(directory)?;
+    if !visited.insert(resolved.clone()) {
+        return Ok(Vec::new());
+    }
+    let reader = root
+        .directory
+        .read_dir(&resolved)
+        .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
+    let mut children = Vec::new();
+    for entry in reader {
+        let entry = entry.map_err(|error| StagingSourceError::ListError(error.to_string()))?;
+        *seen += 1;
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        // This node's bookkeeping lives only in the reserved directory,
+        // so a file the owner named `.aruna-notes` stays theirs.
+        if name == RESERVED_DIR {
+            continue;
+        }
+        // A link out of the offered directory is skipped, not an error: one
+        // stray link must not make the whole listing unusable.
+        let Ok(resolved) = root.resolve(&join_relative(directory, &name)) else {
+            continue;
+        };
+        let Ok(metadata) = root.directory.metadata(&resolved) else {
+            continue;
+        };
+        if metadata.is_dir() || metadata.is_file() {
+            let is_dir = metadata.is_dir();
+            children.push(Child {
                 name,
-                path: relative,
-                kind,
-                size: (kind == SourceEntryKind::File).then_some(metadata.len()),
-                modified: metadata.modified().ok().map(|time| time.into_std()),
-                etag: None,
-                // The listing carries the same stat the serve path reads, so an
-                // observation and a later read agree on one identity.
-                stat: Some(entry_stat(&metadata)),
+                is_dir,
+                value: metadata,
             });
         }
     }
-
-    Ok((entries, false))
+    Ok(children)
 }
 
 pub(crate) async fn read_local(
@@ -470,20 +462,44 @@ pub(crate) mod tests {
             std::fs::create_dir(dir.path().join(format!("empty-{index}"))).unwrap();
         }
         let root = dir.path().to_str().unwrap();
-        let walk = |examined, queued| {
-            let bounds = WalkBounds { examined, queued };
-            walk_entries(root, "", (0, 10), (true, true), bounds)
+        let walk = |examined| {
+            let walk = Walk::new("", Vec::new(), true);
+            walk_entries(root, walk, (10, true), examined)
         };
 
-        assert!(walk(10, 10).is_ok());
+        assert!(walk(10).is_ok());
         assert!(matches!(
-            walk(10, 2),
+            walk(3),
             Err(StagingSourceError::InvalidListing(_))
         ));
-        assert!(matches!(
-            walk(3, 10),
-            Err(StagingSourceError::InvalidListing(_))
-        ));
+    }
+
+    // Each page continues after the last path of the one before, in name order, so a tree is
+    // listed once without walking the paths before the cursor again.
+    #[tokio::test]
+    async fn pages_resume_walk() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["b/x.txt", "b/a/y.txt", "a.txt", "c.txt"] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"data").unwrap();
+        }
+        let (mut after, mut paths) = (Vec::new(), Vec::new());
+        loop {
+            let page = list_local(&access(root.path(), ""), after, 1, true, true).await;
+            let (entries, truncated) = page.unwrap();
+            paths.extend(entries.iter().map(|entry| entry.path.clone()));
+            if !truncated {
+                break;
+            }
+            after = paths
+                .last()
+                .unwrap()
+                .split('/')
+                .map(ToOwned::to_owned)
+                .collect();
+        }
+        assert_eq!(paths, ["a.txt", "b/a/y.txt", "b/x.txt", "c.txt"]);
     }
 
     pub(crate) fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
@@ -546,7 +562,7 @@ pub(crate) mod tests {
             head_local(&access(root.path(), "../secret")).await,
             Err(StagingSourceError::NotFound)
         );
-        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, false)
+        let (entries, _) = list_local(&access(root.path(), ""), Vec::new(), 10, true, false)
             .await
             .unwrap();
         assert!(entries.is_empty());
@@ -583,9 +599,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let (mut entries, truncated) = list_local(&access(root.path(), ""), 0, 10, true, true)
-            .await
-            .unwrap();
+        let listed = list_local(&access(root.path(), ""), Vec::new(), 10, true, true).await;
+        let (mut entries, truncated) = listed.unwrap();
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         assert!(!truncated);
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
@@ -695,9 +710,10 @@ pub(crate) mod tests {
             .unwrap();
         std::os::unix::fs::symlink(root.path(), root.path().join("nested/loop")).unwrap();
 
-        let (entries, truncated) = list_local(&access(root.path(), ""), 0, 100, true, true)
-            .await
-            .unwrap();
+        let (entries, truncated) =
+            list_local(&access(root.path(), ""), Vec::new(), 100, true, true)
+                .await
+                .unwrap();
         assert!(!truncated);
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, vec!["nested/inner.txt"]);

@@ -983,6 +983,7 @@ mod tests {
         }));
         operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id: TxnId::default(),
+            sequence: 1,
         }));
         assert_eq!(operation.finish().unwrap(), rule);
     }
@@ -1026,6 +1027,7 @@ mod tests {
         }));
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id: TxnId::default(),
+            sequence: 1,
         }));
         assert!(matches!(
             effects.as_slice(),

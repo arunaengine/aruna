@@ -177,6 +177,8 @@ pub struct FjallStorage {
     pub(super) deletes: HashMap<String, u64>,
     /// Journal count at the last journal sweep.
     pub(super) swept: usize,
+    /// Write commits applied so far, the sequence of the last one.
+    pub(super) commits: u64,
     pub(super) txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
     pub(super) txn_usage: HashMap<Ulid, PendingChanges>,
     /// Open write transactions that wrote or deleted realm config rows.

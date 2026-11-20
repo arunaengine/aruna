@@ -533,6 +533,7 @@ mod mapped_tests {
         );
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
+            sequence: 1,
         }));
         assert_eq!(effects.as_slice(), [schedule_snapshot_publish()]);
         operation.step(Event::Task(TaskEvent::TimerScheduled {

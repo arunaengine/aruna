@@ -81,7 +81,7 @@ impl TlsFiles {
 }
 
 /// Native settings parsed like a real node, so `S3_HOST` gets the settings normalization.
-fn native_settings(s3_host: &str) -> aruna::settings::Settings {
+fn native_settings(s3_host: &str) -> aruna_config::settings::Settings {
     let map: BTreeMap<String, String> = [
         ("DATABASE_DIR", "/tmp/aruna-https-settings"),
         ("SOCKET_ADDRESS", "127.0.0.1:0"),
@@ -98,7 +98,7 @@ fn native_settings(s3_host: &str) -> aruna::settings::Settings {
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
     .collect();
-    aruna::settings::read_settings_from(&map).expect("native settings parse")
+    aruna_config::settings::read_settings_from(&map).expect("native settings parse")
 }
 
 /// One S3 server on the seed's storage, serving plain and TLS from one loop.

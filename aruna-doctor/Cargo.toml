@@ -12,8 +12,8 @@ rust-version.workspace = true
 
 [dependencies]
 ahash = { workspace = true }
-aruna = { workspace = true }
 aruna-clock = { workspace = true }
+aruna-config = { workspace = true }
 aruna-core = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-storage = { workspace = true }
@@ -48,6 +48,7 @@ tokio-util = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+aruna = { workspace = true }
 aruna-core = { workspace = true, features = ["test-hooks"] }
 aruna-drivers = { workspace = true, features = ["test-hooks"] }
 aruna-net = { workspace = true, features = ["test-hooks"] }

@@ -177,7 +177,12 @@ mod tests {
         // A page reads a bounded number of records after its cursor and names the next one.
         let after = ByteView::from(b"secret:a".as_slice());
         let mut operation = ListSecretsOperation::new(Some(after.clone()));
-        let Ok(Next::Call(IoCall::Page { after: asked, limit, .. })) = operation.first() else {
+        let Ok(Next::Call(IoCall::Page {
+            after: asked,
+            limit,
+            ..
+        })) = operation.first()
+        else {
             panic!("expected a page of records");
         };
         assert_eq!((asked, limit), (Some(after), SECRET_PAGE));

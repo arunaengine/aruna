@@ -4,11 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::{EgressGuard, REDIRECT_HOPS};
+use crate::walk::{Child, Step, Walk};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
@@ -29,87 +30,77 @@ struct Anchor {
     trailing: String,
 }
 
-/// Lists one directory level (or a recursive walk) of an http staging source
-/// by parsing autoindex pages, mirroring `list_operator` semantics for
-/// limits, truncation, and the `files_only` filter.
+/// Lists one directory level (or a recursive walk) of an http staging source by parsing
+/// autoindex pages, in walk order after the cursor names in `after`, with the same limit,
+/// truncation and `files_only` rules as `list_operator`.
 pub(crate) async fn list_http_autoindex(
     guard: &EgressGuard,
     config: &HashMap<String, String>,
     path: &str,
-    offset: usize,
+    after: Vec<String>,
     limit: usize,
     recursive: bool,
     files_only: bool,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let client = HttpIndexClient::from_config(guard, config)?;
-    let mut queue = VecDeque::from([path.trim_matches('/').to_string()]);
+    let mut walk = Walk::new(path, after, recursive);
     let mut entries = Vec::new();
     let mut fetches = 0usize;
-    let mut skipped = 0usize;
-
-    while let Some(dir) = queue.pop_front() {
-        if fetches == MAX_INDEX_FETCHES {
-            // Without an entry the next page could not move on, so the walk fails instead.
-            if entries.is_empty() {
-                return Err(StagingSourceError::InvalidListing(format!(
-                    "the source holds more than {MAX_INDEX_FETCHES} directory indexes without \
-                     entries; list a narrower path"
-                )));
-            }
-            return Ok((entries, true));
-        }
-        fetches += 1;
-        let (base_path, html) = client.fetch_index(&dir).await?;
-        let parsed = parse_autoindex(&base_path, &html).ok_or_else(|| {
-            StagingSourceError::ListError(
-                "http source response is not a recognizable directory index".to_string(),
-            )
-        })?;
-        let prefix = if dir.is_empty() {
-            String::new()
-        } else {
-            format!("{dir}/")
-        };
-        for entry in parsed {
-            let child = format!("{prefix}{name}", name = entry.name);
-            if entry.is_dir && recursive {
-                queue.push_back(child.clone());
-            }
-            let kind = if entry.is_dir {
-                if files_only {
-                    continue;
+    loop {
+        let (path, child) = match walk.step() {
+            Step::List(directory) => {
+                if fetches == MAX_INDEX_FETCHES {
+                    // Without an entry the next page could not move on, so the walk fails.
+                    if entries.is_empty() {
+                        return Err(StagingSourceError::InvalidListing(format!(
+                            "the source holds more than {MAX_INDEX_FETCHES} directory indexes \
+                             without entries; list a narrower path"
+                        )));
+                    }
+                    return Ok((entries, true));
                 }
-                SourceEntryKind::Directory
-            } else {
-                SourceEntryKind::File
-            };
-            if skipped < offset {
-                skipped += 1;
+                fetches += 1;
+                let (base_path, html) = client.fetch_index(&directory).await?;
+                let parsed = parse_autoindex(&base_path, &html).ok_or_else(|| {
+                    StagingSourceError::ListError(
+                        "http source response is not a recognizable directory index".to_string(),
+                    )
+                })?;
+                walk.listed(parsed.into_iter().map(index_child).collect());
                 continue;
             }
-            if entries.len() == limit {
-                return Ok((entries, true));
-            }
-            entries.push(SourceEntry {
-                name: entry.name,
-                path: child,
-                kind,
-                size: if kind == SourceEntryKind::File {
-                    entry.size
-                } else {
-                    None
-                },
-                modified: entry.modified,
-                etag: None,
-                stat: None,
-            });
+            Step::Entry { path, child } => (path, child),
+            Step::Done => return Ok((entries, false)),
+        };
+        if child.is_dir && files_only {
+            continue;
         }
-        if !recursive {
-            break;
+        if entries.len() == limit {
+            return Ok((entries, true));
         }
+        let kind = match child.is_dir {
+            true => SourceEntryKind::Directory,
+            false => SourceEntryKind::File,
+        };
+        let entry = child.value;
+        entries.push(SourceEntry {
+            name: entry.name,
+            path,
+            kind,
+            size: entry.size.filter(|_| kind == SourceEntryKind::File),
+            modified: entry.modified,
+            etag: None,
+            stat: None,
+        });
     }
+}
 
-    Ok((entries, false))
+fn index_child(entry: AutoindexEntry) -> Child<AutoindexEntry> {
+    Child {
+        name: entry.name.clone(),
+        is_dir: entry.is_dir,
+        value: entry,
+    }
 }
 
 struct HttpIndexClient<'guard> {
@@ -830,6 +821,18 @@ mod tests {
         )
     }
 
+    /// A page of `config`'s source from its root, after the path `after` names.
+    async fn page(
+        config: &HashMap<String, String>,
+        after: &[&str],
+        limit: usize,
+        (recursive, files_only): (bool, bool),
+    ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
+        let after = after.iter().map(ToString::to_string).collect();
+        let guard = test_guard();
+        list_http_autoindex(&guard, config, "", after, limit, recursive, files_only).await
+    }
+
     #[tokio::test]
     async fn lists_limited_autoindex() {
         let rows = concat!(
@@ -848,25 +851,20 @@ mod tests {
             ("root".to_string(), "data".to_string()),
         ]);
 
-        let (entries, truncated) =
-            list_http_autoindex(&test_guard(), &config, "", 0, 2, false, false)
-                .await
-                .unwrap();
+        let (entries, truncated) = page(&config, &[], 2, (false, false)).await.unwrap();
 
+        // Pages follow name order; the next one continues after the last name listed.
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].name, "sub");
-        assert_eq!(entries[0].kind, SourceEntryKind::Directory);
-        assert_eq!(entries[1].name, "a.txt");
-        assert_eq!(entries[1].kind, SourceEntryKind::File);
-        assert_eq!(entries[1].size, Some(10));
+        assert_eq!(entries[0].name, "a.txt");
+        assert_eq!(entries[0].kind, SourceEntryKind::File);
+        assert_eq!(entries[0].size, Some(10));
+        assert_eq!(entries[1].name, "b.txt");
         assert!(truncated);
 
-        let (entries, truncated) =
-            list_http_autoindex(&test_guard(), &config, "", 2, 2, false, false)
-                .await
-                .unwrap();
+        let (entries, truncated) = page(&config, &["b.txt"], 2, (false, false)).await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "b.txt");
+        assert_eq!(entries[0].name, "sub");
+        assert_eq!(entries[0].kind, SourceEntryKind::Directory);
         assert!(!truncated);
 
         server.abort();
@@ -889,10 +887,7 @@ mod tests {
         ]);
         let pace = Pace::new(ulid::Ulid::from_bytes([4; 16]), 4);
         let start = std::time::Instant::now();
-        let listed = paced(pace, async {
-            list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false).await
-        })
-        .await;
+        let listed = paced(pace, page(&config, &[], 10, (false, false))).await;
         let (entries, _) = listed.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "a.txt");
@@ -922,7 +917,7 @@ mod tests {
         // Without one entry after the fetch budget the walk fails: no page could move on.
         let (server, endpoint) = spawn_index_server(chain(MAX_INDEX_FETCHES, None)).await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
-        let walked = list_http_autoindex(&test_guard(), &config, "", 0, 10, true, true).await;
+        let walked = page(&config, &[], 10, (true, true)).await;
         assert!(matches!(walked, Err(StagingSourceError::InvalidListing(_))));
         server.abort();
         let _ = server.await;
@@ -930,10 +925,7 @@ mod tests {
         // With an entry the walk stops at the budget and reports more.
         let (server, endpoint) = spawn_index_server(chain(MAX_INDEX_FETCHES, Some("a.txt"))).await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
-        let (entries, truncated) =
-            list_http_autoindex(&test_guard(), &config, "", 0, 10, true, true)
-                .await
-                .unwrap();
+        let (entries, truncated) = page(&config, &[], 10, (true, true)).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert!(truncated);
         server.abort();
@@ -954,10 +946,7 @@ mod tests {
         .await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let (entries, truncated) =
-            list_http_autoindex(&test_guard(), &config, "", 0, 10, true, true)
-                .await
-                .unwrap();
+        let (entries, truncated) = page(&config, &[], 10, (true, true)).await.unwrap();
 
         let paths = entries
             .iter()
@@ -980,9 +969,7 @@ mod tests {
         .await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let error = list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false)
-            .await
-            .unwrap_err();
+        let error = page(&config, &[], 10, (false, false)).await.unwrap_err();
         assert!(matches!(error, StagingSourceError::ListError(_)));
 
         server.abort();
@@ -1004,7 +991,7 @@ mod tests {
                 ("endpoint".to_string(), endpoint.clone()),
                 ("root".to_string(), root.to_string()),
             ]);
-            list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false).await
+            page(&config, &[], 10, (false, false)).await
         };
 
         let (entries, _) = list("exact").await.unwrap();
@@ -1053,9 +1040,7 @@ mod tests {
         ] {
             let mut config = secret;
             config.insert("endpoint".to_string(), endpoint);
-            let error = list_http_autoindex(&test_guard(), &config, "", 0, 10, false, false)
-                .await
-                .unwrap_err();
+            let error = page(&config, &[], 10, (false, false)).await.unwrap_err();
             shown.push(format!("{error} {error:?}"));
         }
         assert_eq!(shown.len(), 5);
@@ -1077,7 +1062,7 @@ mod tests {
         let guard = EgressGuard::new(EgressPolicy::strict()).unwrap();
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let error = list_http_autoindex(&guard, &config, "", 0, 10, false, false)
+        let error = list_http_autoindex(&guard, &config, "", Vec::new(), 10, false, false)
             .await
             .unwrap_err();
 
@@ -1092,9 +1077,17 @@ mod tests {
         let (server, endpoint) = spawn_index_server(Vec::new()).await;
         let config = HashMap::from([("endpoint".to_string(), endpoint)]);
 
-        let error = list_http_autoindex(&test_guard(), &config, "missing", 0, 10, false, false)
-            .await
-            .unwrap_err();
+        let error = list_http_autoindex(
+            &test_guard(),
+            &config,
+            "missing",
+            Vec::new(),
+            10,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error, StagingSourceError::NotFound);
 
         server.abort();

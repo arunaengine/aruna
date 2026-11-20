@@ -1090,12 +1090,12 @@ pub async fn list_connector_entries(
     }))
 }
 
-/// Cursors are opaque to clients: a tagged key or offset in URL-safe base64.
+/// Cursors are opaque to clients: a tagged key or walked path in URL-safe base64.
 fn encode_cursor(cursor: &ListCursor) -> String {
     let raw = match cursor {
         ListCursor::After(key) => format!("k{key}"),
         ListCursor::At(key) => format!("a{key}"),
-        ListCursor::Offset(offset) => format!("o{offset}"),
+        ListCursor::Walk(path) => format!("w{path}"),
     };
     aruna_core::cursor::encode(raw)
 }
@@ -1109,10 +1109,7 @@ fn decode_cursor(cursor: &str) -> ServerResult<ListCursor> {
     match raw.split_at_checked(1) {
         Some(("k", key)) if !key.is_empty() => Ok(ListCursor::After(key.to_string())),
         Some(("a", key)) if !key.is_empty() => Ok(ListCursor::At(key.to_string())),
-        Some(("o", offset)) => offset
-            .parse()
-            .map(ListCursor::Offset)
-            .map_err(|_| invalid()),
+        Some(("w", path)) if !path.is_empty() => Ok(ListCursor::Walk(path.to_string())),
         _ => Err(invalid()),
     }
 }

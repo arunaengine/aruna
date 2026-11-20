@@ -35,10 +35,10 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
-use crate::config::{Config, open_storage, resolve_config};
 use crate::plugin_host::plugin_work::PluginWorkHandler;
-use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
+use aruna_config::settings::Settings;
+use aruna_config::{Config, open_storage, resolve_config};
 
 /// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
 const RECORD_LIMITS: aruna_drivers::recorder::RecordLimits =
@@ -256,7 +256,7 @@ pub(crate) async fn acquire(
     }
     // Parsing operator settings is pure; the store is the first owned
     // resource, established before identity and enrollment I/O.
-    let settings = crate::settings::read_settings()?;
+    let settings = aruna_config::settings::read_settings()?;
     if settings.event_recording {
         aruna_drivers::recorder::enable(RECORD_LIMITS);
     }
@@ -393,7 +393,7 @@ async fn fill(
     }
     if matches!(
         config.startup_mode,
-        crate::config::StartupMode::JoinRealm {
+        aruna_config::StartupMode::JoinRealm {
             phase: aruna_core::onboarding::OnboardingPhase::Bootstrapped
         }
     ) {
@@ -476,7 +476,7 @@ async fn fill(
 
     // Compute settings are collected once from the explicit process source at
     // the resource boundary, then passed into backend construction.
-    let compute_settings = crate::compute_setup::collect(&crate::settings::ProcessEnv)
+    let compute_settings = crate::compute_setup::collect(&aruna_config::settings::ProcessEnv)
         .map_err(std::io::Error::other)?;
     let compute = build_registry(config, &compute_settings)
         .await
@@ -991,8 +991,8 @@ mod tests {
     // subset: every later stage is absent and the store lock is given back.
     #[tokio::test]
     async fn stage_failure_releases() {
-        use crate::config::resolve_settings;
-        use crate::settings::read_settings_from;
+        use aruna_config::resolve_settings;
+        use aruna_config::settings::read_settings_from;
 
         let stages = [
             StartupStage::Net,
@@ -1053,7 +1053,7 @@ mod tests {
     // generating, or persisting an identity or sending enrollment traffic.
     #[tokio::test]
     async fn cancelled_startup_skips() {
-        use crate::settings::read_settings_from;
+        use aruna_config::settings::read_settings_from;
 
         let temp = tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
@@ -1069,7 +1069,7 @@ mod tests {
         .into_iter()
         .collect();
         let settings = read_settings_from(&map).expect("settings parse");
-        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let storage = aruna_config::open_storage(&settings).expect("storage opens");
         let task_handle = TaskHandle::new();
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
@@ -1088,7 +1088,7 @@ mod tests {
 
         let reopened = aruna_storage::storage::worker::FjallStorage::open(&path)
             .expect("cleanup released the store");
-        let identity = crate::identity::IdentityStore::from_storage(reopened);
+        let identity = aruna_config::identity::IdentityStore::from_storage(reopened);
         assert!(
             identity.load().await.unwrap().is_none(),
             "a pre-cancelled startup must not generate or persist an identity"

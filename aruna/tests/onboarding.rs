@@ -4,7 +4,7 @@
 
 use crate::shared;
 
-use aruna::config::StartupMode;
+use aruna_config::StartupMode;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
