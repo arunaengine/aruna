@@ -12,7 +12,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
 
 use crate::admin::{AdminError, AdminState, AuditRecord, ResolveGate, transition};
 use crate::verify::RouteProblem;
@@ -40,6 +39,9 @@ pub struct NameRecord {
     pub name: String,
     pub since: u64,
 }
+
+/// A listed realm's entry, admin state and latest totals.
+pub type Listed = (Entry, AdminState, Option<RealmTotals>);
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -181,14 +183,11 @@ impl Store {
         Ok(self.totals.insert(key, postcard::to_allocvec(totals)?)?)
     }
 
-    /// The realm's latest totals; none for a realm that never sent any or sent an older format.
+    /// The realm's latest totals; none for a realm that never sent any. A stored row that does
+    /// not decode is an error, so it never passes for absent and drops the replay check.
     pub fn totals(&self, realm_id: &RealmId) -> Result<Option<RealmTotals>, StoreError> {
         let value = self.totals.get(realm_id.as_bytes())?;
-        Ok(value.and_then(|value| {
-            postcard::from_bytes(&value)
-                .inspect_err(|error| warn!(error = %error, "Skipping undecodable realm totals"))
-                .ok()
-        }))
+        Ok(value.map(|value| postcard::from_bytes(&value)).transpose()?)
     }
 
     /// The realm's entry while its lease runs.
@@ -196,7 +195,7 @@ impl Store {
         let Some(value) = self.entries.get(realm_id.as_bytes())? else {
             return Ok(None);
         };
-        Ok(decode_entry(&value).filter(|entry| leased(entry, now)))
+        Ok(Some(decode_entry(&value)?).filter(|entry| leased(entry, now)))
     }
 
     /// Every entry whose lease runs, in realm id order.
@@ -206,12 +205,47 @@ impl Store {
         Ok(entries)
     }
 
+    /// Every realm the public listing shows, in realm id order: a leased entry whose admin state
+    /// is listed, with that state and the realm's totals, read in one pass over the entries.
+    pub fn listings(&self, now: u64) -> Result<Vec<Listed>, StoreError> {
+        let mut listed = Vec::new();
+        for item in self.entries.iter() {
+            let (_, value) = item.into_inner()?;
+            let entry = decode_entry(&value)?;
+            if !leased(&entry, now) {
+                continue;
+            }
+            let realm_id = entry.registration.payload.descriptor.payload.realm_id;
+            let admin = self.admin(&realm_id)?;
+            if admin.listed() {
+                let totals = self.totals(&realm_id)?;
+                listed.push((entry, admin, totals));
+            }
+        }
+        Ok(listed)
+    }
+
+    /// Every leased entry the resolver may send identifiers to, in realm id order, read in one
+    /// pass over the entries.
+    pub fn resolvable(&self, now: u64) -> Result<Vec<Entry>, StoreError> {
+        let mut resolvable = Vec::new();
+        for item in self.entries.iter() {
+            let (_, value) = item.into_inner()?;
+            let entry = decode_entry(&value)?;
+            let realm_id = entry.registration.payload.descriptor.payload.realm_id;
+            if leased(&entry, now) && self.may_resolve(&realm_id)? == ResolveGate::Allowed {
+                resolvable.push(entry);
+            }
+        }
+        Ok(resolvable)
+    }
+
     /// Every stored entry, also those whose lease ended, in realm id order.
     pub fn all_entries(&self) -> Result<Vec<Entry>, StoreError> {
         let mut entries = Vec::new();
         for item in self.entries.iter() {
             let (_, value) = item.into_inner()?;
-            entries.extend(decode_entry(&value));
+            entries.push(decode_entry(&value)?);
         }
         Ok(entries)
     }
@@ -219,7 +253,7 @@ impl Store {
     /// The realm's stored entry, also after its lease ended.
     pub fn stored_entry(&self, realm_id: &RealmId) -> Result<Option<Entry>, StoreError> {
         let value = self.entries.get(realm_id.as_bytes())?;
-        Ok(value.and_then(|value| decode_entry(&value)))
+        Ok(value.map(|value| decode_entry(&value)).transpose()?)
     }
 
     /// Every realm with an entry, a name history or admin state, so withdrawn realms stay
@@ -280,18 +314,17 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         let current = self.admin(realm_id)?;
-        let mut holders = Vec::new();
-        for item in self.admin.iter() {
-            let (key, value) = item.into_inner()?;
-            let state: AdminState = postcard::from_bytes(&value)?;
-            if key.as_ref() != realm_id.as_bytes() {
-                holders.extend(state.namespace);
-            }
-        }
+        // Only a change that claims a namespace this realm does not hold reads the others.
+        let claims = (next.namespace.as_ref())
+            .is_some_and(|namespace| current.namespace.as_ref() != Some(namespace));
+        let holders = match claims {
+            true => self.namespace_holders(realm_id)?,
+            false => Vec::new(),
+        };
         let after = transition(&current, next, |namespace| {
             holders.iter().any(|held| held == namespace)
         })?;
-        let sequence = self.audit.prefix(realm_id.as_bytes()).count() as u64;
+        let sequence = self.next_audit(realm_id)?;
         let mut key = realm_id.as_bytes().to_vec();
         key.extend_from_slice(&sequence.to_be_bytes());
         let record = AuditRecord {
@@ -311,6 +344,30 @@ impl Store {
         Ok(after)
     }
 
+    /// The namespaces other realms hold.
+    fn namespace_holders(&self, realm_id: &RealmId) -> Result<Vec<String>, StoreError> {
+        let mut holders = Vec::new();
+        for item in self.admin.iter() {
+            let (key, value) = item.into_inner()?;
+            let state: AdminState = postcard::from_bytes(&value)?;
+            if key.as_ref() != realm_id.as_bytes() {
+                holders.extend(state.namespace);
+            }
+        }
+        Ok(holders)
+    }
+
+    /// The sequence after the realm's last audit record, read from its last key alone, so a
+    /// change never counts the realm's whole history.
+    fn next_audit(&self, realm_id: &RealmId) -> Result<u64, StoreError> {
+        let Some(last) = self.audit.prefix(realm_id.as_bytes()).next_back() else {
+            return Ok(0);
+        };
+        let (key, _) = last.into_inner()?;
+        let sequence = key.get(32..).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok());
+        Ok(sequence.map_or(0, |sequence| u64::from_be_bytes(sequence).saturating_add(1)))
+    }
+
     /// The realm's admin changes, oldest first.
     pub fn audit(&self, realm_id: &RealmId) -> Result<Vec<AuditRecord>, StoreError> {
         let mut records = Vec::new();
@@ -322,11 +379,9 @@ impl Store {
     }
 }
 
-/// An entry in an older stored format counts as absent until the realm renews it.
-fn decode_entry(value: &[u8]) -> Option<Entry> {
-    postcard::from_bytes(value)
-        .inspect_err(|error| warn!(error = %error, "Skipping undecodable registry entry"))
-        .ok()
+/// A stored entry; one that does not decode is an error, never a missing realm.
+fn decode_entry(value: &[u8]) -> Result<Entry, StoreError> {
+    Ok(postcard::from_bytes(value)?)
 }
 
 /// Whether the entry's lease still runs at `now`.
@@ -467,6 +522,79 @@ pub(crate) mod tests {
             store.check_issued(&realm, 100, expired),
             Err(StoreError::Replayed)
         ));
+    }
+
+    // A stored entry or totals row that does not decode is reported, not taken for a missing
+    // realm, so it neither vanishes from the listing nor drops the replay check of totals.
+    #[test]
+    fn undecodable_rows_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = realm_id();
+        store.entries.insert(realm.as_bytes(), vec![0xff, 0xff]).unwrap();
+        store.totals.insert(realm.as_bytes(), vec![0xff, 0xff]).unwrap();
+        assert!(matches!(store.entry(&realm, 1), Err(StoreError::Encoding(_))));
+        assert!(matches!(store.stored_entry(&realm), Err(StoreError::Encoding(_))));
+        assert!(matches!(store.entries(1), Err(StoreError::Encoding(_))));
+        assert!(matches!(store.totals(&realm), Err(StoreError::Encoding(_))));
+    }
+
+    // The next audit record follows the realm's last one, so a gap in its history never makes a
+    // change overwrite a record it did not write.
+    #[test]
+    fn audit_follows_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = realm_id();
+        store.register(&realm, &entry(100, 100), 100).unwrap();
+        let noted = |note: &str| AdminState {
+            note: note.to_string(),
+            ..AdminState::default()
+        };
+        for note in ["a", "b", "c"] {
+            store.update_admin(&realm, noted(note), "test", 101).unwrap();
+        }
+        let mut first = realm.as_bytes().to_vec();
+        first.extend_from_slice(&0u64.to_be_bytes());
+        store.audit.remove(first).unwrap();
+        store.update_admin(&realm, noted("d"), "test", 102).unwrap();
+        let notes: Vec<_> = (store.audit(&realm).unwrap().into_iter())
+            .map(|record| record.after.note)
+            .collect();
+        assert_eq!(notes, ["b", "c", "d"]);
+    }
+
+    // The listing and the resolver read each entry once with its admin state and keep their
+    // gates: the listing shows listed realms with their totals, the resolver approved ones, and
+    // neither an entry whose lease ended.
+    #[test]
+    fn single_pass_gates() {
+        use crate::admin::RealmStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = realm_id();
+        store.register(&realm, &entry(100, 100), 100).unwrap();
+        let listed = store.listings(100).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].1.status, &listed[0].2), (RealmStatus::Listed, &None));
+        assert!(store.resolvable(100).unwrap().is_empty());
+
+        let approved = AdminState {
+            status: RealmStatus::Approved,
+            ..AdminState::default()
+        };
+        store.update_admin(&realm, approved, "test", 101).unwrap();
+        assert_eq!(store.resolvable(101).unwrap().len(), 1);
+        let expired = 100 + LEASE_SECS;
+        assert!(store.listings(expired).unwrap().is_empty());
+        assert!(store.resolvable(expired).unwrap().is_empty());
+
+        let hidden = AdminState {
+            status: RealmStatus::Hidden,
+            ..AdminState::default()
+        };
+        store.update_admin(&realm, hidden, "test", 102).unwrap();
+        assert!(store.listings(102).unwrap().is_empty());
     }
 
     #[test]

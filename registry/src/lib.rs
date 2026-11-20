@@ -218,15 +218,13 @@ fn check_registration(
 /// Listed and approved realms, approved first; hidden and retired ones are left out.
 async fn list_realms(State(state): State<Arc<RegistryState>>) -> Result<Response, RegistryError> {
     let now = unix_timestamp_secs();
-    let mut listings = Vec::new();
-    for entry in state.store.entries(now)? {
-        let realm_id = entry.registration.payload.descriptor.payload.realm_id;
-        let admin = state.store.admin(&realm_id)?;
-        if admin.listed() {
-            let totals = state.store.totals(&realm_id)?;
-            listings.push(Listing::new(entry, now, admin.status, totals));
-        }
-    }
+    // The store reads block, so they run on the blocking pool instead of a request worker.
+    let listed = tokio::task::spawn_blocking(move || state.store.listings(now))
+        .await
+        .map_err(|_| RegistryError::Store(StoreError::Poisoned))??;
+    let mut listings: Vec<_> = (listed.into_iter())
+        .map(|(entry, admin, totals)| Listing::new(entry, now, admin.status, totals))
+        .collect();
     listings.sort_by_key(|listing| listing.status != RealmStatus::Approved);
     Ok(public(listings))
 }

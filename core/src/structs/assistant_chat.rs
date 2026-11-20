@@ -35,6 +35,24 @@ pub struct AssistantChatHead {
     pub deleted_at: Option<u64>,
 }
 
+/// One user's live chats and the payload bytes they hold, kept in the transaction of every chat
+/// change, so a write never reads the user's other heads and their tombstones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantChatTotals {
+    pub chats: u32,
+    pub bytes: u64,
+}
+
+impl AssistantChatTotals {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
 /// One turn of a chat. The payload is the portal's own format and stays opaque.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantChatTurn {

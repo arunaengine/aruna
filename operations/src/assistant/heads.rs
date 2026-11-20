@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    CHAT_CAP, ChatStoreError, decode_head, decode_heads, head_key, heads_page, read_head,
-    turns_page,
+    CHAT_CAP, ChatStoreError, TotalsRead, TotalsStep, decode_head, decode_heads, head_key,
+    heads_page, read_head, totals_entry, turns_page,
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::assistant_chat::{AssistantChatHead, MAX_ASSISTANT_CHATS};
+use aruna_core::structs::assistant_chat::{
+    AssistantChatHead, AssistantChatTotals, MAX_ASSISTANT_CHATS,
+};
 use aruna_core::user::id::UserId;
 
 /// Lists one user's live chat heads, newest change first.
@@ -45,7 +47,7 @@ impl Operation for ListChatOperation {
 #[derive(Debug, PartialEq)]
 enum WriteHeadStage {
     Head,
-    Count,
+    Totals(TotalsRead),
     Written(AssistantChatHead),
 }
 
@@ -101,11 +103,14 @@ impl WriteChatOperation {
         head.subject = self.subject.take();
         head.revision = head.revision.saturating_add(1);
         head.updated_at = self.now;
-        self.write(head)
+        self.write(head, None)
     }
 
-    fn create(&mut self, rows: usize) -> Result<Next<AssistantChatHead>, ChatStoreError> {
-        if rows >= MAX_ASSISTANT_CHATS {
+    fn create(
+        &mut self,
+        totals: AssistantChatTotals,
+    ) -> Result<Next<AssistantChatHead>, ChatStoreError> {
+        if totals.chats as usize >= MAX_ASSISTANT_CHATS {
             return Err(ChatStoreError::TooLarge(CHAT_CAP));
         }
         let head = AssistantChatHead {
@@ -121,20 +126,29 @@ impl WriteChatOperation {
             revision: 1,
             deleted_at: None,
         };
-        self.write(head)
+        let counted = AssistantChatTotals {
+            chats: totals.chats.saturating_add(1),
+            ..totals
+        };
+        self.write(head, Some(counted))
     }
 
+    /// Writes the head, with the user's totals when the write changes them.
     fn write(
         &mut self,
         head: AssistantChatHead,
+        totals: Option<AssistantChatTotals>,
     ) -> Result<Next<AssistantChatHead>, ChatStoreError> {
-        let row = (
+        let mut rows = vec![(
             CHAT_HEAD_KEYSPACE.to_string(),
             head_key(self.user_id, &self.chat_id),
             head.to_bytes()?.into(),
-        );
+        )];
+        if let Some(totals) = totals {
+            rows.push(totals_entry(self.user_id, totals)?);
+        }
         self.stage = WriteHeadStage::Written(head);
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 
@@ -151,18 +165,19 @@ impl Operation for WriteChatOperation {
             WriteHeadStage::Head => match decode_head(result.value()?)? {
                 Some(head) => self.rename(head),
                 None => {
-                    self.stage = WriteHeadStage::Count;
-                    Ok(Next::Call(heads_page(self.user_id)))
+                    let totals = TotalsRead::new(self.user_id);
+                    let call = totals.call();
+                    self.stage = WriteHeadStage::Totals(totals);
+                    Ok(Next::Call(call))
                 }
             },
-            WriteHeadStage::Count => {
-                let (rows, _) = result.page()?;
-                let live = decode_heads(rows)?
-                    .iter()
-                    .filter(|head| head.is_live())
-                    .count();
-                self.create(live)
-            }
+            WriteHeadStage::Totals(mut totals) => match totals.next(result)? {
+                TotalsStep::Call(call) => {
+                    self.stage = WriteHeadStage::Totals(totals);
+                    Ok(Next::Call(call))
+                }
+                TotalsStep::Done(counted) => self.create(counted),
+            },
             WriteHeadStage::Written(head) => {
                 result.done()?;
                 Ok(Next::Done(head))
@@ -181,6 +196,7 @@ enum DeleteChatStage {
     Head,
     Turns(AssistantChatHead),
     Deleted(AssistantChatHead),
+    Totals(AssistantChatHead, TotalsRead),
     Written,
 }
 
@@ -204,7 +220,23 @@ impl DeleteChatOperation {
         }
     }
 
-    fn tombstone(&mut self, mut head: AssistantChatHead) -> Result<Next<()>, ChatStoreError> {
+    fn count(&mut self, head: AssistantChatHead) -> Result<Next<()>, ChatStoreError> {
+        let totals = TotalsRead::new(self.user_id);
+        let call = totals.call();
+        self.stage = DeleteChatStage::Totals(head, totals);
+        Ok(Next::Call(call))
+    }
+
+    /// Leaves the head as a tombstone and takes its chat and bytes off the user's totals.
+    fn tombstone(
+        &mut self,
+        mut head: AssistantChatHead,
+        totals: AssistantChatTotals,
+    ) -> Result<Next<()>, ChatStoreError> {
+        let left = AssistantChatTotals {
+            chats: totals.chats.saturating_sub(1),
+            bytes: totals.bytes.saturating_sub(head.bytes),
+        };
         head.deleted_at = Some(self.now);
         head.bytes = 0;
         head.first_seq = head.next_seq;
@@ -215,8 +247,9 @@ impl DeleteChatOperation {
             head_key(self.user_id, &self.chat_id),
             head.to_bytes()?.into(),
         );
+        let rows = vec![row, totals_entry(self.user_id, left)?];
         self.stage = DeleteChatStage::Written;
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 
@@ -241,7 +274,7 @@ impl Operation for DeleteChatOperation {
             DeleteChatStage::Turns(head) => {
                 let (rows, _) = result.page()?;
                 if rows.is_empty() {
-                    return self.tombstone(head);
+                    return self.count(head);
                 }
                 let deletes = rows
                     .into_iter()
@@ -252,8 +285,15 @@ impl Operation for DeleteChatOperation {
             }
             DeleteChatStage::Deleted(head) => {
                 result.done()?;
-                self.tombstone(head)
+                self.count(head)
             }
+            DeleteChatStage::Totals(head, mut totals) => match totals.next(result)? {
+                TotalsStep::Call(call) => {
+                    self.stage = DeleteChatStage::Totals(head, totals);
+                    Ok(Next::Call(call))
+                }
+                TotalsStep::Done(counted) => self.tombstone(head, counted),
+            },
             DeleteChatStage::Written => {
                 result.done()?;
                 Ok(Next::Done(()))

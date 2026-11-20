@@ -8,7 +8,8 @@ use super::*;
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::structs::assistant_chat::{
-    AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_TURN_BYTES,
+    AssistantChatTotals, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS,
+    MAX_TURN_BYTES,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
@@ -145,9 +146,33 @@ fn written_head(call: &IoCall) -> AssistantChatHead {
     let IoCall::Write(rows) = call else {
         panic!("expected a write, got {call:?}");
     };
-    let (_, key, value) = rows.last().unwrap();
-    assert_eq!(*key, head_key(user(), CHAT));
+    let head = rows.iter().find(|(_, key, _)| *key == head_key(user(), CHAT));
+    let (_, _, value) = head.expect("the write holds the head");
     AssistantChatHead::from_bytes(value.as_ref()).unwrap()
+}
+
+/// The user's totals a write stores with its head.
+fn written_totals(call: &IoCall) -> AssistantChatTotals {
+    let IoCall::Write(rows) = call else {
+        panic!("expected a write, got {call:?}");
+    };
+    let totals = rows.iter().find(|(space, ..)| space == CHAT_TOTAL_KEYSPACE);
+    let (_, _, value) = totals.expect("the write holds the totals");
+    AssistantChatTotals::from_bytes(value.as_ref()).unwrap()
+}
+
+fn is_totals_read(call: &IoCall) -> bool {
+    matches!(call, IoCall::Read(rows) if rows[0].0 == CHAT_TOTAL_KEYSPACE)
+}
+
+/// A user without a stored totals row yet, whose totals are summed from the heads.
+fn no_totals() -> IoResult {
+    IoResult::Values(vec![None])
+}
+
+fn stored_totals(chats: u32, bytes: u64) -> IoResult {
+    let totals = AssistantChatTotals { chats, bytes };
+    IoResult::Values(vec![Some(totals.to_bytes().unwrap().into())])
 }
 
 #[test]
@@ -216,9 +241,12 @@ fn creates_a_head() {
         aruna_core::operation::TransactionMode::Write
     );
     assert_eq!(call(operation.first()), read_head(user(), CHAT));
-    assert!(is_heads_page(&call(operation.next(head_value(None)))));
+    assert!(is_totals_read(&call(operation.next(head_value(None)))));
+    assert!(is_heads_page(&call(operation.next(no_totals()))));
     let write = call(operation.next(heads_rows(&[head("other", 1, 1)])));
     assert_eq!(written_head(&write).title, "Run QC");
+    let counted = AssistantChatTotals { chats: 2, bytes: 1 };
+    assert_eq!(written_totals(&write), counted);
     let saved = done(operation.next(IoResult::Done));
     assert_eq!(saved.chat_id, CHAT);
     assert_eq!(saved.subject.as_deref(), Some("subject"));
@@ -243,6 +271,7 @@ fn refuses_chat_cap() {
     let mut operation = head_op(None);
     operation.first().unwrap();
     operation.next(head_value(None)).unwrap();
+    operation.next(no_totals()).unwrap();
     assert_eq!(
         operation.next(heads_rows(&heads)),
         Err(ChatStoreError::TooLarge(CHAT_CAP))
@@ -252,6 +281,7 @@ fn refuses_chat_cap() {
     let mut operation = head_op(None);
     operation.first().unwrap();
     operation.next(head_value(None)).unwrap();
+    operation.next(no_totals()).unwrap();
     let write = call(operation.next(heads_rows(&heads)));
     assert!(matches!(write, IoCall::Write(_)));
 }
@@ -300,7 +330,8 @@ fn appends_a_turn() {
     );
     operation.first().unwrap();
     let sum = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
-    assert!(is_heads_page(&sum));
+    assert!(is_totals_read(&sum));
+    assert!(is_heads_page(&call(operation.next(no_totals()))));
     let write = call(operation.next(heads_rows(&[head(CHAT, 4, 9), head("other", 1, 100)])));
     let IoCall::Write(rows) = &write else {
         panic!("expected a write, got {write:?}");
@@ -335,9 +366,10 @@ fn rewrites_the_tail() {
     operation.first().unwrap();
     let page = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
     assert_eq!(turns_from(&page), (3, 1));
-    assert!(is_heads_page(&call(
+    assert!(is_totals_read(&call(
         operation.next(turns_rows(&[turn(3, "abcd")]))
     )));
+    operation.next(no_totals()).unwrap();
     let write = call(operation.next(heads_rows(&[head(CHAT, 4, 9)])));
     let saved = written_head(&write);
     assert_eq!(
@@ -356,6 +388,7 @@ fn trims_old_turns() {
     let page = call(operation.next(head_value(Some(&full))));
     assert_eq!(turns_from(&page), (10, 1));
     operation.next(turns_rows(&[turn(10, "old!!")])).unwrap();
+    operation.next(no_totals()).unwrap();
     let trim = call(operation.next(heads_rows(&[full.clone()])));
     assert_eq!(
         trim,
@@ -399,7 +432,7 @@ fn refuses_stale_revision() {
     let mut operation = turn_op_at(4, 3);
     operation.first().unwrap();
     let sum = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
-    assert!(is_heads_page(&sum));
+    assert!(is_totals_read(&sum));
 }
 
 #[test]
@@ -416,6 +449,7 @@ fn refuses_over_budget() {
     let mut operation = turn_op(4, "abcd");
     operation.first().unwrap();
     operation.next(head_value(Some(&head(CHAT, 4, 9)))).unwrap();
+    operation.next(no_totals()).unwrap();
     assert_eq!(
         operation.next(heads_rows(&[head(CHAT, 4, 9), other.clone()])),
         Err(ChatStoreError::TooLarge(BUDGET_CAP))
@@ -425,6 +459,7 @@ fn refuses_over_budget() {
     operation.first().unwrap();
     operation.next(head_value(Some(&head(CHAT, 4, 9)))).unwrap();
     operation.next(turns_rows(&[turn(3, "abcd")])).unwrap();
+    operation.next(no_totals()).unwrap();
     let write = call(operation.next(heads_rows(&[head(CHAT, 4, 9), other])));
     assert!(matches!(write, IoCall::Write(_)));
 }
@@ -441,7 +476,12 @@ fn deletes_once() {
     assert_eq!(turns_from(&page), (0, usize::MAX));
     let delete = call(operation.next(turns_rows(&[turn(0, "a"), turn(1, "b")])));
     assert!(matches!(&delete, IoCall::Delete(keys) if keys.len() == 2));
-    let tombstone = written_head(&call(operation.next(IoResult::Done)));
+    assert!(is_totals_read(&call(operation.next(IoResult::Done))));
+    operation.next(no_totals()).unwrap();
+    let write = call(operation.next(heads_rows(&[head(CHAT, 2, 8), head("other", 1, 5)])));
+    let left = AssistantChatTotals { chats: 1, bytes: 5 };
+    assert_eq!(written_totals(&write), left);
+    let tombstone = written_head(&write);
     assert_eq!(tombstone.deleted_at, Some(70));
     assert_eq!(
         (
@@ -470,7 +510,8 @@ fn skips_missing_chat() {
     let mut operation = delete_op();
     operation.first().unwrap();
     operation.next(head_value(Some(&head(CHAT, 0, 0)))).unwrap();
-    let write = call(operation.next(turns_rows(&[])));
+    assert!(is_totals_read(&call(operation.next(turns_rows(&[])))));
+    let write = call(operation.next(stored_totals(1, 0)));
     assert!(matches!(write, IoCall::Write(_)));
 }
 
@@ -489,7 +530,7 @@ fn rejects_wrong_results() {
     let mut operation = turn_op(4, "x");
     operation.first().unwrap();
     operation.next(head_value(Some(&head(CHAT, 4, 9)))).unwrap();
-    unexpected(operation.next(head_value(None)));
+    unexpected(operation.next(IoResult::Done));
 }
 
 #[test]
@@ -527,4 +568,36 @@ fn rejects_corrupt_records() {
         list.next(IoResult::Page { rows, next: None }),
         Err(ChatStoreError::Conversion(_))
     ));
+}
+
+// With the user's totals stored, an append, a create and a delete never read the other heads,
+// so tombstones of deleted chats cost nothing; each change stores the totals it leaves.
+#[test]
+fn stored_totals_read() {
+    let mut append = turn_op(4, "abcd");
+    append.first().unwrap();
+    append.next(head_value(Some(&head(CHAT, 4, 9)))).unwrap();
+    let write = call(append.next(stored_totals(2, 109)));
+    let held = AssistantChatTotals {
+        chats: 2,
+        bytes: 113,
+    };
+    assert_eq!(written_totals(&write), held);
+
+    let mut create = head_op(None);
+    create.first().unwrap();
+    create.next(head_value(None)).unwrap();
+    let full = stored_totals(MAX_ASSISTANT_CHATS as u32, 0);
+    assert_eq!(create.next(full), Err(ChatStoreError::TooLarge(CHAT_CAP)));
+
+    let mut delete = delete_op();
+    delete.first().unwrap();
+    delete.next(head_value(Some(&head(CHAT, 0, 9)))).unwrap();
+    delete.next(turns_rows(&[])).unwrap();
+    let write = call(delete.next(stored_totals(2, 109)));
+    let left = AssistantChatTotals {
+        chats: 1,
+        bytes: 100,
+    };
+    assert_eq!(written_totals(&write), left);
 }
