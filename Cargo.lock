@@ -949,6 +949,7 @@ dependencies = [
 name = "aruna-plugin"
 version = "3.0.0-alpha.207"
 dependencies = [
+ "aruna-plugin-types",
  "serde",
  "serde_json",
  "wit-bindgen 0.61.1",

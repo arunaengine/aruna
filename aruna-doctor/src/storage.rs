@@ -255,18 +255,14 @@ fn parent_dir(target: &Path) -> &Path {
     }
 }
 
-/// Syncs every file and directory below and including `root`, so restored files are durable
-/// before they are published; answers how many it synced.
-pub(crate) fn sync_tree(root: &Path) -> std::io::Result<usize> {
+/// Syncs every directory below and including `root`, so the entries naming restored files are
+/// durable before publication; files sync through their own writable handles. Answers the count.
+pub(crate) fn sync_dirs(root: &Path) -> std::io::Result<usize> {
     let mut synced = 0;
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            synced += sync_tree(&entry.path())?;
-        } else if file_type.is_file() {
-            File::open(entry.path())?.sync_all()?;
-            synced += 1;
+        if entry.file_type()?.is_dir() {
+            synced += sync_dirs(&entry.path())?;
         }
     }
     sync_dir(root)?;
@@ -359,14 +355,19 @@ mod tests {
         assert_eq!(staged, 1, "only the snapshot file is left");
     }
 
-    // Every restored file and directory is synced, each once.
+    // Every restored directory is synced once, and no file is reopened for it: a file opened
+    // only for reading cannot be synced on Windows, and here it cannot even be opened.
+    #[cfg(unix)]
     #[test]
-    fn tree_synced() {
+    fn dirs_synced() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("one.git/objects")).unwrap();
         std::fs::write(dir.path().join("one.git/HEAD"), b"ref").unwrap();
-        std::fs::write(dir.path().join("one.git/objects/pack"), b"data").unwrap();
-        assert_eq!(super::sync_tree(dir.path()).unwrap(), 5);
+        let pack = dir.path().join("one.git/objects/pack");
+        std::fs::write(&pack, b"data").unwrap();
+        std::fs::set_permissions(&pack, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(super::sync_dirs(dir.path()).unwrap(), 3);
     }
 
     // Large values commit once their bytes reach the limit, long before the entry limit.
