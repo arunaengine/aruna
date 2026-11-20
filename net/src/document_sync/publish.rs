@@ -224,8 +224,15 @@ impl DocumentSyncService {
         // instead of voiding that batch's commit.
         let oplog = self.node.oplog();
         let mut outcome = PublishEventsOutcome::default();
+        // A retryable failure holds back the later events of its topic and admin origin, so none
+        // lands in the oplog ahead of it.
+        let (mut held_topics, mut held_origins) = (BTreeSet::new(), BTreeSet::new());
         for (index, document) in documents.into_iter().enumerate() {
             let allow_genesis = document.allow_genesis();
+            let origin = match &document {
+                DocumentSyncPublish::AdminOperation { event, .. } => Some(event.origin_node_id),
+                _ => None,
+            };
             let event = match document {
                 DocumentSyncPublish::Upsert {
                     event_id,
@@ -271,6 +278,8 @@ impl DocumentSyncService {
                                 );
                                 outcome.retry_indices.push(index);
                                 outcome.retry_error.get_or_insert_with(|| error.to_string());
+                                held_topics.insert(target.sync_topic_id(self.realm_id, &placement));
+                                held_origins.insert(event.origin_node_id);
                                 continue;
                             }
                         },
@@ -288,6 +297,11 @@ impl DocumentSyncService {
             // Shard topics are join-only: only rank-0 creates the genesis, so a
             // publish onto a genesis-less shard defers the outbox record.
             let may_create_topic = !target.uses_shard_topic();
+            let held_origin = origin.is_some_and(|origin| held_origins.contains(&origin));
+            if held_topics.contains(&topic_id) || held_origin {
+                outcome.retry_indices.push(index);
+                continue;
+            }
             let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
             let key = event_key(topic_id, &event)?;
             let envelope = EventEnvelope::encode_event(&event)
@@ -318,6 +332,8 @@ impl DocumentSyncService {
                     outcome
                         .retry_error
                         .get_or_insert_with(|| NetError::TopicNotReady(topic).to_string());
+                    held_topics.insert(topic_id);
+                    held_origins.extend(origin);
                     continue;
                 }
                 Err(error) => return Err(error),
