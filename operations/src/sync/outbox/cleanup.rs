@@ -33,9 +33,15 @@ pub fn standing(
 ) -> BTreeSet<Vec<u8>> {
     let holds = |(key, _, topic): &&DrainRecord| {
         let current = lineages.get(topic).copied().flatten();
-        published.get(key).is_some_and(|lineage| current == Some(*lineage))
+        published
+            .get(key)
+            .is_some_and(|lineage| current == Some(*lineage))
     };
-    records.iter().filter(holds).map(|(key, ..)| key.clone()).collect()
+    records
+        .iter()
+        .filter(holds)
+        .map(|(key, ..)| key.clone())
+        .collect()
 }
 
 /// The digest of the stored row of `record`, which the outbox writes as its postcard encoding.
@@ -78,7 +84,11 @@ pub fn lineages(topics: &[TopicId], result: IoResult) -> Result<Lineages, IoErro
         },
         _ => None,
     };
-    Ok(topics.iter().copied().zip(results.into_iter().map(root)).collect())
+    Ok(topics
+        .iter()
+        .copied()
+        .zip(results.into_iter().map(root))
+        .collect())
 }
 
 /// Deletes outbox rows only while each still holds the row the drain read, by its digest: a row
@@ -146,8 +156,7 @@ mod tests {
         };
         let event = DocumentOutboxEvent::Delete { change };
         let (peers, placement) = (Vec::new(), PlacementRef::NIL);
-        let record =
-            new_identified_record(event_id, actor, target, peers, event, placement, false);
+        let record = new_identified_record(event_id, actor, target, peers, event, placement, false);
         (key.to_vec(), record, TopicId::hash(topic))
     }
 
@@ -180,7 +189,10 @@ mod tests {
         let (read, replaced) = (b"read".to_vec(), b"replaced".to_vec());
         let digest = Some(*blake3::hash(b"read").as_bytes());
         let row = |key: &[u8], value: &[u8]| {
-            let at = (SYNC_OUTBOX_KEYSPACE.to_string(), ByteView::from(key.to_vec()));
+            let at = (
+                SYNC_OUTBOX_KEYSPACE.to_string(),
+                ByteView::from(key.to_vec()),
+            );
             (at, Some(ByteView::from(value.to_vec())))
         };
         let known = [row(b"upsert/one", &read), row(b"upsert/two", &replaced)];
@@ -195,7 +207,11 @@ mod tests {
             panic!("the known rows decide the plan");
         };
         assert_eq!(planned.output, vec![b"upsert/one".to_vec()]);
-        let deleted: Vec<_> = planned.deletes.iter().map(|(_, key)| key.to_vec()).collect();
+        let deleted: Vec<_> = planned
+            .deletes
+            .iter()
+            .map(|(_, key)| key.to_vec())
+            .collect();
         assert_eq!(deleted, vec![b"upsert/one".to_vec()]);
     }
 }

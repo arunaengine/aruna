@@ -310,64 +310,22 @@ async fn run_node_owned(
     let ServerBindings {
         rest_handle,
         s3_handle,
-        mut portal_handle,
-        mut session_s3_handle,
-        mut https_handle,
+        portal_handle,
+        session_s3_handle,
+        https_handle,
         realm_id: _,
         node_id: _,
         is_initial_boot: _,
         device_wipe,
     } = bindings;
-
-    let mut rest_handle = Some(rest_handle);
-    let mut s3_handle = s3_handle;
-
-    // Every long-lived server exit is classified by the one named policy: a
-    // `StopsNode` exit ends serving with its message, a `ReportedOnly` exit is
-    // logged and the node keeps waiting on the remaining servers.
-    loop {
-        let observed = tokio::select! {
-            message = s3_exit(s3_handle.as_mut()) => {
-                Some((Service::S3, message))
-            }
-            result = rest_handle.as_mut().expect("rest server handle is present") => {
-                rest_handle = None;
-                Some((Service::Rest, match result {
-                    Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
-                    Ok(Err(error)) => format!("REST server failed: {error}"),
-                    Err(error) => format!("REST server panicked: {error}"),
-                }))
-            }
-            message = portal_exit(portal_handle.as_mut()) => {
-                portal_handle = None;
-                Some((Service::Portal, message))
-            }
-            message = session_s3_exit(session_s3_handle.as_mut()) => {
-                Some((Service::SessionS3, message))
-            }
-            message = https_exit(https_handle.as_mut()) => {
-                Some((Service::Https, message))
-            }
-            _ = device_wipe_armed(device_wipe.as_ref()) => None,
-            _ = stop_token.cancelled() => None,
-        };
-        let Some((service, message)) = observed else {
-            break;
-        };
-        match exit_effect(service, &message) {
-            Some(_) => {
-                failure = Some(message);
-                break;
-            }
-            None => {
-                tracing::warn!(
-                    service = ?service,
-                    message = %message,
-                    "Server exited; the node keeps serving"
-                );
-            }
-        }
-    }
+    let mut listeners = Listeners {
+        rest: Some(rest_handle),
+        s3: s3_handle,
+        portal: portal_handle,
+        session_s3: session_s3_handle,
+        https: https_handle,
+    };
+    let failure = supervise(&mut listeners, device_wipe.as_ref(), &stop_token, failure).await;
 
     if let Some(failure) = failure.as_ref() {
         tracing::error!(error = %failure, "Shutting down after a server failure");
@@ -381,11 +339,11 @@ async fn run_node_owned(
     let shutdown_outcome = NodeShutdown {
         shutdown: resources.shutdown,
         readiness: resources.readiness,
-        rest: rest_handle,
-        s3: s3_handle,
-        portal: portal_handle,
-        session_s3: session_s3_handle,
-        https: https_handle,
+        rest: listeners.rest,
+        s3: listeners.s3,
+        portal: listeners.portal,
+        session_s3: listeners.session_s3,
+        https: listeners.https,
         monitoring: Some(resources.monitoring),
         task_handle: resources.task_handle,
         jobs_runtime: resources.jobs_runtime,
@@ -417,6 +375,70 @@ async fn run_node_owned(
         (None, true) => ProcessOutcome::Stopped,
         (None, false) => ProcessOutcome::StoppedIncomplete,
     })
+}
+
+/// The long-lived listeners the node supervises once its start has run.
+struct Listeners {
+    rest: Option<tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>>,
+    s3: Option<aruna_api::s3::server::S3ServerHandle>,
+    portal: Option<tokio::task::JoinHandle<()>>,
+    session_s3: Option<aruna_api::s3::server::S3ServerHandle>,
+    https: Option<aruna_api::https::listener::HttpsHandle>,
+}
+
+/// Waits until serving ends and answers the failure that ended it. Every long-lived server exit
+/// is classified by the one named policy: a `StopsNode` exit ends serving with its message, a
+/// `ReportedOnly` exit is logged. A start that already failed ends at once, healthy listeners or not.
+async fn supervise(
+    listeners: &mut Listeners,
+    device_wipe: Option<&std::sync::Arc<device_wipe::DeviceWipe>>,
+    stop: &tokio_util::sync::CancellationToken,
+    failure: Option<String>,
+) -> Option<String> {
+    if failure.is_some() {
+        return failure;
+    }
+    loop {
+        let observed = tokio::select! {
+            message = s3_exit(listeners.s3.as_mut()) => {
+                Some((Service::S3, message))
+            }
+            result = listeners.rest.as_mut().expect("rest server handle is present") => {
+                listeners.rest = None;
+                Some((Service::Rest, match result {
+                    Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => format!("REST server failed: {error}"),
+                    Err(error) => format!("REST server panicked: {error}"),
+                }))
+            }
+            message = portal_exit(listeners.portal.as_mut()) => {
+                listeners.portal = None;
+                Some((Service::Portal, message))
+            }
+            message = session_s3_exit(listeners.session_s3.as_mut()) => {
+                Some((Service::SessionS3, message))
+            }
+            message = https_exit(listeners.https.as_mut()) => {
+                Some((Service::Https, message))
+            }
+            _ = device_wipe_armed(device_wipe) => None,
+            _ = stop.cancelled() => None,
+        };
+        let Some((service, message)) = observed else {
+            break;
+        };
+        match exit_effect(service, &message) {
+            Some(_) => return Some(message),
+            None => {
+                tracing::warn!(
+                    service = ?service,
+                    message = %message,
+                    "Server exited; the node keeps serving"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Decides the armed wipe: an unfinished shutdown declines the destructive
@@ -572,6 +594,34 @@ async fn release_unready(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    // A start that failed before serving, such as a discard that did not finish, goes on to the
+    // shutdown at once although every listener is healthy; a start that succeeded keeps waiting.
+    #[tokio::test]
+    async fn failed_start_exits() {
+        use futures_util::FutureExt;
+        let healthy = || Listeners {
+            rest: Some(tokio::spawn(std::future::pending())),
+            s3: None,
+            portal: None,
+            session_s3: None,
+            https: None,
+        };
+        let stop = tokio_util::sync::CancellationToken::new();
+        let failure = Some("Stale execution state was not discarded".to_string());
+        let mut failed = healthy();
+        let ended = supervise(&mut failed, None, &stop, failure.clone()).now_or_never();
+        assert_eq!(ended, Some(failure));
+        let mut serving = healthy();
+        assert!(
+            supervise(&mut serving, None, &stop, None)
+                .now_or_never()
+                .is_none()
+        );
+        for listeners in [failed, serving] {
+            listeners.rest.expect("the listener is kept").abort();
+        }
+    }
 
     #[test]
     fn supervision_policies() {

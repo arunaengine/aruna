@@ -88,26 +88,6 @@ pub(crate) fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&bytes).public()
 }
 
-pub(crate) fn outbox_handler() -> (tempfile::TempDir, OperationsTaskHandler, TaskHandle) {
-    let dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
-    let task_handle = TaskHandle::new();
-    let handler = OperationsTaskHandler::new(
-        Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: Some(task_handle.clone()),
-            compute_handle: None,
-            outbound_handle: None,
-        }),
-        JobsRuntime::new(),
-    );
-    (dir, handler, task_handle)
-}
-
 pub(crate) async fn scheduled_after(task_handle: &TaskHandle) -> Duration {
     let TaskEvent::TimerScheduled { after, .. } = task_handle
         .schedule_idle_timer(TaskKey::DrainSyncOutbox, Duration::ZERO)

@@ -181,6 +181,9 @@ impl DrainPageOperation {
         let elapsed = Duration::from_millis(self.now_ms.saturating_sub(self.started_ms));
         let invocation = self.invocation()?;
         invocation.scan_elapsed += elapsed;
+        // Every read page and its rows count against the limits, also one filtered to nothing.
+        invocation.pages += 1;
+        invocation.scanned += batch.scanned;
         let has_more = batch.has_more;
         invocation.cursor = batch.next_start_after;
         let cursor = invocation.cursor.clone();
@@ -202,7 +205,7 @@ impl DrainPageOperation {
         }
     }
 
-    /// Counts the page, resolves each record's placement and topic, and asks which shard
+    /// Counts the records, resolves each record's placement and topic, and asks which shard
     /// topics this node may pull a missing genesis for already exist.
     fn prepare(
         &mut self,
@@ -212,7 +215,6 @@ impl DrainPageOperation {
     ) -> PageTurn {
         let (config, realm_id) = (self.config.clone(), self.serving.1);
         let invocation = self.invocation()?;
-        invocation.pages += 1;
         invocation.records += records.len();
         let page_oldest = (records.iter())
             .map(|(_, record)| record.outbox_id.timestamp_ms())
@@ -614,6 +616,7 @@ mod tests {
         run.first().unwrap();
         let empty = OutboxReadBatch {
             records: Vec::new(),
+            scanned: 0,
             has_more: false,
             next_start_after: None,
         };
@@ -622,5 +625,24 @@ mod tests {
         };
         assert_eq!(page.end, PageEnd::Stop);
         assert!(page.invocation.reached_end);
+    }
+
+    // A page whose rows the rotation filters out still counts with its rows.
+    #[test]
+    fn skipped_page_counts() {
+        let mut run = page();
+        run.first().unwrap();
+        let filtered = OutboxReadBatch {
+            records: Vec::new(),
+            scanned: 8,
+            has_more: true,
+            next_start_after: Some(b"k".to_vec()),
+        };
+        let Ok(Next::Done(page)) = run.next(read(Ok(filtered))) else {
+            panic!("a filtered page ends");
+        };
+        assert_eq!(page.end, PageEnd::Skip);
+        assert_eq!((page.invocation.pages, page.invocation.scanned), (1, 8));
+        assert_eq!(page.invocation.records, 0);
     }
 }

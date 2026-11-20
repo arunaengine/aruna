@@ -66,6 +66,9 @@ pub struct FinishBatchOperation {
     now_ms: u64,
 }
 
+/// A record key with the digest of the row as read, or none when its lineage moved.
+type HeldRow = (Vec<u8>, Option<[u8; 32]>);
+
 impl FinishBatchOperation {
     /// Finishes the sub-batch of `record_keys` that asked for `requested` targets, from the event
     /// its sync answered. The usage refresh records under `generation`.
@@ -150,7 +153,11 @@ impl FinishBatchOperation {
         topics.sort();
         topics.dedup();
         let Some(call) = lineage_call(&topics) else {
-            let rows = self.record_keys.iter().map(|key| (key.clone(), None)).collect();
+            let rows = self
+                .record_keys
+                .iter()
+                .map(|key| (key.clone(), None))
+                .collect();
             return self.delete(rows);
         };
         self.topics = topics;
@@ -161,7 +168,7 @@ impl FinishBatchOperation {
 
     /// The rows whose publication still holds: a record whose topic moved to another lineage
     /// since is kept, as is a row replaced since the drain read it.
-    fn held_rows(&mut self, result: IoResult) -> Result<Vec<(Vec<u8>, Option<[u8; 32]>)>, IoError> {
+    fn held_rows(&mut self, result: IoResult) -> Result<Vec<HeldRow>, IoError> {
         let current = lineages(&self.topics, result)?;
         let mut rows = Vec::with_capacity(self.record_keys.len());
         for (index, key) in self.record_keys.iter().enumerate() {
