@@ -21,10 +21,9 @@ pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -
     Box::pin(change_timer(storage, task_handle, effect, keep_live)).await
 }
 
-/// Applies one timer change to its durable row and the scheduler, holding the key's change lock
-/// until the scheduler took it. Each arming is a new admission that owns the row it writes; a
-/// shorten the scheduler answers with an earlier live wake leaves that wake's row. With
-/// `keep_live` the scheduler is armed even when the row cannot be written.
+/// Applies one timer change to its row and the scheduler under the key's change lock. Each arming
+/// is a new admission owning the row it writes; a shorten that keeps an earlier wake leaves its
+/// row. With `keep_live` the scheduler is armed even when the row cannot be written.
 pub async fn change_timer(
     storage: &StorageHandle,
     task_handle: Option<&TaskHandle>,
