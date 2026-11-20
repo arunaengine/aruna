@@ -366,8 +366,13 @@ async fn empty_ranges_resume() {
     let listed = page(&shared, &visit, ("", None, Some(10))).await.unwrap();
     assert!(listed.files.is_empty() && listed.folders.is_empty());
     let next = listed.next_cursor.expect("the range bound ends the page");
-    assert_eq!(decode_resume(&next).unwrap(), Resume::From("k63".to_string()));
-    let rest = page(&shared, &visit, ("", Some(next), Some(10))).await.unwrap();
+    assert_eq!(
+        decode_resume(&next).unwrap(),
+        Resume::From("k63".to_string())
+    );
+    let rest = page(&shared, &visit, ("", Some(next), Some(10)))
+        .await
+        .unwrap();
     let names: Vec<_> = rest.files.into_iter().map(|file| file.name).collect();
     assert_eq!(names, ["z.txt"]);
 }
@@ -391,8 +396,13 @@ async fn hidden_run_resumes() {
     let resume = decode_resume(&next).unwrap();
     assert!(matches!(resume, Resume::Hidden { .. }), "{resume:?}");
     let fields = visible_fields(&resume);
-    assert!(fields.iter().all(|field| !field.contains("secret")), "{resume:?}");
-    let rest = page(&shared, &visit, ("", Some(next), Some(10))).await.unwrap();
+    assert!(
+        fields.iter().all(|field| !field.contains("secret")),
+        "{resume:?}"
+    );
+    let rest = page(&shared, &visit, ("", Some(next), Some(10)))
+        .await
+        .unwrap();
     let names: Vec<_> = rest.files.into_iter().map(|file| file.name).collect();
     assert_eq!(names, ["t.txt"]);
 }

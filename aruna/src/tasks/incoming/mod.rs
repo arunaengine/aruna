@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -44,7 +44,7 @@ impl Drop for OutboxBarrier {
     }
 }
 
-use aruna_drivers::driver::{DriverContext, drive, drive_retry};
+use aruna_drivers::driver::{DriverContext, drive, drive_retry, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
@@ -59,10 +59,15 @@ use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, Job
 use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
 use aruna_operations::metadata::materialization_queue::{
-    NextTimerOperation, RequeueParkedOperation, materialization_group_concurrency,
+    NextTimerOperation, RequeueParkedOperation, UNKNOWN_CORES,
 };
 use aruna_operations::metadata::projection::ProjectionTimerOperation;
 use aruna_operations::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
+
+/// The logical cores this host offers, as the operating system reports them.
+fn host_cores() -> usize {
+    std::thread::available_parallelism().map_or(UNKNOWN_CORES, |cores| cores.get())
+}
 
 /// Arms the graph prune drain for its next due job at start.
 async fn restore_graph_prune(
@@ -109,12 +114,13 @@ use aruna_operations::sync::outbox::defer::{
     DrainDeferState, DrainRecord, admin_origin, classify_deferred_record, partition_drain_records,
 };
 use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
+use aruna_operations::sync::outbox::rotation::OutboxRotation;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
-    TimerInput, TimerMemory, TimerPlan, needs_cluster, timer_operation,
+    TimerInput, TimerMemory, TimerPlan, timer_needs, timer_operation,
 };
-use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_task_effect};
+use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_stamped};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 pub(crate) mod drained;
@@ -179,9 +185,6 @@ pub(crate) struct OperationsTaskHandler {
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
-    // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
-    // a restarted node simply retries from the base interval.
-    retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
     // What each converted timer keeps between runs; the operations decide on it. Loss on
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
@@ -198,39 +201,6 @@ pub(crate) struct OperationsTaskHandler {
     realm_documents: std::sync::Mutex<(u32, u64)>,
     // Signs registry publications; `None` where no node identity was supplied.
     node_capabilities: Option<NodeCapabilities>,
-}
-
-/// Outcome counts accumulated across the invocations of one rotation.
-#[derive(Clone, Copy, Debug, Default)]
-struct RotationTotals {
-    examined: usize,
-    deleted: usize,
-    deferred: usize,
-    undeliverable: usize,
-    retry_invocations: usize,
-    invocations: u32,
-}
-
-/// One rotation of the bounded document-sync drain: head to observed end across
-/// as many bounded invocations as it needs. Ordering blocks and outcome counts
-/// carry across them; holdership and publisher authority never do.
-#[derive(Default)]
-struct OutboxRotation {
-    /// Last key observed when this rotation opened.
-    boundary: Option<Vec<u8>>,
-    /// Last key observed in each independently ordered event-kind stream.
-    stream_boundaries: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Where the next invocation resumes; `None` is the head.
-    cursor: Option<Vec<u8>>,
-    /// Topics whose FIFO is blocked for the rest of this rotation.
-    blocked_topics: HashSet<irokle::TopicId>,
-    /// Admin origin streams blocked for the rest of this rotation.
-    blocked_origins: HashSet<aruna_core::id::NodeId>,
-    /// Topics this node can never publish onto, for the rest of this rotation.
-    undeliverable_topics: HashSet<irokle::TopicId>,
-    totals: RotationTotals,
-    /// Continuations already spent without yielding through the timer.
-    continuations: u32,
 }
 
 struct DrainSubBatch {
@@ -299,7 +269,6 @@ impl OperationsTaskHandler {
             context,
             jobs_runtime,
             rocrate_limits: RoCrateLimits::default(),
-            retry_backoff: std::sync::Mutex::new(HashMap::new()),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             published_records: std::sync::Mutex::new(BTreeSet::new()),
@@ -466,41 +435,12 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Backoff interval for the next re-arm of `key`, from the in-memory attempt count
-    /// without mutating it. The drain re-arm is the only retry path for an accepted
-    /// write after a transient sync failure, so it uses the queue scale, not a 30s base.
-    fn backoff_after(&self, key: &TaskKey) -> Duration {
-        let attempts = self
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(key)
-            .copied()
-            .unwrap_or(0);
-        Duration::from_millis(retry_delay_ms(attempts))
-    }
-
-    fn note_retry_backoff(&self, key: &TaskKey) {
-        let mut backoff = self
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned");
-        let attempts = backoff.entry(key.clone()).or_insert(0);
-        *attempts = attempts.saturating_add(1);
-    }
-
-    fn reset_backoff(&self, key: &TaskKey) {
-        self.retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .remove(key);
-    }
-
-    /// Re-arms `key` at its current backoff interval and records the attempt.
-    async fn reschedule_with_backoff(&self, key: TaskKey) -> bool {
-        let after = self.backoff_after(&key);
-        self.note_retry_backoff(&key);
-        self.reschedule_timer(key, after).await
+    /// Re-arms the outbox drain on the rotation's retry ladder, which counts the attempt. The
+    /// drain re-arm is the only retry path for an accepted write after a transient sync failure.
+    async fn retry_drain(&self, key: TaskKey, mut rotation: OutboxRotation) {
+        let after = rotation.retry_after();
+        self.store_rotation(rotation);
+        self.reschedule_timer(key, after).await;
     }
 
     async fn reschedule_timer(&self, key: TaskKey, after: std::time::Duration) -> bool {
@@ -509,15 +449,18 @@ impl OperationsTaskHandler {
             after,
         };
         let _held = hold_change(&effect).await;
-        if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
-            warn!(task_id = ?key, message = %message, "Failed to persist timer re-arm");
-            return false;
-        }
+        let stamp = match persist_stamped(&self.context.storage_handle, &effect).await {
+            Ok(stamp) => stamp,
+            Err(message) => {
+                warn!(task_id = ?key, message = %message, "Failed to persist timer re-arm");
+                return false;
+            }
+        };
         let Some(task_handle) = self.context.task_handle.as_ref() else {
             warn!(task_id = ?key, "Cannot re-arm failed timer without task handle");
             return false;
         };
-        match task_handle.send_effect(Effect::Task(effect)).await {
+        match task_handle.send_stamped(effect, stamp).await {
             Event::Task(TaskEvent::TimerScheduled { .. }) => true,
             Event::Task(TaskEvent::Error { message, .. }) => {
                 warn!(task_id = ?key, message = %message, "Failed to re-arm failed timer");
@@ -538,11 +481,15 @@ impl OperationsTaskHandler {
             after,
         };
         let _held = hold_change(&effect).await;
-        if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
-            warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
-        }
+        let stamp = match persist_stamped(&self.context.storage_handle, &effect).await {
+            Ok(stamp) => stamp,
+            Err(message) => {
+                warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
+                None
+            }
+        };
         if let Some(task_handle) = self.context.task_handle.as_ref() {
-            task_handle.send_effect(Effect::Task(effect)).await;
+            task_handle.send_stamped(effect, stamp).await;
         }
     }
 
@@ -627,24 +574,34 @@ impl OperationsTaskHandler {
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
     async fn run_trigger(&self, key: TaskKey) {
         let memory = self.kept_memory(&key);
-        let cluster = needs_cluster(&key);
+        let needs = timer_needs(&key);
+        let context = self.context.as_ref();
         let input = TimerInput {
             now_ms: unix_timestamp_millis(),
-            local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
+            local_node: context.net_handle.as_ref().map(|net| net.node_id()),
+            serving: context.node_and_realm(),
             memory: memory.clone(),
-            facts: node_facts(&self.context),
-            routing: aruna_drivers::driver::node_routing(&self.context),
-            has_blob: self.context.blob_handle.is_some(),
-            running: Some(self.jobs_runtime.running_jobs()),
-            has_tasks: self.context.task_handle.is_some(),
-            group_concurrency: materialization_group_concurrency(),
-            heartbeats: if cluster {
-                self.context.fresh_heartbeats()
+            facts: if needs.facts {
+                node_facts(context)
             } else {
                 Default::default()
             },
-            limits: if cluster {
-                self.context.compute_limits()
+            routing: if needs.routing {
+                node_routing(context)
+            } else {
+                Default::default()
+            },
+            has_blob: context.blob_handle.is_some(),
+            running: needs.running.then(|| self.jobs_runtime.running_jobs()),
+            has_tasks: context.task_handle.is_some(),
+            host_cores: (needs.cores.then(host_cores)).unwrap_or(UNKNOWN_CORES),
+            heartbeats: if needs.cluster {
+                context.fresh_heartbeats()
+            } else {
+                Default::default()
+            },
+            limits: if needs.cluster {
+                context.compute_limits()
             } else {
                 Default::default()
             },
@@ -676,8 +633,8 @@ impl OperationsTaskHandler {
         let Some(after) = plan.after else {
             return;
         };
-        if !self.reschedule_timer(key.clone(), after).await && key == TaskKey::DrainAppliedSync {
-            // Its persisted timer is gone and durable rows wait on it, so a live wake stays.
+        if !self.reschedule_timer(key.clone(), after).await {
+            // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
             self.keep_retrying(key, after).await;
         }
     }
@@ -830,9 +787,13 @@ pub struct OutboxDrainer {
 #[async_trait]
 impl InboundTaskHandler for OperationsTaskHandler {
     async fn handle_timer(&self, key: TaskKey) {
+        self.handle_firing(key, None).await;
+    }
+
+    async fn handle_firing(&self, key: TaskKey, stamp: Option<u64>) {
         // An audit record retry keeps its row until the record is stored, in one transaction.
         if !matches!(key, TaskKey::RecordAudit { .. }) {
-            delete_persisted_timer(&self.context.storage_handle, &key).await;
+            delete_persisted_timer(&self.context.storage_handle, &key, stamp).await;
         }
         self.timer_work(key).await;
     }

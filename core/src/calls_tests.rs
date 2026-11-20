@@ -522,6 +522,30 @@ fn abort_ends_transaction() {
     assert!(!operation.is_complete());
 }
 
+// A commit storage rolled back for another cause is told like a conflict, and fails with it.
+#[test]
+fn rollback_told_distinctly() {
+    let write = vec![("rows".to_string(), key("a"), key("1"))];
+    let mut operation = run(script(vec![IoCall::Write(write)]), true);
+    operation.start();
+    operation.step(started());
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    operation.step(Event::Storage(written));
+    let cause = Box::new(StorageError::ReadError("counter".to_string()));
+    let rolled = StorageEvent::Error {
+        error: StorageError::RolledBack(cause.clone()),
+    };
+    assert!(operation.step(Event::Storage(rolled)).is_empty());
+    assert!(
+        operation.operation.rolled_back,
+        "a rolled back commit is told"
+    );
+    let rolled = IoError::Storage(StorageError::RolledBack(cause));
+    assert_eq!(operation.finalize(), Err(rolled));
+}
+
 #[test]
 fn conflict_marks_retry() {
     let write = vec![("rows".to_string(), key("a"), key("1"))];
@@ -765,13 +789,7 @@ impl std::io::Write for Captured {
 
 #[test]
 fn refused_wake_logged() {
-    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || Captured(sink.clone()))
-        .with_ansi(false)
-        .finish();
-    let _logged = tracing::subscriber::set_default(subscriber);
+    let (logs, _logged) = capture_logs();
     let wake = TaskEffect::ShortenTimer {
         key: TaskKey::DrainAppliedSync,
         after: Duration::ZERO,
@@ -789,6 +807,36 @@ fn refused_wake_logged() {
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("A call after the commit failed"), "{logs}");
     assert!(logs.contains("queue full"), "{logs}");
+}
+
+/// The logs of this thread, until the returned guard drops.
+fn capture_logs() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Captured(sink.clone()))
+        .with_ansi(false)
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+// A child after the commit that ends with its error is logged without its private details.
+#[test]
+fn failed_child_logged() {
+    let (logs, _logged) = capture_logs();
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::child(script(Vec::new()))];
+    let mut operation = run(procedure, false);
+    assert_eq!(operation.start().len(), 1, "the child is started");
+    let failed = ChildOutcome::new::<u8, IoError>(Err(IoError::Codec("secret".to_string())));
+    assert!(operation.step(Event::Child(failed)).is_empty());
+    assert_eq!(operation.finalize(), Ok(Vec::new()), "the outcome stays");
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("A call after the commit failed"), "{logs}");
+    assert!(!logs.contains("secret"), "{logs}");
 }
 
 #[test]

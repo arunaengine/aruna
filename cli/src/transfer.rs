@@ -380,7 +380,10 @@ pub async fn upload(
                 // Without its record no run could resume or find the new upload, so it goes.
                 let abort = client.abort_multipart_upload().bucket(bucket).key(key);
                 if let Err(failed) = abort.upload_id(&upload_id).send().await {
-                    eprintln!("warning: upload {upload_id} was not aborted: {}", s3_error(failed));
+                    eprintln!(
+                        "warning: upload {upload_id} was not aborted: {}",
+                        s3_error(failed)
+                    );
                 }
                 return Err(error.into());
             }

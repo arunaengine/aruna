@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -29,6 +29,12 @@ const HANDLER_LIMIT: usize = 64;
 #[async_trait]
 pub trait InboundTaskHandler: Send + Sync {
     async fn handle_timer(&self, key: TaskKey);
+
+    /// Handles one firing; `stamp` names the durable row the firing timer was armed from, if a
+    /// stamped change armed it.
+    async fn handle_firing(&self, key: TaskKey, _stamp: Option<u64>) {
+        self.handle_timer(key).await;
+    }
 }
 
 #[derive(Clone)]
@@ -49,11 +55,13 @@ enum TaskCommand {
     ResetTimer {
         key: TaskKey,
         after: Duration,
+        stamp: Option<u64>,
         response: oneshot::Sender<TaskEvent>,
     },
     ShortenTimer {
         key: TaskKey,
         after: Duration,
+        stamp: Option<u64>,
         response: oneshot::Sender<TaskEvent>,
     },
     ScheduleIdleTimer {
@@ -119,7 +127,8 @@ struct SchedulerState {
     running_by_id: HashMap<u64, RunningTaskEntry>,
     running_warn_deadlines: BTreeSet<(Instant, u64)>,
     in_flight_keys: HashMap<TaskKey, usize>,
-    refire_requested: HashSet<TaskKey>,
+    /// Keys that fired while a run held them, with the stamp of that firing.
+    refire_requested: HashMap<TaskKey, Option<u64>>,
     inbound_handler: Option<Arc<dyn InboundTaskHandler>>,
     drained_waiters: Vec<oneshot::Sender<()>>,
     next_timer_id: u64,
@@ -130,12 +139,15 @@ struct SchedulerState {
 struct TimerEntry {
     id: u64,
     deadline: Instant,
+    /// The durable row this timer was armed from, so its firing deletes only that row.
+    stamp: Option<u64>,
 }
 
 #[derive(Clone)]
 struct RunningTask {
     id: Option<u64>,
     key: TaskKey,
+    stamp: Option<u64>,
     started_at: Instant,
 }
 
@@ -161,7 +173,7 @@ impl SchedulerState {
             running_by_id: HashMap::new(),
             running_warn_deadlines: BTreeSet::new(),
             in_flight_keys: HashMap::new(),
-            refire_requested: HashSet::new(),
+            refire_requested: HashMap::new(),
             inbound_handler: None,
             drained_waiters: Vec::new(),
             next_timer_id: 1,
@@ -212,11 +224,17 @@ impl SchedulerState {
         Some(entry)
     }
 
-    fn prepare_running_task(&mut self, key: TaskKey, started_at: Instant) -> RunningTask {
+    fn prepare_running_task(
+        &mut self,
+        key: TaskKey,
+        stamp: Option<u64>,
+        started_at: Instant,
+    ) -> RunningTask {
         let id = self.allocate_run_id();
         RunningTask {
             id,
             key,
+            stamp,
             started_at,
         }
     }
@@ -252,7 +270,7 @@ impl SchedulerState {
 
     fn spawn_handler(
         &mut self,
-        key: TaskKey,
+        (key, stamp): (TaskKey, Option<u64>),
         started_at: Instant,
         command_tx: &mpsc::WeakSender<TaskCommand>,
     ) {
@@ -260,7 +278,7 @@ impl SchedulerState {
             return;
         }
         if let Some(handler) = self.inbound_handler.clone() {
-            let task = self.prepare_running_task(key, started_at);
+            let task = self.prepare_running_task(key, stamp, started_at);
             let (cancel_tx, cancel_rx) = oneshot::channel();
             let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone(), cancel_rx);
             self.track_running_task(&task, handle, Some(cancel_tx));
@@ -307,12 +325,15 @@ impl SchedulerState {
 
             if matches!(self.timers_by_key.get(&key), Some(entry) if entry.id == timer_id && entry.deadline == deadline)
             {
-                self.timers_by_key.remove(&key);
+                let stamp = self
+                    .timers_by_key
+                    .remove(&key)
+                    .and_then(|entry| entry.stamp);
 
                 if self.in_flight_keys.contains_key(&key) {
-                    self.refire_requested.insert(key);
+                    self.refire_requested.insert(key, stamp);
                 } else {
-                    self.spawn_handler(key, now, command_tx);
+                    self.spawn_handler((key, stamp), now, command_tx);
                 }
             }
         }
@@ -341,7 +362,12 @@ impl SchedulerState {
         }
     }
 
-    fn reset_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
+    fn reset_timer(
+        &mut self,
+        (key, stamp): (TaskKey, Option<u64>),
+        after: Duration,
+        now: Instant,
+    ) -> TaskEvent {
         let Some(deadline) = now.checked_add(after) else {
             return TaskEvent::Error {
                 key: Some(key),
@@ -357,12 +383,22 @@ impl SchedulerState {
         };
 
         self.remove_timer(&key);
-        self.insert_timer(key.clone(), TimerEntry { id, deadline });
+        let entry = TimerEntry {
+            id,
+            deadline,
+            stamp,
+        };
+        self.insert_timer(key.clone(), entry);
 
         TaskEvent::TimerScheduled { key, after }
     }
 
-    fn shorten_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
+    fn shorten_timer(
+        &mut self,
+        (key, stamp): (TaskKey, Option<u64>),
+        after: Duration,
+        now: Instant,
+    ) -> TaskEvent {
         let Some(requested_deadline) = now.checked_add(after) else {
             return TaskEvent::Error {
                 key: Some(key),
@@ -392,6 +428,7 @@ impl SchedulerState {
             TimerEntry {
                 id,
                 deadline: requested_deadline,
+                stamp,
             },
         );
 
@@ -410,11 +447,13 @@ impl SchedulerState {
             return TaskEvent::TimerScheduled { key, after };
         }
 
-        self.reset_timer(key, after, now)
+        self.reset_timer((key, None), after, now)
     }
 
     fn cancel_timer(&mut self, key: TaskKey) -> TaskEvent {
         self.remove_timer(&key);
+        // A firing that waited for a running handler is cancelled too, so no run follows it.
+        self.refire_requested.remove(&key);
         TaskEvent::TimerCancelled { key }
     }
 
@@ -442,8 +481,10 @@ impl SchedulerState {
             );
         }
 
-        if self.release_key(&entry.key) && self.refire_requested.remove(&entry.key) {
-            self.spawn_handler(entry.key, now, command_tx);
+        if self.release_key(&entry.key)
+            && let Some(stamp) = self.refire_requested.remove(&entry.key)
+        {
+            self.spawn_handler((entry.key, stamp), now, command_tx);
         }
 
         self.notify_if_drained();
@@ -532,16 +573,18 @@ impl SchedulerState {
             TaskCommand::ResetTimer {
                 key,
                 after,
+                stamp,
                 response,
             } => {
-                let _ = response.send(self.reset_timer(key, after, now));
+                let _ = response.send(self.reset_timer((key, stamp), after, now));
             }
             TaskCommand::ShortenTimer {
                 key,
                 after,
+                stamp,
                 response,
             } => {
-                let _ = response.send(self.shorten_timer(key, after, now));
+                let _ = response.send(self.shorten_timer((key, stamp), after, now));
             }
             TaskCommand::ScheduleIdleTimer {
                 key,
@@ -637,7 +680,8 @@ fn spawn_timer_handler(
         // A cooperative stop drops the handler future at its next await, then
         // still reports completion so the scheduler releases the key and the
         // drain only after the run really ended. A panic reports completion too.
-        let run = std::panic::AssertUnwindSafe(handler.handle_timer(task.key.clone()));
+        let firing = handler.handle_firing(task.key.clone(), task.stamp);
+        let run = std::panic::AssertUnwindSafe(firing);
         tokio::select! {
             biased;
             _ = &mut cancel => {}
@@ -760,22 +804,35 @@ impl TaskHandle {
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
     }
 
-    async fn reset_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+    async fn reset_timer(&self, key: TaskKey, after: Duration, stamp: Option<u64>) -> TaskEvent {
         self.dispatch_command(key, |key, response| TaskCommand::ResetTimer {
             key,
             after,
+            stamp,
             response,
         })
         .await
     }
 
-    async fn shorten_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+    async fn shorten_timer(&self, key: TaskKey, after: Duration, stamp: Option<u64>) -> TaskEvent {
         self.dispatch_command(key, |key, response| TaskCommand::ShortenTimer {
             key,
             after,
+            stamp,
             response,
         })
         .await
+    }
+
+    /// Hands a timer change to the scheduler with the due time of the durable row it wrote, so
+    /// the firing it arms deletes only that row and never a newer one.
+    pub async fn send_stamped(&self, effect: TaskEffect, stamp: Option<u64>) -> Event {
+        let event = match effect {
+            TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after, stamp).await,
+            TaskEffect::ShortenTimer { key, after } => self.shorten_timer(key, after, stamp).await,
+            other => return self.send_effect(Effect::Task(other)).await,
+        };
+        Event::Task(event)
     }
 
     pub async fn schedule_idle_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
@@ -966,8 +1023,12 @@ impl Handle for TaskHandle {
         match effect {
             Effect::Task(task_effect) => {
                 let event = match task_effect {
-                    TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after).await,
-                    TaskEffect::ShortenTimer { key, after } => self.shorten_timer(key, after).await,
+                    TaskEffect::ResetTimer { key, after } => {
+                        self.reset_timer(key, after, None).await
+                    }
+                    TaskEffect::ShortenTimer { key, after } => {
+                        self.shorten_timer(key, after, None).await
+                    }
                     TaskEffect::ScheduleIdleTimer { key, after } => {
                         self.schedule_idle_timer(key, after).await
                     }
@@ -995,6 +1056,43 @@ mod tests {
     use std::time::Duration;
 
     use tokio::sync::Notify;
+
+    struct StampHandler {
+        seen: Arc<Mutex<Option<Option<u64>>>>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for StampHandler {
+        async fn handle_timer(&self, _key: TaskKey) {}
+
+        async fn handle_firing(&self, _key: TaskKey, stamp: Option<u64>) {
+            *self.seen.lock().expect("stamp lock") = Some(stamp);
+            self.notify.notify_one();
+        }
+    }
+
+    // A firing carries the stamp of the change that armed it, so the handler deletes that row.
+    #[tokio::test]
+    async fn firing_carries_stamp() {
+        let handle = TaskHandle::new();
+        let seen = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        let handler = StampHandler {
+            seen: seen.clone(),
+            notify: notify.clone(),
+        };
+        handle.set_inbound_handler(Arc::new(handler)).await;
+        let reset = TaskEffect::ResetTimer {
+            key: test_key(),
+            after: Duration::ZERO,
+        };
+        handle.send_stamped(reset, Some(42)).await;
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the timer fires");
+        assert_eq!(*seen.lock().expect("stamp lock"), Some(Some(42)));
+    }
 
     #[derive(Clone)]
     struct ReschedulingHandler {
@@ -1794,7 +1892,7 @@ mod tests {
             TaskKey::DrainPruneQueue,
             TaskKey::DrainRefreshQueue,
         ] {
-            state.reset_timer(key, Duration::ZERO, now);
+            state.reset_timer((key, None), Duration::ZERO, now);
         }
         state.dispatch_due_timers(now, &weak);
         assert_eq!(state.running_by_id.len(), 2);
@@ -2195,7 +2293,7 @@ mod decision_tests {
         let mut state = state();
         let start = Instant::now();
         let key = key();
-        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        state.reset_timer((key.clone(), None), Duration::from_secs(10), start);
         let (tx, _rx) = mpsc::channel(1);
         let weak = tx.downgrade();
 
@@ -2211,20 +2309,41 @@ mod decision_tests {
         );
     }
 
+    // A cancellation acknowledged while a handler runs also drops the firing that waited for it.
+    #[test]
+    fn cancel_drops_refire() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.in_flight_keys.insert(key.clone(), 1);
+        state.reset_timer((key.clone(), None), Duration::ZERO, start);
+        let (tx, _rx) = mpsc::channel(1);
+        state.dispatch_due_timers(start, &tx.downgrade());
+        assert!(
+            state.refire_requested.contains_key(&key),
+            "the firing waits"
+        );
+        state.cancel_timer(key.clone());
+        assert!(
+            !state.refire_requested.contains_key(&key),
+            "no run follows the cancel"
+        );
+    }
+
     #[test]
     fn shorten_earlier_deadlines() {
         let mut state = state();
         let start = Instant::now();
         let key = key();
-        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        state.reset_timer((key.clone(), None), Duration::from_secs(10), start);
 
-        state.shorten_timer(key.clone(), Duration::from_secs(30), start);
+        state.shorten_timer((key.clone(), None), Duration::from_secs(30), start);
         assert_eq!(
             state.timers_by_key.get(&key).unwrap().deadline,
             start + Duration::from_secs(10),
             "a later request keeps the existing deadline"
         );
-        state.shorten_timer(key.clone(), Duration::from_secs(5), start);
+        state.shorten_timer((key.clone(), None), Duration::from_secs(5), start);
         assert_eq!(
             state.timers_by_key.get(&key).unwrap().deadline,
             start + Duration::from_secs(5),
@@ -2255,7 +2374,7 @@ mod decision_tests {
         let mut state = state();
         let start = Instant::now();
         let key = key();
-        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        state.reset_timer((key.clone(), None), Duration::from_secs(10), start);
         assert!(!state.timers_by_deadline.is_empty());
 
         state.cancel_timer(key.clone());

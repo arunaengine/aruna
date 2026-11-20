@@ -113,7 +113,12 @@ mod tests {
         let after = secret_expiry_key(5, Ulid::from_bytes([1; 16]));
         let mut operation = ExpiryPageOperation::new(Some(after.clone()), 2);
         assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
-        let Ok(Next::Call(IoCall::Page { after: asked, limit, .. })) = operation.first() else {
+        let Ok(Next::Call(IoCall::Page {
+            after: asked,
+            limit,
+            ..
+        })) = operation.first()
+        else {
             panic!("expected an index page");
         };
         assert_eq!((asked, limit), (Some(after), 2));

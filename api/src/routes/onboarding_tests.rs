@@ -355,7 +355,10 @@ async fn lists_by_expiry() {
         list_onboarding_secrets(State(state.clone()), Extension(Some(auth.clone())), first)
             .await
             .unwrap();
-    assert_eq!(page.secrets[0].enrollment_id, created[1], "the sooner expiry first");
+    assert_eq!(
+        page.secrets[0].enrollment_id, created[1],
+        "the sooner expiry first"
+    );
     let next = Query(ListSecretsQuery {
         cursor: page.next_cursor,
         limit: Some(1),

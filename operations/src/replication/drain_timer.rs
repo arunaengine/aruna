@@ -29,7 +29,7 @@ impl ReplicationTimerOperation {
     pub fn new(input: &TimerInput) -> Self {
         Self {
             routing: input.routing.clone(),
-            serving: input.facts.serving,
+            serving: input.serving,
             memory: input.memory.clone(),
         }
     }

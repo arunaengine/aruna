@@ -248,7 +248,9 @@ impl Store {
         for item in self.listing.range::<Vec<u8>, _>((start, Bound::Unbounded)) {
             let (key, _) = item.into_inner()?;
             read += 1;
-            let realm = key.get(1..).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+            let realm = key
+                .get(1..)
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
             let realm_id = RealmId::from_bytes(realm.ok_or(StoreError::NotFound)?);
             // An entry whose lease ended keeps its row until a write changes it.
             if let Some(entry) = self.entry(&realm_id, now)? {
@@ -713,7 +715,11 @@ pub(crate) mod tests {
         store.register(&first, &entry, 100).unwrap();
         let (second, entry) = seeded_entry(8, 100);
         store.register(&second, &entry, 100).unwrap();
-        let last = if first.as_bytes() > second.as_bytes() { first } else { second };
+        let last = if first.as_bytes() > second.as_bytes() {
+            first
+        } else {
+            second
+        };
         let approved = AdminState {
             status: RealmStatus::Approved,
             ..AdminState::default()

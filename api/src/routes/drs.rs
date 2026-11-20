@@ -12,7 +12,6 @@ use crate::server::state::{RestInterfaceRuntime, ServerState};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
-use aruna_core::holder_choice::PickHolderOperation;
 use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -32,6 +31,7 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, redeem_ticket, unsigned_ticket,
 };
 use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::holder_choice::PickHolderOperation;
 use aruna_operations::replication::locations::LocationSummaryError;
 use aruna_operations::replication::locations::holders::{
     HolderAnswer, HolderResolveError, HolderResolveOperation,

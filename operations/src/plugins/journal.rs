@@ -206,9 +206,15 @@ pub(crate) mod tests {
         assert!(matches!(sources, Next::Call(IoCall::Page { .. })));
         let old = (vec![SOURCE_ROW, 1], 1u64.to_be_bytes().to_vec());
         let first = page_result(vec![old], Some(vec![SOURCE_ROW, 1]));
-        assert!(matches!(prune.next(first).unwrap(), Next::Call(IoCall::Delete(_))));
+        assert!(matches!(
+            prune.next(first).unwrap(),
+            Next::Call(IoCall::Delete(_))
+        ));
         let next = prune.next(IoResult::Done).unwrap();
-        assert!(matches!(next, Next::Call(IoCall::Page { .. })), "then the next page");
+        assert!(
+            matches!(next, Next::Call(IoCall::Page { .. })),
+            "then the next page"
+        );
         let kept = (vec![SOURCE_ROW, 2], now.to_be_bytes().to_vec());
         let last = prune.next(page_result(vec![kept], None)).unwrap();
         assert_eq!(last, Next::Done(1));
@@ -318,7 +324,7 @@ pub(crate) mod tests {
             Next::Call(IoCall::Page { .. })
         ));
         // Source rows inside the dedup horizon stay, and a page with none older sends no delete.
-        assert!(100 <= 1 + DEDUP_RETENTION_MS);
+        const { assert!(100 <= 1 + DEDUP_RETENTION_MS) };
         let anchor = |at: u64| at.to_be_bytes().to_vec();
         let sources = vec![(b"s1".to_vec(), anchor(1)), (b"s2".to_vec(), anchor(99))];
         let next = plan.next(page_result(sources, None)).unwrap();

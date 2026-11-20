@@ -470,6 +470,42 @@ async fn applied_retry_kept() {
     );
 }
 
+// A converted timer whose rearm cannot be stored keeps a live wake, as a backend import does
+// after an accepted rule, so its work does not stop until the node restarts.
+#[tokio::test]
+async fn refused_rearm_kept() {
+    use aruna_operations::jobs::PRUNE_POLL_AFTER;
+    use aruna_test_support::metadata::refusing;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: refusing(storage, TASK_TIMER_KEYSPACE),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+
+    handler.run_trigger(TaskKey::PruneJobs).await;
+
+    let shorten = TaskEffect::ShortenTimer {
+        key: TaskKey::PruneJobs,
+        after: PRUNE_POLL_AFTER * 2,
+    };
+    let Event::Task(TaskEvent::TimerScheduled { after, .. }) =
+        task_handle.send_effect(Effect::Task(shorten)).await
+    else {
+        panic!("expected timer scheduled");
+    };
+    assert!(after <= PRUNE_POLL_AFTER, "the rearm stays armed in memory");
+}
+
 // A timer change waits while another change of the same key holds it, so its row and the
 // scheduler take both changes in one order.
 #[tokio::test]

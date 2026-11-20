@@ -22,6 +22,7 @@ pub mod forward;
 pub mod git;
 pub mod groups;
 pub mod harvest;
+pub mod holder_choice;
 pub mod jobs;
 pub mod metadata;
 pub mod node;

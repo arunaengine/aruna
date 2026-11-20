@@ -37,7 +37,6 @@ pub mod git_state;
 pub mod handle;
 pub mod handoff;
 pub mod heartbeat;
-pub mod holder_choice;
 pub mod id;
 pub mod id_mint;
 pub mod injection;

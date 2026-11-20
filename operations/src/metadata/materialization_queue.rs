@@ -263,14 +263,14 @@ impl Operation for NextTimerOperation {
     }
 }
 
-// Half-core concurrency reserves capacity for foreground create and validation traffic.
-pub fn materialization_group_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|cores| cores.get())
-        .unwrap_or(4)
-        .div_ceil(2)
-        .max(1)
+/// The graph groups one drain finishes at once on a host with `cores` logical cores: half of
+/// them, so capacity stays for foreground create and validation traffic.
+pub fn group_concurrency(cores: usize) -> usize {
+    cores.div_ceil(2).max(1)
 }
+
+/// The cores a caller assumes when the host cannot tell how many logical cores it offers.
+pub const UNKNOWN_CORES: usize = 4;
 
 #[derive(Debug, PartialEq)]
 enum BatchStage {

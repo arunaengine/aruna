@@ -139,21 +139,23 @@ pub struct TimerInput {
     pub now_ms: u64,
     /// This node, `None` on a node without a net transport.
     pub local_node: Option<NodeId>,
+    /// This node and its realm while a net transport runs.
+    pub serving: Option<(NodeId, RealmId)>,
     /// What the timer kept from its last run.
     pub memory: TimerMemory,
-    /// What only this node's handles and host know.
+    /// What only this node's handles and host know, filled only where [`timer_needs`] says.
     pub facts: NodeFacts,
-    /// This node's routing rules and backend catalog.
+    /// This node's routing rules and backend catalog, filled like `facts`.
     pub routing: NodeRouting,
     /// Whether this node has blob storage.
     pub has_blob: bool,
-    /// The jobs running on this node, for its heartbeat.
+    /// The jobs running on this node, for its heartbeat, filled like `facts`.
     pub running: Option<RunningJobs>,
     /// Whether this node runs a task handle.
     pub has_tasks: bool,
-    /// Graph groups the materialization drain finishes at once on this host.
-    pub group_concurrency: usize,
-    /// The fresh heartbeats this node holds, filled only for a key [`needs_cluster`] names.
+    /// The logical cores the host offers, filled like `facts`.
+    pub host_cores: usize,
+    /// The fresh heartbeats this node holds, filled like `facts`.
     pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
     /// What each local executor backend advertises, filled like `heartbeats`.
     pub limits: BTreeMap<String, ResourceEnvelope>,
@@ -161,10 +163,39 @@ pub struct TimerInput {
     pub rocrate_limits: RoCrateLimits,
 }
 
-/// Whether the timer of `key` reads the heartbeats and executor limits; they are copied only
-/// for such a timer, since most runs never look at them.
-pub fn needs_cluster(key: &TaskKey) -> bool {
-    matches!(key, TaskKey::DrainWitnessQueue | TaskKey::MaintainRanges)
+/// Which costly inputs a timer reads; the shell builds only these, since most runs never look
+/// at host telemetry, routing, job counts or other nodes' heartbeats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimerNeeds {
+    pub facts: bool,
+    pub routing: bool,
+    pub running: bool,
+    /// The fresh heartbeats and executor limits.
+    pub cluster: bool,
+    pub cores: bool,
+}
+
+/// The costly inputs the timer of `key` reads.
+pub fn timer_needs(key: &TaskKey) -> TimerNeeds {
+    let routing = matches!(
+        key,
+        TaskKey::MigrateCompression
+            | TaskKey::DrainCaptures
+            | TaskKey::DrainCleanupQueue
+            | TaskKey::DrainReplicationQueue
+            | TaskKey::DrainMaterializationQueue
+            | TaskKey::MaintainRanges
+    );
+    TimerNeeds {
+        facts: matches!(
+            key,
+            TaskKey::SyncPlacements { .. } | TaskKey::PublishNodeInfo
+        ),
+        routing,
+        running: matches!(key, TaskKey::PublishNodeInfo),
+        cluster: matches!(key, TaskKey::DrainWitnessQueue | TaskKey::MaintainRanges),
+        cores: matches!(key, TaskKey::DrainMaterializationQueue),
+    }
 }
 
 impl TimerInput {
@@ -173,13 +204,14 @@ impl TimerInput {
         Self {
             now_ms,
             local_node,
+            serving: None,
             memory: TimerMemory::default(),
             facts: NodeFacts::default(),
             routing: NodeRouting::default(),
             has_blob: false,
             running: None,
             has_tasks: false,
-            group_concurrency: 1,
+            host_cores: 1,
             heartbeats: BTreeMap::new(),
             limits: BTreeMap::new(),
             rocrate_limits: RoCrateLimits::default(),
@@ -308,7 +340,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::MigrateCompression => {
             let after = input.memory.cursor.clone().map(Key::from);
             let routing = input.routing.clone();
-            let run = ProcessMigrationsOperation::new(routing, input.facts.serving, after);
+            let run = ProcessMigrationsOperation::new(routing, input.serving, after);
             Some(TimerOperation::MigrateCompression(run))
         }
         TaskKey::SweepHiddenBlobs => Some(TimerOperation::SweepHiddenBlobs(
@@ -319,7 +351,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         )),
         TaskKey::DeliverKeyWakes => {
             let start = input.memory.cursor.clone().map(Key::from);
-            let deliver = DeliverWakesOperation::new(start, input.facts.serving);
+            let deliver = DeliverWakesOperation::new(start, input.serving);
             Some(TimerOperation::DeliverKeyWakes(deliver))
         }
         TaskKey::DrainCleanupQueue => Some(TimerOperation::DrainCleanupQueue(
@@ -329,7 +361,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             DrainRefreshOperation::new(),
         )),
         TaskKey::DrainCaptures => {
-            let ids = input.facts.serving;
+            let ids = input.serving;
             let routing = input.routing.clone();
             let node = GitNode { ids, routing };
             Some(TimerOperation::DrainCaptures(CaptureDrainOperation::new(
@@ -337,7 +369,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             )))
         }
         TaskKey::SettleJobTerminals => Some(TimerOperation::SettleJobTerminals(
-            SettleTerminalsOperation::new(input.facts.serving, input.now_ms),
+            SettleTerminalsOperation::new(input.serving, input.now_ms),
         )),
         TaskKey::PruneJobs => Some(TimerOperation::PruneJobs(PruneKeepingWork::new(
             JOB_PRUNE_PAGE,
@@ -346,7 +378,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             Some(node_id) => TimerOperation::DrainMirrorRepair(DrainRepairsOperation::new(node_id)),
             None => TimerOperation::Wait(WaitOperation::after(Some(REPAIR_RETRY_AFTER))),
         }),
-        TaskKey::PublishUsageSnapshots => Some(match input.facts.serving {
+        TaskKey::PublishUsageSnapshots => Some(match input.serving {
             Some((node_id, realm_id)) => {
                 let keys = (node_id, realm_id);
                 let publish = PublishUsageOperation::new(keys, Some(realm_id), false, true);
@@ -354,7 +386,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
         }),
-        TaskKey::PublishNodeInfo => Some(match input.facts.serving {
+        TaskKey::PublishNodeInfo => Some(match input.serving {
             Some((node_id, realm_id)) => {
                 let heartbeat = InfoTimerOperation::new(node_id, realm_id, input);
                 TimerOperation::PublishNodeInfo(heartbeat)
@@ -373,7 +405,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainPruneQueue => Some(TimerOperation::DrainPruneQueue(PruneRunOperation::new(
             input,
         ))),
-        TaskKey::DrainFamilyOutbox => Some(match input.facts.serving {
+        TaskKey::DrainFamilyOutbox => Some(match input.serving {
             Some((node_id, realm_id)) => {
                 TimerOperation::DrainFamilyOutbox(FamilyTimerOperation::new(realm_id, node_id))
             }
@@ -381,15 +413,15 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         }),
         TaskKey::DrainWitnessQueue => {
             let (fresh, limits) = (input.heartbeats.clone(), input.limits.clone());
-            let node = witness_node(input.facts.serving, fresh, limits);
+            let node = witness_node(input.serving, fresh, limits);
             let drain = WitnessDrainOperation::new(node, input.now_ms);
             Some(TimerOperation::DrainWitnessQueue(drain))
         }
-        TaskKey::RunBackendImports => Some(match input.facts.serving {
+        TaskKey::RunBackendImports => Some(match input.serving {
             Some((node_id, _)) => {
                 let retention_ms = input.rocrate_limits.artifact_retention_ms;
                 let now_ms = input.now_ms;
-                let run = RunDueOperation::new(node_id, retention_ms, now_ms, input.facts.serving);
+                let run = RunDueOperation::new(node_id, retention_ms, now_ms, input.serving);
                 TimerOperation::RunBackendImports(run)
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
@@ -397,7 +429,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
             input,
         ))),
-        TaskKey::RefreshBlobHolders => Some(match input.facts.serving {
+        TaskKey::RefreshBlobHolders => Some(match input.serving {
             Some((node_id, realm_id)) => {
                 let limits = input.rocrate_limits.clone();
                 let refresh = HoldersTimerOperation::new(realm_id, node_id, limits);
@@ -409,10 +441,10 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
         }),
         TaskKey::DrainUploadOutbox => Some(TimerOperation::DrainUploadOutbox(drain_sync_outbox(
-            input.facts.serving,
+            input.serving,
         ))),
         TaskKey::DrainDeviceIntake => Some(TimerOperation::DrainDeviceIntake(drain_publish_queue(
-            input.facts.serving,
+            input.serving,
         ))),
         _ => None,
     }
@@ -922,6 +954,24 @@ pub enum PeerAnswer {
     Kept,
 }
 
+impl PeerAnswer {
+    /// The answer to a request whose run broke off, where its protocol has one: job control and
+    /// native references answer unavailable, the other protocols close the stream.
+    pub fn unavailable(alpn: Alpn, failure: &PeerFailure) -> Option<PeerAnswer> {
+        match alpn {
+            Alpn::JobControl => Some(PeerAnswer::Job(JobAnswer::unavailable(failure))),
+            Alpn::NativeReference => {
+                let reject = NativeReferenceReject::Unavailable(failure.to_string());
+                Some(PeerAnswer::Native((
+                    NativeReferenceResponse::Rejected(reject),
+                    None,
+                )))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A peer request that ended without an answer; the shell logs it and closes the stream.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("{0}")]
@@ -1255,6 +1305,7 @@ mod tests {
     use crate::connectors::reference_prune::PruneError;
     use crate::jobs::lifecycle::LifecycleError;
     use crate::jobs::prune::JobPruneOutcome;
+    use crate::metadata::materialization_queue::group_concurrency;
     use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
     use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
     use crate::s3::object::metadata::ReferenceRefreshError;
@@ -1477,8 +1528,8 @@ mod tests {
     #[test]
     fn witness_drain_plans() {
         // Only the witness timer copies the cluster facts; left or failed rows retry soon.
-        assert!(needs_cluster(&TaskKey::DrainWitnessQueue));
-        assert!(!needs_cluster(&TaskKey::PruneJobs));
+        assert!(timer_needs(&TaskKey::DrainWitnessQueue).cluster);
+        assert!(!timer_needs(&TaskKey::PruneJobs).cluster);
         let retry = Ok(TimerPlan::from(Some(WITNESS_RETRY_AFTER)));
         assert_eq!(
             WitnessDrainOperation::rearm(Err(IoError::Unfinished)),
@@ -1511,6 +1562,22 @@ mod tests {
         assert_eq!(recheck, Ok(TimerPlan::from(Some(PUBLISH_CONTINUE_AFTER))));
         let idle = DrainPublishOperation::rearm(Ok(DrainOutcome::Idle));
         assert_eq!(idle, Ok(TimerPlan::default()));
+    }
+
+    // A drain that needs only local identity builds no host telemetry, routing or job counts;
+    // only the heartbeat reads facts and job counts, and only the materialization drain the cores.
+    #[test]
+    fn telemetry_only_heartbeat() {
+        assert_eq!(
+            timer_needs(&TaskKey::DrainNotificationOutbox),
+            TimerNeeds::default()
+        );
+        let heartbeat = timer_needs(&TaskKey::PublishNodeInfo);
+        assert!(heartbeat.facts && heartbeat.running && !heartbeat.routing);
+        let materialize = timer_needs(&TaskKey::DrainMaterializationQueue);
+        assert!(materialize.routing && materialize.cores && !materialize.facts);
+        assert_eq!(group_concurrency(7), 4);
+        assert_eq!(group_concurrency(0), 1);
     }
 
     #[test]
@@ -1638,6 +1705,19 @@ mod tests {
         else {
             panic!("a broken native run is refused");
         };
+    }
+
+    // A broken job or native run is answered unavailable; other protocols close the stream.
+    #[test]
+    fn broken_run_answered() {
+        let failure = PeerFailure("broken".to_string());
+        let job = PeerAnswer::unavailable(Alpn::JobControl, &failure);
+        assert_eq!(job, Some(PeerAnswer::Job(JobAnswer::unavailable(&failure))));
+        let native = PeerAnswer::unavailable(Alpn::NativeReference, &failure);
+        let Some(PeerAnswer::Native((NativeReferenceResponse::Rejected(_), None))) = native else {
+            panic!("a broken native run is refused");
+        };
+        assert_eq!(PeerAnswer::unavailable(Alpn::Notification, &failure), None);
     }
 
     #[test]

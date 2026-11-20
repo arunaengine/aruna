@@ -634,7 +634,10 @@ mod tests {
         };
         assert_eq!(notices.len(), 1);
         let turn = operation.next(IoResult::Done);
-        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))), "then the next page");
+        assert!(
+            matches!(turn, Ok(Next::Call(IoCall::Page { .. }))),
+            "then the next page"
+        );
     }
 
     #[test]

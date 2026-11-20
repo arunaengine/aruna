@@ -39,7 +39,9 @@ pub async fn hold_change(effect: &TaskEffect) -> Option<tokio::sync::MutexGuard<
     Some(hold_timer(key).await)
 }
 
-async fn hold_timer(key: &TaskKey) -> tokio::sync::MutexGuard<'static, ()> {
+/// Holds the change lock of `key` as a timer change does, so a caller can reread its row and hand
+/// it to the scheduler before any later change of the key.
+pub async fn hold_timer(key: &TaskKey) -> tokio::sync::MutexGuard<'static, ()> {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     let index = (hasher.finish() % TIMER_LOCK_COUNT as u64) as usize;
@@ -52,17 +54,28 @@ pub async fn persist_task_effect(
     storage: &StorageHandle,
     effect: &TaskEffect,
 ) -> Result<(), String> {
+    persist_stamped(storage, effect).await.map(|_| ())
+}
+
+/// [`persist_task_effect`], answering the due time of the row the change leaves: the stamp the
+/// scheduler carries to the firing, so that firing deletes this row and no newer one.
+pub async fn persist_stamped(
+    storage: &StorageHandle,
+    effect: &TaskEffect,
+) -> Result<Option<u64>, String> {
     if timer_is_restored(effect) || timer_is_ephemeral(effect) {
-        return Ok(());
+        return Ok(None);
     }
 
     match effect {
-        TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await,
-        TaskEffect::ShortenTimer { key, after } => shorten_timer(storage, key, *after).await,
-        TaskEffect::CancelTimer { key } => delete_timer(storage, key).await,
+        TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await.map(Some),
+        TaskEffect::ShortenTimer { key, after } => {
+            shorten_timer(storage, key, *after).await.map(Some)
+        }
+        TaskEffect::CancelTimer { key } => delete_timer(storage, key).await.map(|_| None),
         TaskEffect::ScheduleIdleTimer { .. }
         | TaskEffect::AbortRunningHandlers { .. }
-        | TaskEffect::Pull(_) => Ok(()),
+        | TaskEffect::Pull(_) => Ok(None),
     }
 }
 
@@ -109,12 +122,14 @@ fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     matches!(key, TaskKey::LockBucket { .. })
 }
 
-/// Deletes the row of a timer that fired, if that row is due: a row a later change wrote for the
-/// key stays. Best effort: a due row that survives only fires the work once more after a restart.
-pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey) {
+/// Deletes the row of a timer that fired: the row its `stamp` names, or without a stamp a row
+/// that is due. A row a later change wrote for the key stays. Best effort: a row that survives
+/// only fires the work once more after a restart.
+pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey, stamp: Option<u64>) {
     let _held = hold_timer(key).await;
+    let fired = |due: u64| stamp.map_or(due <= unix_timestamp_millis(), |stamp| due == stamp);
     let due = match read_timer(storage, key).await {
-        Ok(row) => row.is_some_and(|row| row.due_unix_millis <= unix_timestamp_millis()),
+        Ok(row) => row.is_some_and(|row| fired(row.due_unix_millis)),
         Err(error) => {
             warn!(error = %error, key = ?key, "Failed to read a fired task timer");
             return;
@@ -129,7 +144,7 @@ async fn write_timer(
     storage: &StorageHandle,
     key: &TaskKey,
     after: Duration,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let due_unix_millis = due_at_millis(after)?;
     write_record(
         storage,
@@ -138,17 +153,20 @@ async fn write_timer(
             due_unix_millis,
         },
     )
-    .await
+    .await?;
+    Ok(due_unix_millis)
 }
 
 async fn shorten_timer(
     storage: &StorageHandle,
     key: &TaskKey,
     after: Duration,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let requested_due_at = due_at_millis(after)?;
     match read_timer(storage, key).await? {
-        Some(existing) if existing.due_unix_millis <= requested_due_at => Ok(()),
+        Some(existing) if existing.due_unix_millis <= requested_due_at => {
+            Ok(existing.due_unix_millis)
+        }
         _ => {
             write_record(
                 storage,
@@ -157,7 +175,8 @@ async fn shorten_timer(
                     due_unix_millis: requested_due_at,
                 },
             )
-            .await
+            .await?;
+            Ok(requested_due_at)
         }
     }
 }
@@ -218,6 +237,32 @@ pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) -> Result<
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
+    }
+}
+
+/// Deletes a row whose value no longer decodes, under its key's change lock and only while it still
+/// does not decode, so a timer a later change wrote for the key stays.
+pub async fn delete_malformed(storage: &StorageHandle, key: ByteView) -> Result<(), String> {
+    let task_key = postcard::from_bytes::<TaskKey>(&key).ok();
+    let _held = match &task_key {
+        Some(task_key) => Some(hold_timer(task_key).await),
+        None => None,
+    };
+    let read = StorageEffect::Read {
+        key_space: TASK_TIMER_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id: None,
+    };
+    let value = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("unexpected storage event: {other:?}")),
+    };
+    match value {
+        Some(bytes) if postcard::from_bytes::<PersistedTaskTimer>(&bytes).is_err() => {
+            delete_timer_key(storage, key).await
+        }
+        _ => Ok(()),
     }
 }
 
