@@ -66,8 +66,6 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
-use aruna_operations::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
-use aruna_operations::jobs::node_inputs::witness_node;
 use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
 use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
@@ -126,7 +124,9 @@ use aruna_operations::sync::outbox_defer::{
 use aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
-use aruna_operations::triggers::{TimerInput, TimerMemory, TimerPlan, timer_operation};
+use aruna_operations::triggers::{
+    TimerInput, TimerMemory, TimerPlan, needs_cluster, timer_operation,
+};
 use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_task_effect};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
@@ -677,6 +677,7 @@ impl OperationsTaskHandler {
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
     async fn run_trigger(&self, key: TaskKey) {
         let memory = self.kept_memory(&key);
+        let cluster = needs_cluster(&key);
         let input = TimerInput {
             now_ms: unix_timestamp_millis(),
             local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
@@ -687,6 +688,8 @@ impl OperationsTaskHandler {
             running: Some(self.jobs_runtime.running_jobs()),
             has_tasks: self.context.task_handle.is_some(),
             group_concurrency: materialization_group_concurrency(),
+            heartbeats: (cluster.then(|| self.context.fresh_heartbeats())).unwrap_or_default(),
+            limits: (cluster.then(|| self.context.compute_limits())).unwrap_or_default(),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -897,9 +900,7 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainWitnessQueue => Box::pin(async move {
-                self.drain_witness_queue().await;
-            }),
+            TaskKey::DrainWitnessQueue => Box::pin(self.run_trigger(key)),
             TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
             TaskKey::DrainLinkQueue => Box::pin(async move {
                 self.drain_link_queue().await;

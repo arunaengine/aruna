@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -11,7 +12,8 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::ShardTransportMessage;
 use aruna_core::git::GitNode;
-use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, RunningJobs};
+use aruna_core::compute::ResourceEnvelope;
+use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRequest;
 use aruna_core::native_reference::{
@@ -38,6 +40,8 @@ use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::timers::FamilyTimerOperation;
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
+use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
+use crate::jobs::node_inputs::witness_node;
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
@@ -137,6 +141,16 @@ pub struct TimerInput {
     pub has_tasks: bool,
     /// Graph groups the materialization drain finishes at once on this host.
     pub group_concurrency: usize,
+    /// The fresh heartbeats this node holds, filled only for a key [`needs_cluster`] names.
+    pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
+    /// What each local executor backend advertises, filled like `heartbeats`.
+    pub limits: BTreeMap<String, ResourceEnvelope>,
+}
+
+/// Whether the timer of `key` reads the heartbeats and executor limits; they are copied only
+/// for such a timer, since most runs never look at them.
+pub fn needs_cluster(key: &TaskKey) -> bool {
+    matches!(key, TaskKey::DrainWitnessQueue)
 }
 
 impl TimerInput {
@@ -152,6 +166,8 @@ impl TimerInput {
             running: None,
             has_tasks: false,
             group_concurrency: 1,
+            heartbeats: BTreeMap::new(),
+            limits: BTreeMap::new(),
         }
     }
 }
@@ -211,6 +227,7 @@ pub enum TimerOperation {
     DrainMaterializationQueue(MaterializationRunOperation),
     DrainPruneQueue(PruneRunOperation),
     DrainFamilyOutbox(FamilyTimerOperation),
+    DrainWitnessQueue(WitnessDrainOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -342,6 +359,12 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
         }),
+        TaskKey::DrainWitnessQueue => {
+            let (fresh, limits) = (input.heartbeats.clone(), input.limits.clone());
+            let node = witness_node(input.facts.serving, fresh, limits);
+            let drain = WitnessDrainOperation::new(node, input.now_ms);
+            Some(TimerOperation::DrainWitnessQueue(drain))
+        }
         _ => None,
     }
 }
@@ -384,6 +407,7 @@ macro_rules! each_timer {
             TimerOperation::DrainMaterializationQueue($operation) => $body,
             TimerOperation::DrainPruneQueue($operation) => $body,
             TimerOperation::DrainFamilyOutbox($operation) => $body,
+            TimerOperation::DrainWitnessQueue($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -724,6 +748,17 @@ impl TimerRun for FamilyTimerOperation {
             reason: error.to_string(),
         })?;
         Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for WitnessDrainOperation {
+    /// Deadlines left after a bounded pass, or a failed pass, run again soon.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let remaining = result.unwrap_or_else(|error| {
+            warn!(error = %error, "Witness deadline scan failed");
+            true
+        });
+        Ok(TimerPlan::from(remaining.then_some(WITNESS_RETRY_AFTER)))
     }
 }
 
@@ -1318,6 +1353,16 @@ mod tests {
         assert!(!timer_operation(&TaskKey::PruneJobs, &input()).unwrap().bulk_lane());
         let failed = PruneRunOperation::rearm(Err(IoError::Unfinished));
         assert_eq!(failed.unwrap_err().retry_after, GRAPH_RETRY_AFTER);
+    }
+
+    #[test]
+    fn witness_drain_plans() {
+        // Only the witness timer copies the cluster facts; left or failed rows retry soon.
+        assert!(needs_cluster(&TaskKey::DrainWitnessQueue));
+        assert!(!needs_cluster(&TaskKey::PruneJobs));
+        let retry = Ok(TimerPlan::from(Some(WITNESS_RETRY_AFTER)));
+        assert_eq!(WitnessDrainOperation::rearm(Err(IoError::Unfinished)), retry);
+        assert_eq!(WitnessDrainOperation::rearm(Ok(false)), Ok(TimerPlan::default()));
     }
 
     #[test]
