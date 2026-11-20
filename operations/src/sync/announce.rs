@@ -26,7 +26,7 @@ use aruna_core::types::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 

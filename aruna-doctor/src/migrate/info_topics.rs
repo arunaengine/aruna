@@ -192,7 +192,7 @@ pub(super) mod tests {
         SYNC_QUARANTINE_KEYSPACE,
     };
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::sync::outbox_record::new_identified_record;
+    use aruna_operations::sync::outbox::record::new_identified_record;
     use irokle::oplog::Oplog;
     use irokle::{Ed25519Signer, ReplicationPolicy, Signer, TopicGenesis, actor_id_for};
     use tempfile::tempdir;

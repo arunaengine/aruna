@@ -950,7 +950,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::sync::outbox_record::{new_identified_record, outbox_write_entry};
+    use aruna_operations::sync::outbox::record::{new_identified_record, outbox_write_entry};
 
     let storage = env.open_storage().await;
     clear_space(&storage, SYNC_OUTBOX_KEYSPACE).await?;

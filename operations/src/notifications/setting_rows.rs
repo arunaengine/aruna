@@ -27,7 +27,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::compute::{draw_secret, drawn_secret};

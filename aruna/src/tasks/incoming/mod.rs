@@ -105,10 +105,10 @@ use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
-use aruna_operations::sync::outbox_defer::{
+use aruna_operations::sync::outbox::defer::{
     DrainDeferState, DrainRecord, admin_origin, classify_deferred_record, partition_drain_records,
 };
-use aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
+use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{

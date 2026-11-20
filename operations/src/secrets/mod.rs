@@ -30,7 +30,7 @@ use ulid::Ulid;
 /// when it wrote notices. A missed timer leaves the rows to the next drain.
 fn drains(notices: bool) -> Vec<IoCall> {
     let notice = notices.then(notification::schedule_drain_effect);
-    let outbox = crate::sync::outbox_record::schedule_drain_effect();
+    let outbox = crate::sync::outbox::record::schedule_drain_effect();
     (std::iter::once(outbox).chain(notice))
         .map(IoCall::from)
         .collect()

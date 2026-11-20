@@ -17,7 +17,7 @@ use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use tracing::warn;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     ADMIN_OUTBOX_PREFIX, outbox_stream_prefixes, revocation_index_key,
 };
 
@@ -269,10 +269,10 @@ impl Operation for OutboxTimerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::outbox_record::{
+    use crate::sync::outbox::record::{
         OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
     };
-    use crate::sync::outbox_record::{new_identified_record, write_outbox_effect};
+    use crate::sync::outbox::record::{new_identified_record, write_outbox_effect};
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };

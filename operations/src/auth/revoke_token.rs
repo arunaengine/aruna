@@ -28,8 +28,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::epoch_due::DueMarks;
-use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{admin_outbox_prefix, revocation_index_entry};
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -668,7 +668,7 @@ mod tests {
     };
     use crate::document_repository::GetConfigOperation;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::sync::outbox_record::admin_outbox_prefix;
+    use crate::sync::outbox::record::admin_outbox_prefix;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_TOKEN_LIFETIME;
     use aruna_core::auth::bearer_token_hash;

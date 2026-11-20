@@ -16,7 +16,7 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use crate::sync::outbox_record::new_identified_record;
+use crate::sync::outbox::record::new_identified_record;
 
 fn node(seed: u8) -> NodeId {
     let mut bytes = [0u8; 32];

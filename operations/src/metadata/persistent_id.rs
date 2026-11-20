@@ -22,7 +22,7 @@ use crate::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route
 use crate::metadata::pid_transition::{PidOutcome, PidTransition, PidTransitionOperation};
 use crate::metadata::secondary_ids::{AddIdentifiersInput, AddIdentifiersOperation};
 use crate::realm::load_config::config_unavailable;
-use crate::sync::outbox_record::schedule_drain_effect;
+use crate::sync::outbox::record::schedule_drain_effect;
 
 /// Reads one document's persistent identifier mapping, if it has one.
 #[derive(Debug, PartialEq)]
