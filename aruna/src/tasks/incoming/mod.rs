@@ -181,7 +181,7 @@ use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::{
     DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
 };
-use aruna_operations::triggers::{TimerInput, timer_operation};
+use aruna_operations::triggers::{TimerInput, TimerMemory, TimerPlan, timer_operation};
 use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_task_effect};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
@@ -258,6 +258,9 @@ pub(crate) struct OperationsTaskHandler {
     // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
     // a restarted node simply retries from the base interval.
     retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
+    // What each converted timer keeps between runs; the operations decide on it. Loss on
+    // restart is fine: a restarted timer starts afresh.
+    timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
     // Where a capped reclaim sweep resumes. Loss on restart is fine: the next
     // sweep starts from the head and reaches the tail over the ticks after it.
     reclaim_cursor: std::sync::Mutex<Option<Key>>,
@@ -409,6 +412,7 @@ impl OperationsTaskHandler {
             jobs_runtime,
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
+            timer_memory: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
             migration_cursor: std::sync::Mutex::new(None),
             catch_up: std::sync::Mutex::default(),
@@ -818,9 +822,16 @@ impl OperationsTaskHandler {
     /// the selected timer's future stays on the stack while its work runs.
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
     async fn run_trigger(&self, key: TaskKey) {
+        let memory = (self.timer_memory.lock())
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
         let input = TimerInput {
             now_ms: unix_timestamp_millis(),
             local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
+            memory: memory.clone(),
+            facts: node_facts(&self.context),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -832,19 +843,33 @@ impl OperationsTaskHandler {
             .map(|key| key.to_vec())
             .unwrap_or_default();
         let build = || operation.clone();
-        let after = match drive_retry(build, self.context.as_ref(), &seed).await {
-            Ok(after) => after,
+        let plan = match drive_retry(build, self.context.as_ref(), &seed).await {
+            Ok(plan) => plan,
             Err(failure) => {
                 warn!(task_id = ?key, error = %failure, "Timer run failed");
-                Some(failure.retry_after)
+                TimerPlan {
+                    after: Some(failure.retry_after),
+                    memory,
+                }
             }
         };
-        let Some(after) = after else {
+        self.keep_memory(&key, plan.memory);
+        let Some(after) = plan.after else {
             return;
         };
         if !self.reschedule_timer(key.clone(), after).await && key == TaskKey::DrainAppliedSync {
             // Its persisted timer is gone and durable rows wait on it, so a live wake stays.
             self.keep_retrying(key, after).await;
+        }
+    }
+
+    /// Stores what a timer keeps until its next run; an empty memory is dropped.
+    fn keep_memory(&self, key: &TaskKey, memory: TimerMemory) {
+        let mut kept = (self.timer_memory.lock()).unwrap_or_else(|error| error.into_inner());
+        if memory == TimerMemory::default() {
+            kept.remove(key);
+        } else {
+            kept.insert(key.clone(), memory);
         }
     }
 

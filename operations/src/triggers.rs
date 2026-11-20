@@ -9,6 +9,7 @@ use std::time::Duration;
 use aruna_core::alpn::Alpn;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
@@ -29,12 +30,53 @@ use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
 
+/// What a timer keeps on this node between its runs, in memory only: its attempts since the last
+/// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
+/// every decision about it stays with the timer's operation; a restart starts it afresh.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimerMemory {
+    pub attempts: u32,
+    pub cursor: Option<Vec<u8>>,
+}
+
+/// When a timer runs again, `None` while it waits for work, and what it keeps until then.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimerPlan {
+    pub after: Option<Duration>,
+    pub memory: TimerMemory,
+}
+
+impl From<Option<Duration>> for TimerPlan {
+    fn from(after: Option<Duration>) -> Self {
+        Self {
+            after,
+            memory: TimerMemory::default(),
+        }
+    }
+}
+
 /// What the timer shell knows when a timer fires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TimerInput {
     pub now_ms: u64,
     /// This node, `None` on a node without a net transport.
     pub local_node: Option<NodeId>,
+    /// What the timer kept from its last run.
+    pub memory: TimerMemory,
+    /// What only this node's handles and host know.
+    pub facts: NodeFacts,
+}
+
+impl TimerInput {
+    /// A timer firing with nothing kept from an earlier run and no node facts.
+    pub fn new(now_ms: u64, local_node: Option<NodeId>) -> Self {
+        Self {
+            now_ms,
+            local_node,
+            memory: TimerMemory::default(),
+            facts: NodeFacts::default(),
+        }
+    }
 }
 
 /// A timer run that failed; the shell logs it and runs the timer again after `retry_after`.
@@ -57,14 +99,15 @@ impl From<IoError> for TimerFailure {
     }
 }
 
-/// A timer operation decides when its timer runs again.
+/// A timer operation decides when its timer runs again and what it keeps until then.
 pub trait TimerRun: Operation + Sized {
-    /// The delay before the next run, or `None` when the timer stays off until work arrives.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure>;
+    /// The plan of the next run; a failure runs the timer again after its delay, keeping its
+    /// memory as it was.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure>;
 }
 
-/// The operation of one timer run. Its output is when the timer runs again; the shell persists
-/// and arms that timer.
+/// The operation of one timer run. Its output is when the timer runs again and what it keeps;
+/// the shell persists and arms that timer and stores the memory.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TimerOperation {
     DrainNotificationOutbox(DrainOutboxOperation),
@@ -112,7 +155,7 @@ macro_rules! each_timer {
 /// The next call of a timer operation, or when its timer runs again.
 fn timer_turn<O: TimerRun>(
     turn: Result<Next<O::Output>, O::Error>,
-) -> Result<Next<Option<Duration>>, TimerFailure> {
+) -> Result<Next<TimerPlan>, TimerFailure> {
     match turn {
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
@@ -125,7 +168,7 @@ fn timer_turn<O: TimerRun>(
 }
 
 /// The conflict decision of a timer operation; an output it finishes with is rearmed.
-fn timer_conflict<O: TimerRun>(operation: &mut O, attempt: u32) -> AfterConflict<Option<Duration>> {
+fn timer_conflict<O: TimerRun>(operation: &mut O, attempt: u32) -> AfterConflict<TimerPlan> {
     match operation.on_conflict(attempt) {
         AfterConflict::Rerun => AfterConflict::Rerun,
         AfterConflict::Fail => AfterConflict::Fail,
@@ -137,7 +180,7 @@ fn timer_conflict<O: TimerRun>(operation: &mut O, attempt: u32) -> AfterConflict
 }
 
 impl Operation for TimerOperation {
-    type Output = Option<Duration>;
+    type Output = TimerPlan;
     type Error = TimerFailure;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
@@ -173,31 +216,32 @@ impl Operation for TimerOperation {
     }
 }
 
-fn timer_first<O: TimerRun>(operation: &mut O) -> Result<Next<Option<Duration>>, TimerFailure> {
+fn timer_first<O: TimerRun>(operation: &mut O) -> Result<Next<TimerPlan>, TimerFailure> {
     timer_turn::<O>(operation.first())
 }
 
 fn timer_next<O: TimerRun>(
     operation: &mut O,
     result: IoResult,
-) -> Result<Next<Option<Duration>>, TimerFailure> {
+) -> Result<Next<TimerPlan>, TimerFailure> {
     timer_turn::<O>(operation.next(result))
 }
 
 impl TimerRun for DrainOutboxOperation {
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
-        result.map_err(|error| TimerFailure {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
             retry_after: DELIVERY_RETRY_AFTER,
             reason: error.to_string(),
-        })
+        })?;
+        Ok(TimerPlan::from(after))
     }
 }
 
 impl TimerRun for PublishInterestOperation {
     /// A published or skipped run waits for the next change; a failed one runs again soon.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         match result {
-            Ok(_) => Ok(None),
+            Ok(_) => Ok(TimerPlan::default()),
             Err(error) => Err(TimerFailure {
                 retry_after: WATCH_PUBLISH_DEBOUNCE,
                 reason: error.to_string(),
@@ -209,23 +253,23 @@ impl TimerRun for PublishInterestOperation {
 impl TimerRun for WatchDrainOperation {
     /// A finished run waits for the next queued event; one that kept an unsettled event, or
     /// that failed itself, runs again later.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
-        result.map_err(TimerFailure::from)
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
     }
 }
 
 impl TimerRun for AppliedDrainOperation {
     /// A finished run waits for the next applied reconcile; one that kept a row after a failed
     /// follow-up, or that failed itself, runs again later.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
-        result.map_err(TimerFailure::from)
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
     }
 }
 
 impl TimerRun for PruneNotificationsOperation {
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         match result {
-            Ok(outcome) => Ok(Some(outcome.rearm())),
+            Ok(outcome) => Ok(TimerPlan::from(Some(outcome.rearm()))),
             Err(error) => Err(TimerFailure {
                 retry_after: NOTIFICATION_RETRY_AFTER,
                 reason: error.to_string(),
@@ -492,20 +536,19 @@ impl Operation for PeerOperation {
 mod tests {
     use super::*;
 
-    const INPUT: TimerInput = TimerInput {
-        now_ms: 1_000,
-        local_node: None,
-    };
+    fn input() -> TimerInput {
+        TimerInput::new(1_000, None)
+    }
 
     #[test]
     fn unconverted_keys_absent() {
-        assert!(timer_operation(&TaskKey::DrainJobQueue, &INPUT).is_none());
-        assert!(timer_operation(&TaskKey::PruneJobs, &INPUT).is_none());
+        assert!(timer_operation(&TaskKey::DrainJobQueue, &input()).is_none());
+        assert!(timer_operation(&TaskKey::PruneJobs, &input()).is_none());
     }
 
     #[test]
     fn prune_key_named() {
-        let operation = timer_operation(&TaskKey::PruneNotifications, &INPUT);
+        let operation = timer_operation(&TaskKey::PruneNotifications, &input());
         assert_eq!(
             operation,
             Some(TimerOperation::PruneNotifications(
@@ -516,7 +559,7 @@ mod tests {
 
     #[test]
     fn timer_delegates_calls() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
+        let mut operation = timer_operation(&TaskKey::PruneNotifications, &input()).unwrap();
         let mut inner = PruneNotificationsOperation::new(1_000, PRUNE_PAGE_SIZE);
         assert_eq!(
             operation.first(),
@@ -526,17 +569,17 @@ mod tests {
             operation.transaction(),
             aruna_core::operation::TransactionMode::None
         );
-        let drain = timer_operation(&TaskKey::DrainNotificationOutbox, &INPUT);
+        let drain = timer_operation(&TaskKey::DrainNotificationOutbox, &input());
         assert_eq!(
             drain.unwrap().first(),
-            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+            Ok(Next::Done(TimerPlan::from(Some(DELIVERY_RETRY_AFTER))))
         );
     }
 
     /// The table keeps the wrapped operation's cleanup and conflict decisions.
     #[test]
     fn hooks_are_forwarded() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
+        let mut operation = timer_operation(&TaskKey::PruneNotifications, &input()).unwrap();
         assert!(operation.abort().is_empty());
         assert_eq!(operation.on_conflict(1), AfterConflict::Rerun);
         assert_eq!(operation.on_conflict(9), AfterConflict::Fail);
@@ -551,7 +594,7 @@ mod tests {
 
     #[test]
     fn timer_failure_rearms() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
+        let mut operation = timer_operation(&TaskKey::PruneNotifications, &input()).unwrap();
         operation.first().unwrap();
         let failure = operation.next(IoResult::Done).unwrap_err();
         assert_eq!(failure.retry_after, NOTIFICATION_RETRY_AFTER);
