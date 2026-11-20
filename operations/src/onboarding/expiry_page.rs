@@ -142,18 +142,27 @@ mod tests {
         let mut early = ExpiryPageOperation::new(None, 2);
         early.first().unwrap();
         let refused = early.next(IoResult::Values(Vec::new()));
-        assert!(matches!(refused, Err(ListSecretsError::UnexpectedEvent { .. })));
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
         let mut twice = ExpiryPageOperation::new(None, 2);
         twice.first().unwrap();
         twice.next(page()).unwrap();
         let refused = twice.next(page());
-        assert!(matches!(refused, Err(ListSecretsError::UnexpectedEvent { .. })));
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
         let mut done = ExpiryPageOperation::new(None, 2);
         done.first().unwrap();
         done.next(page()).unwrap();
         done.next(IoResult::Values(Vec::new())).unwrap();
         let refused = done.next(IoResult::Values(Vec::new()));
-        assert!(matches!(refused, Err(ListSecretsError::UnexpectedEvent { .. })));
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
     }
 
     #[test]

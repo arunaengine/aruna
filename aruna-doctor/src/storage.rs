@@ -119,7 +119,8 @@ fn import_into(
     while let Some(record) = reader.next_record()? {
         match record {
             SnapshotRecord::Keyspace(name) => {
-                let keyspace = db.keyspace(keyspace_name(&name)?, KeyspaceCreateOptions::default)?;
+                let keyspace =
+                    db.keyspace(keyspace_name(&name)?, KeyspaceCreateOptions::default)?;
                 keyspace_state = Some(ImportKeyspaceState::new(keyspace));
             }
             SnapshotRecord::Entry { key, value } => {
