@@ -1096,10 +1096,8 @@ mod tests {
         let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
         let store = refusing(storage.clone(), PRUNE_JOB_KEYSPACE);
 
-        let run = drive(
-            TombstonesOperation::new([tombstone]),
-            &graph_context(store, graph),
-        );
+        let context = graph_context(store, graph);
+        let run = drive(TombstonesOperation::new([tombstone]), &context);
 
         assert!(matches!(run.await, Err(MetadataGraphError::Storage(_))));
         assert!(read_jobs(&storage).await.is_empty());
@@ -1117,10 +1115,8 @@ mod tests {
         let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
         let store = refusing(storage.clone(), aruna_core::keyspaces::IRI_INDEX_KEYSPACE);
 
-        let run = drive(
-            TombstonesOperation::new([tombstone]),
-            &graph_context(store, graph),
-        );
+        let context = graph_context(store, graph);
+        let run = drive(TombstonesOperation::new([tombstone]), &context);
 
         assert!(matches!(run.await, Err(MetadataGraphError::Metadata(_))));
         assert_eq!(read_jobs(&storage).await.len(), 1);
