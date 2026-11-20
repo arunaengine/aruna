@@ -25,8 +25,9 @@ use aruna_operations::jobs::lifecycle::family_reads::FamilyProjectionOperation;
 use aruna_operations::jobs::lifecycle::screen::ScreenTask;
 use aruna_operations::jobs::lifecycle::submit_external::IngressNode;
 use aruna_operations::jobs::node_inputs::ingress_node;
-use aruna_operations::plugins::calls::install_plugin;
-use aruna_operations::plugins::install::InstallRequest;
+use aruna_operations::plugins::install::{
+    InstallCaller, InstallPrepared, InstallRequest, PrepareInstall,
+};
 use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
 use aruna_operations::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use aruna_operations::plugins::rows::{decode, encode};
@@ -113,7 +114,16 @@ async fn installed() -> TestResult<(Topology, PluginInstall)> {
         secrets: BTreeMap::new(),
     };
     let (actor, auth) = (realm.actor(node), realm.auth_context());
-    let install = install_plugin(node.context.as_ref(), &actor, &auth, &request).await;
+    let place = (actor.realm_id, Some(node.node_id()));
+    let prepare = PrepareInstall::new(&auth, place, &request);
+    let prepared = drive(prepare, node.context.as_ref()).await;
+    let prepared = prepared.map_err(|error| format!("install: {error}"))?;
+    let caller = InstallCaller::new(&actor, &auth, unix_timestamp_millis());
+    let install = drive(
+        InstallPrepared::new(caller, prepared),
+        node.context.as_ref(),
+    )
+    .await;
     let install = install.map_err(|error| format!("install: {error}"))?;
     let id = install.install_id;
     let label = "the install never reached every node";

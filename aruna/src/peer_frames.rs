@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::inbound_frames;
 use aruna_blob::native;
