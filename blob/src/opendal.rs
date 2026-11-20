@@ -4,6 +4,7 @@
 
 use crate::egress::EgressGuard;
 use crate::local_fs::LocalFsBuilder;
+use crate::walk::{walk_after, walk_page};
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::source_access::{
@@ -340,18 +341,18 @@ pub(crate) async fn list_staging_source(
     }
     if *kind == SourceConnectorKind::Http {
         // opendal's Http service cannot list; walk autoindex pages instead.
-        let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
+        let after = walk_after(request, path)?;
         let (entries, truncated) = crate::autoindex::list_http_autoindex(
             guard,
             config,
             path,
-            offset,
+            after,
             request.limit,
             request.recursive,
             request.files_only,
         )
         .await?;
-        return Ok(offset_page(entries, truncated, offset));
+        return Ok(walk_page(entries, truncated));
     }
     let (operator, path, ..) = build_source_operator(guard, access).await?;
     list_operator(&operator, path, request).await
