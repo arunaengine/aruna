@@ -267,13 +267,14 @@ pub fn reusable_parts(
     md5s: &[String],
     stored: &[StoredPart],
 ) -> Vec<Option<String>> {
+    let by_number: std::collections::HashMap<i32, &StoredPart> =
+        stored.iter().map(|held| (held.number, held)).collect();
     parts
         .iter()
         .zip(md5s)
         .map(|(part, md5)| {
-            stored
-                .iter()
-                .find(|held| held.number == part.number && held.size == part.length)
+            (by_number.get(&part.number))
+                .filter(|held| held.size == part.length)
                 .filter(|held| held.etag.trim_matches('"').eq_ignore_ascii_case(md5))
                 .map(|held| held.etag.clone())
         })
