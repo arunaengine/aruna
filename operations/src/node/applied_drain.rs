@@ -11,7 +11,7 @@ use aruna_core::document::{AppliedStep, AppliedSync, applied_sync_entry, order_c
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{APPLIED_ORDER_KEYSPACE, APPLIED_SYNC_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use tracing::{debug, warn};
@@ -231,6 +231,11 @@ fn error_text<T, E: std::fmt::Display>(outcome: Result<T, E>) -> Option<String> 
 impl Operation for AppliedDrainOperation {
     type Output = Option<Duration>;
     type Error = IoError;
+
+    /// Every entry point runs this operation, so one hold keeps two runs off the same rows.
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::AppliedDrain)
+    }
 
     fn first(&mut self) -> Turn {
         self.read_page()
@@ -622,5 +627,24 @@ mod tests {
         assert_eq!(drain.next(rows(&[&later])), order_read(&later));
         let projecting = drain.next(first_entry(entry(1, &later)));
         assert_eq!(projecting, after_project(&later));
+    }
+
+    // The timer run and the run a sync settles inline are the same operation under one hold,
+    // so two drains over the same order head never both project its batch.
+    #[test]
+    fn drains_share_hold() {
+        use aruna_core::operation::SubOperation;
+        let input = crate::triggers::TimerInput {
+            now_ms: 1,
+            local_node: Some(node()),
+        };
+        let timer = crate::triggers::timer_operation(&TaskKey::DrainAppliedSync, &input);
+        let timer = timer.expect("the applied drain runs on its timer");
+        assert_eq!(timer.hold_scope(), Some(HoldScope::AppliedDrain));
+        let mut settle = SettleAppliedOperation::new();
+        let Ok(Next::Call(IoCall::Child(inline))) = settle.first() else {
+            panic!("the settle runs the drain as its child");
+        };
+        assert_eq!(inline.hold_scope(), Some(HoldScope::AppliedDrain));
     }
 }
