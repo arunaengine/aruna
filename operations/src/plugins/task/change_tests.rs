@@ -8,9 +8,9 @@ use aruna_core::types::{Key, Value};
 
 use super::*;
 use crate::plugins::rows::tests::values_result;
-use crate::plugins::work::WorkKind;
 use crate::plugins::work::tests::sample_install;
 use crate::tests::records::{node, payload, user};
+use aruna_core::install_work::WorkKind;
 
 fn ids() -> (Ulid, Ulid) {
     (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2))
@@ -132,19 +132,6 @@ fn end_keeps_claimed() {
         next: None,
     };
     assert_eq!(edit.next(found), Ok(Next::Done(Changed::settled(false))));
-}
-
-#[test]
-fn report_needs_task() {
-    let report = TaskChange::Report(Some("mapped".to_string()));
-    let (_, next) = applied(report.clone(), &reserved(), Some(TaskRow::default()));
-    let Ok(Next::Call(IoCall::Write(rows))) = next else {
-        panic!("an existing task row keeps the report");
-    };
-    let task: TaskRow = decode(&rows[1].2).unwrap();
-    assert_eq!(task.report.as_deref(), Some("mapped"));
-    let (_, next) = applied(report, &reserved(), None);
-    assert_eq!(next, Ok(Next::Done(Changed::default())));
 }
 
 #[test]

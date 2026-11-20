@@ -13,10 +13,10 @@ use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use ulid::Ulid;
 
 use super::super::rows::{StoreError, decode, delete_call, encode, read_call, row, values};
-use super::row::{TaskRow, task_key, task_place};
-use super::super::work::{
+use aruna_core::install_work::{
     FinalState, Found, SendBoundary, Summary, WorkLookup, WorkRow, WorkState, index_key,
 };
+use aruna_core::install_work::{TaskRow, task_key, task_place};
 use aruna_core::job_request::SubmissionRequest;
 
 /// What one send of a task proved.
@@ -49,8 +49,6 @@ pub enum TaskChange {
     DropUnsent,
     /// A finished family settles a dispatched row, with the report the task row keeps.
     Settle(Box<Summary>),
-    /// The report a finished task wrote, kept in a task row that exists.
-    Report(Option<String>),
     /// Proven non-admission ends a reserved row: failed while the install is active, else
     /// deleted. A record of the submission here is a claim or a launch and keeps the row; the
     /// launch reads the row in its own transaction, so one of the two aborts.
@@ -177,10 +175,6 @@ impl ChangeTask {
                 self.put((key, &row), &task, Changed::settled(true))
             }
             TaskChange::Settle(_) => unchanged(true),
-            TaskChange::Report(report) => {
-                task.report = report;
-                self.put((key, &row), &task, Changed::default())
-            }
             TaskChange::Mark { .. } | TaskChange::Record(_) | TaskChange::End { .. }
                 if !reserved =>
             {
@@ -287,9 +281,6 @@ impl Operation for ChangeTask {
             Phase::Task(key, row) => {
                 let [task] = values::<1>(result)?;
                 let task = task.map(|bytes| decode::<TaskRow>(&bytes)).transpose()?;
-                if task.is_none() && matches!(self.change, TaskChange::Report(_)) {
-                    return Ok(Next::Done(Changed::default()));
-                }
                 self.apply(key, *row, task.unwrap_or_default())
             }
             Phase::Written(changed) => {

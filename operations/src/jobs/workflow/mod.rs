@@ -22,6 +22,7 @@ pub mod settle;
 pub mod stop_record;
 mod storage_audit;
 pub mod supervise;
+pub mod task_report;
 pub mod workspace;
 
 use std::sync::Arc;

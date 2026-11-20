@@ -38,7 +38,7 @@ use crate::jobs::store::job_calls::{
 };
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::{read_attempt_control, read_job_record};
-use crate::plugins::task::report::KeepReport;
+use crate::jobs::workflow::task_report::KeepReport;
 
 /// What a run is being finalized for.
 #[derive(Debug, PartialEq)]
