@@ -1035,15 +1035,12 @@ mod tests {
             .await
             .expect("session partial head");
         // Both servers must have admitted their connection before shutdown starts.
-        tokio::time::timeout(Duration::from_secs(60), async {
-            for server in [&main_s3, &session_s3] {
-                while server.connection_count() == 0 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            }
+        let admitted = aruna_clock::testing::poll_until(Duration::from_secs(60), async || {
+            let counts = [main_s3.connection_count(), session_s3.connection_count()];
+            counts.iter().all(|count| *count > 0).then_some(())
         })
-        .await
-        .expect("both servers admit their connection");
+        .await;
+        admitted.expect("both servers admit their connection");
 
         let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
         sequence.s3 = Some(main_s3);
