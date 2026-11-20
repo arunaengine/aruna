@@ -12,7 +12,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
 
 use crate::admin::{AdminError, AdminState, AuditRecord, ResolveGate, transition};
 use crate::verify::RouteProblem;
@@ -181,14 +180,11 @@ impl Store {
         Ok(self.totals.insert(key, postcard::to_allocvec(totals)?)?)
     }
 
-    /// The realm's latest totals; none for a realm that never sent any or sent an older format.
+    /// The realm's latest totals; none for a realm that never sent any. A stored row that does
+    /// not decode is an error, so it never passes for absent and drops the replay check.
     pub fn totals(&self, realm_id: &RealmId) -> Result<Option<RealmTotals>, StoreError> {
         let value = self.totals.get(realm_id.as_bytes())?;
-        Ok(value.and_then(|value| {
-            postcard::from_bytes(&value)
-                .inspect_err(|error| warn!(error = %error, "Skipping undecodable realm totals"))
-                .ok()
-        }))
+        Ok(value.map(|value| postcard::from_bytes(&value)).transpose()?)
     }
 
     /// The realm's entry while its lease runs.
@@ -196,7 +192,7 @@ impl Store {
         let Some(value) = self.entries.get(realm_id.as_bytes())? else {
             return Ok(None);
         };
-        Ok(decode_entry(&value).filter(|entry| leased(entry, now)))
+        Ok(Some(decode_entry(&value)?).filter(|entry| leased(entry, now)))
     }
 
     /// Every entry whose lease runs, in realm id order.
@@ -211,7 +207,7 @@ impl Store {
         let mut entries = Vec::new();
         for item in self.entries.iter() {
             let (_, value) = item.into_inner()?;
-            entries.extend(decode_entry(&value));
+            entries.push(decode_entry(&value)?);
         }
         Ok(entries)
     }
@@ -219,7 +215,7 @@ impl Store {
     /// The realm's stored entry, also after its lease ended.
     pub fn stored_entry(&self, realm_id: &RealmId) -> Result<Option<Entry>, StoreError> {
         let value = self.entries.get(realm_id.as_bytes())?;
-        Ok(value.and_then(|value| decode_entry(&value)))
+        Ok(value.map(|value| decode_entry(&value)).transpose()?)
     }
 
     /// Every realm with an entry, a name history or admin state, so withdrawn realms stay
@@ -322,11 +318,9 @@ impl Store {
     }
 }
 
-/// An entry in an older stored format counts as absent until the realm renews it.
-fn decode_entry(value: &[u8]) -> Option<Entry> {
-    postcard::from_bytes(value)
-        .inspect_err(|error| warn!(error = %error, "Skipping undecodable registry entry"))
-        .ok()
+/// A stored entry; one that does not decode is an error, never a missing realm.
+fn decode_entry(value: &[u8]) -> Result<Entry, StoreError> {
+    Ok(postcard::from_bytes(value)?)
 }
 
 /// Whether the entry's lease still runs at `now`.
@@ -467,6 +461,21 @@ pub(crate) mod tests {
             store.check_issued(&realm, 100, expired),
             Err(StoreError::Replayed)
         ));
+    }
+
+    // A stored entry or totals row that does not decode is reported, not taken for a missing
+    // realm, so it neither vanishes from the listing nor drops the replay check of totals.
+    #[test]
+    fn undecodable_rows_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = realm_id();
+        store.entries.insert(realm.as_bytes(), vec![0xff, 0xff]).unwrap();
+        store.totals.insert(realm.as_bytes(), vec![0xff, 0xff]).unwrap();
+        assert!(matches!(store.entry(&realm, 1), Err(StoreError::Encoding(_))));
+        assert!(matches!(store.stored_entry(&realm), Err(StoreError::Encoding(_))));
+        assert!(matches!(store.entries(1), Err(StoreError::Encoding(_))));
+        assert!(matches!(store.totals(&realm), Err(StoreError::Encoding(_))));
     }
 
     #[test]
