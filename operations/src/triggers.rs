@@ -951,6 +951,21 @@ pub enum PeerAnswer {
     Kept,
 }
 
+impl PeerAnswer {
+    /// The answer to a request whose run broke off, where its protocol has one: job control and
+    /// native references answer unavailable, the other protocols close the stream.
+    pub fn unavailable(alpn: Alpn, failure: &PeerFailure) -> Option<PeerAnswer> {
+        match alpn {
+            Alpn::JobControl => Some(PeerAnswer::Job(JobAnswer::unavailable(failure))),
+            Alpn::NativeReference => {
+                let reject = NativeReferenceReject::Unavailable(failure.to_string());
+                Some(PeerAnswer::Native((NativeReferenceResponse::Rejected(reject), None)))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A peer request that ended without an answer; the shell logs it and closes the stream.
 #[derive(Debug, Error, PartialEq, Eq)]
 #[error("{0}")]
@@ -1681,6 +1696,19 @@ mod tests {
         else {
             panic!("a broken native run is refused");
         };
+    }
+
+    // A broken job or native run is answered unavailable; other protocols close the stream.
+    #[test]
+    fn broken_run_answered() {
+        let failure = PeerFailure("broken".to_string());
+        let job = PeerAnswer::unavailable(Alpn::JobControl, &failure);
+        assert_eq!(job, Some(PeerAnswer::Job(JobAnswer::unavailable(&failure))));
+        let native = PeerAnswer::unavailable(Alpn::NativeReference, &failure);
+        let Some(PeerAnswer::Native((NativeReferenceResponse::Rejected(_), None))) = native else {
+            panic!("a broken native run is refused");
+        };
+        assert_eq!(PeerAnswer::unavailable(Alpn::Notification, &failure), None);
     }
 
     #[test]

@@ -113,6 +113,13 @@ impl OperationsInboundHandler {
             // A request no operation answers gets no answer of its own; its protocol refuses it.
             None => Ok(PeerAnswer::Kept),
         };
+        let answer = answer.or_else(|failure| match PeerAnswer::unavailable(alpn, &failure) {
+            Some(unavailable) => {
+                warn!(peer = %peer, error = %failure, "Peer request broke off; answering unavailable");
+                Ok(unavailable)
+            }
+            None => Err(failure),
+        });
         // The attempts a cancel reached run here, so the runtime signals them.
         if let Ok(PeerAnswer::Job(job)) = &answer {
             for job_id in &job.running {
