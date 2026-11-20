@@ -53,6 +53,26 @@ fn evidence(batch: &DrainSubBatch) -> Vec<(Vec<u8>, [u8; 32])> {
         .collect()
 }
 
+/// Whether two sub-batches hold records of one topic or one admin origin, so their order counts.
+fn shares_domain(first: &DrainSubBatch, second: &DrainSubBatch) -> bool {
+    let (topics, origins) = first.ordering_domains();
+    let (later_topics, later_origins) = second.ordering_domains();
+    topics.iter().any(|topic| later_topics.contains(topic))
+        || origins.iter().any(|origin| later_origins.contains(origin))
+}
+
+/// The entries of `batch` at `published` whose topic or admin origin no entry at `retried` before
+/// them shares; the others wait unsynced, so no peer receives them ahead of a retried entry.
+fn ready_entries(batch: &DrainSubBatch, published: &[usize], retried: &[usize]) -> Vec<usize> {
+    let shares = |first: usize, later: usize| {
+        let topic = |index: usize| batch.topics.get(index);
+        let origin = |index: usize| batch.origins.get(index).copied().flatten();
+        topic(first) == topic(later) || origin(first).is_some_and(|o| origin(later) == Some(o))
+    };
+    let waits = |later: usize| retried.iter().any(|&first| first < later && shares(first, later));
+    published.iter().copied().filter(|&index| !waits(index)).collect()
+}
+
 type PublishTurn = Result<Next<PublishedBatches>, IoError>;
 
 /// The sub-batches of one drain invocation, published and synced in order.
@@ -100,6 +120,12 @@ impl PublishBatchesOperation {
                     None => Ok(Next::Done(std::mem::take(&mut self.out))),
                 };
             };
+            // A batch sharing a topic or admin origin with the one awaiting its sync waits for that
+            // sync, so a failure there holds the later batch before it goes out.
+            if let Some(before) = self.awaiting.take_if(|before| shares_domain(before, &batch)) {
+                self.batches.push_front(batch);
+                return self.sync_alone(before);
+            }
             if batch.documents.is_empty() {
                 match self.awaiting.replace(batch) {
                     Some(before) => return self.sync_alone(before),
@@ -115,7 +141,8 @@ impl PublishBatchesOperation {
             let publish = Effect::Net(NetEffect::DocumentSync(publish));
             self.publishing = Some(batch);
             self.started_ms = self.now_ms;
-            let Some(before) = self.awaiting.take() else {
+            let before = self.awaiting.take();
+            let Some(before) = before.and_then(|before| self.without_blocked(before)) else {
                 self.step = PublishStep::Publish;
                 return Ok(Next::Call(IoCall::from(publish)));
             };
@@ -160,7 +187,11 @@ impl PublishBatchesOperation {
         SyncBatchOperation::new(self.serving, generation, batch)
     }
 
+    /// Syncs `batch` by itself, leaving out entries a failure has blocked since it was queued.
     fn sync_alone(&mut self, batch: DrainSubBatch) -> PublishTurn {
+        let Some(batch) = self.without_blocked(batch) else {
+            return self.advance();
+        };
         let sync = self.sync_batch(batch);
         self.step = PublishStep::Sync;
         Ok(Next::Call(IoCall::child(sync)))
@@ -224,15 +255,24 @@ impl PublishBatchesOperation {
                     Some(retried) => self.block(retried.ordering_domains()),
                     None => self.block(batch.ordering_domains()),
                 }
-                match batch.sync_subset(&published_indices) {
-                    Some(published) if !published.record_keys.is_empty() => {
-                        self.out.published.extend(evidence(&published));
-                        self.awaiting = Some(published);
-                    }
-                    Some(_) => {}
-                    None => {
-                        warn!(task_id = ?task_id, "Invalid partial document publish indices");
-                    }
+                let Some(published) = batch.sync_subset(&published_indices) else {
+                    warn!(task_id = ?task_id, "Invalid partial document publish indices");
+                    return;
+                };
+                // Every published entry is in the oplog, but only those no retried entry before
+                // them shares a topic or origin with sync now.
+                self.out.published.extend(evidence(&published));
+                let ready = ready_entries(&batch, &published_indices, &retry_indices);
+                let waiting: Vec<usize> = (published_indices.iter().copied())
+                    .filter(|index| !ready.contains(index))
+                    .collect();
+                if let Some(waiting) = batch.sync_subset(&waiting) {
+                    self.block(waiting.ordering_domains());
+                }
+                if let Some(ready) = batch.sync_subset(&ready)
+                    && !ready.record_keys.is_empty()
+                {
+                    self.awaiting = Some(ready);
                 }
             }
             Some(Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. }))) => {
@@ -419,6 +459,57 @@ mod tests {
         };
         assert_eq!(done.published, vec![(b"one".to_vec(), lineage(b"one"))]);
         assert_eq!(done.deleted, vec![b"one".to_vec()]);
+    }
+
+    // A batch sharing an admin origin with the one before it waits for that sync instead of
+    // publishing beside it, and a failed sync there holds it before it publishes.
+    #[test]
+    fn shared_origin_waits() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let (mut first, mut second) = (batch(b"one"), batch(b"two"));
+        (first.origins, second.origins) = (vec![Some(origin)], vec![Some(origin)]);
+        let mut run = PublishBatchesOperation::new(serving(), vec![first, second]);
+        run.first().unwrap();
+        let published = net(DocumentNetEvent::DocumentsPublished {
+            targets: Vec::new(),
+        });
+        let sync = run.next(published);
+        assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
+        let mut finished = FinishedBatch::default();
+        finished.outcome.retry_needed = true;
+        finished.outcome.blocked_origins.push(origin);
+        let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
+        let Ok(Next::Done(done)) = run.next(synced) else {
+            panic!("the later batch is held");
+        };
+        assert_eq!(done.published, vec![(b"one".to_vec(), lineage(b"one"))]);
+        assert!(done.outcome.retry_needed);
+    }
+
+    // An entry the adapter published after a retried entry of its topic stays in the oplog but
+    // is not synced, so no peer receives it first.
+    #[test]
+    fn retried_entry_holds_later() {
+        let mut joined = batch(b"one");
+        let later = batch(b"one");
+        joined.documents.extend(later.documents);
+        joined.topics.extend(later.topics);
+        joined.origins.extend(later.origins);
+        joined.targets.extend(later.targets);
+        joined.record_keys.push(b"later".to_vec());
+        joined.stamps.extend(later.stamps);
+        let mut run = PublishBatchesOperation::new(serving(), vec![joined]);
+        run.first().unwrap();
+        let partial = net(DocumentNetEvent::DocumentsPartiallyPublished {
+            published_indices: vec![1],
+            retry_indices: vec![0],
+            error: "busy".to_string(),
+        });
+        let Ok(Next::Done(done)) = run.next(partial) else {
+            panic!("nothing is ready to sync");
+        };
+        assert_eq!(done.published, vec![(b"later".to_vec(), lineage(b"one"))]);
+        assert!(done.outcome.retry_needed);
     }
 
     // After a failed publish, a later sub-batch leaves out the entries of the blocked topic and
