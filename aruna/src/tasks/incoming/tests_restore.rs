@@ -546,7 +546,7 @@ async fn renewal_rearm_kept() {
 
     let (_temp_dir, handler, task_handle) = refusing_handler();
     let key = TaskKey::PublishRegistration;
-    handler.run_trigger(key).await;
+    handler.run_trigger(key.clone()).await;
     let after = armed_after(&task_handle, key, PUBLISH_INTERVAL * 2).await;
     assert!(
         after <= PUBLISH_INTERVAL,
