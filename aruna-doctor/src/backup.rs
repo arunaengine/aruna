@@ -6,7 +6,7 @@
 use crate::error::CliError;
 use crate::storage::{
     ImportKeyspaceState, ensure_target_path, keyspace_name, publish_dir, staging_dir, sync_dir,
-    sync_tree,
+    sync_dirs,
 };
 use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
 use aruna_core::structs::storage::broken::StorageCheck;
@@ -131,13 +131,22 @@ fn restore_into(
     loop {
         // Git files stream to disk; store entries are held, as Fjall takes whole values.
         let git = matches!(section, Some(Section::Git));
+        let mut written = None;
         let record = reader.next_with(|key| {
-            if git {
-                git_file(&git_root, key)
-            } else {
-                Ok(None)
+            if !git {
+                return Ok(None);
             }
+            let value = git_file(&git_root, key)?;
+            if let Some(GitValue::File(file)) = &value {
+                written = Some(file.try_clone()?);
+            }
+            Ok(value)
         })?;
+        // A Git file is synced through its own writable handle once its value is in; Windows
+        // cannot sync a file reopened only for reading.
+        if let Some(file) = written {
+            file.sync_all()?;
+        }
         let Some(record) = record else {
             break;
         };
@@ -160,9 +169,9 @@ fn restore_into(
     for database in &databases {
         database.persist(PersistMode::SyncAll)?;
     }
-    // The Git files were only written; they must be durable before the restore is published.
+    // The Git folders name the synced files; they must be durable before the restore is published.
     if git_root.exists() {
-        sync_tree(&git_root)?;
+        sync_dirs(&git_root)?;
     }
     sync_dir(target)?;
     Ok(())
