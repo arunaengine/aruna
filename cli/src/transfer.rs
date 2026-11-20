@@ -373,7 +373,14 @@ pub async fn upload(
             let upload_id = created
                 .upload_id
                 .ok_or_else(|| CliError::S3("the node returned no upload id".into()))?;
-            keep_id(&mut record, &upload_id)?;
+            if let Err(error) = keep_id(&mut record, &upload_id) {
+                // Without its record no run could resume or find the new upload, so it goes.
+                let abort = client.abort_multipart_upload().bucket(bucket).key(key);
+                if let Err(failed) = abort.upload_id(&upload_id).send().await {
+                    eprintln!("warning: upload {upload_id} was not aborted: {}", s3_error(failed));
+                }
+                return Err(error.into());
+            }
             (upload_id, Vec::new())
         }
     };
@@ -430,7 +437,7 @@ pub async fn upload(
         .send()
         .await
         .map_err(s3_error)?;
-    finish_record(&mut record)?;
+    clear_record(&mut record, key);
     Ok(Uploaded {
         size,
         blake3,
@@ -501,6 +508,14 @@ async fn claim_record(path: PathBuf) -> Result<(std::fs::File, Option<String>), 
 /// every later run lock this same file.
 fn finish_record(record: &mut std::fs::File) -> std::io::Result<()> {
     keep_id(record, "")
+}
+
+/// Finishes the record of a completed upload, best effort: the object exists, and a kept id
+/// only makes a later run of the same file meet `NoSuchUpload` and start afresh.
+fn clear_record(record: &mut std::fs::File, key: &str) {
+    if let Err(error) = finish_record(record) {
+        eprintln!("warning: the upload record of {key} was not cleared: {error}");
+    }
 }
 
 /// Replaces the upload id in a claimed record; an empty id marks the transfer as finished.
@@ -759,6 +774,17 @@ mod tests {
         keep_id(&mut record, "").unwrap();
         drop(record);
         assert_eq!(claim_record(path).await.unwrap().1, None);
+    }
+
+    #[test]
+    fn clearing_is_best_effort() {
+        // A record that cannot be written leaves the completed upload a success.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("record.upload");
+        std::fs::write(&path, "upload-1").unwrap();
+        let mut read_only = std::fs::File::open(&path).unwrap();
+        clear_record(&mut read_only, "key");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "upload-1");
     }
 
     #[tokio::test]
