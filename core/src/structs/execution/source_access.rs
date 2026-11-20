@@ -317,6 +317,8 @@ pub enum ListCursor {
     At(String),
     /// Entries to skip, for a source whose provider cannot start after a key.
     Offset(u64),
+    /// The last path a walked source listed: the next page continues after it in walk order.
+    Walk(String),
 }
 
 /// One bounded page of a source listing. Key bounds need a flat recursive listing.

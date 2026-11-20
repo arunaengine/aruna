@@ -323,21 +323,21 @@ pub(crate) async fn list_staging_source(
     access: &ResolvedSourceAccess,
     request: &ListRequest,
 ) -> Result<(Vec<SourceEntry>, Option<ListCursor>), StagingSourceError> {
+    let ResolvedSourceAccess::OpenDal {
+        kind, config, path, ..
+    } = access;
     if crate::fs_source::is_local_access(access) {
-        let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
+        let after = walk_after(request, path)?;
         let (entries, truncated) = crate::fs_source::list_local(
             access,
-            offset,
+            after,
             request.limit,
             request.recursive,
             request.files_only,
         )
         .await?;
-        return Ok(offset_page(entries, truncated, offset));
+        return Ok(walk_page(entries, truncated));
     }
-    let ResolvedSourceAccess::OpenDal {
-        kind, config, path, ..
-    } = access;
     if *kind == SourceConnectorKind::Http {
         // opendal's Http service cannot list; walk autoindex pages instead.
         let offset = fallback_offset(request, FALLBACK_SKIP_LIMIT)?;
