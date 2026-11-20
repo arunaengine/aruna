@@ -6,11 +6,13 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
-use aruna_storage::task_timers::persist_task_effect;
+use aruna_storage::task_timers::{hold_change, persist_task_effect};
 
 use crate::driver::DriverContext;
 
 pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -> Event {
+    // The row and the scheduler see changes of one key in the same order.
+    let _held = hold_change(&effect).await;
     // An audit record retry runs from memory when storage cannot persist it.
     let kept = matches!(task_effect_key(&effect), Some(TaskKey::RecordAudit { .. }));
     if let Err(message) = persist_task_effect(&context.storage_handle, &effect).await

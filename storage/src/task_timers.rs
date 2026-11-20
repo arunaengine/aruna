@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_clock::unix_timestamp_millis;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
@@ -13,6 +15,33 @@ use byteview::ByteView;
 use tracing::warn;
 
 use crate::storage::handle::StorageHandle;
+
+/// How many locks the timer keys share, picked by key hash.
+const TIMER_LOCK_COUNT: usize = 64;
+
+/// A durable timer change holds its key's lock until the scheduler took it, so the durable and
+/// the live changes of one key happen in the same order.
+static TIMER_LOCKS: LazyLock<Vec<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| (0..TIMER_LOCK_COUNT).map(|_| tokio::sync::Mutex::new(())).collect());
+
+/// Holds the key of a timer change that has a durable row, until its caller handed the change to
+/// the scheduler too; a change without a row holds nothing.
+pub async fn hold_change(effect: &TaskEffect) -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    let key = match effect {
+        TaskEffect::ResetTimer { key, .. }
+        | TaskEffect::ShortenTimer { key, .. }
+        | TaskEffect::CancelTimer { key } => key,
+        _ => return None,
+    };
+    Some(hold_timer(key).await)
+}
+
+async fn hold_timer(key: &TaskKey) -> tokio::sync::MutexGuard<'static, ()> {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    let index = (hasher.finish() % TIMER_LOCK_COUNT as u64) as usize;
+    TIMER_LOCKS[index].lock().await
+}
 
 /// Writes or deletes the durable row a timer effect implies; a timer that re-arms from other
 /// state, or lives in memory only, has none.
@@ -77,8 +106,18 @@ fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     matches!(key, TaskKey::LockBucket { .. })
 }
 
+/// Deletes the row of a timer that fired, if that row is due: a row a later change wrote for the
+/// key stays. Best effort: a due row that survives only fires the work once more after a restart.
 pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey) {
-    if let Err(error) = delete_timer(storage, key).await {
+    let _held = hold_timer(key).await;
+    let due = match read_timer(storage, key).await {
+        Ok(row) => row.is_some_and(|row| row.due_unix_millis <= unix_timestamp_millis()),
+        Err(error) => {
+            warn!(error = %error, key = ?key, "Failed to read a fired task timer");
+            return;
+        }
+    };
+    if due && let Err(error) = delete_timer(storage, key).await {
         warn!(error = %error, key = ?key, "Failed to delete persisted task timer");
     }
 }
@@ -159,13 +198,13 @@ async fn write_record(storage: &StorageHandle, record: &PersistedTaskTimer) -> R
 }
 
 async fn delete_timer(storage: &StorageHandle, key: &TaskKey) -> Result<(), String> {
-    delete_timer_key(storage, task_storage_key(key)?).await;
-    Ok(())
+    delete_timer_key(storage, task_storage_key(key)?).await
 }
 
-/// Deletes one timer row by its row key, such as a row that no longer decodes.
-pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
-    if let Event::Storage(StorageEvent::Error { error }) = storage
+/// Deletes one timer row by its row key, such as a row that no longer decodes; a failed delete is
+/// the caller's to report, as a surviving row re-arms its timer at the next restart.
+pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) -> Result<(), String> {
+    match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
             key,
@@ -173,7 +212,9 @@ pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
         })
         .await
     {
-        warn!(error = %error, "Failed to delete persisted task timer");
+        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected storage event: {other:?}")),
     }
 }
 
