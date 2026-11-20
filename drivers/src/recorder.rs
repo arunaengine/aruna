@@ -88,17 +88,21 @@ pub(crate) fn begin(operation: &'static str, at_ms: u64, input: &dyn Debug) -> O
         return None;
     }
     let run = RUNS.fetch_add(1, Ordering::Relaxed);
-    push(run, at_ms, started(operation, input));
+    push(run, at_ms, started(operation, input, entry_cap()));
     Some(run)
 }
 
 pub(crate) fn event(run: u64, at_ms: u64, event: &Event) {
-    push(run, at_ms, delivered(event));
+    push(run, at_ms, delivered(event, entry_cap()));
 }
 
 /// Closes a run record with its outcome, such as `Ok` or an event label, and its result.
 pub(crate) fn end(run: u64, at_ms: u64, outcome: &'static str, value: &dyn Debug) {
-    push(run, at_ms, ended(outcome, value));
+    push(run, at_ms, ended(outcome, value, entry_cap()));
+}
+
+fn entry_cap() -> usize {
+    ENTRY_BYTES.load(Ordering::Relaxed)
 }
 
 fn push(run: u64, at_ms: u64, entry: Entry) {
@@ -107,16 +111,16 @@ fn push(run: u64, at_ms: u64, entry: Entry) {
     }
 }
 
-fn started(operation: &'static str, input: &dyn Debug) -> Entry {
-    let input_bytes = debug_bytes(input);
+fn started(operation: &'static str, input: &dyn Debug, cap: usize) -> Entry {
+    let input_bytes = debug_bytes(input, cap);
     Entry::Started {
         operation,
         input_bytes,
     }
 }
 
-fn delivered(event: &Event) -> Entry {
-    let detail_bytes = debug_bytes(event);
+fn delivered(event: &Event, cap: usize) -> Entry {
+    let detail_bytes = debug_bytes(event, cap);
     let label = event.label();
     Entry::Event {
         label,
@@ -124,17 +128,36 @@ fn delivered(event: &Event) -> Entry {
     }
 }
 
-fn ended(outcome: &'static str, value: &dyn Debug) -> Entry {
-    let outcome_bytes = debug_bytes(value);
+fn ended(outcome: &'static str, value: &dyn Debug, cap: usize) -> Entry {
+    let outcome_bytes = debug_bytes(value, cap);
     Entry::Ended {
         outcome,
         outcome_bytes,
     }
 }
 
-/// The length of `value`'s `Debug` text.
-fn debug_bytes(value: &dyn Debug) -> usize {
-    format!("{value:?}").len()
+/// The length of `value`'s `Debug` text up to `cap`, counted without keeping the text; the
+/// formatting stops once it passes `cap`.
+fn debug_bytes(value: &dyn Debug, cap: usize) -> usize {
+    let mut counted = Counted { bytes: 0, cap };
+    let _ = std::fmt::write(&mut counted, format_args!("{value:?}"));
+    counted.bytes.min(cap)
+}
+
+/// A text sink that only counts, and fails once it passed its cap so formatting stops there.
+struct Counted {
+    bytes: usize,
+    cap: usize,
+}
+
+impl std::fmt::Write for Counted {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.bytes = self.bytes.saturating_add(text.len());
+        match self.bytes > self.cap {
+            true => Err(std::fmt::Error),
+            false => Ok(()),
+        }
+    }
 }
 
 /// The kept records and the bytes of their texts.
@@ -159,6 +182,11 @@ impl Buffer {
 
     fn push(&mut self, run: u64, at_ms: u64, entry: Entry) {
         let size = entry_bytes(&entry);
+        // A record the whole budget cannot hold is refused instead of dropping every other one.
+        if size > self.total_bytes {
+            self.dropped += 1;
+            return;
+        }
         while self.bytes + size > self.total_bytes
             && let Some(old) = self.records.pop_front()
         {
@@ -215,9 +243,9 @@ mod tests {
         });
         let result: Result<Vec<u8>, ()> = Ok(private.as_bytes().to_vec());
         let entries = [
-            started("PeerOperation", &private),
-            delivered(&grouped),
-            ended("Ok", &result),
+            started("PeerOperation", &private, 4096),
+            delivered(&grouped, 4096),
+            ended("Ok", &result, 4096),
         ];
         for entry in &entries {
             let text = format!("{entry:?}");
@@ -225,6 +253,41 @@ mod tests {
             assert!(!text.contains("105, 110, 98"), "{text}");
         }
         assert!(matches!(entries[1], Entry::Event { detail_bytes, .. } if detail_bytes > 0));
+    }
+
+    // A large result is counted only up to the per-record bound; its text is never kept.
+    #[test]
+    fn large_result_capped() {
+        let large = vec![7u8; 1 << 20];
+        let entry = ended("Ok", &large, 64);
+        assert_eq!(
+            entry,
+            Entry::Ended {
+                outcome: "Ok",
+                outcome_bytes: 64
+            }
+        );
+    }
+
+    // A record larger than the whole budget is refused; the older records stay.
+    #[test]
+    fn oversized_record_refused() {
+        let mut buffer = Buffer::new();
+        buffer.total_bytes = 2 + std::mem::size_of::<usize>();
+        let kept = Entry::Ended {
+            outcome: "Ok",
+            outcome_bytes: 1,
+        };
+        buffer.push(1, 0, kept.clone());
+        let oversized = Entry::Ended {
+            outcome: "Err",
+            outcome_bytes: 1,
+        };
+        buffer.push(1, 0, oversized);
+        let taken = buffer.take();
+        assert_eq!(taken.dropped, 1);
+        let entries: Vec<Entry> = taken.records.into_iter().map(|record| record.entry).collect();
+        assert_eq!(entries, [kept]);
     }
 
     #[test]
