@@ -34,7 +34,7 @@ use ulid::Ulid;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::id_mapping::{MappingRoute, mapping_route_for, tombstone_transition};
 use crate::metadata::repository::{audit_entry, lifecycle_revision_entries, schedule_prune_drain};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::fence::WriteFence;

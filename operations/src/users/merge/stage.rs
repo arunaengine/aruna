@@ -21,7 +21,7 @@ use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashMap;
 
-use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox::record::{new_identified_record, outbox_write_entry};
 use aruna_core::placement::fence::WriteFence;
 
 /// One document's reducer before and after the merge, with the events it emitted.

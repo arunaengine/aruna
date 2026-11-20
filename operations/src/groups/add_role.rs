@@ -33,7 +33,7 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
 use crate::sync::notification_outbox::emit_notifications_effect;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::notification_routing::{RoutingContext, route_resource_event};

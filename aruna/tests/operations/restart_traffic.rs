@@ -352,7 +352,7 @@ const INCIDENT_SHARDS: u32 = 128;
 /// Only this short prefix needs revision-chain ordering during peer recovery.
 const INCIDENT_METADATA_RECORDS: usize = 32;
 /// The production drain examines two full topic pages per invocation.
-const INCIDENT_LIMIT: usize = 2 * aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
+const INCIDENT_LIMIT: usize = 2 * aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 /// Two full invocation windows keep the scale assertion away from the boundary.
 const INCIDENT_SCALE_RECORDS: usize = 2 * INCIDENT_LIMIT;
 /// One bounded pass plus a short chain keeps peer-return coverage controllable.
@@ -801,7 +801,7 @@ async fn seed_outbox(
         let mut writes = Vec::with_capacity(1_024);
         for index in chunk_start..(chunk_start + 1_024).min(record_count) {
             let record = incident_record(realm_id, local, target, placement, holders, index)?;
-            writes.push(aruna_operations::sync::outbox_record::outbox_write_entry(
+            writes.push(aruna_operations::sync::outbox::record::outbox_write_entry(
                 &record,
             )?);
         }
@@ -863,7 +863,7 @@ fn incident_record(
     };
     let registry = incident_registry(realm_id, target, placement, holders, index)?;
     Ok(
-        aruna_operations::sync::outbox_record::new_identified_record(
+        aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target.clone(),
@@ -904,7 +904,7 @@ fn incident_delete(
         graph_iri: format!("https://aruna.example/incident/graph/{index}"),
     };
     Ok(
-        aruna_operations::sync::outbox_record::new_identified_record(
+        aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target,

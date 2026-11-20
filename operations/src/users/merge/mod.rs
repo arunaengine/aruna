@@ -49,7 +49,7 @@ use crate::auth::epoch_due::DueMarks;
 use crate::auth::revoke_token::{
     Revocation, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
-use crate::sync::outbox_record::schedule_drain_effect;
+use crate::sync::outbox::record::schedule_drain_effect;
 use crate::users::vault::read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::link::fresh_local;
 

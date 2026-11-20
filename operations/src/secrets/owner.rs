@@ -37,7 +37,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, drains, widening_notices};
-use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox::record::{new_identified_record, outbox_write_entry};
 use aruna_core::compute::{draw_secret, drawn_secret};
 
 /// Register documents read per page.

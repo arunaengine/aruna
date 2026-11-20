@@ -23,7 +23,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox::record::{new_identified_record, outbox_write_entry};
 use aruna_core::placement::fence::{admits, fence_read};
 use aruna_core::placement::resolve_shard_holders;
 

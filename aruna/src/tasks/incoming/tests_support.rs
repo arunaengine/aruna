@@ -34,7 +34,7 @@ use ulid::Ulid;
 use crate::tasks::incoming::OperationsTaskHandler;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::sync::outbox_record::write_outbox_effect;
+use aruna_operations::sync::outbox::record::write_outbox_effect;
 use aruna_tasks::InboundTaskHandler;
 
 pub(crate) fn job_id() -> JobId {
@@ -134,7 +134,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         .await
         .expect("shared topic genesis");
     for index in 1..=2u128 {
-        let record = aruna_operations::sync::outbox_record::new_identified_record(
+        let record = aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),

@@ -82,6 +82,7 @@ SMALL_DOMAINS = {
     "operations/src/s3": "coherent ownership scope",
     "operations/src/s3/object/member": "grouped shared-prefix domain",
     "operations/src/shard/restore": "grouped shared-prefix domain",
+    "operations/src/sync/outbox": "grouped shared-prefix domain",
     "operations/src/transfer/release": "grouped shared-prefix domain",
     "operations/src/s3/bucket/rotate": "grouped shared-prefix domain",
     "operations/src/s3/imports": "grouped shared-prefix domain",

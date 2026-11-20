@@ -7,7 +7,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::PeerFrame;
 use crate::forward::transport::{ForwardError, reject};
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::admin_documents::AdminDocumentEvent;

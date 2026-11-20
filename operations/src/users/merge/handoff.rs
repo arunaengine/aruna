@@ -21,7 +21,7 @@ use aruna_core::types::Value;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::ensure_config::overlay_reducer_state;
-use crate::sync::outbox_record::schedule_drain_effect;
+use crate::sync::outbox::record::schedule_drain_effect;
 use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]

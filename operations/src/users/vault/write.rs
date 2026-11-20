@@ -24,7 +24,7 @@ use aruna_core::vault_format::key_fingerprint;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};

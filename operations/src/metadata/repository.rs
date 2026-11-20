@@ -124,7 +124,7 @@ pub fn create_outbox_entries(
         postcard::to_allocvec(audit)?.into(),
     ));
     if let Some(outbox) = outbox {
-        writes.push(crate::sync::outbox_record::outbox_write_entry(outbox)?);
+        writes.push(crate::sync::outbox::record::outbox_write_entry(outbox)?);
         if let Some((lifecycle, change)) = outbox_lifecycle_upsert(outbox)? {
             writes.push(lifecycle_revision_entry(
                 &lifecycle,
@@ -323,7 +323,7 @@ pub(crate) fn schedule_prune_drain() -> Effect {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::sync::outbox_record::outbox_key;
+    use crate::sync::outbox::record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE;
     use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;

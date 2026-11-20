@@ -23,7 +23,7 @@ use crate::notifications::watch::records::{
     WatchReplication, WatchSubscriptionError, validated_subscription, watch_subscription_target,
     watch_upsert_replication,
 };
-use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox::record::{outbox_write_entry, schedule_drain_effect};
 
 /// What to store.
 #[derive(Clone, Debug, PartialEq)]
