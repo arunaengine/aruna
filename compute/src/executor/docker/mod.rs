@@ -405,7 +405,7 @@ impl DockerBackend {
             self.verify_layout(container_id, plan).await?;
         }
         self.cancel_submission(attempt, cancel).await?;
-        guard.mark_start()?;
+        guard.mark_start().await?;
         let started = self.start_by_name(container_id).await;
         self.cancel_submission(attempt, cancel).await?;
         started?;
@@ -718,7 +718,10 @@ impl ExecutorBackend for DockerBackend {
 
     async fn health(&self) -> Result<(), BackendError> {
         self.docker.ping().await.map_err(|e| classify(&e))?;
-        self.daemon_lock.verify()?;
+        let daemon_lock = Arc::clone(&self.daemon_lock);
+        tokio::task::spawn_blocking(move || daemon_lock.verify())
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker health task failed: {error}")))??;
         if let Some(bytes) = self.config.default_disk_bytes {
             self.probe_disk_limit(bytes).await?;
         }

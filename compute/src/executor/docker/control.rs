@@ -120,13 +120,18 @@ impl ControlGuard {
 
     /// Fences the start request before the daemon is asked to start: from here
     /// on an absent container is lost evidence, never a licence to create one.
-    pub fn mark_start(&mut self) -> Result<(), BackendError> {
+    /// The durable write runs on the blocking pool while this guard keeps the lock.
+    pub async fn mark_start(&mut self) -> Result<(), BackendError> {
         let record = self.0.record_mut().ok_or_else(missing_record)?;
         if record.started {
             return Ok(());
         }
         record.started = true;
-        self.0.persist().map_err(control_error)
+        let (path, record) = (self.0.path().to_path_buf(), record.clone());
+        tokio::task::spawn_blocking(move || control_store::write_json(&path, &record))
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
+            .map_err(control_error)
     }
 
     pub fn tombstone(&self) -> Option<TombstoneEvidence> {
@@ -205,14 +210,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn records_start_durably() {
+    #[tokio::test]
+    async fn records_start_durably() {
         // A recorded start must survive the guard so a resubmit cannot re-create.
         let directory = tempdir().unwrap();
         let daemon = DaemonLock::acquire(directory.path()).unwrap();
         let mut control = daemon.control(&fence(1)).unwrap();
         assert!(!control.started());
-        control.mark_start().unwrap();
+        control.mark_start().await.unwrap();
         drop(control);
         assert!(daemon.control(&fence(2)).unwrap().started());
     }
