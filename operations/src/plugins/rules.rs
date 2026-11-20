@@ -21,8 +21,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::entry::{EntryError, ReadEntry};
-use super::grants::covers;
-use super::grants::{InstallScope, parse_grants};
+use super::grants::InstallScope;
+use crate::auth::install_access::covers;
+use crate::auth::install_access::parse_grants;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretError, OwnerSecretOperation};

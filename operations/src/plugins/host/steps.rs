@@ -27,13 +27,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use ulid::Ulid;
 
-use super::super::check::{Authorize, CallError, CheckCall, RunScope, matching};
+use super::super::check::{CallError, CheckCall, RunScope, authorize_call, matching};
 use super::super::creates::write_outcome;
 use super::super::dataset::{
     content_urls, dataset_change, dataset_crate, dataset_of, file_entities, parse_document,
     same_revision,
 };
-use super::super::grants::{install_scope, parse_grants, patterns_for, restricted_account};
+use super::super::grants::{install_scope, restricted_account};
 use super::super::install::{
     InstallError, config_answer, config_call, pick_version, read_manifest,
 };
@@ -46,8 +46,9 @@ use super::super::rows::StoreError;
 use super::super::submit::WorkRequest;
 use super::super::task::start::{StartTask, TaskRequest};
 use super::super::unavailable;
-use super::super::work::RequestContext;
 use super::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
+use crate::auth::install_access::Authorize;
+use crate::auth::install_access::{parse_grants, patterns_for};
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
@@ -62,6 +63,7 @@ use crate::metadata::forward::write::MetadataWriteError;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_core::install_work::RequestContext;
 use aruna_core::metadata::api::{
     CreateDocumentPayload, ExportMetadataResult, RoCrateExportView, UpdateDocumentMutation,
 };
@@ -473,7 +475,7 @@ impl ListDatasets {
             let check = Authorize::call(&install, permission, &path, &patterns);
             self.current = Some(id);
             self.phase = ListPhase::Checking(install);
-            return Next::Call(IoCall::child(check));
+            return Next::Call(authorize_call(check));
         }
         Next::Done(Listing {
             resources: std::mem::take(&mut self.resources),

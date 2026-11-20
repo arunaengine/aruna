@@ -17,15 +17,14 @@ use aruna_plugin_types::calls::{ErrorKind, HostError};
 use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
-use super::check::{Authorize, CallError, CheckCall, CopyGrants, RunScope, matching};
+use super::check::{CallError, CheckCall, CopyGrants, RunScope, authorize_call, matching};
 use super::grants::InstallScope;
 use super::objects::{LocalObject, Unmarked};
 use super::rows::encode;
 use super::unavailable;
-use super::work::{
-    Identity, RequestContext, Reserve, ReserveWork, WorkError, WorkKind, WorkRow, WorkState,
-    reserve,
-};
+use super::work::{Reserve, ReserveWork, WorkError, reserve};
+use crate::auth::install_access::Authorize;
+use aruna_core::install_work::{Identity, RequestContext, WorkKind, WorkRow, WorkState};
 
 /// Unfinished in-process work one install may have at a time.
 pub const WORK_ACTIVE: u32 = 8;
@@ -198,7 +197,7 @@ impl PrepareWork {
     fn grant(&self, permission: Permission, path: &str) -> Result<IoCall, CallError> {
         let install = self.install()?;
         let patterns = matching(install, permission, path)?;
-        Ok(IoCall::child(Authorize::call(
+        Ok(authorize_call(Authorize::call(
             install, permission, path, &patterns,
         )))
     }
@@ -218,7 +217,7 @@ impl PrepareWork {
                 let patterns = matching(install, upload, self.source())?;
                 let read = (upload, Access::READ);
                 let check = Authorize::access(install, read, self.source(), &patterns);
-                Ok(IoCall::child(check))
+                Ok(authorize_call(check))
             }
             Step::Source => self.locate(self.source()),
             Step::Target => self.locate(self.target()),

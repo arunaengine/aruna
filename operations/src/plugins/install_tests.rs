@@ -288,7 +288,7 @@ async fn serializes_retries() {
 
 #[test]
 fn accesses_per_action() {
-    use crate::plugins::grants::accesses;
+    use crate::auth::install_access::accesses;
     use aruna_plugin_types::permission::Permission;
     assert_eq!(
         accesses(Permission::ObjectsCopy),

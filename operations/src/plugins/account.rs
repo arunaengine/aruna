@@ -21,11 +21,13 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::types::{GroupId, RoleId};
 use aruna_core::user::id::UserId;
 
-use super::grants::{InstallScope, READ_ROLE, WRITE_ROLE, parse_grants, role_name, role_paths};
+use super::grants::{InstallScope, READ_ROLE, WRITE_ROLE, role_name, role_paths};
 use super::rows::{StoreError, mapped_child, read_call, values};
+use crate::auth::install_access::parse_grants;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::remove_role::{RemoveGroupConfig, RemoveGroupOperation};
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
+use crate::users::install_account::{owns_install, read_user_call, read_user_result};
 use crate::users::service_account::create::{CreateServiceConfig, CreateServiceOperation};
 
 /// Why an account or role of an install could not be read, made right or checked.
@@ -82,17 +84,6 @@ fn stored_auth(row: Option<Vec<u8>>) -> Result<Option<GroupAuthorizationDocument
     decoded(row, GroupAuthorizationDocument::from_bytes)
 }
 
-/// The call that reads an account, for an operation that decides with it.
-pub(crate) fn read_user_call(user_id: UserId) -> IoCall {
-    read_call(vec![user_row(user_id)])
-}
-
-/// The account a [`read_user_call`] answered.
-pub(crate) fn read_user_result(result: IoResult) -> Result<Option<User>, AccountError> {
-    let [row] = values::<1>(result)?;
-    stored_user(row)
-}
-
 /// Runs `operation` as a child that answers only whether it worked and why not.
 fn step<O>(operation: O) -> IoCall
 where
@@ -132,10 +123,6 @@ pub(crate) fn guard_of(install: &PluginInstall) -> InstallGuard {
         install_id: install.install_id,
         revision: install.revision,
     }
-}
-
-pub(crate) fn owned(user: &User, scope: &InstallScope) -> bool {
-    user.service_group() == Some(scope.group_id) && user.install() == Some(scope.install_id)
 }
 
 /// Whether a role is the install's own: a plugin role held by the account alone, or by no one.
@@ -269,7 +256,13 @@ impl Operation for EnsureAccount {
         self.writing = true;
         match stored_user(user)? {
             None => Ok(Next::Call(step(self.create()))),
-            Some(user) if !owned(&user, &self.change.scope) => {
+            Some(user)
+                if !owns_install(
+                    &user,
+                    self.change.scope.group_id,
+                    self.change.scope.install_id,
+                ) =>
+            {
                 Err(refused("an account with this id belongs elsewhere"))
             }
             Some(user) if user.is_deactivated() => Ok(Next::Call(step(self.change.status(true)))),
@@ -388,7 +381,8 @@ impl Operation for CheckReady {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, AccountError> {
         let [user, realm, group, user_state, group_state] = values::<5>(result)?;
         let user = stored_user(user)?.ok_or_else(|| refused("the account is missing"))?;
-        if !owned(&user, &self.scope) || user.is_deactivated() {
+        if !owns_install(&user, self.scope.group_id, self.scope.install_id) || user.is_deactivated()
+        {
             return Err(refused(
                 "the account is not an active account of this install",
             ));
@@ -474,7 +468,9 @@ impl Operation for Teardown {
             TeardownPhase::ReadingUser => {
                 let user = read_user_result(result)?;
                 let scope = &self.change.scope;
-                if user.is_some_and(|user| owned(&user, scope) && !user.is_deactivated()) {
+                if user.is_some_and(|user| {
+                    owns_install(&user, scope.group_id, scope.install_id) && !user.is_deactivated()
+                }) {
                     self.phase = TeardownPhase::Deactivating;
                     return Ok(Next::Call(step(self.change.status(false))));
                 }
@@ -720,7 +716,9 @@ impl Operation for RepairAccount {
                 Ok(Next::Call(read_user_call(account)))
             }
             RepairPhase::ReadingUser => {
-                let user = read_user_result(result).map_err(StepError::at("account"))?;
+                let user = read_user_result(result)
+                    .map_err(AccountError::from)
+                    .map_err(StepError::at("account"))?;
                 if user.is_some_and(|user| user.is_deactivated() && !user.stopped_by_install()) {
                     return Ok(Next::Done(false));
                 }

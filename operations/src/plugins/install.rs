@@ -35,16 +35,17 @@ use super::account::{
     Teardown,
 };
 use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, vault_kind};
-use super::grants::covers;
 use super::grants::{
-    GrantError, Grants, InstallScope, accesses, carry_grants, check_supported, narrow_grants,
-    parse_grants, patterns_for, role_paths, stored_grants, writes,
+    GrantError, InstallScope, carry_grants, check_supported, narrow_grants, role_paths,
+    stored_grants, writes,
 };
 use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::rules::{EnsureRules, RetireRules, RulesFailure};
 use super::settings::{SettingError, check_settings};
 use crate::auth::enforcement::{compiled_policies, group_from_path, policy_reads, read_policies};
+use crate::auth::install_access::covers;
+use crate::auth::install_access::{Grants, accesses, parse_grants, patterns_for};
 use crate::auth::permission_rules::{PermissionRules, read_rules, rule_reads};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::advertised::{Advertised, AdvertisementsOperation};

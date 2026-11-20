@@ -5,6 +5,8 @@
 use super::*;
 use serde_json::json;
 
+use crate::auth::install_access::parse_grants;
+
 fn manifest(extra: serde_json::Value) -> Manifest {
     let mut value = json!({
         "name": "dataset-announcer",

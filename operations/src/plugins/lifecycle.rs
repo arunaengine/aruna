@@ -26,8 +26,7 @@ use ulid::Ulid;
 use super::account::{AccountError, Teardown};
 use super::bound::{BindError, BindPlace, BindSlots, BoundSlots};
 use super::grants::{
-    Grants, InstallScope, carry_grants, check_supported, held_covers, narrow_grants, parse_grants,
-    patterns_for, stored_grants,
+    InstallScope, carry_grants, check_supported, held_covers, narrow_grants, stored_grants,
 };
 use super::install::{
     CheckHolder, InstallCaller, InstallError, SettleInstall, admin_answer, admin_call,
@@ -37,6 +36,7 @@ use super::matcher::Target;
 use super::records::{InstallEntryConfig, InstallEntryOperation, ReadEntry, RecordError};
 use super::rules::RulesFailure;
 use super::settings::check_settings;
+use crate::auth::install_access::{Grants, parse_grants, patterns_for};
 use crate::realm::mutate_placement::node_kind;
 
 /// An install as the realm config holds it now, for a caller proven group admin.

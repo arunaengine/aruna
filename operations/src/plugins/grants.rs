@@ -18,9 +18,7 @@ use aruna_plugin_types::permission::{Grant, Permission};
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Granted resource patterns: `read` and `write` as the installer scoped them, and the paths of
-/// the services and readable secrets the manifest declares.
-pub type Grants = BTreeMap<Grant, BTreeSet<String>>;
+use crate::auth::install_access::{Grants, accesses, covers, patterns_for};
 
 pub const READ_ROLE: &str = "plugin-read";
 pub const WRITE_ROLE: &str = "plugin-write";
@@ -173,28 +171,6 @@ fn resource_grants(
         .collect()
 }
 
-/// The granted patterns a call of `permission` may use.
-pub(crate) fn patterns_for(grants: &Grants, permission: Permission) -> BTreeSet<String> {
-    (permission.grants().iter())
-        .filter_map(|grant| grants.get(grant))
-        .flatten()
-        .cloned()
-        .collect()
-}
-
-/// Whether a granted pattern, an exact path or a `<base>/**` subtree, covers `target`.
-pub fn covers(pattern: &str, target: &str) -> bool {
-    match pattern.strip_suffix("/**") {
-        Some(base) => {
-            target == base
-                || target
-                    .strip_prefix(base)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        }
-        None => pattern == target,
-    }
-}
-
 /// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
 pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
     let (base, subtree) = match pattern.strip_suffix("/**") {
@@ -223,22 +199,6 @@ pub fn within(pattern: &str, root: &str) -> bool {
             _ => !glob,
         }
     })
-}
-
-/// The accesses a permission's actions need on its patterns, as the plan's table checks them.
-pub(crate) fn accesses(permission: Permission) -> &'static [Access] {
-    match permission {
-        Permission::ObjectsCopy => &[Access::READ, Access::WRITE],
-        Permission::MetadataWrite
-        | Permission::MetadataCreate
-        | Permission::TransfersDownload
-        | Permission::JobsRun => &[Access::WRITE],
-        Permission::MetadataRead
-        | Permission::ObjectsRead
-        | Permission::TransfersUpload
-        | Permission::ConnectionsSend
-        | Permission::SecretsValue => &[Access::READ],
-    }
 }
 
 /// The access the role needs on a grant's patterns.
@@ -296,15 +256,6 @@ pub(crate) fn carry_grants(
 pub fn stored_grants(grants: &Grants) -> BTreeMap<String, Vec<String>> {
     (grants.iter())
         .map(|(grant, patterns)| (grant.to_string(), patterns.iter().cloned().collect()))
-        .collect()
-}
-
-/// Grants read back from an install record; names this version does not know are dropped.
-pub fn parse_grants(stored: &BTreeMap<String, Vec<String>>) -> Grants {
-    (stored.iter())
-        .filter_map(|(name, patterns)| {
-            Some((name.parse().ok()?, patterns.iter().cloned().collect()))
-        })
         .collect()
 }
 
