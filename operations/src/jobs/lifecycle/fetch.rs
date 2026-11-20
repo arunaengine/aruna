@@ -19,12 +19,12 @@ use aruna_core::metadata::protocol::{
 };
 
 /// The holder that answered, if any, and the records of its page.
-pub(super) type FetchedFamily = (Option<NodeId>, Vec<JobRecordFrame>);
+pub(crate) type FetchedFamily = (Option<NodeId>, Vec<JobRecordFrame>);
 
-/// Asks the holders in order for one page of a family. The first holder that answers with a page
-/// ends the fetch; a holder that refuses or fails is passed over, and the shared deadline ends it.
+/// Asks the holders in order for one page of a family, or of the submission without a digest.
+/// The first page ends it; a holder that refuses or fails is passed over until the deadline.
 #[derive(Debug, PartialEq)]
-pub(super) struct FetchFamilyOperation {
+pub(crate) struct FetchFamilyOperation {
     holders: Vec<NodeId>,
     frame: Option<Vec<u8>>,
     remaining: Duration,
@@ -32,16 +32,16 @@ pub(super) struct FetchFamilyOperation {
 }
 
 impl FetchFamilyOperation {
-    pub(super) fn new(
+    pub(crate) fn new(
         placement: PlacementRef,
         holders: Vec<NodeId>,
-        family: (SubmissionId, [u8; 32]),
+        family: (SubmissionId, Option<[u8; 32]>),
         deadline: Duration,
     ) -> Self {
         let message = MetadataTransportMessage::ForwardRecordPage {
             placement,
             submission_id: family.0,
-            request_digest: Some(family.1),
+            request_digest: family.1,
             cursor: None,
             limit: PageLimit::default(),
         };

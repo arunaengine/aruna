@@ -5,22 +5,28 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
 use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::job::family::{
-    ExecutionRole, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope, LogicalJobSpec,
-    PhysicalExecutionState, ProjectedExecution,
+    ExecutionRole, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope, JobRecordKind,
+    LogicalJobSpec, PhysicalExecutionState, ProjectedExecution,
 };
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::structs::execution::job::prune::FamilyTombstone;
+use aruna_core::structs::execution::job::record_keys::family_prefix;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::user::id::UserId;
 
+use super::alias::AliasFamilyOperation;
+use super::membership::{MembershipViewOperation, family_not_run, mark_not_run};
 use super::report::{
     AuditPaging, AuditRange, FamilyReport, ReportDetails, ReportDetailsOperation, started_at,
 };
@@ -35,6 +41,7 @@ use crate::jobs::records::project::{
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
+use crate::secrets::owner::WriterView;
 use aruna_core::job_request::session_of;
 
 /// A projection that lost its transaction every time is busy, not failed: the
@@ -58,7 +65,20 @@ pub type FamilyView = (ProjectedFamily, LogicalJobSpec);
 pub struct FamilyProjectionOperation {
     job_id: JobId,
     now_ms: u64,
+    /// Who reads: only the submitter learns that a job was pruned, everyone else finds nothing.
+    reader: Option<UserId>,
+    /// The pruned-family check before anything is projected.
+    checking: Option<PruneCheck>,
     projected: Option<ProjectedFamily>,
+    /// The view and its records while this node's membership view is read.
+    viewing: Option<Box<(FamilyView, Vec<JobRecordEnvelope>)>>,
+}
+
+#[derive(Debug, PartialEq)]
+enum PruneCheck {
+    Alias,
+    Tombstone(JobFamilyId),
+    Claims(FamilyTombstone),
 }
 
 type ProjectionNext = Result<Next<Option<FamilyView>>, JobRouteError>;
@@ -68,8 +88,76 @@ impl FamilyProjectionOperation {
         Self {
             job_id,
             now_ms,
+            reader: None,
+            checking: None,
             projected: None,
+            viewing: None,
         }
+    }
+
+    /// The read of `reader`, who is told when its own job was pruned.
+    pub fn for_reader(mut self, reader: UserId) -> Self {
+        self.reader = Some(reader);
+        self
+    }
+
+    /// A pruned family is never projected again: its rows may be half deleted, and a projection
+    /// would write a cache row for it. Only a later incarnation that holds this alias is read.
+    fn check(&mut self, check: PruneCheck, result: IoResult) -> ProjectionNext {
+        match check {
+            PruneCheck::Alias => match result.child::<Option<JobFamilyId>, JobRouteError>()?? {
+                Some(family) => {
+                    self.checking = Some(PruneCheck::Tombstone(family));
+                    let row = (
+                        FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+                        family_prefix(&family),
+                    );
+                    Ok(Next::Call(IoCall::Read(vec![row])))
+                }
+                None => self.project(),
+            },
+            PruneCheck::Tombstone(family) => {
+                let Some(value) = result.value()? else {
+                    return self.project();
+                };
+                let tombstone = from_bytes::<FamilyTombstone>(&value).map_err(unavailable)?;
+                self.checking = Some(PruneCheck::Claims(tombstone));
+                let read = LoadFamilyOperation::kind(family, JobRecordKind::Claim);
+                Ok(Next::Call(IoCall::child(read)))
+            }
+            PruneCheck::Claims(tombstone) => {
+                let claims = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()?;
+                let claimed = (claims.map_err(unavailable)?.iter()).any(|envelope| {
+                    matches!(&envelope.record, JobFamilyRecord::Claim(claim) if claim.job_id == self.job_id)
+                });
+                if tombstone.finished && claimed {
+                    return self.project();
+                }
+                // Reads stay self-scoped: only the submitter learns that its job was pruned.
+                match tombstone
+                    .created_by
+                    .is_some_and(|by| Some(by) == self.reader)
+                {
+                    true => Err(JobRouteError::Pruned),
+                    false => Err(JobRouteError::NotFound),
+                }
+            }
+        }
+    }
+
+    fn project(&mut self) -> ProjectionNext {
+        let (job_id, now_ms) = (self.job_id, self.now_ms);
+        let build = move || {
+            ProjectFamilyOperation::new(ProjectFamilyConfig {
+                family: FamilyRef::Alias(job_id),
+                now_ms,
+                rebuild: false,
+            })
+        };
+        let child = boxed_retry(build, &job_id.to_bytes(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
     fn projected(&mut self, read: Result<ProjectedFamily, RecordStoreError>) -> ProjectionNext {
@@ -87,19 +175,33 @@ impl FamilyProjectionOperation {
         Ok(Next::Call(IoCall::child(read)))
     }
 
+    /// Finds the spec, then reads the membership view the not-run reading needs.
     fn with_spec(
-        &self,
+        &mut self,
         projected: ProjectedFamily,
-        records: &[JobRecordEnvelope],
+        records: Vec<JobRecordEnvelope>,
     ) -> ProjectionNext {
         let canonical = (projected.projection.as_ref())
             .ok_or_else(no_projection)?
             .canonical_job_id;
         let spec = records.iter().find_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Spec(spec) if spec.job_id == canonical => Some(spec.as_ref().clone()),
+            JobFamilyRecord::Spec(spec) if spec.job_id == canonical => {
+                Some((envelope.realm_id, spec.as_ref().clone()))
+            }
             _ => None,
         });
-        let spec = spec.ok_or_else(|| unavailable("job family spec unavailable"))?;
+        let (realm_id, spec) = spec.ok_or_else(|| unavailable("job family spec unavailable"))?;
+        self.viewing = Some(Box::new(((projected, spec), records)));
+        let read = MembershipViewOperation::new(realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    /// Not run is this node's reading of the records, so it is applied here and never cached.
+    fn viewed(&mut self, view: Option<WriterView>) -> ProjectionNext {
+        let ((mut projected, spec), records) = *self.viewing.take().ok_or_else(no_projection)?;
+        if let (Some(view), Some(projection)) = (view, projected.projection.as_mut()) {
+            mark_not_run(projection, &family_not_run(&records, &view));
+        }
         Ok(Next::Done(Some((projected, spec))))
     }
 }
@@ -109,26 +211,25 @@ impl Operation for FamilyProjectionOperation {
     type Error = JobRouteError;
 
     fn first(&mut self) -> ProjectionNext {
-        let (job_id, now_ms) = (self.job_id, self.now_ms);
-        let build = move || {
-            ProjectFamilyOperation::new(ProjectFamilyConfig {
-                family: FamilyRef::Alias(job_id),
-                now_ms,
-                rebuild: false,
-            })
-        };
-        let child = boxed_retry(build, &job_id.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        self.checking = Some(PruneCheck::Alias);
+        Ok(Next::Call(IoCall::child(AliasFamilyOperation::new(
+            self.job_id,
+        ))))
     }
 
     fn next(&mut self, result: IoResult) -> ProjectionNext {
+        if let Some(check) = self.checking.take() {
+            return self.check(check, result);
+        }
+        if self.viewing.is_some() {
+            let view = result.child::<Option<WriterView>, IoError>()?;
+            return self.viewed(view.ok().flatten());
+        }
         match self.projected.take() {
             None => self.projected(result.child::<ProjectedFamily, RecordStoreError>()?),
             Some(projected) => {
                 let records = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()?;
-                self.with_spec(projected, &records.map_err(unavailable)?)
+                self.with_spec(projected, records.map_err(unavailable)?)
             }
         }
     }
@@ -163,6 +264,7 @@ impl Operation for FamilyStatusOperation {
 
     fn first(&mut self) -> Result<Next<Self::Output>, JobRouteError> {
         let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let read = read.for_reader(self.user_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -298,6 +400,7 @@ impl Operation for SessionJobOperation {
 
     fn first(&mut self) -> SessionNext {
         let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let read = read.for_reader(self.user_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -334,11 +437,22 @@ impl Operation for SessionJobOperation {
 pub struct FamilyResponderOperation {
     job_id: JobId,
     now_ms: u64,
+    reader: Option<UserId>,
 }
 
 impl FamilyResponderOperation {
     pub fn new(job_id: JobId, now_ms: u64) -> Self {
-        Self { job_id, now_ms }
+        Self {
+            job_id,
+            now_ms,
+            reader: None,
+        }
+    }
+
+    /// The read of `reader`, who is told when its own job was pruned.
+    pub fn for_reader(mut self, reader: UserId) -> Self {
+        self.reader = Some(reader);
+        self
     }
 }
 
@@ -347,7 +461,10 @@ impl Operation for FamilyResponderOperation {
     type Error = JobRouteError;
 
     fn first(&mut self) -> Result<Next<Option<NodeId>>, JobRouteError> {
-        let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let mut read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        if let Some(reader) = self.reader {
+            read = read.for_reader(reader);
+        }
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -476,6 +593,7 @@ impl Operation for FamilyReportOperation {
 
     fn first(&mut self) -> ReportNext {
         let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let read = read.for_reader(self.user_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -551,6 +669,7 @@ impl Operation for FamilyLogOperation {
 
     fn first(&mut self) -> Result<Next<Option<AuditPage>>, JobRouteError> {
         let read = FamilyProjectionOperation::new(self.job_id, self.now_ms);
+        let read = read.for_reader(self.user_id);
         Ok(Next::Call(IoCall::child(read)))
     }
 
@@ -687,14 +806,23 @@ mod tests {
         UserId::local(ulid::Ulid::from_parts(9, 9), REALM)
     }
 
+    /// A projection read past its pruned check: the alias names no family here yet.
+    fn projecting() -> FamilyProjectionOperation {
+        let mut read = FamilyProjectionOperation::new(job(), 1);
+        let alias = IoCall::child(AliasFamilyOperation::new(job()));
+        assert_eq!(read.first(), Ok(Next::Call(alias)));
+        let unknown = child(Ok::<Option<JobFamilyId>, JobRouteError>(None));
+        assert!(matches!(
+            read.next(unknown),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        read
+    }
+
     // An unknown alias names no family; a lost transaction reads as busy.
     #[test]
     fn projection_outcomes() {
-        let answer = |error| {
-            let mut read = FamilyProjectionOperation::new(job(), 1);
-            assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
-            read.next(child(Err::<ProjectedFamily, _>(error)))
-        };
+        let answer = |error| projecting().next(child(Err::<ProjectedFamily, _>(error)));
         assert_eq!(answer(RecordStoreError::UnknownAlias), Ok(Next::Done(None)));
         let conflict =
             RecordStoreError::Storage(aruna_core::errors::StorageError::TransactionConflict);
@@ -705,8 +833,7 @@ mod tests {
     #[test]
     fn projection_needs_content() {
         let family = Family::new([1; 32]);
-        let mut read = FamilyProjectionOperation::new(job(), 1);
-        read.first().expect("the projection starts");
+        let mut read = projecting();
         let done = read.next(child(Ok::<_, RecordStoreError>(projected(&family, false))));
         assert_eq!(done, Err(no_projection()));
     }
@@ -767,6 +894,11 @@ mod tests {
             partial.next(view(&family, true)),
             Err(JobRouteError::Unavailable(_))
         ));
+        // The caller is passed on, so the submitter of a pruned job is told so.
+        let owner = family.spec().created_by;
+        let mut read = FamilyResponderOperation::new(job(), 1).for_reader(owner);
+        let projection = FamilyProjectionOperation::new(job(), 1).for_reader(owner);
+        assert_eq!(read.first(), Ok(Next::Call(IoCall::child(projection))));
     }
 
     // A report is read only by the submitter, whose paged inputs are filled next.

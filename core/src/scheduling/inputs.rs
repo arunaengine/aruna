@@ -14,6 +14,7 @@ use crate::structs::placement::policy::{
 };
 use crate::structs::placement::record::LabelMatch;
 use crate::structs::storage::replication::VersionedObjectArn;
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -47,10 +48,10 @@ pub enum PlanError {
     DuplicateInput { key: String },
     #[error("input {key} pins a version its source does not name")]
     InputMismatch { key: String },
-    #[error("target {kind} on node {node_id} is advertised twice")]
-    DuplicateTarget { node_id: NodeId, kind: String },
-    #[error("target {kind} on node {node_id} does not continue the scan in order")]
-    PageOrder { node_id: NodeId, kind: String },
+    #[error("target {backend} on node {node_id} is advertised twice")]
+    DuplicateTarget { node_id: NodeId, backend: String },
+    #[error("target {backend} on node {node_id} does not continue the scan in order")]
+    PageOrder { node_id: NodeId, backend: String },
     #[error(transparent)]
     Policy(#[from] PlacementPolicyError),
     #[error(transparent)]
@@ -105,7 +106,12 @@ pub struct PlanRequest {
     /// A durable logical admission record exists for this request.
     pub admitted: bool,
     pub resources: EffectiveResources,
+    /// The group the job runs for, which a backend's allow-list must name.
+    pub group_id: GroupId,
     pub executor_constraint: Option<String>,
+    /// A backend name the request is pinned to; names are node-local, so one name matches it
+    /// on every node unless a node label pins the node too.
+    pub backend: Option<String>,
     pub required_labels: Vec<LabelMatch>,
     pub staging: StagingMode,
     pub network: NetworkAccess,
@@ -160,7 +166,7 @@ impl PlanRequest {
 pub(crate) fn target_order(candidate: &TargetCandidate) -> (&[u8; 32], &str) {
     (
         candidate.node_id.as_bytes(),
-        candidate.capability.kind.as_str(),
+        candidate.capability.backend.as_str(),
     )
 }
 

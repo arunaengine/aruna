@@ -10,6 +10,8 @@ use aruna_core::structs::execution::job::family::{
     JobRecordKind, PhysicalExecutionState,
 };
 use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::record_keys::{alias_key, record_key};
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
@@ -19,8 +21,6 @@ use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::tests::records::Family;
-use aruna_core::structs::execution::job::record_keys::{alias_key, record_key};
-use aruna_core::structs::execution::job::record_rows::to_bytes;
 
 fn fixture() -> Family {
     Family::new([5u8; 32])
@@ -58,6 +58,10 @@ fn reservation(receipt: &ExecutionReceipt) -> JobReservationRecord {
         created_at_ms: 1,
         subject_generation: 0,
         subject_digest: [0; 32],
+        config_clock: Default::default(),
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
     }
 }
 

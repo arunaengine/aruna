@@ -143,6 +143,7 @@ async fn finished_run(
         env: Default::default(),
         resources: Default::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),

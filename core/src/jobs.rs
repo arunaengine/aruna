@@ -22,7 +22,7 @@ use crate::metadata::AuthToken;
 use crate::operation::SubOperation;
 use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::execution::job::family::{LogicalJobState, SubmissionId};
+use crate::structs::execution::job::family::{ExpiryReason, LogicalJobState, SubmissionId};
 use crate::structs::execution::job::identity::{JobId, JobState};
 use crate::structs::execution::job::input::{
     InputSelection, JobPayload, RoCrateLimits, StagingJobCheckpoint,
@@ -123,6 +123,8 @@ pub struct JobStatusView {
     pub state: JobState,
     pub attempts: u32,
     pub cancel_requested: bool,
+    /// Set when a holder cancelled the job because it expired without an outcome.
+    pub expiry_reason: Option<ExpiryReason>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -171,6 +173,7 @@ impl From<&JobRecord> for JobStatusView {
             state: record.state,
             attempts: record.attempts,
             cancel_requested: record.cancel_requested,
+            expiry_reason: None,
             created_at_ms: record.created_at_ms,
             updated_at_ms: record.updated_at_ms,
             finished_at_ms: record.finished_at_ms,
@@ -447,6 +450,33 @@ pub enum SubmissionRefusal {
         reason: String,
     },
     Unavailable,
+}
+
+/// What a node a plugin task's submission was sent to answers after its admission deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClosureAnswer {
+    /// The node stores a claim of the submission: its request family and alias.
+    Claimed {
+        family: crate::structs::execution::job::family::JobFamilyId,
+        job_id: JobId,
+    },
+    /// No claim, and a committed closure row refuses every later admission there.
+    Absent,
+    /// Nothing decided; ask again.
+    Undecided,
+}
+
+/// How a target answers whether it ever accepted one launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchClosureAnswer {
+    /// The target holds a receipt for exactly this launch.
+    Receipt(Box<crate::effects::ReceiptFrame>),
+    /// No receipt, and the launch window passed on the target's clock, so none can follow.
+    NeverAccepted,
+    /// The target pruned the family after every execution it ran there had stopped.
+    Pruned,
+    /// The window has not passed on the target's clock yet; ask again later.
+    TooEarly,
 }
 
 /// A failed call leaves the request unanswered, which another holder may still answer.

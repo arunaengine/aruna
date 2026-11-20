@@ -220,6 +220,25 @@ export declare const jobs: {
   copy(source: string, target: string, options?: { version?: string }): Job;
 };
 
+export interface TaskStart {
+  /** Values for the `{name}` parts of the command, one argument each. */
+  parameters?: { [name: string]: unknown };
+  /** Container paths to objects or bucket paths; a path ending in `/` gives every object below it. */
+  inputs?: { [path: string]: string | Object };
+  /** Container paths to small text or bytes, at most 64 KiB together. */
+  files?: { [path: string]: string | Uint8Array };
+  /** Container directories to bucket path prefixes. */
+  outputs?: { [directory: string]: string };
+}
+
+export declare class Task {
+  name: string;
+  /** Starts the task; it needs read on every input and write on every output. */
+  start(request?: TaskStart): Job;
+}
+
+export declare function task(name: string): Task;
+
 /** Puts a host in place of the component's imports; for the build's entry and tests. */
 export declare function use(host: object, types?: { [field: string]: string }): void;
 

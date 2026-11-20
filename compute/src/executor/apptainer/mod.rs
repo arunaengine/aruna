@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use aruna_core::compute::backend::RuntimeDestination;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
@@ -290,6 +291,12 @@ fn enforced_limits(config: &ApptainerConfig, spec: &TaskSpec) -> Result<(u64, u6
 impl ExecutorBackend for ApptainerBackend {
     fn kind(&self) -> ExecutorKind {
         ExecutorKind::Apptainer
+    }
+
+    fn destination(&self) -> Option<RuntimeDestination> {
+        Some(RuntimeDestination::Apptainer {
+            state_root: self.config.state_root.display().to_string(),
+        })
     }
 
     fn capabilities(&self) -> BackendCaps {

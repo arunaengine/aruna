@@ -47,7 +47,7 @@ fn candidate(family: &Family, spec: LogicalJobSpec, claim: SubmissionClaim) -> A
     }
 }
 
-async fn admit(
+pub(super) async fn admit(
     context: &DriverContext,
     family: &Family,
     job_id: JobId,
@@ -64,6 +64,7 @@ async fn admit(
             now_ms: 3_000,
             quota_refusal: None,
             quota_revision: None,
+            admit_by: None,
         }),
         context,
     )
@@ -104,6 +105,7 @@ async fn rejects_stale_quota() {
             now_ms: 3_000,
             quota_refusal: None,
             quota_revision: Some(0),
+            admit_by: None,
         }),
         &ctx,
     )
@@ -279,6 +281,7 @@ fn identity_is_deterministic() {
         captured_inputs: Vec::new(),
         output_policies: Vec::new(),
         input_pages: None,
+        admit_by: None,
     };
     let identity = request.identity().expect("identity derives");
 
@@ -456,4 +459,70 @@ fn refuses_reserved_tags() {
     let mut spec = payload();
     store_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace stored");
     assert!(store_workspace(&mut spec, WorkspaceMode::None, None).is_err());
+}
+
+// A keyed submission whose family is still being deleted here gets a retryable error and writes
+// nothing; it is admitted as a new incarnation once the deletion finished.
+#[tokio::test]
+async fn waits_for_pruning() {
+    use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
+    use aruna_core::structs::execution::job::prune::FamilyTombstone;
+    use aruna_core::structs::execution::job::record_keys::family_prefix;
+    let family = Family::new([5u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let store = |finished| {
+        let tombstone = FamilyTombstone {
+            pruned_at_ms: 600,
+            last_record_ms: 500,
+            finished,
+            created_by: None,
+            aliases: Vec::new(),
+        };
+        StorageEffect::Write {
+            key_space: FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+            key: family_prefix(&family.family()),
+            value: postcard::to_allocvec(&tombstone).unwrap().into(),
+            txn_id: None,
+        }
+    };
+    ctx.storage_handle.send_storage_effect(store(false)).await;
+
+    let refused = admit(&ctx, &family, family.job_id).await;
+    assert_eq!(refused, Err(LifecycleError::Pruning));
+    let alias = drive(AliasFamilyOperation::new(family.job_id), &ctx).await;
+    assert_eq!(alias, Ok(None));
+    ctx.storage_handle.send_storage_effect(store(true)).await;
+    let admitted = admit(&ctx, &family, family.job_id).await;
+    assert!(
+        admitted.expect("new incarnation").1,
+        "the keyed family starts again"
+    );
+}
+
+// A keyed replay while the family is being deleted gets the retryable error, although its old
+// claim is still stored, instead of the old alias that already reads as pruned.
+#[tokio::test]
+async fn replay_waits_pruning() {
+    use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
+    let family = Family::new([6u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let first = admit(&ctx, &family, family.job_id).await;
+    assert!(first.expect("first admission").1);
+    let deleting = FamilyTombstone {
+        pruned_at_ms: 600,
+        last_record_ms: 500,
+        finished: false,
+        created_by: None,
+        aliases: Vec::new(),
+    };
+    let store = StorageEffect::Write {
+        key_space: FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+        key: family_prefix(&family.family()),
+        value: postcard::to_allocvec(&deleting).unwrap().into(),
+        txn_id: None,
+    };
+    ctx.storage_handle.send_storage_effect(store).await;
+
+    let replay = admit(&ctx, &family, family.job_id).await;
+    assert_eq!(replay, Err(LifecycleError::Pruning));
 }

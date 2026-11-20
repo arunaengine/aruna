@@ -19,11 +19,13 @@ use aruna_core::rows::values;
 use aruna_core::structs::execution::harvest::HarvestSource;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
-    ImportRoCrateSource, ImportRoCrateSpec, JobPayload, RoCrateUploadRecord,
+    ImportRoCrateSource, ImportRoCrateSpec, JobPayload, RoCrateUploadRecord, upload_key,
 };
 use aruna_core::structs::execution::job::local::{
-    ActiveJobKind, JobRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
+    ActiveJobKind, JobRecord, LocalAdmission, WorkspaceMode, job_active_prefix, job_record_key,
+    parse_dedup_value,
 };
+use aruna_core::structs::execution::job::rows::{dedup_index_key, job_insert_entries};
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::snapshot::DistributionView;
@@ -37,8 +39,6 @@ use super::import::upload::claim_upload;
 use crate::harvest::repository::source_key;
 use crate::s3::imports::cron::is_running;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, UploadClaimError};
-use aruna_core::structs::execution::job::input::upload_key;
-use aruna_core::structs::execution::job::rows::{dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {
@@ -114,6 +114,12 @@ pub struct SubmitJobOperation {
 }
 
 impl SubmitJobOperation {
+    /// Stores the backend values a device admitted the job under in the same transaction.
+    pub fn with_admission(mut self, admission: Option<LocalAdmission>) -> Self {
+        self.record.local_admission = admission;
+        self
+    }
+
     pub fn new(spec: SubmitJobSpec, job_id: JobId) -> Self {
         let active_cap = spec.active_cap.or_else(|| {
             spec.payload
@@ -660,6 +666,7 @@ mod tests {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),

@@ -258,7 +258,7 @@ impl StoreOutputsOperation {
                     "Output record deferred: the local job family view is unavailable"
                 );
             }
-            Admission::Pending(_) | Admission::PendingFull => {
+            Admission::Pending(_) | Admission::PendingFull | Admission::Pruning => {
                 return Err(JobError::retryable(
                     "output record admission is awaiting family evidence",
                 ));
@@ -338,7 +338,7 @@ impl Operation for StoreOutputsOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
     use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
     use aruna_core::structs::execution::job::local::{AttemptIntent, JobClaim};
     use aruna_core::structs::identity::realm::RealmId;
@@ -349,7 +349,6 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_test_support::jobs::insert_job;
 
@@ -380,6 +379,7 @@ mod tests {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -470,6 +470,9 @@ mod tests {
                     executor_kind: "docker".to_string(),
                     pinned_image: "alpine@sha256:0".to_string(),
                     attempt_epoch: 0,
+                    backend: "docker".to_string(),
+                    config_generation: 0,
+                    home_digest: aruna_core::compute::identity::home_digest("docker", None),
                 },
                 None,
                 None,

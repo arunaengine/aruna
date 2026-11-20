@@ -48,7 +48,7 @@ struct Fixture {
 /// Docker-backed node running its own jobs + a group bucket holding a few dated
 /// objects the aggregation counts.
 async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(Arc::new(backend)));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", Arc::new(backend)));
     let seed = spawn_compute_seed(registry).await?;
     let endpoint = seed.s3.clone().expect("full node exposes S3");
     let bearer = create_bearer_token(

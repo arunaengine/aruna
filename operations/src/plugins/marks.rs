@@ -17,8 +17,8 @@ use super::rows::{
     Row, StoreError, decode, delete_call, done, encode, mapped_child, page_call, page_of,
     read_call, row, values,
 };
-use super::work::{Found, WorkKind, WorkLookup, WorkState};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_core::install_work::{Found, WorkKind, WorkLookup, WorkState};
 
 /// Row kind of the marks in the work keyspace, apart from the rows an install's removal deletes.
 pub const MARK_ROW: u8 = b'm';

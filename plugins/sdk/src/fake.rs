@@ -11,7 +11,7 @@ use aruna_plugin_types::calls::merge_into;
 use serde_json::{Map, Value};
 
 use crate::Level;
-use crate::bindings::aruna::plugin::jobs::{DownloadRequest, Status, UploadRequest};
+use crate::bindings::aruna::plugin::jobs::{DownloadRequest, Status, TaskRequest, UploadRequest};
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
@@ -345,6 +345,36 @@ impl Host for Fake {
             request.target,
             limit.as_deref().unwrap_or("-"),
             sums.join(",")
+        ));
+        Ok(format!("job-{}", self.0.borrow().jobs.len() + 1))
+    }
+
+    fn job_task(&self, request: &TaskRequest) -> Answer<String> {
+        let pairs = |fields: &[Field]| -> Vec<String> {
+            (fields.iter())
+                .map(|field| format!("{}={}", field.name, field.value))
+                .collect()
+        };
+        let inputs: Vec<_> = (request.inputs.iter())
+            .map(|input| {
+                format!(
+                    "{}={}@{}",
+                    input.path,
+                    input.source,
+                    input.version.as_deref().unwrap_or("-")
+                )
+            })
+            .collect();
+        let files: Vec<_> = (request.files.iter())
+            .map(|file| format!("{}={}", file.path, String::from_utf8_lossy(&file.content)))
+            .collect();
+        self.note(format!(
+            "task {} {} {} {} {}",
+            request.task,
+            pairs(&request.parameters).join(","),
+            inputs.join(","),
+            files.join(","),
+            pairs(&request.outputs).join(",")
         ));
         Ok(format!("job-{}", self.0.borrow().jobs.len() + 1))
     }

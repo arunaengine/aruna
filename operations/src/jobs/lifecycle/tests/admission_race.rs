@@ -15,6 +15,7 @@ use aruna_core::structs::execution::job::family::{JobFamilyRecord, JobRecordKind
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::types::Key;
 use tokio::sync::Barrier;
 use ulid::Ulid;
@@ -28,7 +29,6 @@ use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::tests::records::{Family, REALM, context};
-use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 use aruna_test_support::jobs::read_job_record;
@@ -114,8 +114,11 @@ pub(super) fn config(
         resources: resources(),
         subject_generation: receipt.subject_generation,
         subject_digest: receipt.subject_digest,
+        config_generation: receipt.config_generation,
+        config_digest: receipt.config_digest,
         record: Box::new(record),
         now_ms: 4_000,
+        fence: None,
     }
 }
 

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::id::NodeId;
+use aruna_core::install_work::{WorkKind, WorkRow};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunTrigger};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, PluginAudit};
@@ -19,9 +20,7 @@ use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for}
 use aruna_operations::plugins::install::InstallError;
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
-use aruna_operations::plugins::work::{
-    WorkKind, WorkRow, list_work as list_work_rows, read_work, work_state,
-};
+use aruna_operations::plugins::work::{list_work as list_work_rows, read_work, work_state};
 use aruna_operations::users::service_account::group_admin_path;
 use axum::Json;
 use axum::body::Bytes;
@@ -1301,6 +1300,7 @@ mod tests {
     #[tokio::test]
     async fn lists_work_state() {
         // The receiver lists its work with the state of each job, to the group's admins only.
+        use aruna_core::install_work::{Identity, WorkRow};
         use aruna_core::structs::execution::job::identity::{JobId, JobState};
         use aruna_core::structs::execution::job::input::{
             JobPayload, PluginWorkAction, PluginWorkSpec,
@@ -1309,9 +1309,7 @@ mod tests {
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
         use aruna_drivers::driver::drive;
-        use aruna_operations::plugins::work::{
-            Identity, WorkChange, WorkRow, reserve, update_work,
-        };
+        use aruna_operations::plugins::work::{WorkChange, reserve, update_work};
         use aruna_test_support::jobs::insert_job;
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -1365,7 +1363,7 @@ mod tests {
         let row = config.to_bytes(&actor).unwrap();
         let key = (*realm_id.as_bytes()).into();
         write_doc(&ctx, REALM_CONFIG_KEYSPACE, key, row.into()).await;
-        let kind = aruna_operations::plugins::work::WorkKind::Copy;
+        let kind = aruna_core::install_work::WorkKind::Copy;
         let mut work = WorkRow::reserved(
             &install,
             kind,

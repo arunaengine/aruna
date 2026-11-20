@@ -24,6 +24,8 @@ pub(crate) struct FamilyRouteOperation {
     request: Option<JobRequest>,
     node: (NodeId, RealmId),
     now_ms: u64,
+    /// The caller, so the submitter of a pruned job is told so.
+    reader: Option<UserId>,
     routing: bool,
 }
 
@@ -39,8 +41,14 @@ impl FamilyRouteOperation {
             request,
             node,
             now_ms,
+            reader: None,
             routing: false,
         }
+    }
+
+    pub(crate) fn for_reader(mut self, reader: UserId) -> Self {
+        self.reader = Some(reader);
+        self
     }
 }
 
@@ -49,7 +57,10 @@ impl Operation for FamilyRouteOperation {
     type Error = JobRouteError;
 
     fn first(&mut self) -> Result<Next<JobRouteOutcome>, JobRouteError> {
-        let responder = FamilyResponderOperation::new(self.job_id, self.now_ms);
+        let mut responder = FamilyResponderOperation::new(self.job_id, self.now_ms);
+        if let Some(reader) = self.reader {
+            responder = responder.for_reader(reader);
+        }
         Ok(Next::Call(IoCall::child(responder)))
     }
 
@@ -158,6 +169,7 @@ impl Operation for RecordRouteOperation {
             .take()
             .map(|auth_token| JobRequest::Record { auth_token, job_id });
         let route = FamilyRouteOperation::new(job_id, request, node, self.now_ms);
+        let route = route.for_reader(self.user_id);
         Ok(Next::Call(IoCall::child(route)))
     }
 

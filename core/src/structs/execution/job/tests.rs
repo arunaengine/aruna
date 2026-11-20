@@ -4,15 +4,16 @@
 
 use super::family::JobRecordBody;
 use super::family::{
-    CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt, ExecutionRole,
-    ExecutionUpdate, HolderView, JOB_BUDGET_DOMAIN, JOB_CANCEL_DOMAIN, JOB_CLAIM_DOMAIN,
-    JOB_ENVELOPE_DOMAIN, JOB_LAUNCH_DOMAIN, JOB_OUTPUT_DOMAIN, JOB_RECEIPT_DOMAIN, JOB_SPEC_DOMAIN,
-    JOB_UPDATE_DOMAIN, JobAdmissionRecord, JobCancelRecord, JobContractError, JobFamilyId,
-    JobFamilyRecord, JobProjection, JobRecordContext, JobRecordEnvelope, JobRecordError,
-    JobRecordKey, JobRecordKind, JobRetryPolicy, LaunchIntent, LocalExecution, LogicalJobSpec,
-    LogicalJobState, MAX_EXECUTION_OUTPUTS, MAX_MESSAGE_BYTES, OutputSet, PhysicalExecutionResult,
+    CLOCK_MARGIN_MS, CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt,
+    ExecutionRole, ExecutionStop, ExecutionUpdate, HolderView, JOB_BUDGET_DOMAIN,
+    JOB_CANCEL_DOMAIN, JOB_CLAIM_DOMAIN, JOB_ENVELOPE_DOMAIN, JOB_LAUNCH_DOMAIN, JOB_OUTPUT_DOMAIN,
+    JOB_RECEIPT_DOMAIN, JOB_SPEC_DOMAIN, JOB_UPDATE_DOMAIN, JobAdmissionRecord, JobCancelRecord,
+    JobContractError, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordContext,
+    JobRecordEnvelope, JobRecordError, JobRecordKey, JobRecordKind, JobRetryPolicy,
+    LAUNCH_WINDOW_MS, LaunchIntent, LocalExecution, LogicalJobSpec, LogicalJobState,
+    MAX_EXECUTION_OUTPUTS, MAX_MESSAGE_BYTES, OutputSet, PhysicalExecutionResult,
     PhysicalExecutionState, ProjectedExecution, RECORD_KEY_BYTES, RecordVerdict, ResultMessage,
-    SubmissionClaim, SubmissionId, WitnessBudgetRecord, canonical_execution_key,
+    StopEvidence, SubmissionClaim, SubmissionId, WitnessBudgetRecord, canonical_execution_key,
     verify_update_chain,
 };
 use super::identity::{
@@ -22,7 +23,8 @@ use super::identity::{
 use super::input::{
     CollisionPolicy, CompositionError, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
     ImportRoCrateSpec, ImportRoCrateTarget, InputMode, InputSelection, InputSource, JobPayload,
-    OutputDestination, OutputSelection, RoCrateLimits, WorkspaceOutput, plan_composition,
+    OutputDestination, OutputSelection, PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG, RoCrateLimits,
+    TagError, Tagged, WorkspaceOutput, named_install, plan_composition, tagged,
 };
 use super::local::{
     AttemptControl, JobRecord, JobResultPayload, JobTransitionError, OutputCommitIntent,
@@ -31,6 +33,11 @@ use super::local::{
     job_prune_key, job_record_key, lease_index_key, owner_index_key, owner_index_prefix,
     parse_dedup_value, parse_owner_key, parse_schedule_key, user_dedup_key, validate_transition,
     workspace_credential_id,
+};
+use super::membership::{Membership, NotRun, left_executions, membership, not_run};
+use super::prune::{
+    Freshness, HoldReason, PruneInput, PruneVerdict, TOMBSTONE_RETENTION_MS, last_record_ms,
+    pending_expired, prune_verdict, spec_freshness,
 };
 use super::*;
 
@@ -149,6 +156,17 @@ fn illegal_transitions() {
     }
 }
 
+// An execution that never submitted an attempt can end as an error; an in-process job not.
+#[test]
+fn discard_ends_unsubmitted() {
+    for from in [JobState::Queued, JobState::AwaitingKey] {
+        let class = JobExecutionClass::ExternalAttempt;
+        assert!(validate_transition(class, from, JobState::Failed).is_ok());
+        let class = JobExecutionClass::InProcess;
+        assert!(validate_transition(class, from, JobState::Failed).is_err());
+    }
+}
+
 #[test]
 fn internal_rejects_external() {
     // External-only states must be rejected for an in-process job. Parking on
@@ -260,6 +278,31 @@ fn input(key: &str, mode: InputMode, version: Option<&str>) -> InputSelection {
     }
 }
 
+#[test]
+fn inline_appends_variant() {
+    // Stored object inputs keep their encoding; inline bytes are a new variant after them.
+    let object = input("a", InputMode::ExactReference, Some("v"));
+    let encoded = postcard::to_allocvec(&object.source).unwrap();
+    assert_eq!(encoded[0], 0);
+    assert_eq!(
+        postcard::from_bytes::<InputSource>(&encoded).unwrap(),
+        object.source
+    );
+    let inline = InputSource::Inline {
+        bytes: b"x".to_vec(),
+    };
+    let encoded = postcard::to_allocvec(&inline).unwrap();
+    assert_eq!(encoded[0], 1);
+    assert_eq!(
+        postcard::from_bytes::<InputSource>(&encoded).unwrap(),
+        inline
+    );
+    // An inline input pins no version, so no input mode refuses it.
+    let mut pinned = object;
+    pinned.source = inline;
+    assert!(plan_composition(vec![pinned], CollisionPolicy::Reject).is_ok());
+}
+
 fn colliding() -> Vec<InputSelection> {
     let mut second = input("a", InputMode::Snapshot, None);
     second.source = InputSource::S3 {
@@ -342,6 +385,7 @@ fn resolves_workspace_outputs() {
         }],
         output_prefixes: vec!["outputs/".to_string()],
         collision_policy: Default::default(),
+        backend: None,
     };
 
     spec.resolve_outputs("ws-job", node_id);
@@ -510,6 +554,7 @@ fn submission() -> SubmissionId {
 fn target() -> ExecutionTargetId {
     ExecutionTargetId {
         node_id: node_id(9),
+        backend: "docker".to_string(),
         executor_kind: "docker".to_string(),
     }
 }
@@ -630,6 +675,7 @@ fn sample_spec() -> LogicalJobSpec {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         },
         request_digest: [1u8; 32],
         spec_digest: [0u8; 32],
@@ -689,6 +735,7 @@ fn sample_launch() -> LaunchIntent {
         plan_digest: [12u8; 32],
         spec_digest: spec_digest(),
         created_at_ms: 1_700_000_000_000,
+        config_clock: Default::default(),
     }
 }
 
@@ -708,6 +755,9 @@ fn sample_receipt() -> ExecutionReceipt {
         subject_generation: 2,
         subject_digest: [15u8; 32],
         accepted_at_ms: 1_700_000_000_000,
+        config_clock: Default::default(),
+        config_generation: 0,
+        config_digest: [0u8; 32],
     }
 }
 
@@ -795,6 +845,7 @@ fn sample_projection() -> JobProjection {
         }],
         outputs: OutputSet::canonical(vec![sample_output()]).expect("canonical outputs"),
         cancel_requested: false,
+        expiry_reason: None,
     }
 }
 
@@ -844,16 +895,16 @@ fn canonical_encodings() {
         digests,
         [
             "2e3adfb3440145e2f0acf7dcac006c00cdbccb0fa8df37b935fc0ba4055993d2",
-            "867bcdf4ee17d3181c9b89ad4d3e3d5d0e08fa45de30818a29a76ff66cf93f34",
+            "240e97a3ad85964661055de2abcda8424c44612245aa3d2c7d46132973e13383",
             "1c4dc854b3931565ff75fafec7a24673cc03c1989516f9b46dc93a093ec2bfeb",
-            "08c19deca0ed44b4647bba5d11f0d2729b0d2949d347ede46ca9acb80bfc4b45",
-            "957b71361481ffdfdca3ec746bb904a90dad09faf61012c35b69634e21c50614",
-            "ea5f320399ec50f6cf373d1569adae7cafcd459e47e68b2112c109ee883562b3",
-            "d411a8c29cf623f809a3b64ebc90afb265f2aeab9004b5f9e6d97bc4bc08c868",
-            "8b6fe57497102547e048acb401f95467697a9ea8cc6e619a56eb030510938265",
-            "f558c0cf6296de333a89a2848d71293cfc0763dc83ba63e2a6bd923ea10760cc",
-            "da845a6ec08937f98ab8cd3df645b29f3ac9e25ea36e2ecb21c79b47dca1018b",
-            "bb342189b2c25f4c3c70813b14199b2e1c0fc2b54e8869e05fff02957ffc5d79",
+            "3bc380ef38b8aea7a61f277e383118ad35a7b5ed4130d3d52debb38a7e0cef42",
+            "67f5b55b2fb8a390fdc60fdaaba482585584f7a3413eec06415a0ce55f3c34b9",
+            "da6ae1482014c0c1535e57ae4632b530681fc0b8c6b4ba2bdbbb80c434c971f6",
+            "d14be59bb9e621e1117b683cb3f7ce6aa4625c1a016ca46566425c393767c3b4",
+            "4edb0f0f8747740b198088daa5871fc6cb1f7ef6c5a1374718c7fef8f6b63ce3",
+            "f5857651315f67e941101ee28b569748662845c823407846b6f87269bc84a66c",
+            "ee8318c302baf68aab8c51c3dd55d7966a1516206a92dc9582930d30a82aee97",
+            "4fc7a54b9e841491ec560e5aa7d9c7559b9bbdb966cb63dc7e97a0d93ad64894",
         ]
     );
     assert_eq!(postcard::to_allocvec(&submission()).unwrap(), vec![3u8; 32]);
@@ -1478,6 +1529,7 @@ fn rejects_wrong_target() {
     elsewhere.executor_node_id = node_id(2);
     elsewhere.target = ExecutionTargetId {
         node_id: node_id(2),
+        backend: "docker".to_string(),
         executor_kind: "docker".to_string(),
     };
     assert_eq!(
@@ -2057,4 +2109,512 @@ fn owner_index_scoped() {
     let id = JobId::from_bytes([4u8; 16]);
     let ka = owner_index_key(a, 1_000, id);
     assert!(!ka.starts_with(owner_index_prefix(b).as_ref()));
+}
+
+/// The stop of the successful sample execution, naming its terminal update and output.
+fn sample_stop() -> ExecutionStop {
+    ExecutionStop {
+        execution_id: Ulid::from_bytes([13u8; 16]),
+        submission_id: submission(),
+        request_digest: [1u8; 32],
+        executor_node_id: node_id(9),
+        receipt_digest: sample_receipt().digest().expect("receipt digests"),
+        update_sequence: 1,
+        update_digest: success_update().digest().expect("update digests"),
+        output_digest: Some(output_record().digest().expect("output digests")),
+        evidence: StopEvidence::Tombstoned,
+        stopped_at_ms: 1_700_000_003_000,
+    }
+}
+
+#[test]
+fn stop_needs_evidence() {
+    // A stop stays pending until this node holds the receipt, the terminal update and the
+    // output record it names; a running update is no terminal one.
+    let view = LocalView::new();
+    let (receipt, update, output) = (sample_receipt(), success_update(), output_record());
+    let stop = envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 9);
+    let receipted = JobRecordContext {
+        receipt: Some(&receipt),
+        ..view.context()
+    };
+    let updated = JobRecordContext {
+        previous_update: Some(&update),
+        ..receipted
+    };
+    let complete = JobRecordContext {
+        output: Some(&output),
+        ..updated
+    };
+
+    let missing = |kind| Ok(RecordVerdict::MissingEvidence(kind));
+    assert_eq!(
+        stop.verify(&view.context()),
+        missing(JobRecordKind::Receipt)
+    );
+    assert_eq!(stop.verify(&receipted), missing(JobRecordKind::Update));
+    assert_eq!(stop.verify(&updated), missing(JobRecordKind::Output));
+    assert_eq!(stop.verify(&complete), Ok(RecordVerdict::Authentic));
+
+    let running = sample_update();
+    let early = ExecutionStop {
+        update_sequence: 0,
+        update_digest: running.digest().expect("update digests"),
+        output_digest: None,
+        ..sample_stop()
+    };
+    let checked = JobRecordContext {
+        previous_update: Some(&running),
+        ..receipted
+    };
+    assert_eq!(
+        envelope(JobFamilyRecord::Stop(Box::new(early)), 9).verify(&checked),
+        Err(JobRecordError::EvidenceMismatch(JobRecordKind::Update))
+    );
+}
+
+#[test]
+fn stop_rejects_signer() {
+    // Only the receipted executor states that its execution stopped.
+    let view = LocalView::new();
+    let (receipt, update, output) = (sample_receipt(), success_update(), output_record());
+    let complete = JobRecordContext {
+        receipt: Some(&receipt),
+        previous_update: Some(&update),
+        output: Some(&output),
+        ..view.context()
+    };
+    assert_eq!(
+        envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 2).verify(&complete),
+        Err(JobRecordError::WrongPublisher(JobRecordKind::Stop))
+    );
+    let claimed = ExecutionStop {
+        executor_node_id: node_id(2),
+        ..sample_stop()
+    };
+    assert_eq!(
+        envelope(JobFamilyRecord::Stop(Box::new(claimed)), 2).verify(&complete),
+        Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt))
+    );
+}
+
+#[test]
+fn launch_window_target() {
+    // The window counts on the deciding target's clock: a target whose clock is five minutes
+    // behind the scheduler's still accepts the launch five minutes longer in real time.
+    let launch = sample_launch();
+    let created = launch.created_at_ms;
+    assert!(!launch.expired(created));
+    assert!(!launch.expired(created + LAUNCH_WINDOW_MS));
+    assert!(launch.expired(created + LAUNCH_WINDOW_MS + 1));
+    let target_clock = |scheduler_ms: u64| scheduler_ms - 5 * 60 * 1000;
+    let passed = created + LAUNCH_WINDOW_MS + 1;
+    assert!(!launch.expired(target_clock(passed)));
+    assert!(launch.expired(target_clock(passed + 5 * 60 * 1000)));
+}
+
+/// The node that writes every realm config event of the membership tests.
+fn config_origin() -> NodeId {
+    node_id(20)
+}
+
+fn config_dot(seq: u64) -> crate::admin_documents::AdminDocumentDot {
+    crate::admin_documents::AdminDocumentDot {
+        event_id: Ulid::from_bytes([seq as u8; 16]),
+        origin_node_id: config_origin(),
+        origin_seq: seq,
+    }
+}
+
+fn config_clock(seq: u64) -> crate::admin_documents::AdminDocumentClock {
+    crate::admin_documents::AdminDocumentClock::default().with_observed(config_origin(), seq)
+}
+
+fn interval(node: NodeId, added: u64, removed: &[u64]) -> crate::admin_documents::NodeInterval {
+    crate::admin_documents::NodeInterval {
+        node_id: node,
+        added: config_dot(added),
+        removed: removed.iter().map(|seq| config_dot(*seq)).collect(),
+    }
+}
+
+#[test]
+fn membership_follows_removals() {
+    // A removal closes the interval the cited clock names; until this node applied it, or while
+    // its clock does not cover the cited one, the node has not left.
+    let node = node_id(9);
+    let removed = [interval(node, 1, &[3])];
+    let applied = [interval(node, 1, &[])];
+    let at = |cited, intervals: &[_], local| {
+        membership(node, &config_clock(cited), intervals, &config_clock(local))
+    };
+    assert_eq!(at(2, &removed, 3), Membership::Left);
+    assert_eq!(at(2, &applied, 2), Membership::Open);
+    assert_eq!(at(2, &removed, 1), Membership::Unknown);
+    assert_eq!(at(0, &removed, 3), Membership::Absent);
+}
+
+#[test]
+fn membership_names_intervals() {
+    // A promotion adds a second open interval; a cited clock that saw both adds is left only
+    // once both closed. After a re-add, old work stays left and new work stays open.
+    let node = node_id(9);
+    let promoted = [interval(node, 1, &[3]), interval(node, 2, &[])];
+    let at = |cited, intervals: &[_]| {
+        membership(node, &config_clock(cited), intervals, &config_clock(5))
+    };
+    assert_eq!(at(2, &promoted), Membership::Open);
+    assert_eq!(at(1, &promoted), Membership::Left);
+    let closed = [interval(node, 1, &[4]), interval(node, 2, &[4])];
+    assert_eq!(at(2, &closed), Membership::Left);
+    let readded = [interval(node, 1, &[3]), interval(node, 5, &[])];
+    assert_eq!(at(2, &readded), Membership::Left);
+    assert_eq!(at(5, &readded), Membership::Open);
+}
+
+// Only an execution whose every interval at its cited clock closed has left; one admitted after
+// a re-add, or one this node cannot judge yet, keeps running.
+#[test]
+fn cancels_left_executions() {
+    let local = node_id(9);
+    let intervals = [interval(local, 1, &[3]), interval(local, 5, &[])];
+    let (old, new, unknown) = (config_clock(2), config_clock(5), config_clock(7));
+    let reservations = [(1, &old), (2, &new), (3, &unknown)];
+    let left = left_executions(local, reservations, &intervals, &config_clock(6));
+    assert_eq!(left, [1]);
+}
+
+/// The sample launch and receipt, both citing realm config clock 2.
+fn cited_records() -> Vec<JobRecordEnvelope> {
+    let launch = LaunchIntent {
+        config_clock: config_clock(2),
+        ..sample_launch()
+    };
+    let receipt = ExecutionReceipt {
+        launch_digest: launch.digest().expect("launch digests"),
+        config_clock: config_clock(2),
+        ..sample_receipt()
+    };
+    vec![
+        envelope(JobFamilyRecord::Launch(Box::new(launch)), 1),
+        envelope(JobFamilyRecord::Receipt(Box::new(receipt)), 9),
+        envelope(JobFamilyRecord::Update(Box::new(sample_update())), 9),
+    ]
+}
+
+#[test]
+fn removal_closes_work() {
+    // The executor left: its open execution is not run and so is the family; nothing is
+    // published, every holder derives it from the records it holds.
+    let left = [interval(node_id(9), 1, &[3])];
+    let records = cited_records();
+
+    let derived = not_run(&records, &left, &config_clock(3));
+    assert_eq!(
+        derived.executions.into_iter().collect::<Vec<_>>(),
+        vec![Ulid::from_bytes([13u8; 16])]
+    );
+    assert!(derived.launches.is_empty(), "the launch has its receipt");
+    assert!(derived.family);
+    assert!(
+        !not_run(&records, &left, &config_clock(1)).family,
+        "clock not covered"
+    );
+    let open = [interval(node_id(9), 1, &[])];
+    assert!(
+        !not_run(&records, &open, &config_clock(3)).family,
+        "removal not applied"
+    );
+}
+
+#[test]
+fn outcomes_stay_decided() {
+    // A success stays the outcome, a stopped execution is closed anyway, and an open launch
+    // to a target that is still a member keeps the family undecided.
+    let left = [interval(node_id(9), 1, &[3]), interval(node_id(5), 1, &[])];
+    let mut succeeded = cited_records();
+    succeeded.push(envelope(
+        JobFamilyRecord::Update(Box::new(success_update())),
+        9,
+    ));
+    assert!(!not_run(&succeeded, &left, &config_clock(3)).family);
+
+    let mut stopped = cited_records();
+    stopped.push(envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 9));
+    let derived = not_run(&stopped, &left, &config_clock(3));
+    assert!(derived.executions.is_empty() && !derived.family);
+
+    let mut pending = cited_records();
+    let other = LaunchIntent {
+        launch_id: Ulid::from_bytes([21u8; 16]),
+        scheduler_seq: 1,
+        target: ExecutionTargetId {
+            node_id: node_id(5),
+            backend: "docker".to_string(),
+            executor_kind: "docker".to_string(),
+        },
+        config_clock: config_clock(2),
+        ..sample_launch()
+    };
+    pending.push(envelope(JobFamilyRecord::Launch(Box::new(other)), 1));
+    assert!(!not_run(&pending, &left, &config_clock(3)).family);
+}
+
+/// A successful family with one stopped execution: spec, launch, receipt, output, update, stop.
+fn finished_records() -> Vec<JobRecordEnvelope> {
+    vec![
+        envelope(JobFamilyRecord::Spec(Box::new(sample_spec())), 1),
+        envelope(JobFamilyRecord::Launch(Box::new(sample_launch())), 1),
+        envelope(JobFamilyRecord::Receipt(Box::new(sample_receipt())), 9),
+        envelope(JobFamilyRecord::Output(Box::new(output_record())), 9),
+        envelope(JobFamilyRecord::Update(Box::new(success_update())), 9),
+        envelope(JobFamilyRecord::Stop(Box::new(sample_stop())), 9),
+    ]
+}
+
+fn prune_input<'a>(
+    records: &'a [JobRecordEnvelope],
+    closed: &'a BTreeSet<Ulid>,
+    not_run: &'a NotRun,
+) -> PruneInput<'a> {
+    PruneInput {
+        records,
+        state: LogicalJobState::Succeeded,
+        truncated: false,
+        closed,
+        not_run,
+        local_work: false,
+        undelivered: false,
+        now_ms: last_record_ms(records) + RETENTION_MS + 1,
+    }
+}
+
+#[test]
+fn prunes_settled_family() {
+    // A settled family whose executions stopped and launches closed is prunable after its
+    // retention, and each other rule alone holds it.
+    let records = finished_records();
+    let (closed, not_run) = (BTreeSet::new(), NotRun::default());
+    let input = prune_input(&records, &closed, &not_run);
+    assert_eq!(prune_verdict(&input), PruneVerdict::Prunable);
+
+    let held = |input: PruneInput<'_>| match prune_verdict(&input) {
+        PruneVerdict::Held { reason, .. } => reason,
+        verdict => panic!("held family was {verdict:?}"),
+    };
+    assert_eq!(
+        held(PruneInput {
+            truncated: true,
+            ..input
+        }),
+        HoldReason::Truncated
+    );
+    assert_eq!(
+        held(PruneInput {
+            local_work: true,
+            ..input
+        }),
+        HoldReason::LocalWork
+    );
+    assert_eq!(
+        held(PruneInput {
+            undelivered: true,
+            ..input
+        }),
+        HoldReason::Undelivered
+    );
+    let young = PruneInput {
+        now_ms: input.now_ms - 2,
+        ..input
+    };
+    assert_eq!(
+        prune_verdict(&young),
+        PruneVerdict::Held {
+            reason: HoldReason::Retention,
+            recheck_ms: Some(input.now_ms - 1)
+        }
+    );
+    for state in [
+        LogicalJobState::Indeterminate,
+        LogicalJobState::Running,
+        LogicalJobState::Queued,
+    ] {
+        let undecided = PruneInput {
+            state,
+            now_ms: u64::MAX,
+            ..input
+        };
+        // Without an outcome but with every other rule met, the family expires instead.
+        assert_eq!(prune_verdict(&undecided), PruneVerdict::Expire, "{state:?}");
+        let working = PruneInput {
+            local_work: true,
+            ..undecided
+        };
+        assert_eq!(held(working), HoldReason::Undecided, "{state:?}");
+    }
+}
+
+#[test]
+fn holds_unstopped_execution() {
+    // A success does not hide a second execution without a stop record, and an execution that
+    // ended in an error without one holds too; a not-run execution counts as closed.
+    let mut records = finished_records();
+    let second = ExecutionReceipt {
+        execution_id: Ulid::from_bytes([30u8; 16]),
+        ..sample_receipt()
+    };
+    records.push(envelope(JobFamilyRecord::Receipt(Box::new(second)), 9));
+    let (closed, mut not_run) = (BTreeSet::new(), NotRun::default());
+    let input = prune_input(&records, &closed, &not_run);
+    assert_eq!(
+        prune_verdict(&input),
+        PruneVerdict::Held {
+            reason: HoldReason::Running(node_id(9)),
+            recheck_ms: None
+        }
+    );
+    not_run.executions.insert(Ulid::from_bytes([30u8; 16]));
+    let input = prune_input(&records, &closed, &not_run);
+    assert_eq!(prune_verdict(&input), PruneVerdict::Prunable);
+
+    let unstopped: Vec<_> = finished_records()[..5].to_vec();
+    let no_run = NotRun::default();
+    let cancelled = PruneInput {
+        state: LogicalJobState::Cancelled,
+        ..prune_input(&unstopped, &closed, &no_run)
+    };
+    assert!(matches!(
+        prune_verdict(&cancelled),
+        PruneVerdict::Held {
+            reason: HoldReason::Running(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn holds_open_launch() {
+    // A launch without receipt and closure holds the family until its closure time; a closure
+    // row or a not-run launch closes it, and a not-run family counts as settled.
+    let open = LaunchIntent {
+        launch_id: Ulid::from_bytes([31u8; 16]),
+        ..sample_launch()
+    };
+    let mut records = finished_records();
+    records.push(envelope(JobFamilyRecord::Launch(Box::new(open.clone())), 1));
+    let (mut closed, not_run) = (BTreeSet::new(), NotRun::default());
+    let early = PruneInput {
+        now_ms: open.closure_due() - 1,
+        ..prune_input(&records, &closed, &not_run)
+    };
+    assert_eq!(
+        prune_verdict(&early),
+        PruneVerdict::Held {
+            reason: HoldReason::LaunchOpen(node_id(9)),
+            recheck_ms: Some(open.closure_due())
+        }
+    );
+    closed.insert(open.launch_id);
+    assert_eq!(
+        prune_verdict(&prune_input(&records, &closed, &not_run)),
+        PruneVerdict::Prunable
+    );
+    let left = NotRun {
+        launches: [open.launch_id].into(),
+        family: true,
+        ..NotRun::default()
+    };
+    let unclosed = BTreeSet::new();
+    let input = PruneInput {
+        state: LogicalJobState::Indeterminate,
+        ..prune_input(&records, &unclosed, &left)
+    };
+    assert_eq!(prune_verdict(&input), PruneVerdict::Prunable);
+}
+
+#[test]
+fn horizon_bounds_pending() {
+    // A pending row expires at the horizon; a spec at the pruned C is refused, one after C plus
+    // the margin starts a new incarnation, and an old one is stale.
+    assert!(!pending_expired(1_000, 1_000 + TOMBSTONE_RETENTION_MS - 1));
+    assert!(pending_expired(1_000, 1_000 + TOMBSTONE_RETENTION_MS));
+    let now = 10 * TOMBSTONE_RETENTION_MS;
+    let last = now - 1_000_000;
+    assert_eq!(spec_freshness(last, now, Some(last)), Freshness::Pruned);
+    assert_eq!(
+        spec_freshness(last + CLOCK_MARGIN_MS + 1, now, Some(last)),
+        Freshness::Fresh
+    );
+    assert_eq!(
+        spec_freshness(now - TOMBSTONE_RETENTION_MS, now, None),
+        Freshness::Stale
+    );
+    assert_eq!(spec_freshness(now - 1, now, None), Freshness::Fresh);
+}
+
+/// A plain job spec with its plugin task tags set to `install` and `work`.
+fn task_spec(install: &str, work: &str) -> ExecutionSpec {
+    let mut spec = sample_spec().payload;
+    spec.tags
+        .insert(PLUGIN_INSTALL_TAG.to_string(), install.to_string());
+    spec.tags
+        .insert(PLUGIN_WORK_TAG.to_string(), work.to_string());
+    spec
+}
+
+// The task tags name an install and a work only with an output; a broken tag is malformed.
+#[test]
+fn reads_task_tags() {
+    let (install_id, work_id) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
+    assert_eq!(tagged(&sample_spec().payload), None);
+    let mut spec = task_spec(&install_id.to_string(), &work_id.to_string());
+    assert_eq!(tagged(&spec), Some(Err(TagError::NoOutput)));
+    spec.file_outputs.push(OutputSelection {
+        container_path: "/out/".to_string(),
+        path_prefix: None,
+        destination_node_id: None,
+        destination: OutputDestination::S3 {
+            bucket: "results".to_string(),
+            key: "maps/".to_string(),
+        },
+        name: None,
+        description: None,
+    });
+    let named = Tagged {
+        install_id,
+        work_id,
+    };
+    assert_eq!(tagged(&spec), Some(Ok(named)));
+    spec.tags
+        .insert(PLUGIN_WORK_TAG.to_string(), "not a ulid".to_string());
+    assert_eq!(tagged(&spec), Some(Err(TagError::Malformed)));
+    spec.tags.remove(PLUGIN_INSTALL_TAG);
+    assert_eq!(tagged(&spec), Some(Err(TagError::Malformed)));
+}
+
+// Only an active install that is not paused runs a task.
+#[test]
+fn names_active_install() {
+    use crate::plugin_installs::{InstallState, tests::install};
+    let mut installs = vec![install()];
+    let named = Tagged {
+        install_id: Ulid::from_bytes([1; 16]),
+        work_id: Ulid::nil(),
+    };
+    let removed = Err(TagError::Install("removed or conflicting"));
+    assert_eq!(named_install(&installs, named), removed);
+    let named = Tagged {
+        install_id: installs[0].install_id,
+        ..named
+    };
+    assert!(named_install(&installs, named).is_ok());
+    installs[0].paused = true;
+    assert_eq!(
+        named_install(&installs, named),
+        Err(TagError::Install("paused"))
+    );
+    installs[0].paused = false;
+    installs[0].state = InstallState::Removing;
+    let state = Err(TagError::Install(InstallState::Removing.as_str()));
+    assert_eq!(named_install(&installs, named), state);
 }

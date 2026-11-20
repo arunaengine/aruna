@@ -60,8 +60,8 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             let cleanup = aruna_operations::jobs::workflow::cleanup::TerminalCleanupOperation::new(
                 *for_job,
                 ctx.claim_token,
-                attempt.clone(),
-                access_key,
+                (attempt.clone(), access_key),
+                ctx.driver.node_and_realm(),
             );
             let result = Box::pin(aruna_drivers::driver::drive(cleanup, &ctx.driver)).await;
             aruna_operations::jobs::workflow::cleanup::cleanup_outcome(result)

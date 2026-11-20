@@ -13,6 +13,7 @@ use aruna_core::compute::effect::{
     AttemptEnd, BackendFacts, ComputeAnswer, ComputeEffect, ComputeRequest, OutputBody,
     OutputFailure, SessionOpen, WorkspaceAddress,
 };
+use aruna_core::compute::identity::home_digest;
 use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{BackendError, FenceContext, OutputChunks, TaskOutput};
 use aruna_core::stream::{BackendStream, StreamError};
@@ -23,10 +24,17 @@ use tokio_util::sync::CancellationToken;
 use super::job::{JobHost, current_host, run_session};
 use crate::driver::DriverContext;
 
-fn facts(backend: &Arc<dyn ExecutorBackend>) -> BackendFacts {
+fn facts(
+    registry: &ExecutorRegistry,
+    (name, backend): (&str, &Arc<dyn ExecutorBackend>),
+) -> BackendFacts {
     let caps = backend.capabilities();
+    let kind = backend.kind();
     BackendFacts {
-        kind: backend.kind(),
+        name: name.to_string(),
+        home_digest: home_digest(&kind.as_wire(), backend.destination().as_ref()),
+        config_digest: registry.config_digest(name).unwrap_or_default(),
+        kind,
         s3_mount: caps.s3_mount,
         session: caps.session,
         local_site: caps.local_site,
@@ -227,42 +235,47 @@ pub(super) async fn dispatch_compute(
     let Some(registry) = context.compute_handle.as_ref() else {
         return ComputeAnswer::NoCompute;
     };
-    let backend_of = |kind| registry.get(kind).cloned();
+    let backend_of = |name: &str| registry.named(name).cloned();
     match effect {
-        ComputeEffect::Select { constraint } => {
-            ComputeAnswer::Selected(registry.select(constraint.as_ref()).map(facts))
+        ComputeEffect::Select {
+            backend,
+            constraint,
+        } => {
+            let placed = registry.placed(backend.as_deref(), constraint.as_ref());
+            ComputeAnswer::Selected(placed.map(|placed| facts(registry, placed)))
         }
-        ComputeEffect::Facts { kind } => match backend_of(&kind) {
-            Some(backend) => ComputeAnswer::Facts(facts(&backend)),
+        ComputeEffect::Facts { backend } => match registry.named(&backend) {
+            Some(named) => ComputeAnswer::Facts(facts(registry, (&backend, named))),
             None => ComputeAnswer::NoBackend,
         },
+        ComputeEffect::Offers => ComputeAnswer::Offers(registry.offers()),
         ComputeEffect::Fenced {
-            kind,
+            backend,
             subject,
             generation,
             digest,
         } => ComputeAnswer::Fenced(
             registry
-                .fenced(&kind, &subject, generation, &digest)
-                .map(facts),
+                .fenced(&backend, &subject, generation, &digest)
+                .map(|fenced| facts(registry, (&backend, fenced))),
         ),
-        ComputeEffect::Endpoint => {
-            let workspace = registry.workspace_endpoint();
-            ComputeAnswer::Endpoint(WorkspaceAddress {
+        ComputeEffect::Endpoint { backend } => match registry.workspace(Some(&backend), None) {
+            Some(workspace) => ComputeAnswer::Endpoint(WorkspaceAddress {
                 endpoint: workspace.endpoint.clone(),
                 session_endpoint: workspace.session_endpoint.clone(),
                 region: workspace.region.clone(),
-            })
-        }
-        ComputeEffect::ResolveImage { kind, image } => {
-            let Some(backend) = backend_of(&kind) else {
+            }),
+            None => ComputeAnswer::NoBackend,
+        },
+        ComputeEffect::ResolveImage { backend, image } => {
+            let Some(backend) = backend_of(&backend) else {
                 return ComputeAnswer::NoBackend;
             };
             let token = CancellationToken::new();
             let resolved = cancelling(&token, backend.resolve_image(&image, &token)).await;
             ComputeAnswer::Image(resolved)
         }
-        ComputeEffect::Granted { kind, spec } => match backend_of(&kind) {
+        ComputeEffect::Granted { backend, spec } => match backend_of(&backend) {
             Some(backend) => {
                 let resources = backend.granted(&spec);
                 ComputeAnswer::Granted { spec, resources }
@@ -270,10 +283,10 @@ pub(super) async fn dispatch_compute(
             None => ComputeAnswer::NoBackend,
         },
         ComputeEffect::Attempt {
-            kind,
+            backend,
             fence,
             request,
-        } => match backend_of(&kind) {
+        } => match backend_of(&backend) {
             Some(backend) => attempt_call(registry, &backend, &fence, request).await,
             None => ComputeAnswer::NoBackend,
         },

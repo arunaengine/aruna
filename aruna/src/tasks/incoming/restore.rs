@@ -6,6 +6,8 @@ use super::drained::remove_drained_backends;
 use super::*;
 use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use aruna_drivers::driver::node_routing;
+use aruna_operations::jobs::records::prune::pass::ArmFamiliesOperation;
+use aruna_operations::node::catch_up::catch_up_timer;
 use std::time::SystemTime;
 
 /// The first and the longest wait before an incomplete timer restoration resumes.
@@ -378,6 +380,10 @@ impl TaskQueues {
         if stopped() {
             return;
         }
+        arm_catch_up(&task_handle).await;
+        if stopped() {
+            return;
+        }
         restore_mirror_timer(&context).await;
         if stopped() {
             return;
@@ -641,6 +647,18 @@ async fn arm_prune_timer(context: &DriverContext) {
     let timer = PruneTimerOperation::new(unix_timestamp_millis());
     if let Err(error) = drive(timer, context).await {
         warn!(error = %error, "Failed to restore job prune timer");
+    }
+    if let Err(error) = drive(ArmFamiliesOperation::new(), context).await {
+        warn!(error = %error, "Failed to restore the family prune timer");
+    }
+}
+
+/// Arms the first realm config catch-up pass of this start.
+async fn arm_catch_up(task_handle: &TaskHandle) {
+    if let Event::Task(TaskEvent::Error { message, .. }) =
+        task_handle.send_effect(catch_up_timer()).await
+    {
+        warn!(message = %message, "Failed to arm the realm config catch-up");
     }
 }
 

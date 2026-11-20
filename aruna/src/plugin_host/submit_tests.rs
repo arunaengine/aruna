@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::plugin_host::plugin_work::tests::scope;
+use aruna_core::install_work::Identity;
+use aruna_core::install_work::WorkKind;
+use aruna_core::install_work::WorkRow;
 use aruna_drivers::driver::drive;
-use aruna_operations::plugins::work::Identity;
-use aruna_operations::plugins::work::WorkKind;
-use aruna_operations::plugins::work::WorkRow;
 use aruna_operations::plugins::work::read_work;
 use aruna_plugin_types::calls::ErrorKind;
 use aruna_test_support::plugins::Fixture;
@@ -220,7 +220,8 @@ async fn reply_rechecked() {
     use aruna_plugins::broker::{Broker, CallContext};
 
     use crate::plugin_host::broker::RunBroker;
-    use aruna_operations::plugins::work::{RequestContext, WorkChange, reserve, update_work};
+    use aruna_core::install_work::RequestContext;
+    use aruna_operations::plugins::work::{WorkChange, reserve, update_work};
     use aruna_test_support::plugins::{ORIGIN, hold_keys, replace_rules, rule_for, secret_with};
     let fixture = Fixture::keyed().await;
     fetcher(&fixture).await;

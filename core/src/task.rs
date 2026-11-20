@@ -91,6 +91,10 @@ pub enum TaskKey {
     PruneConnectorReferences,
     /// Accounts recorded splits, rebuilds split children and splits ranges above thresholds.
     MaintainRanges,
+    /// Prunes the job families whose prune index row is due, page by page.
+    PruneFamilies,
+    /// Catches up with the realm config after a start, then refreshes the last contact.
+    ConfigCatchUp,
     /// Emits the watch events producers queued as rows, then deletes the rows.
     DrainWatchEvents,
     /// Runs the follow-ups of the reconciles shard pulls applied, then deletes their rows.

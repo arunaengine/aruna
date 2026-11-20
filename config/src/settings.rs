@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
+use aruna_core::compute::backend::{self as compute_backend, DestinationInputs};
 use aruna_core::federation::valid_federation_url;
 use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts, cors_allows};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
@@ -419,7 +420,10 @@ fn backend_credentials(env: &dyn SettingsEnv, name: &str) -> Option<(String, Str
 
 /// Refuses a file where two backends would read the same credential variables,
 /// which would let one backend authenticate with another's account.
-fn reject_token_clashes(names: impl Iterator<Item = String>) -> Result<(), SetupError> {
+fn reject_token_clashes(
+    names: impl Iterator<Item = String>,
+    variables: impl Fn(&str) -> String,
+) -> Result<(), SetupError> {
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for name in names {
         let token = credential_token(&name);
@@ -427,7 +431,7 @@ fn reject_token_clashes(names: impl Iterator<Item = String>) -> Result<(), Setup
             return Err(invalid_config_value(
                 "BLOB_BACKENDS_PATH",
                 format!("{other}, {name}"),
-                format!("both backends resolve to BLOB_BACKEND_{token}_* credentials"),
+                format!("both backends resolve to {}", variables(&token)),
             ));
         }
     }
@@ -446,8 +450,27 @@ fn load_backends_config(
     };
     let text = std::fs::read_to_string(&path)?;
     let file = BackendsFile::parse(&text)?;
-    reject_token_clashes(file.backend.keys().cloned())?;
-    Ok(file.resolve(&|name| backend_credentials(env, name), timeouts)?)
+    reject_token_clashes(file.backend.keys().cloned(), |token| {
+        format!("BLOB_BACKEND_{token}_* credentials")
+    })?;
+    reject_token_clashes(file.compute.keys().cloned(), |token| {
+        format!("the environment token {token}")
+    })?;
+    let config = file.resolve(&|name| backend_credentials(env, name), timeouts)?;
+    let docker_host = env.var("DOCKER_HOST");
+    let inputs = DestinationInputs {
+        docker_host: docker_host.as_deref(),
+        kube_server: &crate::compute_setup::kube_server,
+    };
+    // Dormant until the fencing, site and tenant checks exist: checked, never run.
+    if !compute_backend::resolve(&file, &inputs)?.is_empty() {
+        return Err(invalid_config_value(
+            "BLOB_BACKENDS_PATH",
+            path,
+            "configured compute backends are not enabled yet; remove the [compute] tables",
+        ));
+    }
+    Ok(config)
 }
 
 pub(crate) fn normalize_env_value(value: &str) -> String {
@@ -1810,11 +1833,42 @@ mod tests {
 
     #[test]
     fn duplicate_tokens_rejected() {
-        assert!(reject_token_clashes(["hot", "cold"].into_iter().map(str::to_string)).is_ok());
-        let error =
-            reject_token_clashes(["hot-store", "hot_store"].into_iter().map(str::to_string))
-                .unwrap_err();
+        let token = |token: &str| token.to_string();
+        assert!(
+            reject_token_clashes(["hot", "cold"].into_iter().map(str::to_string), token).is_ok()
+        );
+        let error = reject_token_clashes(
+            ["hot-store", "hot_store"].into_iter().map(str::to_string),
+            token,
+        )
+        .unwrap_err();
         assert_eq!(invalid_key(error), "BLOB_BACKENDS_PATH");
+    }
+
+    fn with_backends(text: &str) -> Result<Settings, SetupError> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("backends.toml");
+        std::fs::write(&file, text).unwrap();
+        parse(&[("BLOB_BACKENDS_PATH", file.to_str().unwrap())])
+    }
+
+    #[test]
+    fn compute_entries_dormant() {
+        let storage = "[backend.a]\ntype = \"filesystem\"\nroot = \"/data\"\n\
+                       multipart_bucket = \"parts\"\ndefault = true\n";
+        assert!(with_backends(storage).is_ok());
+        let slurm = |name: &str| {
+            format!(
+                "[compute.{name}]\nkind = \"slurm\"\n[compute.{name}.slurm]\nstate_root = \"/{name}\"\n"
+            )
+        };
+
+        let error = with_backends(&format!("{storage}{}", slurm("hpc"))).unwrap_err();
+        assert!(error.to_string().contains("not enabled yet"), "{error}");
+        let clash = with_backends(&format!("{storage}{}{}", slurm("hpc-a"), slurm("hpc_a")));
+        assert!(clash.unwrap_err().to_string().contains("token HPC_A"));
+        let invalid = with_backends(&format!("{storage}{}", slurm("default")));
+        assert!(invalid.unwrap_err().to_string().contains("reserved"));
     }
 
     #[test]

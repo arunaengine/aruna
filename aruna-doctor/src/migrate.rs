@@ -17,15 +17,15 @@ use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
     FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
     FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
-    JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
-    NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
-    PLUGIN_OUTBOX_KEYSPACE, PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
-    QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE,
-    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
-    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
-    USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
+    JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, JOB_STATE_KEYSPACE, LAUNCH_RECORD_KEYSPACE,
+    NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_STATS_KEYSPACE,
+    NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE,
+    PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE,
+    SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+    STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::plugin_installs::PluginInstall;
@@ -72,6 +72,7 @@ use std::path::Path;
 use ulid::Ulid;
 
 mod buckets;
+mod compute;
 pub(crate) mod cursor_repair;
 mod families;
 mod federation;
@@ -280,6 +281,9 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let mutation_rows = db.keyspace(POLICY_MUTATION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let intent_rows = db.keyspace(BULK_INTENT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let node_rows = db.keyspace(NODE_INFO_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let explain_rows = db.keyspace(PLAN_EXPLAIN_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let launch_rows = db.keyspace(LAUNCH_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let reservation_rows = db.keyspace(JOB_RESERVATION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let connector_rows = db.keyspace(SOURCE_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
     let obligation_rows = db.keyspace(
         REPLICATION_OBLIGATION_KEYSPACE,
@@ -424,7 +428,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         padded::<CurrentVersionPointer>(&db, &head_rows, BLOB_HEAD_KEYSPACE, HEAD)?,
         padded::<PolicyMutationRecord>(&db, &mutation_rows, POLICY_MUTATION_KEYSPACE, HEAD)?,
         padded::<PolicyIntent>(&db, &intent_rows, BULK_INTENT_KEYSPACE, HEAD)?,
-        padded::<NodeInfoDocument>(&db, &node_rows, NODE_INFO_KEYSPACE, NODE_INFO)?,
+        node_documents(&db, &node_rows)?,
         padded::<SourceConnector>(&db, &connector_rows, SOURCE_INDEX_KEYSPACE, CONNECTOR)?,
         padded::<LiveObligationRecord>(
             &db,
@@ -460,7 +464,32 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     relaid_rows.push((&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.rows));
     let announced = layouts::cleanup_rows(&db, &cleanup_rows)?.rows;
     relaid_rows.push((&cleanup_rows, BLOB_CLEANUP_KEYSPACE, announced));
-    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 7] = [
+    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 12] = [
+        (
+            &reservation_rows,
+            JOB_RESERVATION_KEYSPACE,
+            compute::old_rows(&db, &reservation_rows, compute::old_reservation)?,
+        ),
+        (
+            &launch_rows,
+            LAUNCH_RECORD_KEYSPACE,
+            compute::old_rows(&db, &launch_rows, compute::old_launch)?,
+        ),
+        (
+            &node_rows,
+            NODE_INFO_KEYSPACE,
+            compute::old_rows(&db, &node_rows, compute::old_document)?,
+        ),
+        (
+            &explain_rows,
+            PLAN_EXPLAIN_KEYSPACE,
+            compute::old_rows(&db, &explain_rows, compute::old_explain)?,
+        ),
+        (
+            &outbox_rows,
+            SYNC_OUTBOX_KEYSPACE,
+            compute::old_outbox(&db, &outbox_rows)?,
+        ),
         (
             &refresh_rows,
             REFRESH_JOB_KEYSPACE,
@@ -697,6 +726,23 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         mirror_repairs_rewritten: mirrors.rewritten,
         unknown_rows,
     })
+}
+
+/// Node info documents in their older padded shape. An alpha.206 document is deleted instead.
+fn node_documents<'k>(
+    db: &OptimisticTxDatabase,
+    keyspace: &'k OptimisticTxKeyspace,
+) -> Result<layouts::KeyspaceRows<'k>, ExplorerError> {
+    let rows = rewrite_rows(
+        db,
+        keyspace,
+        NODE_INFO_KEYSPACE,
+        |value| match compute::old_document(value) {
+            true => Ok(None),
+            false => relaid::<NodeInfoDocument, NodeInfoDocument>(value, NODE_INFO),
+        },
+    )?;
+    Ok((keyspace, NODE_INFO_KEYSPACE, rows.rows))
 }
 
 /// The node secret the node derives its sealing keys from at startup.

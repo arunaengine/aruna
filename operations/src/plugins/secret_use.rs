@@ -29,16 +29,15 @@ use tracing::warn;
 use ulid::Ulid;
 use url::Url;
 
-use super::account::{owned, read_user_call, read_user_result};
 use super::artifacts::ServingNode;
 use super::entry::{EntryError, ReadEntry};
-use super::grants::InstallScope;
 use super::install::{pick_version, read_manifest};
 use super::rows::{Row, StoreError, read_call, values, write_rows};
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::sealed_value;
+use crate::users::install_account::{owns_install, read_user_call, read_user_result};
 
 /// A failed release, as the operations behind it report it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -443,15 +442,12 @@ impl ReleaseSecret {
         admitted: Box<Admitted>,
         result: IoResult,
     ) -> Result<Next<Released>, ReleaseFailure> {
-        let user = read_user_result(result).map_err(|error| unavailable(error.0))?;
+        let user = read_user_result(result).map_err(|error| unavailable(error.to_string()))?;
         let install = self.install()?;
-        let scope = InstallScope {
-            realm_id: install.account.realm_id,
-            group_id: install.group_id,
-            install_id: install.install_id,
-        };
+        let (group_id, install_id) = (install.group_id, install.install_id);
         let active = user.is_some_and(|user| {
-            user.user_id == install.account && owned(&user, &scope) && !user.is_deactivated()
+            let owned = owns_install(&user, group_id, install_id);
+            user.user_id == install.account && owned && !user.is_deactivated()
         });
         if !active {
             return self.refuse(Refusal::Authority, Some(&admitted.selected));

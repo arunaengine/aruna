@@ -25,13 +25,13 @@ pub struct ScoredTarget {
 }
 
 impl ScoredTarget {
-    /// Ascending rank: score first, then node id bytes and executor kind, the
+    /// Ascending rank: score first, then node id bytes and backend name, the
     /// total order of plan section 8.4.
     fn order(&self) -> (&TargetScore, &[u8; 32], &str) {
         (
             &self.score,
             self.target.node_id.as_bytes(),
-            self.target.executor_kind.as_str(),
+            self.target.backend.as_str(),
         )
     }
 }

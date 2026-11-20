@@ -26,6 +26,7 @@ use super::finalize::{FinalizeGoal, FinalizeOperation};
 use super::session::{
     SessionInputs, SessionPlan, SessionPlanOperation, SessionReportOperation, session_call,
 };
+use crate::jobs::fence::{fence_read, fence_up};
 use crate::jobs::store::job_calls::record_attempt_started;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
@@ -34,6 +35,8 @@ use aruna_core::job_request::session_of;
 #[derive(Debug, PartialEq)]
 enum SuperviseStep {
     Anchor,
+    /// Behind the start fence no session reopens; walltime and finalization still run.
+    Fence(u64),
     Facts(u64),
     Plan(u64),
     Open(u64),
@@ -94,9 +97,7 @@ impl SuperviseOperation {
         if session_of(&scope.spec).is_none() || scope.wiring.serving.is_none() {
             return self.wait(started_at_ms);
         }
-        let kind = scope.kind.clone();
-        let call = compute_call(ComputeEffect::Facts { kind });
-        self.call(SuperviseStep::Facts(started_at_ms), call)
+        self.call(SuperviseStep::Fence(started_at_ms), fence_read())
     }
 
     fn plan_session(&mut self, started_at_ms: u64, mounts: bool) -> SuperviseNext {
@@ -205,6 +206,14 @@ impl Operation for SuperviseOperation {
                 let anchored = result.child::<u64, IoError>()?;
                 self.anchored(anchored.unwrap_or(self.now_ms))
             }
+            SuperviseStep::Fence(started_at_ms) => match fence_up(result) {
+                true => self.wait(started_at_ms),
+                false => {
+                    let backend = scope.backend.clone();
+                    let call = compute_call(ComputeEffect::Facts { backend });
+                    self.call(SuperviseStep::Facts(started_at_ms), call)
+                }
+            },
             SuperviseStep::Facts(started_at_ms) => {
                 let mounts = match compute_answer(result)? {
                     ComputeAnswer::Facts(facts) => facts.s3_mount,

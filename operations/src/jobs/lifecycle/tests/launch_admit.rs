@@ -16,6 +16,7 @@ use ulid::Ulid;
 
 use super::admission_race::{config, envelope};
 use crate::document_repository::GetConfigError;
+use crate::jobs::fence::fence_read;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::launch_admit::{
     AdmitLaunchOperation, CommitReceiptOperation, LaunchAnswer, LaunchNode, LaunchUndecided,
@@ -187,12 +188,31 @@ fn admit(family: &Family, launch: &LaunchIntent) -> AdmitLaunchOperation {
         now_ms: 4_000,
         execution_id: Ulid::from_parts(9, 9),
         limits: Some(envelope(4)),
+        config_digest: Some([0; 32]),
     };
     AdmitLaunchOperation::new(frame, node)
 }
 
+/// Starts `operation` on a node that is not fenced.
+fn past_fence(operation: &mut AdmitLaunchOperation) {
+    assert_eq!(operation.first(), Ok(Next::Call(fence_read())));
+    calls_child(operation.next(IoResult::Values(vec![None])));
+}
+
 fn config_answer(family: &Family) -> IoResult {
     child(Ok::<_, GetConfigError>(family.config.clone()))
+}
+
+// Behind the start fence a target admits nothing and answers that it cannot decide, so the
+// scheduler retries or places elsewhere instead of acting on a decline.
+#[test]
+fn fenced_cannot_decide() {
+    let family = Family::new([5; 32]);
+    let launch = family.launch(&family.spec(), family.holder.public(), 0);
+    let mut operation = admit(&family, &launch);
+    operation.first().unwrap();
+    let fenced = IoResult::Values(vec![Some(aruna_core::types::Value::from(&[][..]))]);
+    assert_eq!(operation.next(fenced), Err(LaunchUndecided));
 }
 
 // An offer for another node is refused before any record is read.
@@ -202,7 +222,7 @@ fn other_target_refused() {
     let mut launch = family.launch(&family.spec(), family.holder.public(), 0);
     launch.target.node_id = node(9);
     let mut operation = admit(&family, &launch);
-    calls_child(operation.first());
+    past_fence(&mut operation);
     assert_eq!(
         operation.next(config_answer(&family)),
         Ok(Next::Done(Err(LaunchDecline::Unauthorized)))
@@ -215,7 +235,7 @@ fn config_needed() {
     let family = Family::new([5; 32]);
     let launch = family.launch(&family.spec(), family.holder.public(), 0);
     let mut operation = admit(&family, &launch);
-    calls_child(operation.first());
+    past_fence(&mut operation);
     let missing = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
     assert_eq!(operation.next(child(missing)), Err(LaunchUndecided));
 }
@@ -236,7 +256,7 @@ fn unretained_launch_undecided() {
         )))
     };
     let mut operation = admit(&family, &launch);
-    calls_child(operation.first());
+    past_fence(&mut operation);
     calls_child(operation.next(config_answer(&family)));
     calls_child(operation.next(records(vec![stored])));
     calls_child(operation.next(child(Ok::<_, PageReadError>(spec))));

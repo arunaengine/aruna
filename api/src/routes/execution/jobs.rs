@@ -246,8 +246,8 @@ pub struct SubmitExecutionRequest {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// Scheduling tags. `aruna-engine.org/label/<key>` demands a matching target
-    /// label, at most 16 of them. The workspace tags of that namespace are
-    /// reserved and refused. Defaults to empty.
+    /// label, at most 16 of them. The workspace tags of that namespace and every
+    /// `aruna-engine.org/plugin-` tag are reserved and refused. Defaults to empty.
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
     /// Absolute working directory inside the container, for example `/work`.
@@ -268,6 +268,10 @@ pub struct SubmitExecutionRequest {
     /// Optional executor selector. Leave unset unless the realm documents one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor_constraint: Option<String>,
+    /// Optional compute backend name, for example `default`. Names are node-local, so a name
+    /// matches that backend on every node; a node label pins one node as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// Objects staged into or mounted for the run.
     #[serde(default)]
     pub inputs: Vec<ExecutionInputRequest>,
@@ -318,6 +322,7 @@ impl From<SubmitExecutionRequest> for SubmitExecutionCommand {
             ram_bytes: request.ram_bytes,
             max_walltime_ms: request.max_walltime_ms,
             executor_constraint: request.executor_constraint,
+            backend: request.backend,
             inputs: request.inputs.into_iter().map(Into::into).collect(),
             outputs: request.outputs.into_iter().map(Into::into).collect(),
             output_prefixes: request.output_prefixes,
@@ -858,6 +863,7 @@ pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
             ServerError::Conflict(error.to_string())
         }
         LocalExecutionError::Unsupported(_)
+        | LocalExecutionError::Refused(_)
         | LocalExecutionError::InputNotLocal { .. }
         | LocalExecutionError::InputRefused { .. } => {
             ServerError::BadRequestMessage(error.to_string())
@@ -885,8 +891,13 @@ caller holds WRITE on the document it mints for. A repository link push is reada
 the link's group, who may manage the link.
 
 **Behavior**
-- `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed` or
-  `cancelled`.
+- `state` is a point-in-time value that keeps moving until it reaches `succeeded`, `failed`,
+  `cancelled` or `not_run`. A distributed job is `not_run` when every execution and launch still
+  open belongs to a node that left the realm; such a job is not launched again.
+- `expiry_reason` is present when a holder cancelled a distributed job that has no outcome:
+  `retention` (every execution stopped and retention passed), `stale_spec` (its spec was older
+  than the horizon) or `budget_used` (no target accepted it within its launches). It is not a
+  failure; submit the job again to run it.
 - A distributed execution job carries a `family` block reduced from the replicated records: the
   request's `submission_id`, the currently canonical alias, the canonical execution and its exact
   output VersionIds, how many physical executions and duplicate successes are known, the projection
@@ -995,6 +1006,7 @@ the link's group, who may manage the link.
                     "locally_exhausted": false,
                     "cancel_requested": false,
                     "placement": {
+                        "backend": "default",
                         "executor_kind": "docker",
                         "target_node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
                         "scheduler_node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
@@ -1015,17 +1027,20 @@ the link's group, who may manage the link.
                         "candidates": [
                             {
                                 "node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c",
+                                "backend": "default",
                                 "executor_kind": "docker",
                                 "verdict": "selected"
                             },
                             {
                                 "node_id": "f3a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f",
+                                "backend": "default",
                                 "executor_kind": "docker",
                                 "verdict": "ranked",
                                 "rank": 1
                             },
                             {
                                 "node_id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9091a2b3c4d5e6f708192a3b4c5d6e7f8",
+                                "backend": "hpc",
                                 "executor_kind": "apptainer",
                                 "verdict": "rejected",
                                 "reason": "no executor of that kind"
@@ -1038,6 +1053,7 @@ the link's group, who may manage the link.
         (status = 400, description = "The bearer token cannot be forwarded to the owning node", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such job, or it was submitted by somebody else; absence and foreign ownership are deliberately indistinguishable", body = ErrorResponse),
+        (status = 410, description = "The distributed job's family was pruned on this node after its retention", body = ErrorResponse),
         (status = 503, description = "The node owning this job could not be reached or is not yet known here; retryable, the caller may repeat the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))

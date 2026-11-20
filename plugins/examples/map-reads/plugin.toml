@@ -1,0 +1,25 @@
+# Example plugin: maps reads to a reference genome in a container and records the result.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name = "map-reads"
+version = "0.1.0"
+title = "Map reads to a reference genome"
+on = ["manual", "job_finished"]
+access = "write"
+
+[settings]
+results = "Bucket path for results"
+
+[tasks.map]
+image = "harbor.computational.bio.uni-giessen.de/aruna/map-reads@sha256:4f2a8c1d9e7b6a5f3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b"
+command = ["/opt/map.sh", "{reference}"]
+network = "open"                                # map.sh fetches the reference from NCBI
+cpu = 8
+memory = "32 GiB"
+report = "/out/report.json"                     # read by the node and given to the plugin
+
+[manual]
+dataset = { type = "dataset" }
+reads = "Bucket path of the FASTQ files"
+reference = "Reference genome accession, such as GCF_000005845.2"

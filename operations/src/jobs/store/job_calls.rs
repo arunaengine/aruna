@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::local::LocalAdmission;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 
 use super::attempt_intent::{AttemptCommit, RecordIntentOperation};
@@ -72,8 +73,13 @@ where
     StoreCall::of(build, Ok, ATTEMPT_EXHAUSTED)
 }
 
-fn control_of(job_id: JobId, change: impl ControlEdit) -> StoreCall<AttemptControl> {
-    let build = move || MutateControlOperation::new(job_id, Vec::new(), change.clone());
+/// A change to a job's attempt control, with `extra` rows that must land with the change.
+fn control_with(
+    job_id: JobId,
+    extra: JobWrites,
+    change: impl ControlEdit,
+) -> StoreCall<AttemptControl> {
+    let build = move || MutateControlOperation::new(job_id, extra.clone(), change.clone());
     StoreCall::of(
         build,
         |changed: ControlChange| Ok(changed.control),
@@ -188,6 +194,19 @@ pub fn transition_to_preparing(job_id: JobId, token: Ulid, now_ms: u64) -> Store
         if let Some(claim) = record.claim.as_mut() {
             claim.lease_expires_ms = now_ms.saturating_add(JOB_LEASE_MS);
         }
+        Ok(JobMutation::Persist)
+    })
+}
+
+/// Stores the backend values a device job now starts under, while `token` holds its claim.
+pub fn store_admission(
+    job_id: JobId,
+    token: Ulid,
+    admission: LocalAdmission,
+) -> StoreCall<JobRecord> {
+    change_job(job_id, move |record| {
+        guard_token(record, token)?;
+        record.local_admission = Some(admission.clone());
         Ok(JobMutation::Persist)
     })
 }
@@ -687,6 +706,24 @@ pub fn release_job(job_id: JobId, token: Ulid, now_ms: u64) -> StoreCall<Release
     change_mapped(job_id, mutate, released)
 }
 
+/// Ends one execution of a discard as an infrastructure error with retention zero, so its rows go
+/// right after its cleanup and release. A terminal job is left as it is; both answer the row.
+pub fn discard_execution(job_id: JobId, now_ms: u64, error: JobError) -> StoreCall<JobRecord> {
+    let mutate = move |record: &mut JobRecord| {
+        if record.state.is_terminal() {
+            return Ok(JobMutation::Skip);
+        }
+        record.state = JobState::Failed;
+        record.last_error = Some(error.clone());
+        record.claim = None;
+        record.finished_at_ms = Some(now_ms);
+        record.updated_at_ms = now_ms;
+        record.retention_ms = 0;
+        Ok(JobMutation::Persist)
+    };
+    change_mapped(job_id, mutate, |record, _| record)
+}
+
 /// Requeue a dependency-blocked job without spending an attempt. Unlike a shutdown release,
 /// this records the reason and delays the next claim so a lagging projection is not polled hot.
 pub fn defer_job(
@@ -841,8 +878,19 @@ pub fn record_attempt_tombstone(
     attempt_epoch: u64,
     tombstone_ref: String,
 ) -> StoreCall<AttemptControl> {
-    control_of(
+    record_stop_tombstone(job_id, token, (attempt_epoch, tombstone_ref), Vec::new())
+}
+
+/// Records the attempt tombstone and writes `stop`, the stop record rows, in the same transaction.
+pub fn record_stop_tombstone(
+    job_id: JobId,
+    token: Ulid,
+    (attempt_epoch, tombstone_ref): (u64, String),
+    stop: JobWrites,
+) -> StoreCall<AttemptControl> {
+    control_with(
         job_id,
+        stop,
         move |_: &mut JobRecord, control: &mut AttemptControl| {
             if control.attempt_epoch != attempt_epoch {
                 return Err(JobMutationError::EpochMismatch);

@@ -446,6 +446,26 @@ fn with_output() -> Arc<AttemptScope> {
     scope_of(spec)
 }
 
+// A plugin task's report is kept before anything else of an exited attempt is read.
+#[test]
+fn task_report_first() {
+    use aruna_core::structs::execution::job::input::{PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG};
+    let mut spec = (*with_output().spec).clone();
+    for (tag, value) in [
+        (PLUGIN_INSTALL_TAG, Ulid::from_parts(1, 1).to_string()),
+        (PLUGIN_WORK_TAG, Ulid::from_parts(2, 2).to_string()),
+        (PLUGIN_REPORT_TAG, "/out/report.json".to_string()),
+    ] {
+        spec.tags.insert(tag.to_string(), value);
+    }
+    let mut finalize = FinalizeOperation::new(scope_of(spec), FinalizeGoal::Walltime);
+    finalize.stamp(NOW);
+    assert!(is_child(&finalize.plan_status(exited(3))));
+    assert_eq!(finalize.step, Step::Report);
+    let kept = child(Ok::<_, IoError>(()));
+    assert_eq!(finalize.next(kept), Ok(read_control()));
+}
+
 /// A clean exit whose output export just reported `error`.
 fn export_failed(error: JobError) -> (FinalizeOperation, Result<Next<()>, IoError>) {
     let mut finalize = FinalizeOperation::new(with_output(), FinalizeGoal::Walltime);

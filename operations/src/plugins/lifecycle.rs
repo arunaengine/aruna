@@ -4,17 +4,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::plugin_installs::{InstallState, PluginInstall, Widening};
+use aruna_core::plugin_installs::{InstallGuard, InstallState, PluginInstall, Widening};
 use aruna_core::plugins::PublishedPlugin;
+use aruna_core::reducer::InstallEntry;
 use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::types::GroupId;
 use aruna_plugin_types::manifest::Manifest;
 use aruna_plugin_types::trigger::TriggerKind;
 use serde_json::{Map, Value};
@@ -24,17 +26,17 @@ use ulid::Ulid;
 use super::account::{AccountError, Teardown};
 use super::bound::{BindError, BindPlace, BindSlots, BoundSlots};
 use super::grants::{
-    Grants, InstallScope, carry_grants, check_supported, held_covers, narrow_grants, parse_grants,
-    patterns_for, stored_grants,
+    InstallScope, carry_grants, check_supported, held_covers, narrow_grants, stored_grants,
 };
 use super::install::{
     CheckHolder, InstallCaller, InstallError, SettleInstall, admin_answer, admin_call,
     config_answer, config_call, pick_version, read_manifest, scope_of, written,
 };
 use super::matcher::Target;
-use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
+use super::records::{InstallEntryConfig, InstallEntryOperation, ReadEntry, RecordError};
 use super::rules::RulesFailure;
 use super::settings::check_settings;
+use crate::auth::install_access::{Grants, parse_grants, patterns_for};
 use crate::realm::mutate_placement::node_kind;
 
 /// An install as the realm config holds it now, for a caller proven group admin.
@@ -315,7 +317,8 @@ impl UpdateInstall {
         changeable(&current)?;
         let plugin = pick_version(&config, &current.plugin, Some(&self.digest))?;
         let manifest = read_manifest(&plugin)?;
-        check_supported(&manifest)?;
+        let quota = (config.compute.effective_quota(&current.group_id)).unwrap_or_default();
+        check_supported(&manifest, &quota)?;
         let stored: Map<String, Value> =
             serde_json::from_str(&current.settings).unwrap_or_default();
         let settings = check_settings(&manifest, self.settings.as_ref().unwrap_or(&stored))?;
@@ -568,6 +571,7 @@ impl RemoveInstall {
                 self.caller
                     .audit(self.ids.mint(self.now_ms), action, removing),
             ),
+            proven: Default::default(),
         }))
     }
 }
@@ -633,6 +637,123 @@ impl Operation for RemoveInstall {
                 let (install_id, plugin) = (self.install_id, &removing.plugin);
                 info!(%install_id, %plugin, "Removed a plugin install");
                 Ok(Next::Done(*removing))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ConflictPhase {
+    Entry,
+    Teardown(Box<PluginInstall>, VecDeque<PluginInstall>),
+    Rules(VecDeque<PluginInstall>),
+    Deleted,
+}
+
+/// Removes an install whose path holds a conflict with a deletion: every record candidate is
+/// torn down under its own account, then the resolving deletion is written. The caller proved
+/// group admin for `proven`; the write refuses a candidate of a group outside it.
+#[derive(Debug, PartialEq)]
+pub struct RemoveConflicted {
+    caller: InstallCaller,
+    install_id: Ulid,
+    proven: BTreeSet<GroupId>,
+    group_id: GroupId,
+    phase: ConflictPhase,
+}
+
+type ConflictNext = Result<Next<()>, InstallError>;
+
+impl RemoveConflicted {
+    pub fn new(caller: InstallCaller, (install_id, proven): (Ulid, BTreeSet<GroupId>)) -> Self {
+        Self {
+            caller,
+            install_id,
+            proven,
+            group_id: Ulid::nil(),
+            phase: ConflictPhase::Entry,
+        }
+    }
+
+    /// Tears down the next candidate; no install is materialized at a conflicted path, so the
+    /// guard names the candidate's account.
+    fn teardown_next(&mut self, mut candidates: VecDeque<PluginInstall>) -> ConflictNext {
+        let Some(candidate) = candidates.pop_front() else {
+            return self.delete();
+        };
+        let mut change = self.caller.change(&candidate);
+        change.guard = InstallGuard::Unnamed {
+            install_id: self.install_id,
+            account: candidate.account,
+        };
+        self.phase = ConflictPhase::Teardown(Box::new(candidate), candidates);
+        Ok(Next::Call(IoCall::child(Teardown::new(change))))
+    }
+
+    fn delete(&mut self) -> ConflictNext {
+        let delete = InstallEntryOperation::new(InstallEntryConfig {
+            actor: self.caller.actor.clone(),
+            auth_context: self.caller.auth.clone(),
+            install_id: self.install_id,
+            group_id: self.group_id,
+            expected: None,
+            install: None,
+            audit: None,
+            proven: std::mem::take(&mut self.proven),
+        });
+        self.phase = ConflictPhase::Deleted;
+        Ok(Next::Call(IoCall::child(delete)))
+    }
+}
+
+impl Operation for RemoveConflicted {
+    type Output = ();
+    type Error = InstallError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginInstall(self.install_id))
+    }
+
+    fn first(&mut self) -> ConflictNext {
+        let read = ReadEntry::new(self.caller.actor.realm_id, self.install_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ConflictNext {
+        match std::mem::replace(&mut self.phase, ConflictPhase::Deleted) {
+            ConflictPhase::Entry => {
+                let entry = result.child::<InstallEntry, RecordError>()??;
+                let InstallEntry::Conflict {
+                    deletion: true,
+                    installs,
+                } = entry
+                else {
+                    return Err(InstallError::NotFound);
+                };
+                let first = installs.first().map(|install| install.group_id);
+                self.group_id = first.unwrap_or_else(Ulid::nil);
+                self.teardown_next(installs.into())
+            }
+            ConflictPhase::Teardown(candidate, candidates) => {
+                let torn = result.child::<(), AccountError>()?;
+                torn.map_err(|error| InstallError::Step {
+                    step: "remove",
+                    error: error.0,
+                })?;
+                self.phase = ConflictPhase::Rules(candidates);
+                Ok(Next::Call(self.caller.retire(&candidate)))
+            }
+            ConflictPhase::Rules(candidates) => {
+                if let Err(error) = result.child::<(), RulesFailure>()? {
+                    tracing::warn!(%error, "Could not remove a plugin install's use rules");
+                }
+                self.teardown_next(candidates)
+            }
+            ConflictPhase::Deleted => {
+                result.child::<Option<PluginInstall>, RecordError>()??;
+                let install_id = self.install_id;
+                info!(%install_id, "Resolved a conflicted plugin install to its removal");
+                Ok(Next::Done(()))
             }
         }
     }

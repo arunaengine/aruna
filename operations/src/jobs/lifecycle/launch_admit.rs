@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use aruna_core::admin_documents::AdminDocumentClock;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{ExecutorCapability, ResourceEnvelope};
 use aruna_core::effects::{
@@ -17,14 +18,17 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::scheduling::PlannedInput;
+use aruna_core::scheduling::{PlannedInput, backend_verdict, hosts_session};
 use aruna_core::structs::execution::job::family::{
     ExecutionClaim, ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobRecordBody,
     JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
 };
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::execution::job::input::{InputSource, JobPayload};
+use aruna_core::structs::execution::job::input::{InputSource, JobPayload, tagged};
 use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
+use aruna_core::structs::execution::job::membership::membership::membership::membership::{
+    Membership, membership,
+};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use std::collections::BTreeMap;
@@ -35,10 +39,14 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::cancel::FlagRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
+use super::ids::{session_of, workspace_of};
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
+use super::membership::MembershipViewOperation;
 use super::outbox::schedule_outbox_drain;
+use super::plan::network_access;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::jobs::fence::{fence_read, fence_up};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -51,6 +59,7 @@ use crate::jobs::records::pages::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::schedule_drain_effect;
+use crate::secrets::owner::WriterView;
 use aruna_core::job_request::{mint_configured_job, workspace_of};
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
@@ -184,6 +193,10 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
         | LifecycleError::Store(_)
         | LifecycleError::IdempotencyConflict { .. }
         | LifecycleError::QuotaDenied(_)
+        | LifecycleError::AdmissionClosed
+        // The next offer's task check refuses an ended task for good.
+        | LifecycleError::TaskEnded
+        | LifecycleError::Pruning
         | LifecycleError::NotFinished
         | LifecycleError::UnexpectedEvent { .. } => CommitVerdict::Faulted,
     }
@@ -356,7 +369,7 @@ impl PullFamilyOperation {
                 holders.retain(|holder| *holder != scheduler);
                 holders.truncate(MAX_RECORD_HOLDERS.saturating_sub(1));
                 holders.insert(0, scheduler);
-                let family = (family.submission_id, family.request_digest);
+                let family = (family.submission_id, Some(family.request_digest));
                 FetchFamilyOperation::new(placement, holders, family, FETCH_DEADLINE)
             });
         Self {
@@ -475,6 +488,8 @@ pub struct LaunchNode {
     pub(crate) now_ms: u64,
     pub(crate) execution_id: Ulid,
     pub(crate) limits: Option<ResourceEnvelope>,
+    /// The offered backend's config digest now; `None` without that backend.
+    pub(crate) config_digest: Option<[u8; 32]>,
 }
 
 impl LaunchNode {
@@ -492,15 +507,20 @@ impl LaunchNode {
 
 #[derive(Debug, PartialEq)]
 enum AdmitStep {
+    /// Behind the start fence no launch is admitted: an availability answer, never a refusal.
+    Fence,
     Config,
     Records,
     Pull,
     RecordsAfterPull,
     SpecInputs,
     PlannedInputs(Box<LogicalJobSpec>),
-    Append { retried: bool },
+    Append {
+        retried: bool,
+    },
     PullBeforeAppend,
     Decide,
+    Interval,
     Checks,
     Membership(Box<ExecutorCapability>),
     Sign(Box<PreparedReceipt>),
@@ -515,6 +535,8 @@ struct PreparedReceipt {
     job_id: JobId,
     subject_generation: u64,
     subject_digest: [u8; 32],
+    config_generation: u64,
+    config_digest: [u8; 32],
     record: JobRecord,
 }
 
@@ -527,6 +549,8 @@ pub(crate) struct AdmitLaunchOperation {
     intent: Option<LaunchIntent>,
     spec: Option<LogicalJobSpec>,
     planned: Option<LaunchIntent>,
+    /// This node's applied realm config clock, which the receipt cites.
+    clock: AdminDocumentClock,
     ids: IdMint,
     step: AdmitStep,
 }
@@ -542,8 +566,9 @@ impl AdmitLaunchOperation {
             intent: None,
             spec: None,
             planned: None,
+            clock: AdminDocumentClock::default(),
             ids: IdMint::default(),
-            step: AdmitStep::Config,
+            step: AdmitStep::Fence,
         }
     }
 
@@ -632,11 +657,30 @@ impl AdmitLaunchOperation {
             let settle = SettleLaunchOperation::new(decision);
             return Ok(Next::Call(IoCall::child(settle)));
         }
+        // After the window no admission path accepts this launch, which lets holders close it.
+        if intent.expired(self.node.now_ms) {
+            return Ok(Next::Done(Err(LaunchDecline::Expired)));
+        }
         if cancelled(family, &records) {
             return Ok(Next::Done(Err(LaunchDecline::Cancelled)));
         }
         if already_running(family, &records, self.node.local) {
             return Ok(Next::Done(Err(LaunchDecline::AlreadyRunning)));
+        }
+        let read = MembershipViewOperation::new(self.node.realm_id);
+        self.call(AdmitStep::Interval, IoCall::child(read))
+    }
+
+    /// A launch binds the target's membership interval the scheduler saw; an interval that
+    /// closed since then never accepts it, also after the target was added again.
+    fn bound(&mut self, view: WriterView) -> AdmitNext {
+        let cited = &self.intent()?.config_clock;
+        match membership(self.node.local, cited, &view.intervals, &view.clock) {
+            Membership::Open => self.clock = view.clock,
+            Membership::Unknown => return Err(LaunchUndecided),
+            Membership::Left | Membership::Absent => {
+                return Ok(Next::Done(Err(LaunchDecline::WrongInterval)));
+            }
         }
         let check = LaunchCheck {
             config: self.config()?.clone(),
@@ -656,6 +700,14 @@ impl AdmitLaunchOperation {
         };
         if !limits.fits(&spec.resources) {
             return Ok(Next::Done(Err(LaunchDecline::Capacity)));
+        }
+        // An advertisement that lags the config, as after a restart, is undecided: the holder
+        // retries once it is refreshed, where a refusal would exclude this target for good.
+        if self.node.config_digest != Some(capability.config_digest) {
+            return Err(LaunchUndecided);
+        }
+        if !hosts_offer(spec, &capability) || !suits_offer(spec, &capability) {
+            return Err(LaunchUndecided);
         }
         let read = ReadInfoOperation::new(vec![self.node.local]);
         self.call(
@@ -701,6 +753,9 @@ impl AdmitLaunchOperation {
             subject_generation: capability.subject.generation,
             subject_digest: capability.subject_digest,
             accepted_at_ms: node.now_ms,
+            config_clock: self.clock.clone(),
+            config_generation: capability.config_generation,
+            config_digest: capability.config_digest,
         };
         let claim = ExecutionClaim {
             realm_id: node.realm_id,
@@ -711,6 +766,8 @@ impl AdmitLaunchOperation {
             job_id,
             subject_generation: capability.subject.generation,
             subject_digest: capability.subject_digest,
+            config_generation: capability.config_generation,
+            config_digest: capability.config_digest,
             record,
         };
         self.ids = ids;
@@ -755,8 +812,13 @@ impl AdmitLaunchOperation {
             resources: spec.resources,
             subject_generation: prepared.subject_generation,
             subject_digest: prepared.subject_digest,
+            config_generation: prepared.config_generation,
+            config_digest: prepared.config_digest,
             record: Box::new(prepared.record),
             now_ms: node.now_ms,
+            fence: tagged(&spec.payload)
+                .and_then(Result::ok)
+                .map(|task| (task.install_id, task.work_id)),
         };
         let commit = CommitReceiptOperation::new(config, intent);
         self.call(AdmitStep::Commit, IoCall::child(commit))
@@ -772,12 +834,19 @@ impl Operation for AdmitLaunchOperation {
     }
 
     fn first(&mut self) -> AdmitNext {
-        let read = GetConfigOperation::new(self.node.realm_id);
-        Ok(Next::Call(IoCall::child(read)))
+        Ok(Next::Call(fence_read()))
     }
 
     fn next(&mut self, result: IoResult) -> AdmitNext {
         match std::mem::replace(&mut self.step, AdmitStep::Commit) {
+            AdmitStep::Fence => {
+                if fence_up(result) {
+                    return Err(LaunchUndecided);
+                }
+                self.step = AdmitStep::Config;
+                let read = GetConfigOperation::new(self.node.realm_id);
+                Ok(Next::Call(IoCall::child(read)))
+            }
             AdmitStep::Config => {
                 let config = result.child::<RealmConfigDocument, GetConfigError>()?;
                 self.configured(config.map_err(|_| LaunchUndecided)?)
@@ -833,6 +902,10 @@ impl Operation for AdmitLaunchOperation {
                 self.append_launch(true)
             }
             AdmitStep::Decide => self.decide(family_read(result)?),
+            AdmitStep::Interval => match result.child::<Option<WriterView>, IoError>()? {
+                Ok(Some(view)) => self.bound(view),
+                _ => Err(LaunchUndecided),
+            },
             AdmitStep::Checks => match result.child::<Verdict, CheckError>()? {
                 Ok(Ok(capability)) => self.checked(capability),
                 Ok(Err(reason)) => Ok(Next::Done(Err(reason))),
@@ -880,6 +953,10 @@ fn materialize_local(
 ) -> Result<JobRecord, LaunchDecline> {
     let mut payload = spec.payload.clone();
     for input in &mut payload.inputs {
+        // Inline bytes travel in the spec; nothing pins them.
+        if input.source.is_inline() {
+            continue;
+        }
         let Some(pin) = intent
             .inputs
             .iter()
@@ -887,8 +964,9 @@ fn materialize_local(
         else {
             return Err(LaunchDecline::Unauthorized);
         };
-        let InputSource::S3 { version_id, .. } = &mut input.source;
-        *version_id = Some(pin.version_id.to_string());
+        if let InputSource::S3 { version_id, .. } = &mut input.source {
+            *version_id = Some(pin.version_id.to_string());
+        }
         // The plan picked which holder the bytes come from; no source means the
         // target already holds the compliant copy.
         input.source_node_id = pin.source_node_id.or(Some(local));
@@ -902,6 +980,7 @@ fn materialize_local(
     payload.resources.max_walltime_ms = Some(spec.resources.max_walltime_ms);
     payload.resources.preemptible = spec.resources.preemptible;
     payload.executor_constraint = Some(intent.target.executor_kind.clone());
+    payload.backend = Some(intent.target.backend.clone());
     let (mode, bucket) = workspace_of(&spec.payload);
     let (physical_mode, physical_bucket) = match mode {
         WorkspaceMode::Existing if local != spec.ingress_node_id => {
@@ -983,6 +1062,24 @@ fn cancelled(family: JobFamilyId, records: &[JobRecordEnvelope]) -> bool {
     })
 }
 
+/// Whether the backend can host the offered session now. Session support is runtime state, such
+/// as a Docker daemon that moved, so a miss leaves the offer undecided instead of refused.
+pub(crate) fn hosts_offer(spec: &LogicalJobSpec, capability: &ExecutorCapability) -> bool {
+    session_of(&spec.payload).is_none()
+        || hosts_session(&capability.kind, capability.session, network_access(spec))
+}
+
+/// Whether the backend's allow-list, walltime maximum and suitability admit the offered run.
+/// They are node config a restart can change, so a miss leaves the offer undecided.
+pub(crate) fn suits_offer(spec: &LogicalJobSpec, capability: &ExecutorCapability) -> bool {
+    let session = session_of(&spec.payload).is_some();
+    let walltime_ms = spec.resources.max_walltime_ms;
+    let (groups, suitability) = (&capability.groups, &capability.suitability);
+    let group_id = spec.payload.group_id;
+    let maximum = capability.max_walltime_ms;
+    backend_verdict(groups, maximum, suitability, group_id, session, walltime_ms).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use aruna_core::job_request;
@@ -1015,6 +1112,7 @@ mod tests {
             now_ms: 4_000,
             execution_id: Ulid::from_parts(9, 9),
             limits,
+            config_digest: Some([0; 32]),
         };
         let mut config = family.config.clone();
         config.seed_job_control(family.target.public(), 0);
@@ -1035,7 +1133,12 @@ mod tests {
             executor_kind: None,
             local_to_controller: true,
         };
-        ExecutorCapability::new(family.target_id().executor_kind, subject).expect("subject")
+        ExecutorCapability::new(
+            family.target_id().backend,
+            family.target_id().executor_kind,
+            subject,
+        )
+        .expect("subject")
     }
 
     fn declined(reason: LaunchDecline) -> AdmitNext {
@@ -1053,6 +1156,48 @@ mod tests {
             operation.decide(vec![cancel]),
             declined(LaunchDecline::Cancelled)
         );
+    }
+
+    // A launch whose cited clock shows no open interval of this target is declined; a view that
+    // does not cover the cited clock leaves the offer undecided.
+    #[test]
+    fn interval_bounds_launch() {
+        use aruna_core::admin_documents::{AdminDocumentDot, NodeInterval};
+        let family = Family::new([8; 32]);
+        let mut operation = prepared(&family, Some(limits()));
+        let read = IoCall::child(MembershipViewOperation::new(operation.node.realm_id));
+        assert_eq!(operation.decide(Vec::new()), Ok(Next::Call(read)));
+        let closed = operation.bound(WriterView::default());
+        assert_eq!(closed, declined(LaunchDecline::WrongInterval));
+        let added = AdminDocumentDot {
+            event_id: Ulid::nil(),
+            origin_node_id: family.holder.public(),
+            origin_seq: 1,
+        };
+        let mut clock = AdminDocumentClock::default();
+        clock.advance(added.origin_node_id, 1);
+        let interval = NodeInterval {
+            node_id: operation.node.local,
+            added,
+            removed: Vec::new(),
+        };
+        let open = WriterView {
+            clock: clock.clone(),
+            intervals: vec![interval],
+        };
+        let cite = |operation: &mut AdmitLaunchOperation, clock: &AdminDocumentClock| {
+            let intent = operation.intent.as_mut().expect("intent");
+            intent.config_clock = clock.clone();
+        };
+        cite(&mut operation, &clock);
+        assert!(matches!(
+            operation.bound(open),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.clock, clock);
+        let mut behind = prepared(&family, Some(limits()));
+        cite(&mut behind, &clock);
+        assert_eq!(behind.bound(WriterView::default()), Err(LaunchUndecided));
     }
 
     // A replayed offer answers with the stored receipt instead of reserving again.
@@ -1192,7 +1337,10 @@ mod tests {
         };
         let InputSource::S3 {
             version_id: pinned, ..
-        } = &payload.inputs[0].source;
+        } = &payload.inputs[0].source
+        else {
+            panic!("the input names an object");
+        };
         let expected_version = version_id.to_string();
         assert_eq!(pinned.as_deref(), Some(expected_version.as_str()));
         assert_eq!(payload.resources.cpu_cores, Some(spec.resources.cpu_cores));

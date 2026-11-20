@@ -906,6 +906,9 @@ async fn recover_reconciles_external() {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine@sha256:digest".to_string(),
         attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     });
     insert_job(&context, &record).await.unwrap();
 
@@ -1009,6 +1012,9 @@ async fn recovery_spares_attempts() {
             executor_kind: "docker".to_string(),
             pinned_image: "alpine@sha256:digest".to_string(),
             attempt_epoch: 0,
+            backend: "docker".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("docker", None),
         },
         None,
         None,

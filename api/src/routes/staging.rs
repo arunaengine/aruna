@@ -1363,7 +1363,8 @@ fn staging_state(state: JobState) -> &'static str {
         JobState::AwaitingKey
         | JobState::Cancelling
         | JobState::Indeterminate
-        | JobState::Cancelled => state.name(),
+        | JobState::Cancelled
+        | JobState::NotRun => state.name(),
     }
 }
 

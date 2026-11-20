@@ -10,8 +10,10 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload, OutputDestination};
-use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, InputSource, JobPayload, MAX_INLINE_BYTES, OutputDestination, plugin_tag,
+};
+use aruna_core::structs::execution::job::local::{LocalAdmission, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
@@ -47,6 +49,17 @@ pub(crate) fn validate_execution(
             "input {} needs a container path",
             input.dest_key
         )));
+    }
+    // Only the plugin host writes bytes into a spec, and only a few.
+    let inline = (spec.inputs.iter()).filter_map(|input| match &input.source {
+        InputSource::Inline { bytes } => Some(bytes.len()),
+        InputSource::S3 { .. } => None,
+    });
+    let (count, bytes) = inline.fold((0, 0usize), |(count, sum), len| (count + 1, sum + len));
+    if (count > 0 && plugin_tag(&spec.tags).is_none()) || bytes > MAX_INLINE_BYTES {
+        return Err(SubmitJobError::InvalidWorkspace(
+            "inline inputs are for plugin tasks only, at most 64 KiB together".to_string(),
+        ));
     }
     // One bound governs declaration, expansion, the local result, and the
     // immutable output record, so a valid success is always publishable.
@@ -138,6 +151,8 @@ pub struct ExecutionSubmission {
     /// This node and the realm it serves; `None` on a node without a net transport.
     pub serving: Option<(NodeId, RealmId)>,
     pub now_ms: u64,
+    /// The backend values a device admitted the run under; `None` on any other node.
+    pub local_admission: Option<LocalAdmission>,
 }
 
 /// Validates an execution request, mints its job id from the serving node's placement, and
@@ -185,9 +200,9 @@ impl SubmitExecutionOperation {
             workspace_bucket: submission.workspace_bucket.clone(),
             active_cap: submission.active_cap,
         };
-        Ok(Next::Call(IoCall::child(SubmitJobOperation::new(
-            spec, job_id,
-        ))))
+        let admission = submission.local_admission.clone();
+        let submit = SubmitJobOperation::new(spec, job_id).with_admission(admission);
+        Ok(Next::Call(IoCall::child(submit)))
     }
 }
 

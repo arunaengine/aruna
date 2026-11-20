@@ -101,6 +101,13 @@ pub enum Commands {
         bucket: String,
         target_path: String,
     },
+    /// Print the node report, one section per subject; its first section counts job records.
+    /// Writes no records and creates no keyspace; it opens the database like `explore` and
+    /// `export`, so stop the node first.
+    Report {
+        #[arg(long)]
+        database_path: String,
+    },
     /// Rewrite legacy job, PID mapping and realm rows, rebuild the identifier index, seal
     /// plain secrets and delete the former node info topics. Writes the database and must run
     /// while the node is stopped. Current rows stay unchanged, so repeating it is safe.

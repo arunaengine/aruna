@@ -122,6 +122,7 @@ fn timer_is_restored(effect: &TaskEffect) -> bool {
             | TaskKey::DrainLinkQueue
             | TaskKey::PruneConnectorReferences
             | TaskKey::MaintainRanges
+            | TaskKey::PruneFamilies
             | TaskKey::DrainWatchEvents
             | TaskKey::DrainAppliedSync
             | TaskKey::DrainCaptures

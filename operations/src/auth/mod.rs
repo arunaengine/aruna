@@ -8,6 +8,7 @@ pub mod create_token;
 pub mod enforcement;
 pub mod epoch_due;
 pub mod error;
+pub mod install_access;
 pub mod permission_rules;
 pub mod request_authorization;
 pub mod revoke_token;

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
+use aruna_core::structs::execution::job::family::LAUNCH_WINDOW_MS;
 
 use super::*;
 use crate::tests::records::{Family, REALM, node};
@@ -45,9 +46,38 @@ fn configured(fixture: &Family) -> WitnessRoundOperation {
     let mut operation = round(fixture, fixture.holder.public());
     assert!(is_child(&operation.first()));
     let config = child(Ok::<_, GetConfigError>(fixture.config.clone()));
-    assert!(is_child(&operation.next(config)));
+    assert_eq!(operation.next(config), Ok(Next::Call(fence_read())));
+    assert!(is_child(&operation.next(IoResult::Values(vec![None]))));
     assert_eq!(operation.step, RoundStep::Family);
     operation
+}
+
+// Behind the start fence the round plans nothing and looks again after its base delay.
+#[test]
+fn fenced_round_waits() {
+    let fixture = Family::new([27u8; 32]);
+    let base = fixture.config.compute.witness_delay_ms;
+    let mut operation = round(&fixture, fixture.holder.public());
+    operation.first().unwrap();
+    let config = child(Ok::<_, GetConfigError>(fixture.config.clone()));
+    operation.next(config).unwrap();
+    let fenced = IoResult::Values(vec![Some(Value::from(&[][..]))]);
+    assert_eq!(
+        outcome(operation.next(fenced)),
+        RoundOutcome::Retry { after_ms: base }
+    );
+}
+
+/// Answers the family read with `records`, then the membership read with `view`.
+fn viewed(
+    operation: &mut WitnessRoundOperation,
+    records: Vec<JobRecordEnvelope>,
+    view: WriterView,
+) -> RoundNext {
+    let read = IoCall::child(MembershipViewOperation::new(REALM));
+    let family = operation.next(child(Ok::<_, FamilyReadError>(records)));
+    assert_eq!(family, Ok(Next::Call(read)));
+    operation.next(child(Ok::<_, IoError>(Some(view))))
 }
 
 fn offering(fixture: &Family, retry_after_ms: u64) -> WitnessRoundOperation {
@@ -110,11 +140,49 @@ fn family_read_required() {
         RoundOutcome::Retry { after_ms: base }
     );
     let mut operation = configured(&fixture);
-    let empty = child(Ok::<_, FamilyReadError>(Vec::<JobRecordEnvelope>::new()));
-    assert_eq!(
-        outcome(operation.next(empty)),
-        RoundOutcome::Retry { after_ms: base }
-    );
+    let empty = viewed(&mut operation, Vec::new(), WriterView::default());
+    assert_eq!(outcome(empty), RoundOutcome::Retry { after_ms: base });
+    // An unreadable membership view is no verdict either.
+    let mut operation = configured(&fixture);
+    operation
+        .next(child(Ok::<_, FamilyReadError>(
+            Vec::<JobRecordEnvelope>::new(),
+        )))
+        .unwrap();
+    let unknown = operation.next(child(Ok::<Option<WriterView>, IoError>(None)));
+    assert_eq!(outcome(unknown), RoundOutcome::Retry { after_ms: base });
+}
+
+// A family whose only open launch went to a target that left the realm is not run.
+#[test]
+fn left_target_ends() {
+    use aruna_core::admin_documents::{AdminDocumentDot, NodeInterval};
+    let fixture = Family::new([26u8; 32]);
+    let origin = fixture.holder.public();
+    let dot = |origin_seq| AdminDocumentDot {
+        event_id: Ulid::nil(),
+        origin_node_id: origin,
+        origin_seq,
+    };
+    let (mut cited, mut clock) = (AdminDocumentClock::default(), AdminDocumentClock::default());
+    cited.advance(origin, 1);
+    clock.advance(origin, 2);
+    let mut launch = fixture.launch(&fixture.spec(), origin, 0);
+    launch.config_clock = cited;
+    let target = launch.target.node_id;
+    let record = fixture.sign(&fixture.holder, JobFamilyRecord::Launch(Box::new(launch)));
+    let interval = NodeInterval {
+        node_id: target,
+        added: dot(1),
+        removed: vec![dot(2)],
+    };
+    let left = WriterView {
+        clock,
+        intervals: vec![interval],
+    };
+    let mut operation = configured(&fixture);
+    let answer = viewed(&mut operation, vec![record], left);
+    assert_eq!(outcome(answer), RoundOutcome::Done);
 }
 
 // A first round stores this witness's launch budget before anything else.
@@ -128,8 +196,7 @@ fn budget_signed_first() {
         fixture.sign(&fixture.holder, JobFamilyRecord::Spec(Box::new(spec))),
         fixture.sign(&fixture.holder, claim),
     ];
-    let records = child(Ok::<_, FamilyReadError>(family));
-    let next = operation.next(records).unwrap();
+    let next = viewed(&mut operation, family, WriterView::default()).unwrap();
     let Next::Call(IoCall::Effect(effect)) = next else {
         panic!("expected the signature request");
     };
@@ -187,6 +254,7 @@ fn offer_picks_route() {
         now_ms: 5_000,
         execution_id: Ulid::from_parts(5_000, 4),
         limits: None,
+        config_digest: None,
     };
     let admit = AdmitLaunchOperation::new(LaunchFrame::new(records[0].clone()).unwrap(), here);
     assert_eq!(
@@ -220,18 +288,164 @@ fn stores_accepted_receipt() {
     );
 }
 
-// A cancelled launch ends the round, and a passing refusal waits for the next one.
+/// An explain row with `deferred` and nothing else.
+fn explain_of(deferred: Vec<DeferredTarget>) -> WitnessExplain {
+    WitnessExplain {
+        sequence: 0,
+        plan: empty_plan(),
+        declined: Vec::new(),
+        deferred,
+        answer: None,
+        overlapping: false,
+        stored_at_ms: 1,
+    }
+}
+
+// A cancelled launch ends the round; a passing refusal or no answer is kept as the last answer
+// and the round waits for the next one.
 #[test]
 fn declines_settle_round() {
     let fixture = Family::new([28u8; 32]);
     let cancelled = OfferOutcome::Declined(LaunchDecline::Cancelled);
     let settled = offering(&fixture, 7).settle(cancelled);
     assert_eq!(outcome(settled), RoundOutcome::Done);
-    let busy = OfferOutcome::Declined(LaunchDecline::Capacity);
-    let settled = offering(&fixture, 7).settle(busy);
-    assert_eq!(outcome(settled), RoundOutcome::Retry { after_ms: 7 });
-    let settled = offering(&fixture, 7).settle(OfferOutcome::Unavailable);
-    assert_eq!(outcome(settled), RoundOutcome::Retry { after_ms: 7 });
+    for (answer, kind) in [
+        (
+            OfferOutcome::Declined(LaunchDecline::Capacity),
+            DeferKind::Capacity,
+        ),
+        (OfferOutcome::Unavailable, DeferKind::Silent),
+    ] {
+        let mut operation = offering(&fixture, 7);
+        assert!(is_child(&operation.settle(answer)));
+        assert_eq!(operation.step, RoundStep::AmendRead);
+        let mut expected = explain_of(Vec::new());
+        expected.answer = Some(kind);
+        let write = operation.explain_write(&expected).unwrap();
+        let stored = child(Ok::<_, JobMutationError>(Some(explain_of(Vec::new()))));
+        assert_eq!(operation.next(stored), Ok(Next::Call(write)));
+        let written = child(Ok::<_, JobMutationError>(()));
+        let after = RoundOutcome::Retry { after_ms: 7 };
+        assert_eq!(outcome(operation.next(written)), after);
+    }
+}
+
+// A temporary answer of a deferred target renews its deferral.
+#[test]
+fn answer_renews_deferral() {
+    let fixture = Family::new([31u8; 32]);
+    let mut operation = offering(&fixture, 7);
+    let old = DeferredTarget {
+        target: fixture.target_id(),
+        kind: DeferKind::Silent,
+        at_ms: 1,
+    };
+    operation
+        .settle(OfferOutcome::Declined(LaunchDecline::Draining))
+        .unwrap();
+    let renewed = DeferredTarget {
+        kind: DeferKind::Draining,
+        at_ms: 5_000,
+        ..old.clone()
+    };
+    let mut expected = explain_of(vec![renewed]);
+    expected.answer = Some(DeferKind::Draining);
+    let write = operation.explain_write(&expected).unwrap();
+    let stored = child(Ok::<_, JobMutationError>(Some(explain_of(vec![old]))));
+    assert_eq!(operation.next(stored), Ok(Next::Call(write)));
+}
+
+/// A configured round holding its own launch of the fixture spec, created at `created_at_ms`.
+fn launched(fixture: &Family, created_at_ms: u64) -> (WitnessRoundOperation, LaunchIntent) {
+    let mut operation = configured(fixture);
+    let spec = fixture.spec();
+    let mut launch = fixture.launch(&spec, fixture.holder.public(), 0);
+    launch.created_at_ms = created_at_ms;
+    let envelope = fixture.sign(
+        &fixture.holder,
+        JobFamilyRecord::Launch(Box::new(launch.clone())),
+    );
+    let facts = operation.facts().unwrap();
+    facts.records = vec![envelope];
+    facts.spec = Some(spec);
+    facts.window_ms = 1;
+    facts.max_launches = 3;
+    (operation, launch)
+}
+
+// A launch whose receipt wait ended without a receipt sets its target aside with the last
+// answer, silent when none came.
+#[test]
+fn expired_wait_defers() {
+    let fixture = Family::new([32u8; 32]);
+    let (mut operation, launch) = launched(&fixture, 1_000);
+    assert!(is_child(&operation.explained(None)));
+    assert_eq!(operation.step, RoundStep::AmendRead);
+    let mut stored = explain_of(Vec::new());
+    stored.sequence = 1;
+    let entry = DeferredTarget {
+        target: launch.target,
+        kind: DeferKind::Silent,
+        at_ms: 5_000,
+    };
+    let mut expected = stored.clone();
+    expected.deferred = vec![entry];
+    let write = operation.explain_write(&expected).unwrap();
+    let read = child(Ok::<_, JobMutationError>(Some(stored)));
+    assert_eq!(operation.next(read), Ok(Next::Call(write)));
+}
+
+// Inside the launch window a deferred target is screened and then gets the same launch again.
+#[test]
+fn deferred_gets_launch() {
+    let fixture = Family::new([33u8; 32]);
+    let (mut operation, launch) = launched(&fixture, 4_000);
+    let entry = DeferredTarget {
+        target: launch.target.clone(),
+        kind: DeferKind::Silent,
+        at_ms: 4_500,
+    };
+    assert!(is_child(
+        &operation.explained(Some(explain_of(vec![entry])))
+    ));
+    assert_eq!(operation.step, RoundStep::Ready);
+    let ready = operation.next(child(Ok::<_, IoError>(true)));
+    assert!(is_child(&ready), "{ready:?}");
+    assert_eq!(operation.step, RoundStep::Offered);
+}
+
+// Past the launch window a new launch waits for the target's closure, unless the target left.
+#[test]
+fn deferred_gates_launch() {
+    let fixture = Family::new([34u8; 32]);
+    let entry = |launch: &LaunchIntent| DeferredTarget {
+        target: launch.target.clone(),
+        kind: DeferKind::Silent,
+        at_ms: 1,
+    };
+    let (mut gated, launch) = launched(&fixture, 1);
+    gated.now_ms = 2 + LAUNCH_WINDOW_MS;
+    assert!(is_child(
+        &gated.explained(Some(explain_of(vec![entry(&launch)])))
+    ));
+    assert_eq!(gated.step, RoundStep::Gate(launch.launch_id));
+    let open = child(Ok::<_, LifecycleError>(BTreeSet::<Ulid>::new()));
+    let base = fixture.config.compute.witness_delay_ms;
+    assert_eq!(
+        outcome(gated.next(open)),
+        RoundOutcome::Retry { after_ms: base }
+    );
+    let (mut left, launch) = launched(&fixture, 1);
+    left.now_ms = 2 + LAUNCH_WINDOW_MS;
+    left.facts()
+        .unwrap()
+        .not_run
+        .launches
+        .insert(launch.launch_id);
+    assert!(is_child(
+        &left.explained(Some(explain_of(vec![entry(&launch)])))
+    ));
+    assert_eq!(left.step, RoundStep::Inputs);
 }
 
 // A target that refused for good is remembered, so the next round plans around it.
@@ -241,17 +455,19 @@ fn permanent_decline_recorded() {
     let mut operation = offering(&fixture, 7);
     let refused = OfferOutcome::Declined(LaunchDecline::Unauthorized);
     assert!(is_child(&operation.settle(refused)));
-    assert_eq!(operation.step, RoundStep::DeclineRead);
+    assert_eq!(operation.step, RoundStep::AmendRead);
     let explain = WitnessExplain {
         sequence: 0,
         plan: empty_plan(),
         declined: Vec::new(),
+        deferred: Vec::new(),
+        answer: None,
         overlapping: false,
         stored_at_ms: 1,
     };
     let stored = child(Ok::<_, JobMutationError>(Some(explain)));
     assert!(is_child(&operation.next(stored)));
-    assert_eq!(operation.step, RoundStep::DeclineStored);
+    assert_eq!(operation.step, RoundStep::AmendStored(0));
     let written = child(Ok::<_, JobMutationError>(()));
     assert_eq!(
         outcome(operation.next(written)),
@@ -319,4 +535,50 @@ fn lost_target_expires() {
     assert!(lost_target_expired(10, 10 + window, window));
     assert_eq!(lost_retry_ms(10, 10, base, window), base);
     assert_eq!(lost_retry_ms(10, 9 + window, base, window), 1);
+}
+
+// A used-up budget cancels the family with an expiry once its work settled; a running
+// execution keeps the round waiting a window.
+#[test]
+fn used_budget_expires() {
+    let fixture = Family::new([26u8; 32]);
+    let spec = fixture.spec();
+    let claim = JobFamilyRecord::Claim(fixture.claim(&spec));
+    let records = vec![
+        fixture.sign(
+            &fixture.holder,
+            JobFamilyRecord::Spec(Box::new(spec.clone())),
+        ),
+        fixture.sign(&fixture.holder, claim),
+    ];
+    let serving = Some((fixture.holder.public(), REALM));
+    let used = |records: &[JobRecordEnvelope]| {
+        let mut operation = configured(&fixture);
+        let facts = operation.facts().unwrap();
+        facts.records = records.to_vec();
+        facts.spec = Some(spec.clone());
+        let close = CloseLaunchesOperation::new(fixture.family(), records.to_vec(), serving);
+        assert_eq!(
+            operation.explained(None),
+            Ok(Next::Call(IoCall::child(close)))
+        );
+        operation
+    };
+    let mut settled = used(&records);
+    let closed = child(Ok::<_, LifecycleError>(BTreeSet::<Ulid>::new()));
+    let reason = ExpiryReason::BudgetUsed;
+    let cancel = PublishCancelOperation::expiry(spec.clone(), reason, serving, 5_000);
+    assert_eq!(settled.next(closed), Ok(Next::Call(IoCall::child(cancel))));
+    let published = child(Ok::<_, JobRouteError>(()));
+    assert_eq!(outcome(settled.next(published)), RoundOutcome::Done);
+
+    let launch = fixture.launch(&spec, node(2), 0);
+    let receipt = JobFamilyRecord::Receipt(Box::new(fixture.receipt(&launch, 1)));
+    let mut running = records.clone();
+    running.push(fixture.sign(&fixture.target, receipt));
+    let mut waiting = used(&running);
+    let window = fixture.config.compute.catch_up_ms;
+    let closed = child(Ok::<_, LifecycleError>(BTreeSet::<Ulid>::new()));
+    let after = RoundOutcome::Retry { after_ms: window };
+    assert_eq!(outcome(waiting.next(closed)), after);
 }

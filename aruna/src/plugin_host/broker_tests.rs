@@ -9,6 +9,7 @@ use aruna_core::metadata::api::ExportMetadataResult;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_drivers::driver::drive;
+use aruna_operations::auth::install_access::parse_grants;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
@@ -19,7 +20,7 @@ use aruna_operations::metadata::update_document::UpdateDocumentError;
 use aruna_operations::plugins::dataset::{
     content_urls, dataset_change, dataset_crate, same_revision,
 };
-use aruna_operations::plugins::grants::{install_scope, parse_grants};
+use aruna_operations::plugins::grants::install_scope;
 use std::collections::BTreeMap;
 
 use super::*;

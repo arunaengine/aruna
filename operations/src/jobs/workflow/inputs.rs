@@ -148,7 +148,9 @@ impl InputSourceOperation {
         let Some(captured) = self.captured().cloned() else {
             return self.fail(JobError::permanent("captured inputs are missing"));
         };
-        let InputSource::S3 { version_id, .. } = &self.input.source;
+        let InputSource::S3 { version_id, .. } = &self.input.source else {
+            return self.fail(JobError::permanent("an inline input is local"));
+        };
         let version = version_id.as_deref().map(Ulid::from_string).transpose();
         let Ok(version) = version else {
             return self.fail(JobError::permanent("input version is invalid"));
@@ -187,7 +189,10 @@ impl InputSourceOperation {
             bucket,
             key,
             version_id,
-        } = self.input.source.clone();
+        } = self.input.source.clone()
+        else {
+            return self.fail(JobError::permanent("an inline input is local"));
+        };
         let version = version_id
             .as_deref()
             .map(Ulid::from_string)
@@ -496,8 +501,17 @@ impl LoadInputsOperation {
     }
 
     fn next_input(&mut self) -> LoadNext {
-        let Some(input) = self.pending.pop_front() else {
-            return self.keep_served();
+        let input = loop {
+            let Some(input) = self.pending.pop_front() else {
+                return self.keep_served();
+            };
+            // A plugin task's inline bytes become a file again at every attempt.
+            let InputSource::Inline { bytes } = &input.source else {
+                break input;
+            };
+            let path = (input.container_path.clone())
+                .ok_or_else(|| JobError::permanent("input has no container path"))?;
+            self.files.push(TaskInput::from_bytes(path, bytes.clone()));
         };
         let source = source_object(&input)?;
         let dest_key = input.dest_key.clone();

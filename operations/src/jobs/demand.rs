@@ -252,7 +252,10 @@ fn nonterminal(projection: Option<&JobProjection>) -> Option<JobFamilyId> {
                 request_digest: projection.request_digest,
             })
         }
-        LogicalJobState::Succeeded | LogicalJobState::Cancelled | LogicalJobState::Failed => None,
+        LogicalJobState::Succeeded
+        | LogicalJobState::Cancelled
+        | LogicalJobState::Failed
+        | LogicalJobState::NotRun => None,
     }
 }
 

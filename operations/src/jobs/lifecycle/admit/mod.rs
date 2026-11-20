@@ -15,7 +15,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ADMISSION_QUOTA_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
-    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
+    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE,
+    JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SUBMISSION_CLOSURE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
@@ -24,24 +25,26 @@ use aruna_core::structs::execution::job::family::{
     SubmissionClaim, SubmissionId,
 };
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::input::{JobPayload, plugin_tag};
 use aruna_core::structs::execution::job::local::{
     JobRecord, WorkspaceMode, job_record_key, owner_index_key,
+};
+use aruna_core::structs::execution::job::prune::FamilyTombstone;
+use aruna_core::structs::execution::job::record_keys::{
+    alias_key, family_prefix, prune_rows, record_key, submission_prefix,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
+use super::closure::closure_key;
 use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
 use aruna_core::job_request::workspace_of;
-use aruna_core::structs::execution::job::record_keys::{
-    alias_key, family_prefix, record_key, submission_prefix,
-};
-use aruna_core::structs::execution::job::record_rows::{
-    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
-};
 
 /// The alias this node would mint, with the records it already signed for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +67,8 @@ pub struct AdmitSubmissionConfig {
     pub quota_refusal: Option<QuotaDenied>,
     /// The group revision that the successful quota check observed.
     pub quota_revision: Option<u64>,
+    /// A plugin task is admitted only until this unix ms, on this node's clock.
+    pub admit_by: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +95,9 @@ pub struct AdmitSubmissionOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdmitState {
     ReadConfig,
+    ReadTombstone,
     Scan,
+    ReadClosure,
     ReadQuota,
     ReadCache,
     Write,
@@ -115,6 +122,16 @@ impl AdmitSubmissionOperation {
             submission_id: self.config.submission_id,
             request_digest: self.config.request_digest,
         }
+    }
+
+    /// A family still being deleted here answers before its old claims could be replayed.
+    fn read_tombstone(&mut self) -> Step {
+        self.state = AdmitState::ReadTombstone;
+        let row = (
+            FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+            family_prefix(&self.family()),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
     /// Claims of every request family under this submission, so a replay and an
@@ -165,6 +182,37 @@ impl AdmitSubmissionOperation {
         if let Some(existing_job_id) = self.conflicting() {
             return Err(LifecycleError::IdempotencyConflict { existing_job_id });
         }
+        // A plugin task's closure row is read in this transaction, so an answer of "absent"
+        // that commits first makes this admission conflict and its retry refuse.
+        if self.tagged() {
+            self.state = AdmitState::ReadClosure;
+            let closure = closure_key(self.config.submission_id);
+            let read = (SUBMISSION_CLOSURE_KEYSPACE.to_string(), closure);
+            return Ok(Next::Call(IoCall::Read(vec![read])));
+        }
+        self.quota()
+    }
+
+    /// Whether the request is a plugin task's: only those have deadlines and closure rows.
+    fn tagged(&self) -> bool {
+        match &self.config.candidate.spec.envelope().record {
+            JobFamilyRecord::Spec(spec) => plugin_tag(&spec.payload.tags).is_some(),
+            _ => false,
+        }
+    }
+
+    /// A fresh admission of a plugin task is too late with a closure row, past its deadline
+    /// here, or without one; a replay was answered before.
+    fn closed(&mut self, result: IoResult) -> Step {
+        let [closure] = values::<1>(result)?;
+        let late = (self.config.admit_by).is_none_or(|admit_by| self.config.now_ms > admit_by);
+        if closure.is_some() || late {
+            return Err(LifecycleError::AdmissionClosed);
+        }
+        self.quota()
+    }
+
+    fn quota(&mut self) -> Step {
         if let Some(denied) = self.config.quota_refusal.take() {
             return Err(LifecycleError::QuotaDenied(denied));
         }
@@ -240,6 +288,7 @@ impl AdmitSubmissionOperation {
                 ),
             ));
         }
+        writes.extend(prune_rows(&self.family(), self.config.now_ms));
         writes.push((
             FAMILY_ALIAS_KEYSPACE.to_string(),
             alias_key(self.config.candidate.job_id, &self.family()),
@@ -307,10 +356,16 @@ impl Operation for AdmitSubmissionOperation {
         TransactionMode::Write
     }
 
+    /// Every run reads the clock again, so a retry meets the admission deadline.
+    fn stamp(&mut self, now_ms: u64) {
+        self.config.now_ms = self.config.now_ms.max(now_ms);
+    }
+
     fn expected_error(error: &Self::Error) -> bool {
         matches!(
             error,
             LifecycleError::IdempotencyConflict { .. }
+                | LifecycleError::AdmissionClosed
                 | LifecycleError::NotHolder
                 | LifecycleError::RealmConfigMissing
                 | LifecycleError::Store(RecordStoreError::UnknownAlias)
@@ -338,11 +393,19 @@ impl Operation for AdmitSubmissionOperation {
                     if self.view.is_none() {
                         return Err(LifecycleError::NotHolder);
                     }
-                    self.scan(None)
+                    self.read_tombstone()
                 }
                 Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
                 other => Err(self.unexpected("realm config read", other.label())),
             },
+            (AdmitState::ReadTombstone, result) => {
+                let [tombstone] = values::<1>(result)?;
+                let tombstone = tombstone.and_then(|row| from_bytes::<FamilyTombstone>(&row).ok());
+                if tombstone.is_some_and(|tombstone| !tombstone.finished) {
+                    return Err(LifecycleError::Pruning);
+                }
+                self.scan(None)
+            }
             (AdmitState::Scan, IoResult::Page { rows, next }) => {
                 self.keep_claims(rows)?;
                 match next {
@@ -350,6 +413,7 @@ impl Operation for AdmitSubmissionOperation {
                     None => self.decide(),
                 }
             }
+            (AdmitState::ReadClosure, result) => self.closed(result),
             (AdmitState::ReadQuota, result) => self.read_cache(result),
             (AdmitState::ReadCache, result) => {
                 let [value] = values::<1>(result)?;
@@ -424,6 +488,7 @@ mod pure_tests {
             now_ms: 3_000,
             quota_refusal: None,
             quota_revision: None,
+            admit_by: None,
         });
         assert_eq!(
             operation.transaction(),

@@ -813,11 +813,106 @@ impl TelemetryState {
     }
 }
 
+/// One compute backend the node offers. Read-only: only node or realm admins configure backends,
+/// at node start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ExecutorCapabilityResponse {
+    /// The backend's node-local name; `default` is the one built from the environment.
+    pub backend: String,
     pub kind: String,
     pub file_staging: bool,
     pub direct_s3: bool,
+    /// Where the backend's workers run; empty when the backend cannot prove it.
+    pub location: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    #[schema(inline)]
+    pub limits: BackendLimits,
+    /// The longest run the operator allows here; absent is unbounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_walltime_ms: Option<u64>,
+    /// What the operator declared the backend offers.
+    #[schema(inline)]
+    pub capabilities: BackendCapabilities,
+    /// How well the backend fits each workload kind: `refused`, `possible`, `good` or `best`.
+    #[schema(inline)]
+    pub suitability: BackendSuitability,
+    /// How many groups the backend is limited to; 0 means open to every group.
+    pub group_count: u32,
+    /// Advances whenever the backend's settings change on its node.
+    pub config_generation: u64,
+}
+
+/// The backend's resource ceilings. An absent dimension is unmeasured and bounds nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BackendLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cpu_cores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ram_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_disk_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BackendCapabilities {
+    pub gpus: u32,
+    pub architectures: Vec<String>,
+    pub stdin: bool,
+    pub multi_container: bool,
+    pub services: bool,
+    pub ingress: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BackendSuitability {
+    pub batch: String,
+    pub sessions: String,
+    pub services: String,
+}
+
+/// One advertised backend as the node document shows it; group ids are never shown.
+fn executor_response(
+    executor: &aruna_core::compute::ExecutorCapability,
+) -> ExecutorCapabilityResponse {
+    let name = |value: aruna_core::compute::backend::Suitability| {
+        serde_json::to_value(value)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let declared = &executor.declared;
+    ExecutorCapabilityResponse {
+        backend: executor.backend.clone(),
+        kind: executor.kind.clone(),
+        file_staging: executor.file_staging,
+        direct_s3: executor.direct_s3,
+        location: executor.subject.location.clone(),
+        labels: executor.subject.labels.clone(),
+        limits: BackendLimits {
+            max_cpu_cores: executor.limits.max_cpu_cores,
+            max_ram_bytes: executor.limits.max_ram_bytes,
+            max_disk_bytes: executor.limits.max_disk_bytes,
+            max_concurrent: executor.limits.max_concurrent,
+        },
+        max_walltime_ms: executor.max_walltime_ms,
+        capabilities: BackendCapabilities {
+            gpus: declared.gpus,
+            architectures: declared.architectures.clone(),
+            stdin: declared.stdin,
+            multi_container: declared.multi_container,
+            services: declared.services,
+            ingress: declared.ingress,
+        },
+        suitability: BackendSuitability {
+            batch: name(executor.suitability.batch),
+            sessions: name(executor.suitability.sessions),
+            services: name(executor.suitability.services),
+        },
+        group_count: executor.groups.len() as u32,
+        config_generation: executor.config_generation,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1012,7 +1107,26 @@ token of another realm or one this node cannot validate, the response is the pub
                                 "connection_status": "connected",
                                 "placement": {"location": "dc-a", "weight": 100, "full": false, "draining": false},
                                 "info": {
-                                    "executors": [{"kind": "docker", "file_staging": true, "direct_s3": false}],
+                                    "executors": [{
+                                        "backend": "default",
+                                        "kind": "docker",
+                                        "file_staging": true,
+                                        "direct_s3": false,
+                                        "location": "eu-west",
+                                        "labels": {"aruna-engine.org/location": "eu-west"},
+                                        "limits": {"max_cpu_cores": 8, "max_concurrent": 4},
+                                        "capabilities": {
+                                            "gpus": 0,
+                                            "architectures": ["x86_64"],
+                                            "stdin": false,
+                                            "multi_container": false,
+                                            "services": false,
+                                            "ingress": false
+                                        },
+                                        "suitability": {"batch": "good", "sessions": "good", "services": "possible"},
+                                        "group_count": 0,
+                                        "config_generation": 1
+                                    }],
                                     "labels": {"zone": "dc-a"},
                                     "urls": {"api": "https://node.example.test/api/v1"},
                                     "utilization": {
@@ -1362,15 +1476,7 @@ fn map_node_document(
     });
     let jobs = held.and_then(|held| held.heartbeat.jobs);
     NodeDocumentResponse {
-        executors: document
-            .executors
-            .iter()
-            .map(|executor| ExecutorCapabilityResponse {
-                kind: executor.kind.clone(),
-                file_staging: executor.file_staging,
-                direct_s3: executor.direct_s3,
-            })
-            .collect(),
+        executors: document.executors.iter().map(executor_response).collect(),
         labels: document.labels.clone(),
         urls: RealmUrlsResponse {
             api: document.urls.api.clone(),

@@ -17,13 +17,13 @@ use aruna_plugin_types::permission::{Grant, Permission};
 use ulid::Ulid;
 
 use super::check::{CallError, CheckCall, RunScope};
-use super::grants::{parse_grants, patterns_for};
 use super::install::{InstallError, config_answer, config_call};
 use super::intents::open_intent;
 use super::matcher::event_trigger;
 use super::receiver::{eligible, lost_reason};
 use super::rows::StoreError;
 use super::runs::{Ended, RunError, conclude, read_run, save_run, unfinished};
+use crate::auth::install_access::{parse_grants, patterns_for};
 
 const INSTALL_REMOVED: &str = "the install was removed";
 

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::compute;
 use super::jobs::LegacyInput;
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
@@ -38,9 +39,10 @@ use ulid::Ulid;
 
 /// Where a stored envelope names its record variant: after the 32 bytes of the realm id.
 const VARIANT_AT: usize = 32;
-/// Variant indexes of `JobFamilyRecord::Spec` and `JobFamilyRecord::Launch`.
+/// Variant indexes of `JobFamilyRecord::Spec`, `JobFamilyRecord::Launch` and the receipt.
 const SPEC: u8 = 0;
 const LAUNCH: u8 = 3;
+const RECEIPT: u8 = 4;
 
 /// A row of a family keyspace: an envelope first, then fields alpha.134 stored the same way.
 pub(super) trait Held: Serialize + DeserializeOwned {
@@ -77,12 +79,13 @@ pub(super) struct Evidence {
     receipts: BTreeSet<(Ulid, [u8; 32], [u8; 32])>,
 }
 
-/// A spec or launch row: its envelope when it reads back unchanged in the current layout, and
-/// its envelope when it reads back unchanged in the alpha.134 layout.
+/// A spec, launch or receipt row: its envelope when it reads back unchanged in the current
+/// layout or in the alpha.134 layout, and its ids when it reads as alpha.206 stored it.
 pub(super) struct Candidate {
     key: Vec<u8>,
     current: Option<JobRecordEnvelope>,
     historical: Option<OldEnvelope>,
+    unnamed: Option<(SubmissionId, [u8; 32], JobId)>,
 }
 
 /// What the migration deletes: the families of old specs and launches, with their local runs.
@@ -110,12 +113,13 @@ pub(super) fn scan<T: Held>(
         if let Some(envelope) = &current {
             evidence.add(envelope);
         }
-        if matches!(value.get(VARIANT_AT), Some(&SPEC | &LAUNCH)) {
+        if matches!(value.get(VARIANT_AT), Some(&SPEC | &LAUNCH | &RECEIPT)) {
             let historical = exact::<(OldEnvelope, T::Tail)>(&value).map(|(old, _)| old);
             candidates.push(Candidate {
                 key: key.to_vec(),
                 current,
                 historical,
+                unnamed: compute::family_ids::<T::Tail>(&value),
             });
         }
     }
@@ -201,7 +205,8 @@ impl Removal {
         keyspace: &OptimisticTxKeyspace,
         rewrites: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ExplorerError> {
-        if self.is_empty() {
+        // An alpha.206 job record is always among the rewrites.
+        if self.is_empty() && rewrites.is_empty() {
             return Ok(());
         }
         let rewrites: BTreeMap<&[u8], &[u8]> = rewrites
@@ -219,7 +224,12 @@ impl Removal {
                 JobPayload::WriteRunCrate { for_job } => self.jobs.contains(for_job),
                 _ => false,
             };
-            if parent || self.jobs.contains(&record.job_id) || cleanups.contains(&record.job_id) {
+            let unnamed = compute::old_job(&stored).is_some();
+            if unnamed
+                || parent
+                || self.jobs.contains(&record.job_id)
+                || cleanups.contains(&record.job_id)
+            {
                 records.push(record);
             }
         }
@@ -321,6 +331,11 @@ impl Removal {
 
     /// Claims name a logical job; receipts name the physical job and execution on this node.
     fn record_jobs(&mut self, value: &[u8]) {
+        if let Some((physical_job_id, execution_id)) = compute::receipt_jobs(value) {
+            self.jobs.insert(physical_job_id);
+            self.executions.insert(execution_id);
+            return;
+        }
         let Ok(envelope) = postcard::from_bytes::<JobRecordEnvelope>(value) else {
             return;
         };
@@ -416,7 +431,7 @@ impl Candidate {
                     _ => None,
                 })
         };
-        let (submission_id, request_digest, job_id) = old.or_else(current)?;
+        let (submission_id, request_digest, job_id) = old.or(self.unnamed).or_else(current)?;
         let family = JobFamilyId {
             submission_id,
             request_digest,
@@ -426,7 +441,7 @@ impl Candidate {
 }
 
 /// `T` read from `value` when it encodes back to the same bytes.
-fn exact<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
+pub(super) fn exact<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
     let decoded = postcard::from_bytes::<T>(value).ok()?;
     let bytes = postcard::to_allocvec(&decoded).ok()?;
     (bytes == value).then_some(decoded)
@@ -505,7 +520,7 @@ struct OldEnvelope {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use crate::explorer::ExplorerError;
     use crate::migrate::tests::{read, write};
     use crate::migrate::{MigrateOutput, migrate_output};
@@ -514,19 +529,17 @@ mod tests {
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         ACTIVE_USER_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
-        FAMILY_PENDING_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
-        JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
-        WITNESS_DEADLINE_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
     };
     use aruna_core::structs::execution::job::family::{
         EffectiveResources, ExecutionReceipt, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
         JobRecordEnvelope, JobRecordKey, JobRecordKind, JobRetryPolicy, LaunchIntent,
-        SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+        SubmissionClaim, SubmissionId,
     };
     use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
     use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
-    use aruna_core::structs::execution::job::record_rows::{PendingNeed, PendingRecord};
     use aruna_core::structs::execution::job::rows::job_insert_entries;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
@@ -639,14 +652,6 @@ mod tests {
         signature: iroh::Signature,
     }
 
-    #[derive(Serialize)]
-    struct OldPending {
-        envelope: OldEnvelope,
-        need: PendingNeed,
-        first_seen_ms: u64,
-        attempts: u32,
-    }
-
     fn secret() -> iroh::SecretKey {
         iroh::SecretKey::from_bytes(&[7u8; 32])
     }
@@ -658,6 +663,7 @@ mod tests {
     fn target() -> ExecutionTargetId {
         ExecutionTargetId {
             node_id: secret().public(),
+            backend: "kubernetes".to_string(),
             executor_kind: "kubernetes".to_string(),
         }
     }
@@ -680,6 +686,7 @@ mod tests {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         }
     }
 
@@ -792,6 +799,7 @@ mod tests {
             plan_digest: [8u8; 32],
             spec_digest,
             created_at_ms,
+            config_clock: Default::default(),
         };
         signed(JobFamilyRecord::Launch(Box::new(launch)))
     }
@@ -828,12 +836,15 @@ mod tests {
             subject_generation: 1,
             subject_digest: [12u8; 32],
             accepted_at_ms: 3_000,
+            config_clock: Default::default(),
+            config_generation: 0,
+            config_digest: [0u8; 32],
         };
         signed(JobFamilyRecord::Receipt(Box::new(receipt)))
     }
 
     /// The storage key of a record of `kind` in `family`.
-    fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
+    pub(crate) fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
         let key = JobRecordKey {
             family,
             kind,
@@ -980,91 +991,18 @@ mod tests {
     }
 
     #[test]
-    fn deletes_receipted_aliases() {
-        // An alpha.134 launch without inputs and a plan digest starting with zero reads back
-        // unchanged as a current launch, with shifted digests. A receipt binding its aliased
-        // digest but its true spec digest is no evidence, so the family goes, receipt included.
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("db");
+    fn launches_never_alias() {
+        // Launches cite their scheduler's realm config clock, so an alpha.134 launch no longer
+        // reads as a current one, and a current launch no longer reads as alpha.134.
         let mut launch = old_launch(1);
         launch.inputs.clear();
         launch.plan_digest[0] = 0;
-        launch.created_at_ms = 1_730_000_000_000;
-        let pending = |envelope| OldPending {
-            envelope,
-            need: PendingNeed::Evidence(JobRecordKind::Spec),
-            first_seen_ms: 2_000,
-            attempts: 1,
-        };
-        let launch = OldRecord::Launch(Box::new(launch));
-        let bytes = postcard::to_allocvec(&pending(old_envelope(launch))).unwrap();
-        let aliased = super::exact::<PendingRecord>(&bytes).expect("aliases a current row");
-        let digest = aliased.envelope.record.digest().unwrap();
-        let receipt = PendingRecord {
-            envelope: postcard::from_bytes(&receipt(
-                JobId::from_bytes([22u8; 16]),
-                Ulid::nil(),
-                digest,
-            ))
-            .unwrap(),
-            need: PendingNeed::Evidence(JobRecordKind::Spec),
-            first_seen_ms: 3_000,
-            attempts: 1,
-        };
-        let rows = [
-            (key(OLD, JobRecordKind::Launch, 1), bytes),
-            (
-                key(OLD, JobRecordKind::Receipt, 2),
-                postcard::to_allocvec(&receipt).unwrap(),
-            ),
-        ];
-        let rows = rows
-            .iter()
-            .map(|(key, value)| (key.as_slice(), value.clone()));
-        write(&path, FAMILY_PENDING_KEYSPACE, rows.collect());
+        let old = OldRecord::Launch(Box::new(launch));
+        let bytes = postcard::to_allocvec(&old_envelope(old)).unwrap();
+        assert!(super::exact::<JobRecordEnvelope>(&bytes).is_none());
 
-        let output = migrate_output(path.to_str().unwrap()).unwrap();
-        assert_eq!(deleted(&output, FAMILY_PENDING_KEYSPACE), 2);
-        assert!(read(&path, FAMILY_PENDING_KEYSPACE).is_empty());
-    }
-
-    #[test]
-    fn keeps_bound_launches() {
-        // A current launch whose bytes also read as alpha.134 counts as old until a budget binds
-        // its spec digest; then it stays unchanged, also on a second run.
         let launch = current_launch([0x99u8; 32], 1_730_000_000_000);
-        let historical = super::exact::<(super::OldEnvelope, ())>(&launch);
-        assert!(historical.is_some(), "also reads as alpha.134");
-        let budget = signed(JobFamilyRecord::Budget(WitnessBudgetRecord {
-            submission_id: OLD.submission_id,
-            request_digest: OLD.request_digest,
-            scheduler_node_id: secret().public(),
-            source_spec_digest: [0x99u8; 32],
-            max_launches: 1,
-        }));
-        let launch_key = key(OLD, JobRecordKind::Launch, 1);
-        let budget_key = key(OLD, JobRecordKind::Budget, 1);
-
-        let temp = tempdir().unwrap();
-        let alone = temp.path().join("alone");
-        write(
-            &alone,
-            FAMILY_RECORD_KEYSPACE,
-            vec![(&launch_key, launch.clone())],
-        );
-        let output = migrate_output(alone.to_str().unwrap()).unwrap();
-        assert_eq!(output.old_families_deleted, 1);
-
-        let bound = temp.path().join("bound");
-        let rows = vec![(&launch_key[..], launch), (&budget_key[..], budget)];
-        write(&bound, FAMILY_RECORD_KEYSPACE, rows);
-        let rows = read(&bound, FAMILY_RECORD_KEYSPACE);
-        for _ in 0..2 {
-            let output = migrate_output(bound.to_str().unwrap()).unwrap();
-            assert_eq!((output.records_scanned, output.records_rewritten), (2, 0));
-            assert_eq!(output.old_families_deleted, 0);
-            assert_eq!(read(&bound, FAMILY_RECORD_KEYSPACE), rows);
-        }
+        assert!(super::exact::<(super::OldEnvelope, ())>(&launch).is_none());
     }
 
     #[test]

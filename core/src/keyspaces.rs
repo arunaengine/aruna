@@ -188,6 +188,10 @@ pub const RENAMED_ROW_KEYSPACE: &str = "backend_import_renamed_rows";
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
 pub const CHECK_QUEUE_KEYSPACE: &str = "storage_check_queue";
+/// Node-local count of a bucket's current versions against its placement rules.
+pub const COVERAGE_COUNT_KEYSPACE: &str = "coverage_counts";
+/// Buckets whose coverage count is unfinished; the migration worker scans only these.
+pub const COUNT_QUEUE_KEYSPACE: &str = "coverage_count_queue";
 /// Versions a check found broken, keyed by version key so one bucket is one prefix.
 pub const BROKEN_VERSION_KEYSPACE: &str = "broken_versions";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
@@ -299,6 +303,8 @@ pub const NODE_INFO_KEYSPACE: &str = "node_info";
 /// Single-row local placement subject and its generation. Governed writes and
 /// internal serves are evaluated against it; a rejoin blocks serving here.
 pub const NODE_SUBJECT_KEYSPACE: &str = "node_subject";
+/// One `BackendConfigRecord` per compute backend name: its digests and config generation.
+pub const COMPUTE_BACKEND_KEYSPACE: &str = "compute_backends";
 pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
 pub const PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
@@ -484,6 +490,9 @@ pub const FAMILY_PENDING_KEYSPACE: &str = "job_family_pending";
 pub const FAMILY_CONFLICT_KEYSPACE: &str = "job_family_conflicts";
 /// Alias index: one accepted `JobId` to the request family that admitted it.
 pub const FAMILY_ALIAS_KEYSPACE: &str = "job_family_aliases";
+/// Closure rows of plugin task submissions this node answered as not admitted; admission reads
+/// them, so no admission of that submission commits here afterwards.
+pub const SUBMISSION_CLOSURE_KEYSPACE: &str = "job_submission_closures";
 /// Per-family projection cache and its bounded revision. Derived state only; it
 /// is rebuilt from the immutable records and is never authority.
 pub const FAMILY_PROJECTION_KEYSPACE: &str = "job_family_projections";
@@ -501,6 +510,13 @@ pub const WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
 pub const DEADLINE_INDEX_KEYSPACE: &str = "job_witness_deadline_index";
 /// Bounded explain record of the plan a witness stored before it launched.
 pub const PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
+/// Launches without a receipt that their target answered as closed, by family and launch id.
+pub const LAUNCH_CLOSURE_KEYSPACE: &str = "job_launch_closures";
+/// Family prune index: due rows by due time and family, and one row per family naming its
+/// current due time.
+pub const FAMILY_PRUNE_KEYSPACE: &str = "job_family_prune";
+/// What stays of a pruned family on this node until it expires, by family.
+pub const FAMILY_TOMBSTONE_KEYSPACE: &str = "job_family_tombstones";
 pub const ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 /// The single row recording what this node could not resolve when it departed.
 pub const COMPUTE_DEPARTURE_KEYSPACE: &str = "compute_departure";
@@ -707,6 +723,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RENAMED_ROW_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
     CHECK_QUEUE_KEYSPACE,
+    COVERAGE_COUNT_KEYSPACE,
+    COUNT_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,
     ABE_PARAMETERS_KEYSPACE,
     ABE_EPOCH_KEYSPACE,
@@ -759,6 +777,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NODE_STATS_KEYSPACE,
     NODE_INFO_KEYSPACE,
     NODE_SUBJECT_KEYSPACE,
+    COMPUTE_BACKEND_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE,
     PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE,
@@ -832,6 +851,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     FAMILY_PENDING_KEYSPACE,
     FAMILY_CONFLICT_KEYSPACE,
     FAMILY_ALIAS_KEYSPACE,
+    SUBMISSION_CLOSURE_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE,
     FAMILY_OUTBOX_KEYSPACE,
     JOB_RESERVATION_KEYSPACE,
@@ -839,6 +859,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     WITNESS_DEADLINE_KEYSPACE,
     DEADLINE_INDEX_KEYSPACE,
     PLAN_EXPLAIN_KEYSPACE,
+    LAUNCH_CLOSURE_KEYSPACE,
+    FAMILY_PRUNE_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE,
     ARTIFACT_TOMBSTONE_KEYSPACE,
     COMPUTE_DEPARTURE_KEYSPACE,
     JOB_STATE_KEYSPACE,

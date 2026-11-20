@@ -56,7 +56,7 @@ impl From<IoError> for PageReadError {
     }
 }
 
-fn page_key(submission: &SubmissionId, digest: &[u8; 32]) -> Key {
+pub(crate) fn page_key(submission: &SubmissionId, digest: &[u8; 32]) -> Key {
     let mut key = submission_prefix(*submission).to_vec();
     key.extend_from_slice(digest);
     Key::from(key.as_slice())
@@ -82,7 +82,7 @@ pub(crate) fn page_rows(
 }
 
 /// The page a stored row holds, checked against the digest it is kept under.
-fn stored_page(row: &[u8], digest: &[u8; 32]) -> Result<InputPage, PageReadError> {
+pub(crate) fn stored_page(row: &[u8], digest: &[u8; 32]) -> Result<InputPage, PageReadError> {
     let page: InputPage =
         postcard::from_bytes(row).map_err(|error| PageReadError::Storage(error.to_string()))?;
     match page.digest().map_err(PageError::from)? == *digest {
@@ -341,7 +341,12 @@ impl Operation for SpecInputsOperation {
         let pages = result.child::<Vec<InputPage>, PageReadError>()??;
         let (inputs, captured): (Vec<_>, Vec<_>) = spec_entries(pages)?.into_iter().unzip();
         let mut filled = self.spec.clone();
-        filled.payload.inputs = inputs;
+        // Inline inputs carry no capture, so they stay in the spec beside the pages.
+        filled
+            .payload
+            .inputs
+            .retain(|input| input.source.is_inline());
+        filled.payload.inputs.extend(inputs);
         filled.captured_inputs = captured;
         Ok(Next::Done(filled))
     }
@@ -441,14 +446,15 @@ pub struct StoreEntriesOperation {
 }
 
 impl StoreEntriesOperation {
-    /// The inputs of a request with their captures; every input must have one.
+    /// The inputs of a request with their captures; every input that names an object must have
+    /// one, and inline inputs stay in the spec.
     pub fn request(
         submission: SubmissionId,
         inputs: &[InputSelection],
         captured: &[CapturedInput],
     ) -> Self {
-        let pairs: Option<Vec<_>> = inputs
-            .iter()
+        let pairs: Option<Vec<_>> = (inputs.iter())
+            .filter(|input| !input.source.is_inline())
             .map(|input| {
                 let capture = captured
                     .iter()

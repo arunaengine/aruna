@@ -15,12 +15,14 @@ use super::records::RecordStoreError;
 use super::records::verify::FamilyView;
 
 pub mod admit;
-mod advertised;
+pub(crate) mod advertised;
 pub mod alias;
 pub mod cancel;
 pub mod chain;
+pub mod closure;
+pub mod deferred;
 pub mod family_reads;
-mod fetch;
+pub(crate) mod fetch;
 mod forward;
 pub mod held;
 #[cfg(test)]
@@ -29,6 +31,7 @@ mod input_capture;
 mod input_walk;
 pub mod launch_admit;
 pub(crate) mod launch_checks;
+pub mod membership;
 pub mod offer;
 pub mod outbox;
 mod output_policies;
@@ -38,10 +41,12 @@ pub mod report;
 pub mod reservation;
 mod resolve_inputs;
 pub mod routing;
+pub mod screen;
 pub mod serve_inputs;
 pub mod stage;
 mod submission_rules;
 pub mod submit_external;
+pub mod task_job;
 pub mod updates;
 pub mod witness;
 
@@ -77,6 +82,15 @@ pub enum LifecycleError {
     /// Standing quota refused this NEW admission; replays are never refused.
     #[error("standing compute quota refused the admission: {0}")]
     QuotaDenied(#[from] QuotaDenied),
+    /// A plugin task's request reached a holder after its admission deadline, or without one.
+    #[error("the request is past its admission deadline")]
+    AdmissionClosed,
+    /// A plugin task's work row on the receiver is no longer dispatched.
+    #[error("the plugin task's work has ended")]
+    TaskEnded,
+    /// The keyed family is still being deleted on this node; the submission is retried later.
+    #[error("the job family is still being pruned; retry later")]
+    Pruning,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]

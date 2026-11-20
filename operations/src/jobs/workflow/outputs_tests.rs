@@ -49,7 +49,7 @@ fn output(container_path: &str, node_id: NodeId) -> OutputSelection {
 fn scope_of(spec: ExecutionSpec, until_stop: bool) -> CaptureScope {
     let record = record();
     CaptureScope {
-        kind: ExecutorKind::Docker,
+        backend: "docker".to_string(),
         fence: fence(),
         run: RunIdentity::new(&spec, &record, realm(), node()),
         spec: Arc::new(spec),
@@ -215,7 +215,7 @@ fn wildcard_listed_first() {
             pattern: "/out/*.txt".to_string(),
             until_stop: true,
         };
-        let list = attempt_call(&ExecutorKind::Docker, &fence(), request);
+        let list = attempt_call("docker", &fence(), request);
         assert_eq!(capture.first(), Ok(Next::Call(list)));
         assert_eq!(capture.next(compute(answer)), Err(expected));
     }
@@ -403,7 +403,7 @@ fn output_fetch_requested() {
         path: PATH.to_string(),
         until_stop: true,
     };
-    let fetch = attempt_call(&ExecutorKind::Docker, &fence(), request);
+    let fetch = attempt_call("docker", &fence(), request);
     assert_eq!(put_at(PutStep::Fetch).fetch(), Ok(Next::Call(fetch)));
 }
 

@@ -108,8 +108,11 @@ async fn reserve(
             resources: resources(),
             subject_generation: receipt.subject_generation,
             subject_digest: receipt.subject_digest,
+            config_generation: receipt.config_generation,
+            config_digest: receipt.config_digest,
             record: Box::new(record),
             now_ms: 4_000,
+            fence: None,
         }),
         ctx,
     )
@@ -128,12 +131,24 @@ fn holds_static_ceilings() {
         created_at_ms: 1,
         subject_generation: 1,
         subject_digest: [0u8; 32],
+        config_clock: Default::default(),
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
     }];
-    assert!(fits(&held, &resources(), &envelope(2)));
-    assert!(!fits(&held, &resources(), &envelope(1)));
-    assert!(fits(&held, &resources(), &ResourceEnvelope::default()));
+    assert!(fits(&held, "default", &resources(), &envelope(2)));
+    assert!(!fits(&held, "default", &resources(), &envelope(1)));
+    assert!(fits(
+        &held,
+        "default",
+        &resources(),
+        &ResourceEnvelope::default()
+    ));
+    // Another backend's reservations take nothing from this one's ceilings.
+    assert!(fits(&held, "lab", &resources(), &envelope(1)));
     assert!(!fits(
         &[],
+        "default",
         &resources(),
         &ResourceEnvelope {
             max_ram_bytes: Some(512),
@@ -158,6 +173,10 @@ async fn pages_reservations() {
                 created_at_ms: index as u64,
                 subject_generation: 1,
                 subject_digest: [0u8; 32],
+                config_clock: Default::default(),
+                backend: "default".to_string(),
+                config_generation: 0,
+                config_digest: [0; 32],
             };
             (
                 JOB_RESERVATION_KEYSPACE.to_string(),

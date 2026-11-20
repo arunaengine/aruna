@@ -58,3 +58,20 @@ test("starts transfers", () => {
   assert.deepEqual([sent.method, sent.path, sent.source, sent.fileField], ["post", "deposit", "raw/r.fq", "file"]);
   assert.deepEqual(sent.fields, [["title", "Run 7"]]);
 });
+
+test("starts tasks", () => {
+  const fake = new Fake();
+  const reads = new aruna.Object({ path: "raw/run-7/a.fq", size: 4, version: "v3" });
+  const job = aruna.task("map").start({
+    parameters: { reference: "GCF_000005845.2" },
+    inputs: { "/in/a.fq": reads, "/in/reads/": "raw/run-7/" },
+    files: { "/in/samples.tsv": "a.fq\tA\n" },
+    outputs: { "/out/results/": "results/run-7/" },
+  });
+  assert.deepEqual([job.id, job.kind, job.state], ["job-1", "task", "queued"]);
+  const [, sent] = fake.calls.at(-1);
+  assert.deepEqual(sent.parameters, [["reference", "GCF_000005845.2"]]);
+  assert.deepEqual(sent.inputs, [["/in/a.fq", "raw/run-7/a.fq", "v3"], ["/in/reads/", "raw/run-7/", null]]);
+  assert.deepEqual([...sent.files[0][1]], [...new TextEncoder().encode("a.fq\tA\n")]);
+  assert.deepEqual(sent.outputs, [["/out/results/", "results/run-7/"]]);
+});

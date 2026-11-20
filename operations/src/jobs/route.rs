@@ -170,6 +170,9 @@ pub enum JobRouteError {
     Unavailable(String),
     #[error("job operation failed: {0}")]
     Internal(String),
+    /// The job's family was pruned on this node after its retention.
+    #[error("job was pruned after its retention")]
+    Pruned,
 }
 
 impl From<aruna_core::calls::IoError> for JobRouteError {
@@ -254,6 +257,7 @@ mod pure_tests {
             state: JobState::Succeeded,
             attempts: 1,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 1,
             updated_at_ms: 2,
             finished_at_ms: Some(2),

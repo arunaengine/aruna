@@ -435,6 +435,23 @@ fn native_records_start() {
 }
 
 #[test]
+fn native_starts_task() {
+    let request = TaskRequest {
+        task: "map".to_string(),
+        parameters: Default::default(),
+        inputs: Vec::new(),
+        files: Vec::new(),
+        outputs: Vec::new(),
+        ordinal: 0,
+    };
+    let node = crate::tests::records::local_ingress();
+    let mut call = NativeCall::task(&scope(), intent(), request, node);
+    assert!(is_child(&call.first()));
+    assert!(is_child(&call.next(fresh())));
+    assert_eq!((call.work, call.phase), (None, NativePhase::Start));
+}
+
+#[test]
 fn native_repeats_unknown() {
     let mut call = native();
     let unknown = Begun::Unknown("lost".to_string());

@@ -168,6 +168,12 @@ class Fake:
         self.job(id, kind="upload", path=source, state="queued")
         return id
 
+    def job_task(self, task, parameters, inputs, files, outputs):
+        self.calls.append(("task", task, dict(parameters), inputs, dict(files), dict(outputs)))
+        id = f"job-{len(self.jobs) + 1}"
+        self.job(id, kind="task", state="queued")
+        return id
+
     def job_get(self, id):
         if id not in self.jobs:
             raise NotFound(f"the install has no job {id}")

@@ -18,6 +18,7 @@ use aruna_outbound::transfers::{TransferError, UploadBody};
 use ulid::Ulid;
 
 use super::plugin_work::{PROGRESS_TICK, key_wait, permanent, refused};
+use aruna_core::install_work::WorkRow;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
@@ -28,7 +29,7 @@ use aruna_operations::plugins::transfer_steps::{
     KeepReply, PrepareDownload, PrepareUpload, TransferEnd, TransferWork, UploadReply, account,
     check_answer, send_end, source_gone, write_failure,
 };
-use aruna_operations::plugins::work::{WorkChange, WorkRow, begin_send, update_work};
+use aruna_operations::plugins::work::{WorkChange, begin_send, update_work};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 

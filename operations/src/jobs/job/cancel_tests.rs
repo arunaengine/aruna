@@ -49,6 +49,10 @@ fn reservation(logical: u8, physical: u8) -> JobReservationRecord {
         created_at_ms: 1,
         subject_generation: 0,
         subject_digest: [0u8; 32],
+        config_clock: Default::default(),
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
     }
 }
 
@@ -143,6 +147,7 @@ fn settled_execution_wakes() {
         env: Default::default(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),

@@ -48,6 +48,7 @@ use super::{
 use crate::auth::bearer_token::GrantValidOperation;
 use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
+use crate::blob::migration::count::ProcessCountsOperation;
 use crate::blob::migration::job_pages::{ProcessLinkedOperation, StillAdminOperation};
 
 /// Versions one task run handles per bucket before it yields to other timers.
@@ -210,6 +211,7 @@ enum RunStep {
     Page,
     Transitions,
     Checks,
+    Counts,
     Linked,
 }
 
@@ -373,6 +375,11 @@ impl Operation for ProcessMigrationsOperation {
                 self.call(RunStep::Checks, IoCall::child(checks))
             }
             RunStep::Checks => {
+                self.take_wait(result)?;
+                let counts = ProcessCountsOperation::new();
+                self.call(RunStep::Counts, IoCall::child(counts))
+            }
+            RunStep::Counts => {
                 self.take_wait(result)?;
                 let linked = ProcessLinkedOperation::new(self.routing.clone());
                 self.call(RunStep::Linked, IoCall::child(linked))

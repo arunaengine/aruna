@@ -12,6 +12,7 @@ use aruna_plugin_types::manifest::{
     Manifest, ManifestError, Requests, SecretKind, SecretSlot, Setting, SettingKind,
 };
 use aruna_plugin_types::permission::Permission;
+use aruna_plugin_types::recipe::{DEFAULT_PATTERN, Network, Recipe, placeholders};
 use aruna_plugin_types::trigger::{Trigger, TriggerKind};
 
 /// The secret slot of the webhook's verifying secret.
@@ -34,6 +35,8 @@ struct Authored {
     services: BTreeMap<String, Service>,
     #[serde(default)]
     secrets: BTreeMap<String, Secret>,
+    #[serde(default)]
+    tasks: BTreeMap<String, Task>,
     #[serde(default)]
     timer: Option<Timer>,
     #[serde(default)]
@@ -100,6 +103,43 @@ struct SecretTable {
     title: String,
     #[serde(default)]
     kind: Option<SecretKind>,
+}
+
+/// A container task: a pinned image and, unless its entrypoint fits, a command; the rest has
+/// defaults.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Task {
+    image: String,
+    #[serde(default)]
+    command: Option<Vec<String>>,
+    #[serde(default = "one")]
+    cpu: u32,
+    #[serde(default = "two_gib")]
+    memory: String,
+    #[serde(default = "one_hour")]
+    time: String,
+    #[serde(default)]
+    network: Network,
+    #[serde(default)]
+    parameters: BTreeMap<String, String>,
+    #[serde(default)]
+    report: Option<String>,
+    /// Refused until containers can get secrets; read so the author learns why.
+    #[serde(default)]
+    secrets: Option<toml::Value>,
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn two_gib() -> String {
+    "2 GiB".to_string()
+}
+
+fn one_hour() -> String {
+    "1h".to_string()
 }
 
 #[derive(Deserialize)]
@@ -183,6 +223,15 @@ impl Authored {
                 return Err(malformed(format!("`on` lists `{name}` twice")));
             }
         }
+        let mut recipes = BTreeMap::new();
+        for (name, task) in self.tasks {
+            if self.access != Access::Write {
+                return Err(malformed(format!(
+                    "task `{name}` writes its outputs, so the plugin needs `access = \"write\"`"
+                )));
+            }
+            recipes.insert(name.clone(), task.recipe(&name)?);
+        }
         let unused = [
             (timer.is_some(), "timer"),
             (webhook.is_some(), "webhook"),
@@ -202,7 +251,8 @@ impl Authored {
             secrets,
             connections,
             triggers,
-            permissions: requests(self.access, readable),
+            permissions: requests(self.access, readable, !recipes.is_empty()),
+            recipes,
         })
     }
 }
@@ -253,8 +303,72 @@ fn fields(fields: BTreeMap<String, Field>) -> BTreeMap<String, Setting> {
         .collect()
 }
 
+impl Task {
+    /// The task with its defaults filled in: every `{name}` without a pattern gets the default.
+    fn recipe(self, name: &str) -> Result<Recipe, ManifestError> {
+        let invalid = |why: &str| malformed(format!("task `{name}`: {why}"));
+        if self.secrets.is_some() {
+            return Err(invalid(
+                "secrets in the container need a later Aruna version",
+            ));
+        }
+        let used = placeholders(self.command.as_deref().unwrap_or_default());
+        let used = used.map_err(invalid)?;
+        if let Some(unused) = self.parameters.keys().find(|key| !used.contains(*key)) {
+            return Err(invalid(&format!(
+                "`{unused}` is no `{{name}}` in the command"
+            )));
+        }
+        let mut parameters = self.parameters;
+        for name in used {
+            parameters
+                .entry(name)
+                .or_insert_with(|| DEFAULT_PATTERN.to_string());
+        }
+        let memory = bytes(&self.memory)
+            .ok_or_else(|| invalid("memory is a whole number of MiB or GiB, such as \"2 GiB\""))?;
+        let time = seconds(&self.time)
+            .ok_or_else(|| invalid("time is a whole number of m, h or d, such as \"1h\""))?;
+        Ok(Recipe {
+            image: self.image,
+            command: self.command,
+            cpu: self.cpu,
+            memory,
+            time,
+            network: self.network,
+            parameters,
+            report: self.report,
+        })
+    }
+}
+
+/// `512 MiB` or `2 GiB` in bytes.
+fn bytes(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (count, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    let unit = match unit.trim() {
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        _ => return None,
+    };
+    count.parse::<u64>().ok()?.checked_mul(unit)
+}
+
+/// `30m`, `1h` or `2d` in seconds.
+fn seconds(text: &str) -> Option<u64> {
+    let at = (text.len().checked_sub(1)).filter(|at| text.is_char_boundary(*at))?;
+    let (count, unit) = text.split_at(at);
+    let unit = match unit {
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return None,
+    };
+    count.parse::<u64>().ok()?.checked_mul(unit)
+}
+
 /// The permissions an access asks for, until grants name read and write themselves.
-fn requests(access: Access, readable: bool) -> Requests {
+fn requests(access: Access, readable: bool, tasks: bool) -> Requests {
     // An upload reads its source and sends it through a declared service, as `send` may.
     let mut required = BTreeSet::from([
         Permission::MetadataRead,
@@ -272,6 +386,9 @@ fn requests(access: Access, readable: bool) -> Requests {
     }
     if readable {
         required.insert(Permission::SecretsValue);
+    }
+    if tasks {
+        required.insert(Permission::JobsRun);
     }
     Requests {
         required,

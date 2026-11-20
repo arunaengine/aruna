@@ -12,15 +12,11 @@ use std::fmt;
 use std::marker::PhantomData;
 
 /// The serde name of `SessionRef`, whose older layouts lack trailing fields.
-const SESSION_REF: &str = "SessionRef";
+pub(super) const SESSION_REF: &str = "SessionRef";
 
 /// Stored field counts by serde struct name, or by the comma-joined field names of a struct
 /// variant, which has no serde name; a listed struct lacks its later fields.
 pub(super) type Layout = &'static [(&'static str, usize)];
-
-/// Session references before the linked login, and before the display name too.
-pub(super) const NO_LOGIN: Layout = &[(SESSION_REF, 3)];
-pub(super) const NO_NAME: Layout = &[(SESSION_REF, 2)];
 
 /// Decodes `bytes` as `T` with every struct `layout` names stored with only its first fields.
 /// All bytes must be used.
@@ -189,8 +185,21 @@ impl<'de, E: serde::de::Error> Deserializer<'de> for Zero<E> {
         visitor.visit_u64(0)
     }
 
+    fn deserialize_str<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_str("")
+    }
+
+    fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_str("")
+    }
+
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
         visitor.visit_seq(SeqDeserializer::new(std::iter::empty::<()>()))
+    }
+
+    /// A fixed array, such as a digest, of zero bytes.
+    fn deserialize_tuple<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value, E> {
+        visitor.visit_seq(SeqDeserializer::new(std::iter::repeat_n(0u8, len)))
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, E> {
@@ -205,9 +214,43 @@ impl<'de, E: serde::de::Error> Deserializer<'de> for Zero<E> {
         visitor.visit_newtype_struct(self)
     }
 
+    /// A struct, such as a clock, with every field at its zero value.
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, E> {
+        visitor.visit_seq(ZeroFields::<E> {
+            left: fields.len(),
+            error: PhantomData,
+        })
+    }
+
     serde::forward_to_deserialize_any! {
-        i8 i16 i32 i64 i128 u8 u16 u32 u128 f32 f64 char str string bytes byte_buf unit
-        unit_struct tuple tuple_struct struct enum identifier ignored_any
+        i8 i16 i32 i64 i128 u8 u16 u32 u128 f32 f64 char bytes byte_buf unit
+        unit_struct tuple_struct enum identifier ignored_any
+    }
+}
+
+/// The fields of a struct an older layout lacks, each at its zero value.
+struct ZeroFields<E> {
+    left: usize,
+    error: PhantomData<E>,
+}
+
+impl<'de, E: serde::de::Error> SeqAccess<'de> for ZeroFields<E> {
+    type Error = E;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, E> {
+        if self.left == 0 {
+            return Ok(None);
+        }
+        self.left -= 1;
+        seed.deserialize(Zero(PhantomData)).map(Some)
     }
 }
 

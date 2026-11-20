@@ -81,7 +81,7 @@ impl StartCheckOperation {
 }
 
 /// The wake of the migration task, sent after the commit so the task sees the record.
-fn wake_migration() -> IoCall {
+pub(crate) fn wake_migration() -> IoCall {
     let wake = TaskEffect::ShortenTimer {
         key: TaskKey::MigrateCompression,
         after: Duration::ZERO,

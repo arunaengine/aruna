@@ -170,6 +170,12 @@ pub(crate) async fn start(
     let mut core_documents = Some(documents);
     let mut task_queues = Some(task_queues);
     let mut completed_all_phases = true;
+    // A node offline longer than the job retention ends its executions before any job work.
+    let discard =
+        aruna_operations::jobs::discard::DiscardOperation::new(driver_ctx.node_and_realm());
+    if let Err(error) = drive(discard, &driver_ctx).await {
+        warn!(error = %error, "Failed to discard stale execution state; the next start retries");
+    }
 
     for phase in STARTUP_PHASES {
         // The supervision policy applies here exactly as it does in steady

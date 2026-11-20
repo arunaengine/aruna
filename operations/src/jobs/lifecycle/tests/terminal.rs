@@ -139,8 +139,11 @@ pub(super) async fn reserve_execution(
             resources: resources(),
             subject_generation: receipt.subject_generation,
             subject_digest: receipt.subject_digest,
+            config_generation: receipt.config_generation,
+            config_digest: receipt.config_digest,
             record: Box::new(record.clone()),
             now_ms: 4_000,
+            fence: None,
         }),
         ctx,
     )
@@ -163,6 +166,9 @@ async fn publishes_terminal_success() {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine@sha256:0".to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
     let commit = aruna_drivers::driver::drive(
         crate::jobs::store::job_calls::record_attempt_intent(

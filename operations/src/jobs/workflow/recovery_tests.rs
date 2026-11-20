@@ -29,6 +29,9 @@ fn pinned_record() -> JobRecord {
         executor_kind: "docker".to_string(),
         pinned_image: PINNED.to_string(),
         attempt_epoch: EPOCH,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     });
     job
 }

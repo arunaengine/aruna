@@ -286,6 +286,27 @@ impl NetHandle {
             .await
     }
 
+    /// One realm config catch-up round with `peer`; `None` when it stopped at its page budget.
+    pub async fn catch_up_round(
+        &self,
+        topic_id: ::irokle::TopicId,
+        peer: NodeId,
+    ) -> Result<Option<::irokle::ActorClock>> {
+        self.inner.document_sync.sync_round(topic_id, peer).await
+    }
+
+    /// Whether this node applied `topic_id` up to every one of `targets`.
+    pub async fn applied_covers(
+        &self,
+        topic_id: ::irokle::TopicId,
+        targets: &[::irokle::ActorClock],
+    ) -> Result<bool> {
+        self.inner
+            .document_sync
+            .applied_covers(topic_id, targets)
+            .await
+    }
+
     pub async fn allow_topic_peers(
         &self,
         topics: &[::irokle::TopicId],
@@ -1151,6 +1172,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
         Effect::Net(NetEffect::SyncTopic { .. }) => "sync_topic",
         Effect::Net(NetEffect::MissingTopicPeers { .. }) => "missing_topic_peers",
+        Effect::Net(NetEffect::ConfigCatchUp(_)) => "config_catch_up",
         Effect::Net(NetEffect::Notification(_)) => "notification",
         Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
         Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",

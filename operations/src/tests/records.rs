@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::family::{
-    CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate,
-    JobAdmissionRecord, JobCancelRecord, JobFamilyId, JobFamilyRecord, JobRecordBody,
-    JobRecordEnvelope, JobRetryPolicy, LaunchIntent, LogicalJobSpec, OutputSet,
-    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId,
-    WitnessBudgetRecord,
+    CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt, ExecutionStop,
+    ExecutionUpdate, JobAdmissionRecord, JobCancelRecord, JobFamilyId, JobFamilyRecord,
+    JobRecordBody, JobRecordEnvelope, JobRetryPolicy, LaunchIntent, LogicalJobSpec, OutputSet,
+    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, StopEvidence, SubmissionClaim,
+    SubmissionId, WitnessBudgetRecord,
 };
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
@@ -194,12 +194,14 @@ impl Family {
             plan_digest: [5u8; 32],
             spec_digest: spec.spec_digest,
             created_at_ms: 1_002,
+            config_clock: Default::default(),
         }
     }
 
     pub fn target_id(&self) -> ExecutionTargetId {
         ExecutionTargetId {
             node_id: self.target.public(),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         }
     }
@@ -220,6 +222,9 @@ impl Family {
             subject_generation: 1,
             subject_digest: [6u8; 32],
             accepted_at_ms: 1_003,
+            config_clock: Default::default(),
+            config_generation: 0,
+            config_digest: [0; 32],
         }
     }
 
@@ -285,6 +290,35 @@ impl Family {
             authority: CancelAuthority::Submitter,
             requested_at_ms: 1_020,
         }
+    }
+
+    /// A successful run of execution 1 with its stop record, as the target signed it.
+    pub fn stopped_run(&self) -> Vec<JobRecordEnvelope> {
+        self.stopped_with(PhysicalExecutionState::Succeeded)
+    }
+
+    /// One execution that ended in `terminal` and stopped.
+    pub fn stopped_with(&self, terminal: PhysicalExecutionState) -> Vec<JobRecordEnvelope> {
+        let mut records = self.run(1, 0, terminal);
+        let (JobFamilyRecord::Receipt(receipt), JobFamilyRecord::Update(update)) =
+            (&records[4].record, &records[7].record)
+        else {
+            panic!("the run fixture keeps its order");
+        };
+        let stop = ExecutionStop {
+            execution_id: receipt.execution_id,
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+            executor_node_id: self.target.public(),
+            receipt_digest: receipt.digest().expect("receipt digest"),
+            update_sequence: update.sequence,
+            update_digest: update.digest().expect("update digest"),
+            output_digest: (update.result.as_ref()).and_then(|result| result.output_digest),
+            evidence: StopEvidence::Tombstoned,
+            stopped_at_ms: 1_100,
+        };
+        records.push(self.sign(&self.target, JobFamilyRecord::Stop(Box::new(stop))));
+        records
     }
 
     pub fn sign(&self, key: &iroh::SecretKey, record: JobFamilyRecord) -> JobRecordEnvelope {
@@ -371,6 +405,7 @@ pub fn payload() -> ExecutionSpec {
         env: Default::default(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
