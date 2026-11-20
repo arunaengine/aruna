@@ -12,7 +12,9 @@ use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
-use crate::onboarding::create_secret::{secret_pages, secret_record_key};
+use crate::onboarding::create_secret::{
+    expiry_entry, secret_expiry_key, secret_pages, secret_record_key,
+};
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +97,7 @@ impl RecoverInitialOperation {
                 ByteView::from(value),
             ),
             state,
+            expiry_entry(&self.input.record),
         ])
     }
 
@@ -150,6 +153,8 @@ impl RecoverInitialOperation {
                     ONBOARDING_KEYSPACE.to_string(),
                     secret_state_key(record.enrollment_id),
                 ));
+                let expiry = secret_expiry_key(record.expires_at, record.enrollment_id);
+                deletes.push((ONBOARDING_KEYSPACE.to_string(), expiry));
             }
         }
         if deletes.is_empty() {

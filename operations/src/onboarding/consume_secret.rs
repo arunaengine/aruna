@@ -13,7 +13,7 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::create_secret::secret_record_key;
+use crate::onboarding::create_secret::{expiry_entry, secret_record_key};
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +142,7 @@ impl ConsumeSecretOperation {
                 node_id: node.clone(),
             },
         )?;
+        let expiry = expiry_entry(&record);
         self.claimed = Some(record);
         Ok(Next::Call(IoCall::Write(vec![
             (
@@ -150,6 +151,7 @@ impl ConsumeSecretOperation {
                 ByteView::from(value),
             ),
             state_entry,
+            expiry,
         ])))
     }
 }
