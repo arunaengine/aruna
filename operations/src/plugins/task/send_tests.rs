@@ -97,6 +97,11 @@ fn send(now_ms: u64) -> SendTask {
 }
 
 fn stored_task(admit_by: u64) -> IoResult {
+    stored_pages(admit_by, None)
+}
+
+/// The task row of a first send whose request kept `input_pages` here.
+fn stored_pages(admit_by: u64, input_pages: Option<PageManifest>) -> IoResult {
     let request = SubmissionRequest {
         created_by: user(),
         spec: payload(),
@@ -105,7 +110,7 @@ fn stored_task(admit_by: u64) -> IoResult {
         ingress_node_id: node(1),
         captured_inputs: Vec::new(),
         output_policies: Vec::new(),
-        input_pages: None,
+        input_pages,
         admit_by: Some(admit_by),
     };
     let task = TaskRow {
@@ -140,8 +145,50 @@ fn resend_marks_first() {
         resend.next(read),
         Ok(Next::Call(IoCall::Child(_)))
     ));
+    assert!(matches!(resend.phase, SendPhase::Screen(_)));
+    let install = sample_install(Ulid::from_parts(1, 1));
+    let screened = child(Ok::<_, ScreenError>(install));
+    assert!(matches!(
+        resend.next(screened),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
     assert!(matches!(resend.phase, SendPhase::Mark(_)));
     // A row that is no longer reserved is not sent to.
     let unchanged = child(Ok::<_, StoreError>(Changed::default()));
     assert_eq!(resend.next(unchanged), Ok(Next::Done(())));
+}
+
+/// A resend of a stored task past its config read, at `pages`.
+fn resent(pages: Option<PageManifest>) -> SendTask {
+    let mut config = Family::new([4; 32]).config;
+    config.seed_job_control(node(1), 0);
+    let mut resend = send(1_000);
+    resend.first().unwrap();
+    resend.next(stored_pages(5_000, pages)).unwrap();
+    resend.next(child(Ok::<_, GetConfigError>(config))).unwrap();
+    resend
+}
+
+// A resend checks its stored request again before it is marked: a grant withdrawn since the
+// first send stops it for every holder, this node too, and saved pages are read back first.
+#[test]
+fn resend_rescreened() {
+    let mut refused = resent(None);
+    let withdrawn = ScreenError::Refused("objects.read is not granted".to_string());
+    let answer = refused.next(child(Err::<PluginInstall, _>(withdrawn)));
+    assert!(matches!(answer, Err(CallError(error)) if error.kind == ErrorKind::Denied));
+    let manifest = PageManifest {
+        count: 1,
+        pages: 1,
+        first: [3; 32],
+    };
+    let paged = resent(Some(manifest));
+    assert!(matches!(paged.phase, SendPhase::Load(_)));
+    let mut loaded = paged;
+    let pages = child(Ok::<_, PageReadError>(Vec::<InputPage>::new()));
+    assert!(matches!(
+        loaded.next(pages),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert!(matches!(loaded.phase, SendPhase::Screen(_)));
 }
