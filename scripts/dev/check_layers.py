@@ -106,8 +106,8 @@ BACKENDS = frozenset(
     "aruna-storage aruna-net aruna-blob aruna-tasks aruna-compute aruna-plugins aruna-graph aruna-outbound".split()
 )
 TRIGGER_MATCHES = (
-    ("operations/src/tasks/incoming/mod.rs", "TaskKey::"),
-    ("operations/src/sync/incoming.rs", "Alpn::"),
+    ("aruna/src/tasks/incoming/mod.rs", "TaskKey::"),
+    ("aruna/src/inbound.rs", "Alpn::"),
 )
 TRIGGER_IMPLS = (("aruna/src/plugin_host/broker.rs", "Broker"),)
 SIMILAR_NAMES = (
@@ -542,14 +542,17 @@ def match_arms(masked):
 
 
 def trigger_arms(sources):
-    """Arms of the trigger shells whose bodies still run async code."""
+    """Arms of the trigger shells that do more than drive one operation; a shell without its
+    dispatch match counts too, so a moved shell cannot pass unchecked."""
     found = []
     for rel, prefix in TRIGGER_MATCHES:
         source = sources.get(rel)
-        if not source:
-            continue
-        for pattern, body in match_arms(source.masked):
-            if prefix in pattern and ASYNC_RE.search(body):
+        masked = source.masked if source else ""
+        arms = [(pattern, body) for pattern, body in match_arms(masked) if prefix in pattern]
+        if not arms:
+            found.append(f"{rel}: no {prefix} dispatch")
+        for pattern, body in arms:
+            if ASYNC_RE.search(body) and not one_drive(body):
                 found.append(f"{rel}: {SPACE_RE.sub(' ', pattern.strip())}")
     for rel, trait in TRIGGER_IMPLS:
         source = sources.get(rel)

@@ -377,15 +377,19 @@ impl QueryCache {
         stamp: [u64; 2],
         now: Instant,
     ) -> Option<(MetadataQueryResults, usize)> {
-        let mut state = locked(&self.state);
-        let entry = state.entries.get(key)?;
-        if entry.stamp != stamp || entry.expires_at <= now {
-            let bytes = entry.bytes;
-            state.entries.pop(key);
-            state.bytes = state.bytes.saturating_sub(bytes);
-            return None;
-        }
-        Some(((*entry.results).clone(), entry.nodes_queried))
+        let (results, nodes_queried) = {
+            let mut state = locked(&self.state);
+            let entry = state.entries.get(key)?;
+            if entry.stamp != stamp || entry.expires_at <= now {
+                let bytes = entry.bytes;
+                state.entries.pop(key);
+                state.bytes = state.bytes.saturating_sub(bytes);
+                return None;
+            }
+            (Arc::clone(&entry.results), entry.nodes_queried)
+        };
+        // Copied after the lock is released, so other keys wait for no copy.
+        Some(((*results).clone(), nodes_queried))
     }
 
     /// Keeps a result unless a change landed since `stamp`; shared entries make that check
