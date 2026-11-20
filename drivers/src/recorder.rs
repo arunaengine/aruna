@@ -1,8 +1,10 @@
-//! Records operation runs and their ordered events for replay; off unless it is enabled.
+//! Records the ordered steps of operation runs by label, outcome and size, never their content;
+//! off unless it is enabled.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -27,19 +29,21 @@ pub struct Record {
     pub entry: Entry,
 }
 
-/// What a record holds. Texts are `Debug` output with secret fields redacted.
+/// What a record holds: the type label, outcome and `Debug` size of each step, never its content,
+/// as inputs, events and results can carry private data in any field or nested payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
     Started {
         operation: &'static str,
-        input: String,
+        input_bytes: usize,
     },
     Event {
         label: &'static str,
-        detail: String,
+        detail_bytes: usize,
     },
     Ended {
-        outcome: String,
+        outcome: &'static str,
+        outcome_bytes: usize,
     },
 }
 
@@ -79,32 +83,22 @@ pub fn take() -> Recorded {
 }
 
 /// Opens a run record when recording is on and returns the run's number.
-pub(crate) fn begin(
-    operation: &'static str,
-    at_ms: u64,
-    input: impl FnOnce() -> String,
-) -> Option<u64> {
+pub(crate) fn begin(operation: &'static str, at_ms: u64, input: &dyn Debug) -> Option<u64> {
     if !ENABLED.load(Ordering::Relaxed) {
         return None;
     }
     let run = RUNS.fetch_add(1, Ordering::Relaxed);
-    let input = shown(&input());
-    push(run, at_ms, Entry::Started { operation, input });
+    push(run, at_ms, started(operation, input));
     Some(run)
 }
 
 pub(crate) fn event(run: u64, at_ms: u64, event: &Event) {
-    let label = event.label();
-    let detail = match RAW_PAYLOADS.contains(&label) {
-        true => String::from("<payload not recorded>"),
-        false => shown(&format!("{event:?}")),
-    };
-    push(run, at_ms, Entry::Event { label, detail });
+    push(run, at_ms, delivered(event));
 }
 
-pub(crate) fn end(run: u64, at_ms: u64, outcome: impl FnOnce() -> String) {
-    let outcome = shown(&outcome());
-    push(run, at_ms, Entry::Ended { outcome });
+/// Closes a run record with its outcome, such as `Ok` or an event label, and its result.
+pub(crate) fn end(run: u64, at_ms: u64, outcome: &'static str, value: &dyn Debug) {
+    push(run, at_ms, ended(outcome, value));
 }
 
 fn push(run: u64, at_ms: u64, entry: Entry) {
@@ -113,84 +107,34 @@ fn push(run: u64, at_ms: u64, entry: Entry) {
     }
 }
 
-/// `text` redacted and cut to the per-record bound.
-fn shown(text: &str) -> String {
-    let mut text = redact(text);
-    let limit = ENTRY_BYTES.load(Ordering::Relaxed);
-    if text.len() > limit {
-        let mut end = limit;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
+fn started(operation: &'static str, input: &dyn Debug) -> Entry {
+    let input_bytes = debug_bytes(input);
+    Entry::Started {
+        operation,
+        input_bytes,
     }
-    text
 }
 
-/// Field names whose values never enter a record.
-const SECRET_MARKERS: [&str; 6] = [
-    "secret",
-    "token",
-    "password",
-    "credential",
-    "private",
-    "bearer",
-];
-
-/// Events that carry raw stored, streamed or received bytes; a record keeps only their label.
-const RAW_PAYLOADS: [&str; 6] = [
-    "StorageEvent::ReadResult",
-    "StorageEvent::BatchReadResult",
-    "StorageEvent::IterResult",
-    "BlobEvent::StreamCollected",
-    "BlobEvent::MessageReceived",
-    "NetEvent::Dht",
-];
-
-/// `Debug` text with the value of every field whose name holds a secret marker replaced.
-fn redact(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(colon) = rest.find(": ") {
-        let (head, tail) = rest.split_at(colon);
-        let tail = &tail[2..];
-        out.push_str(head);
-        out.push_str(": ");
-        let name = head
-            .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        rest = match SECRET_MARKERS.iter().any(|marker| name.contains(marker)) {
-            true => {
-                out.push_str("<redacted>");
-                &tail[value_end(tail)..]
-            }
-            false => tail,
-        };
+fn delivered(event: &Event) -> Entry {
+    let detail_bytes = debug_bytes(event);
+    let label = event.label();
+    Entry::Event {
+        label,
+        detail_bytes,
     }
-    out.push_str(rest);
-    out
 }
 
-/// The end of one `Debug` field value: the first `,` or closing bracket outside nested
-/// brackets and strings.
-fn value_end(text: &str) -> usize {
-    let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
-    for (index, c) in text.char_indices() {
-        match (quoted, c) {
-            (true, _) if escaped => escaped = false,
-            (true, '\\') => escaped = true,
-            (true, '"') => quoted = false,
-            (true, _) => {}
-            (false, '"') => quoted = true,
-            (false, '(' | '[' | '{') => depth += 1,
-            (false, ')' | ']' | '}' | ',') if depth == 0 => return index,
-            (false, ')' | ']' | '}') => depth -= 1,
-            _ => {}
-        }
+fn ended(outcome: &'static str, value: &dyn Debug) -> Entry {
+    let outcome_bytes = debug_bytes(value);
+    Entry::Ended {
+        outcome,
+        outcome_bytes,
     }
-    text.len()
+}
+
+/// The length of `value`'s `Debug` text.
+fn debug_bytes(value: &dyn Debug) -> usize {
+    format!("{value:?}").len()
 }
 
 /// The kept records and the bytes of their texts.
@@ -242,46 +186,55 @@ impl Buffer {
     }
 }
 
+/// The bytes a record keeps: its label and its size field.
 fn entry_bytes(entry: &Entry) -> usize {
-    match entry {
-        Entry::Started { operation, input } => operation.len() + input.len(),
-        Entry::Event { label, detail } => label.len() + detail.len(),
-        Entry::Ended { outcome } => outcome.len(),
-    }
+    let label = match entry {
+        Entry::Started { operation, .. } => operation,
+        Entry::Event { label, .. } => label,
+        Entry::Ended { outcome, .. } => outcome,
+    };
+    label.len() + std::mem::size_of::<usize>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Raw payload events keep their label; the stored bytes never enter the record.
+    // A run's input, a grouped read and a raw byte result leave only labels, outcomes and sizes
+    // in the record, never the private data they carry.
     #[test]
-    fn payload_bytes_hidden() {
-        let read = Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+    fn private_data_kept_out() {
+        use aruna_core::events::{GroupEvent, GroupResult, StorageEvent};
+        let private = "inbox entry of ann";
+        let read = Event::Storage(StorageEvent::ReadResult {
             key: byteview::ByteView::from(b"key".as_slice()),
-            value: Some(byteview::ByteView::from(b"stored secret".as_slice())),
+            value: Some(byteview::ByteView::from(private.as_bytes())),
         });
-        assert!(RAW_PAYLOADS.contains(&read.label()));
-        assert!(redact(r#"Call { bearer: "abc", id: 1 }"#).contains("bearer: <redacted>"));
-    }
-
-    #[test]
-    fn redacts_secret_fields() {
-        let text =
-            r#"Login { user: "ann", password: "p,a)ss", session_token: Some([1, 2]), id: 7 }"#;
-        assert_eq!(
-            redact(text),
-            r#"Login { user: "ann", password: <redacted>, session_token: <redacted>, id: 7 }"#
-        );
+        let grouped = Event::Group(GroupEvent::Finished {
+            results: vec![GroupResult::Done(Box::new(read))],
+        });
+        let result: Result<Vec<u8>, ()> = Ok(private.as_bytes().to_vec());
+        let entries = [
+            started("PeerOperation", &private),
+            delivered(&grouped),
+            ended("Ok", &result),
+        ];
+        for entry in &entries {
+            let text = format!("{entry:?}");
+            assert!(!text.contains("inbox"), "{text}");
+            assert!(!text.contains("105, 110, 98"), "{text}");
+        }
+        assert!(matches!(entries[1], Entry::Event { detail_bytes, .. } if detail_bytes > 0));
     }
 
     #[test]
     fn drops_oldest_records() {
         let mut buffer = Buffer::new();
-        buffer.total_bytes = 10;
+        // Each record keeps a four byte label and its size field.
+        buffer.total_bytes = 2 * (4 + std::mem::size_of::<usize>());
         for outcome in ["aaaa", "bbbb", "cccc"] {
-            let outcome = outcome.to_string();
-            buffer.push(1, 0, Entry::Ended { outcome });
+            let outcome_bytes = 1;
+            buffer.push(1, 0, Entry::Ended { outcome, outcome_bytes });
         }
         let taken = buffer.take();
         assert_eq!(taken.dropped, 1);
