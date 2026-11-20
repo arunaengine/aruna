@@ -2,22 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::identity::JobExecutionClass;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Key;
 use aruna_tasks::shutdown::Shutdown;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
@@ -100,11 +97,9 @@ use aruna_operations::queue_backoff::retry_delay_ms;
 use aruna_operations::replication::drain::RestoreDrainOperation;
 use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
-use aruna_operations::sync::document_outbox::{OutboxTailsOperation, OutboxTimerOperation};
-use aruna_operations::sync::outbox::batches::{DrainInvocation, OutboxLimits};
-use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
+use aruna_operations::sync::document_outbox::OutboxTimerOperation;
+use aruna_operations::sync::outbox::batches::OutboxLimits;
 use aruna_operations::sync::outbox::rotation::OutboxRotation;
-use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
     TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
 };
@@ -117,15 +112,6 @@ pub mod git_drain;
 pub mod outbox;
 pub mod restore;
 
-/// Process-wide tally of document sync outbox records ever classified
-/// undeliverable. The drain already error-logs each one; this exposes the count
-/// so a test can assert the draining-flush path never black-holes a record.
-pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Outbox records remembered as published; past it they are forgotten and published once
-/// more, which only costs log space.
-const MAX_PUBLISHED_RECORDS: usize = 65_536;
 const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 
 /// How long a device keeps its copy of the realm documents before asking for
@@ -146,13 +132,6 @@ pub(crate) struct OperationsTaskHandler {
     // What each converted timer keeps between runs; the operations decide on it. Loss on
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
-    // Rotation state of the bounded outbox drain. Loss on restart is fine: the
-    // next rotation opens at the head.
-    rotation: std::sync::Mutex<OutboxRotation>,
-    // Outbox records whose op this process already created, so a retry only syncs them.
-    // Loss on restart is fine: such a record is published once more.
-    published_records: std::sync::Mutex<BTreeSet<Vec<u8>>>,
-    drain_guard: tokio::sync::Mutex<()>,
     outbox_limits: OutboxLimits,
     // When a device may next fetch the realm documents, and how many attempts
     // have failed. Loss on restart is fine: a restart fetches them anyway.
@@ -167,9 +146,6 @@ impl OperationsTaskHandler {
             jobs_runtime,
             rocrate_limits: RoCrateLimits::default(),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
-            rotation: std::sync::Mutex::new(OutboxRotation::default()),
-            published_records: std::sync::Mutex::new(BTreeSet::new()),
-            drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
         }
@@ -194,14 +170,6 @@ impl OperationsTaskHandler {
             continuation_streak,
         };
         self
-    }
-
-    /// Re-arms the outbox drain on the rotation's retry ladder, which counts the attempt. The
-    /// drain re-arm is the only retry path for an accepted write after a transient sync failure.
-    async fn retry_drain(&self, key: TaskKey, mut rotation: OutboxRotation) {
-        let after = rotation.retry_after();
-        self.store_rotation(rotation);
-        self.reschedule_timer(key, after).await;
     }
 
     async fn reschedule_timer(&self, key: TaskKey, after: std::time::Duration) -> bool {
@@ -246,24 +214,6 @@ impl OperationsTaskHandler {
     pub(super) async fn arm_backend_imports(&self) {
         self.keep_retrying(TaskKey::RunBackendImports, Duration::ZERO)
             .await;
-    }
-
-    // Kicks the placement reconciler immediately (not persisted; it is re-derived
-    // from the realm config at startup by `RestoreTopicsOperation`).
-    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::id::NodeId) {
-        let task_id = TaskKey::SyncPlacements { realm_id, node_id };
-        let Some(task_handle) = self.context.task_handle.as_ref() else {
-            warn!(task_id = ?task_id, "Cannot schedule shard placement sync without task handle");
-            return;
-        };
-        let effect = Effect::Task(TaskEffect::ResetTimer {
-            key: task_id.clone(),
-            after: Duration::ZERO,
-        });
-        if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await
-        {
-            warn!(task_id = ?task_id, message = %message, "Failed to schedule shard placement sync after local realm config change");
-        }
     }
 
     /// Fetches the realm documents on a device, at most once per backoff
@@ -435,9 +385,7 @@ impl OperationsTaskHandler {
         match key {
             TaskKey::RealmPresence { .. } => Box::pin(self.run_trigger(key)),
             TaskKey::SyncPlacements { .. } => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainSyncOutbox => Box::pin(async move {
-                self.drain_sync_outbox().await;
-            }),
+            TaskKey::DrainSyncOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
             TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
             TaskKey::DrainProjectionQueue => Box::pin(self.run_trigger(key)),
@@ -555,6 +503,13 @@ impl InboundTaskHandler for OperationsTaskHandler {
     }
 
     async fn handle_firing(&self, key: TaskKey, stamp: Option<u64>) {
+        // A test pins the first outbox drain of a launch until it releases the barrier.
+        #[cfg(debug_assertions)]
+        if matches!(key, TaskKey::DrainSyncOutbox)
+            && let Some(barrier) = OutboxBarrier::new()
+        {
+            barrier.wait_start().await;
+        }
         // An audit record retry keeps its row until the record is stored, in one transaction.
         if !matches!(key, TaskKey::RecordAudit { .. }) {
             delete_persisted_timer(&self.context.storage_handle, &key, stamp).await;

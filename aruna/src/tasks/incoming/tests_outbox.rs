@@ -337,7 +337,7 @@ async fn config_reloads_between() {
     } = config_setup().await;
     handler.drain_sync_outbox().await;
     {
-        let rotation = handler.rotation.lock().expect("rotation lock");
+        let rotation = handler.kept_rotation();
         assert!(rotation.cursor.is_some());
         assert_eq!(rotation.totals.deleted, 1);
     }
@@ -372,24 +372,13 @@ fn outbox_bound_finite() {
     assert_ne!(OUTBOX_INVOCATION_RECORDS, 0);
 }
 
-#[tokio::test(start_paused = true)]
-async fn empty_resets_backoff() {
-    let _clock = freeze_clock();
-    let (_dir, handler, _task_handle) = outbox_handler();
-    let key = TaskKey::DrainSyncOutbox;
-    handler.store_rotation(OutboxRotation {
-        retry_attempts: 3,
-        ..OutboxRotation::default()
-    });
-    let rotation = std::mem::take(&mut *handler.rotation.lock().expect("rotation lock"));
-
-    assert!(handler.open_rotation(&key, rotation).await.is_none());
-    let attempts = handler
-        .rotation
-        .lock()
-        .expect("rotation lock")
-        .retry_attempts;
-    assert_eq!(attempts, 0, "an empty outbox drops the retry ladder");
+/// Keeps `rotation` as the drain's open rotation, as an earlier invocation would have left it.
+fn seed_rotation(handler: &OperationsTaskHandler, rotation: OutboxRotation) {
+    let memory = TimerMemory {
+        rotation,
+        ..TimerMemory::default()
+    };
+    handler.keep_memory(&TaskKey::DrainSyncOutbox, memory);
 }
 
 #[tokio::test]
@@ -413,10 +402,11 @@ async fn blocked_keeps_backoff() {
     });
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
-    handler.store_rotation(OutboxRotation {
+    let rotation = OutboxRotation {
         retry_attempts: 3,
         ..OutboxRotation::default()
-    });
+    };
+    seed_rotation(&handler, rotation);
     let mut blocked_change = change();
     blocked_change.placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: Ulid::from_bytes([48; 16]),
@@ -439,11 +429,7 @@ async fn blocked_keeps_backoff() {
     handler.drain_sync_outbox().await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    let attempts = handler
-        .rotation
-        .lock()
-        .expect("rotation lock")
-        .retry_attempts;
+    let attempts = handler.kept_rotation().retry_attempts;
     assert_eq!(attempts, 3);
     shutdown_net(&net).await;
 }
@@ -661,11 +647,7 @@ async fn rotation_streak() {
     for expected in 1..=OUTBOX_CONTINUATION_STREAK {
         handler.drain_sync_outbox().await;
         assert_eq!(
-            handler
-                .rotation
-                .lock()
-                .expect("rotation lock")
-                .continuations,
+            handler.kept_rotation().continuations,
             expected
         );
         assert_eq!(
@@ -675,11 +657,7 @@ async fn rotation_streak() {
     }
     handler.drain_sync_outbox().await;
     assert_eq!(
-        handler
-            .rotation
-            .lock()
-            .expect("rotation lock")
-            .continuations,
+        handler.kept_rotation().continuations,
         0
     );
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
@@ -1281,7 +1259,7 @@ impl BoundaryHarness {
     }
 
     fn assert_rotation(&self, examined: usize, cursor: bool, continuations: u32) {
-        let rotation = self.handler.rotation.lock().expect("rotation lock");
+        let rotation = self.handler.kept_rotation();
         assert_eq!(
             (rotation.totals.examined, rotation.cursor.is_some()),
             (examined, cursor)

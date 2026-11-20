@@ -94,7 +94,7 @@ async fn installed_fence() {
     drive_sync_drain(context.clone()).await;
     assert!(recv_progress(&mut completed).await);
     {
-        let rotation = handler.rotation.lock().expect("rotation lock");
+        let rotation = handler.kept_rotation();
         assert_eq!(rotation.totals.examined, 1);
         assert!(rotation.cursor.is_some());
         assert_eq!(rotation.continuations, 1);
