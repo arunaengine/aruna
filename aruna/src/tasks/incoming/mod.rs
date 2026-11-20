@@ -361,6 +361,7 @@ impl OperationsTaskHandler {
                 Default::default()
             },
             rocrate_limits: self.rocrate_limits.clone(),
+            outbox: self.outbox_limits,
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
