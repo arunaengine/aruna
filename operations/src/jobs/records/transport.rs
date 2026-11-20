@@ -31,7 +31,7 @@ use crate::jobs::lifecycle::cancel::CancelRunsOperation;
 use crate::jobs::lifecycle::launch_admit::{
     AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
 };
-use crate::jobs::lifecycle::witness_arm::ArmFamilyOperation;
+use crate::jobs::lifecycle::witness::arm::ArmFamilyOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::metadata::protocol::{
     JobPageReply, MetadataTransportMessage, transport_message_kind,

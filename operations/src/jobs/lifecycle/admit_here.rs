@@ -29,7 +29,7 @@ use super::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission,
 };
 use super::outbox::schedule_outbox_drain;
-use super::witness_arm::ArmFamilyOperation;
+use super::witness::arm::ArmFamilyOperation;
 use crate::jobs::quota::{QuotaCheckOperation, QuotaError, QuotaVerdict};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::project::{

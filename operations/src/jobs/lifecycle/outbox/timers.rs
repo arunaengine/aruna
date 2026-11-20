@@ -11,7 +11,7 @@ use aruna_core::operation::Operation;
 use aruna_core::types::Key;
 
 use super::{OUTBOX_RETRY_AFTER, schedule_outbox_drain};
-use crate::jobs::lifecycle::witness_arm::schedule_witness_drain;
+use crate::jobs::lifecycle::witness::arm::schedule_witness_drain;
 
 /// The timers to arm, with the witness drain only while witness deadlines are stored.
 pub fn lifecycle_timers(witness_pending: bool) -> Vec<Effect> {

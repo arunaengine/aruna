@@ -22,14 +22,14 @@ use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use super::LifecycleError;
+use super::super::LifecycleError;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::verify::FamilyView;
 
 /// Domain of the stable witness order.
 const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
-pub(super) const DEADLINE_KEY_BYTES: usize = 8 + 64;
+pub(in crate::jobs::lifecycle) const DEADLINE_KEY_BYTES: usize = 8 + 64;
 
 /// One family's persisted fallback deadline. The row exists while this node may
 /// still have to launch, so a restart resumes the same schedule.
@@ -99,14 +99,14 @@ fn jitter_ms(family: &JobFamilyId, node: NodeId, base_delay_ms: u64) -> u64 {
     u64::from(u16::from_be_bytes([key[0], key[1]])) % spread
 }
 
-pub(super) fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
+pub(in crate::jobs::lifecycle) fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
     let mut bytes = Vec::with_capacity(DEADLINE_KEY_BYTES);
     bytes.extend_from_slice(&due_at_ms.to_be_bytes());
     bytes.extend_from_slice(&family.to_bytes());
     Key::from(bytes.as_slice())
 }
 
-pub(super) fn deadline_index_key(family: &JobFamilyId) -> Key {
+pub(in crate::jobs::lifecycle) fn deadline_index_key(family: &JobFamilyId) -> Key {
     Key::from(family.to_bytes().as_slice())
 }
 
@@ -295,7 +295,7 @@ impl Operation for ArmFamilyOperation {
 /// One change of a family's persisted deadline, applied only while the index row still holds the
 /// deadline the drain read.
 #[derive(Debug, PartialEq)]
-pub(super) enum DeadlineChange {
+pub(in crate::jobs::lifecycle) enum DeadlineChange {
     /// Removes the due deadline `expected` at `key` with its index row.
     Clear { key: Key, expected: WitnessDeadline },
     /// Removes a deadline row at `key` the index no longer names.
@@ -317,7 +317,7 @@ enum ChangeState {
 }
 
 #[derive(Debug, PartialEq)]
-pub(super) struct ChangeDeadlineOperation {
+pub(in crate::jobs::lifecycle) struct ChangeDeadlineOperation {
     family: JobFamilyId,
     change: DeadlineChange,
     deletes: Vec<(String, Key)>,
@@ -327,7 +327,7 @@ pub(super) struct ChangeDeadlineOperation {
 type ChangeStep = Result<Next<bool>, LifecycleError>;
 
 impl ChangeDeadlineOperation {
-    pub(super) fn new(family: JobFamilyId, change: DeadlineChange) -> Self {
+    pub(in crate::jobs::lifecycle) fn new(family: JobFamilyId, change: DeadlineChange) -> Self {
         Self {
             family,
             change,

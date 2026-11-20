@@ -3,6 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod arm;
+pub mod round;
+
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -14,11 +17,11 @@ use aruna_core::types::{Key, Value};
 use tracing::warn;
 
 use super::LifecycleError;
-use super::witness_arm::{
+use arm::{
     ChangeDeadlineOperation, DEADLINE_KEY_BYTES, DeadlineChange, WitnessDeadline,
     deadline_index_key, deadline_key,
 };
-use super::witness_round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
+use round::{RoundOutcome, WitnessNode, WitnessRoundOperation};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::RowRead;
 

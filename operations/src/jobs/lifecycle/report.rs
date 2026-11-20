@@ -20,7 +20,7 @@ use aruna_core::types::Key;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
 
-use super::witness_arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
+use super::witness::arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::route::JobRouteError;
 use aruna_core::calls::{IoCall, IoResult, Next};
