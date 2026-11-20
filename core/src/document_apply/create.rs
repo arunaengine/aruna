@@ -294,8 +294,10 @@ impl RowPlan for CreateBatchPlan {
         let mut writes = Vec::new();
         let mut held = BTreeSet::new();
         let mut waiting = false;
-        // The drain projects the accepted events in this order, so an update follows its create.
-        let (mut queued, mut identities) = (DocumentReconcileResult::default(), Vec::new());
+        // The drain projects the accepted events in this order, so an update follows its create;
+        // without follow-ups nothing is gathered.
+        let mut queued = (self.followups).map(|node| (node, DocumentReconcileResult::default()));
+        let mut identities = Vec::new();
         for candidate in &self.candidates {
             let apply = &candidate.apply;
             // A candidate that needs rows does not stop the others, so one read serves them all.
@@ -313,9 +315,11 @@ impl RowPlan for CreateBatchPlan {
                     if with_revision {
                         writes.extend(candidate.revision.iter().cloned());
                     }
-                    queued.targets.push(apply.target.clone());
-                    queued.metadata_create_events.push(apply.record.clone());
-                    identities.push(apply.identity);
+                    if let Some((_, queued)) = &mut queued {
+                        queued.targets.push(apply.target.clone());
+                        queued.metadata_create_events.push(apply.record.clone());
+                        identities.push(apply.identity);
+                    }
                     outcome
                         .accepted
                         .push((apply.target.clone(), apply.record.clone()));
@@ -341,10 +345,10 @@ impl RowPlan for CreateBatchPlan {
         if waiting {
             return Err(NeedsRows.into());
         }
-        if let Some(node) = &self.followups
+        if let Some((node, queued)) = queued
             && !identities.is_empty()
         {
-            writes.push(followup_row(node, &identities, queued)?);
+            writes.push(followup_row(&node, &identities, queued)?);
         }
         match quarantine_entries(rows, &rejections)? {
             Some(entries) => writes.extend(entries),
