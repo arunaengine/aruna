@@ -20,7 +20,7 @@ use aruna_api::routes::access::credentials::{
 use aruna_api::routes::access::groups::{
     CreateGroupRequest, CreateGroupResponse, GroupInfoResponse,
 };
-use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
+use aruna_api::s3::server::{S3Server, S3ServerHandle};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_blob::blob::BlobHandler;
@@ -32,6 +32,7 @@ use aruna_config::settings::read_settings_from;
 use aruna_config::{Config, resolve_settings};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::listener::S3ServerTimeouts;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::node_vault::NodeVaultKey;
 use aruna_core::onboarding::{
@@ -1196,7 +1197,7 @@ async fn spawn_rest_server(
         state.clone(),
         ServerConfig {
             http_addr: addr,
-            max_body_size: aruna_api::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors: test_cors_config(),
         },
     );

@@ -962,7 +962,8 @@ mod tests {
         shutdown: &Shutdown,
     ) -> (std::net::SocketAddr, aruna_api::s3::server::S3ServerHandle) {
         use aruna_api::cors::CorsConfig;
-        use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
+        use aruna_api::s3::server::S3Server;
+        use aruna_core::listener::S3ServerTimeouts;
         use aruna_core::metrics::NodeMetrics;
         use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
