@@ -2276,7 +2276,7 @@ async fn prefix_token_precedence() {
     let mut request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
     request.input.start_after = Some("imaging/z".to_string());
     let token =
-        aruna_operations::s3::object::member_merge::merged_marker("study", Some("imaging/0"), None)
+        aruna_operations::s3::object::member::merge::merged_marker("study", Some("imaging/0"), None)
             .unwrap();
     request.input.continuation_token = ArunaS3Service::encode_list_token(token.as_ref()).unwrap();
     let output = service.list_objects_v2(request).await.unwrap().output;

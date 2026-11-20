@@ -14,7 +14,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::share::{SHARE_CREDENTIAL_PREFIX, ShareLink};
-use aruna_operations::s3::object::member_read::{MemberFailure, MemberRefusal};
+use aruna_operations::s3::object::member::read::{MemberFailure, MemberRefusal};
 use aruna_operations::s3::object::range_list::MemberAccess;
 use axum::http::StatusCode;
 use bytes::Bytes;

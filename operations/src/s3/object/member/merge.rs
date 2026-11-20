@@ -38,7 +38,7 @@ use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListContinuationToken, ListedObject,
     decode_list_token, encode_list_token,
 };
-use crate::s3::object::member_read::{
+use crate::s3::object::member::read::{
     MemberCallOperation, MemberPayload, MemberRefusal, MemberRequest, MemberTarget,
     MemberTextOperation,
 };
@@ -1331,5 +1331,5 @@ impl Operation for RemoteUploadsOperation {
 }
 
 #[cfg(test)]
-#[path = "member_merge_tests.rs"]
+#[path = "merge_tests.rs"]
 mod tests;

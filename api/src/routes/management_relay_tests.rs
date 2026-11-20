@@ -5,7 +5,7 @@
 use super::{MANAGEMENT_URL_TTL, healthy_first};
 use crate::error::{ErrorResponse, ServerError};
 use aruna_operations::relay::management::{RELAYED_ROUTES, relay_route};
-use aruna_operations::s3::object::member_rest::API_PREFIX;
+use aruna_operations::s3::object::member::rest::API_PREFIX;
 use axum::body::to_bytes;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;

@@ -17,7 +17,7 @@ use aruna_core::structs::storage::node_info::NodeUrls;
 use bytes::Bytes;
 use ulid::Ulid;
 
-use crate::s3::object::member_read::Header;
+use crate::s3::object::member::read::Header;
 
 /// The nest every REST route is served under.
 pub const API_PREFIX: &str = "/api/v1";

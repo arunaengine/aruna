@@ -65,7 +65,7 @@ use crate::s3::service::ArunaS3Service;
 use crate::s3::service::forward::reads::delegated_caller;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_operations::s3::object::member_read::{MemberKey, MemberRead, MemberReadOperation};
+use aruna_operations::s3::object::member::read::{MemberKey, MemberRead, MemberReadOperation};
 use aruna_operations::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
 use std::sync::atomic::{AtomicU64, Ordering};
 

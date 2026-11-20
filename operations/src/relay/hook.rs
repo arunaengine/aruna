@@ -21,7 +21,7 @@ use super::call::{
 use super::management::next_hops;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::plugins::dispatch::HookAuthorization;
-use crate::s3::object::member_rest::{RELAY_HOP_HEADER, rest_url};
+use crate::s3::object::member::rest::{RELAY_HOP_HEADER, rest_url};
 
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// The answer headers a webhook provider gets back.

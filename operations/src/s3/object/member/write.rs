@@ -24,7 +24,7 @@ use crate::distribution::routing::{
     bound_view, read_coordinator, route_read, route_upload, route_write,
 };
 use crate::s3::object::delete::bulk::BulkDeleteEntry;
-use crate::s3::object::member_read::{
+use crate::s3::object::member::read::{
     Header, MemberCallOperation, MemberFailure, MemberPayload, MemberRefusal, MemberRequest,
     MemberTarget,
 };

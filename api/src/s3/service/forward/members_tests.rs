@@ -1530,19 +1530,19 @@ async fn copy_read_marked() {
     copy_rows(&members, 1, 2).await;
     let binding = members.nodes[0].bucket().await.distribution.unwrap();
     let snapshot = snapshot_of(&members.nodes[0].service, &binding).await;
-    let copy = aruna_operations::s3::object::member_read::MemberTarget {
+    let copy = aruna_operations::s3::object::member::read::MemberTarget {
         set_id: binding.set_id,
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),
     };
-    let read = || aruna_operations::s3::object::member_read::MemberRequest {
+    let read = || aruna_operations::s3::object::member::read::MemberRequest {
         method: aruna_core::member_read::MemberMethod::Get,
         operation: "GetObject",
         bucket: BUCKET.to_string(),
         key: "k/1".to_string(),
         query: None,
         headers: Vec::new(),
-        body: aruna_operations::s3::object::member_read::MemberPayload::Empty,
+        body: aruna_operations::s3::object::member::read::MemberPayload::Empty,
     };
     let service = &members.nodes[0].service;
     let error = service

@@ -11,14 +11,14 @@ use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::id::NodeId;
 use aruna_core::member_read::MemberBody;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_operations::s3::object::member_read::{
+use aruna_operations::s3::object::member::read::{
     MemberFailure, MemberRead, MemberReadOperation, MemberRefusal, MemberTextOperation,
 };
-use aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER;
-use aruna_operations::s3::object::member_rest::{
+use aruna_operations::s3::object::member::rest::RELAY_NODE_HEADER;
+use aruna_operations::s3::object::member::rest::{
     RestAnswer, RestAsk, RestCall, RestCallOperation, rest_url,
 };
-use aruna_operations::s3::object::member_write::WriteTargetOperation;
+use aruna_operations::s3::object::member::write::WriteTargetOperation;
 use aruna_operations::transfer::status_view::node_reach;
 use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};

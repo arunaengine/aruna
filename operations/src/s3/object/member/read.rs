@@ -35,7 +35,7 @@ use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
 use crate::distribution::guard::GuardError;
 use crate::distribution::resolve::key_holders;
 use crate::distribution::routing::{copy_readers, read_coordinator, route_read};
-use crate::s3::object::member_rest::{RestAnswer, RestAsk, RestCallOperation};
+use crate::s3::object::member::rest::{RestAnswer, RestAsk, RestCallOperation};
 use crate::s3::object::range_list::DelegatedCaller;
 
 /// How long a delegation lets a caller without a credential act.
@@ -952,5 +952,5 @@ impl Operation for MemberReadOperation {
 }
 
 #[cfg(test)]
-#[path = "member_read_tests.rs"]
+#[path = "read_tests.rs"]
 mod tests;
