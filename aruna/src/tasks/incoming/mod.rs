@@ -676,8 +676,8 @@ impl OperationsTaskHandler {
         let Some(after) = plan.after else {
             return;
         };
-        if !self.reschedule_timer(key.clone(), after).await && key == TaskKey::DrainAppliedSync {
-            // Its persisted timer is gone and durable rows wait on it, so a live wake stays.
+        if !self.reschedule_timer(key.clone(), after).await {
+            // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
             self.keep_retrying(key, after).await;
         }
     }
