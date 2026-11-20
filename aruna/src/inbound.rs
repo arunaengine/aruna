@@ -6,52 +6,43 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::inbound_frames;
-use crate::peer_frames::{PeerRead, read_peer, write_peer};
+use crate::peer_frames::{PeerLimits, PeerRead, read_peer, write_peer};
 use aruna_blob::blob::inbound::{InboundError, refuse_stream};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{AppliedStep, DocumentEvictedDocument, DocumentTarget};
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::id::NodeId;
-use aruna_core::metadata::MetadataError;
-use aruna_core::metadata::protocol::{
-    INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
-};
+use aruna_core::metadata::protocol::INBOUND_FRAME_BYTES;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
-use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
-use aruna_operations::jobs::records::pages::ServePageOperation;
-use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
-use aruna_operations::metadata::serve::forwards::needs_view;
-use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 use aruna_operations::node::applied_drain::SettleAppliedOperation;
+use aruna_operations::node::peer_metadata::{MetadataNode, metadata_needs};
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::placement::process_placements::PlacementReconcileOutcome;
 use aruna_operations::placement::process_placements::ReconcilePlacementsOperation;
-use aruna_operations::plugins::peer::AnswerPeer;
 use aruna_operations::queue_backoff::retry_delay_ms;
 use aruna_operations::replication::catch_up::WakeBootstrapOperation;
 use aruna_operations::replication::incoming::stream::{
     BaoAdmission, BaoAdmissionOperation, BaoPeerStream, ServeBaoOperation,
 };
 use aruna_operations::sync::evicted::ReemitEvictedOperation;
-use aruna_operations::triggers::{PeerAnswer, PeerInput, peer_operation};
+use aruna_operations::triggers::{PeerAnswer, PeerInput, PeerRequest, peer_operation};
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
+use tracing::{Instrument, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
 /// Peer audit pages this node serves at once.
@@ -64,10 +55,9 @@ struct OperationsInboundHandler {
     context: Arc<DriverContext>,
     document_sync_reconcile: Arc<DocumentReconcileCoalescer>,
     rocrate_limits: RoCrateLimits,
-    /// The payload bytes of the metadata requests in flight on this node.
-    frame_budget: Arc<Semaphore>,
-    /// The peer audit pages this node serves at once; one more answers unavailable.
-    audit_slots: Arc<Semaphore>,
+    /// The payload bytes of the metadata requests in flight on this node, and the peer audit
+    /// pages it serves at once; one more audit page answers unavailable.
+    limits: PeerLimits,
     jobs_runtime: Arc<JobsRuntime>,
 }
 
@@ -78,7 +68,14 @@ impl OperationsInboundHandler {
         name = "peer.incoming.stream",
         level = "debug",
         skip(self, stream),
-        fields(peer = %peer, alpn = ?alpn)
+        fields(
+            peer = %peer,
+            alpn = ?alpn,
+            request = field::Empty,
+            response = field::Empty,
+            drain_ms = field::Empty,
+            write_ms = field::Empty,
+        )
     )]
     async fn serve_peer(&self, alpn: Alpn, mut stream: BiStream, peer: NodeId) {
         let context = self.context.as_ref();
@@ -86,10 +83,15 @@ impl OperationsInboundHandler {
             debug!(peer = %peer, "Dropping inbound peer stream without net handle");
             return;
         };
+        if alpn == Alpn::Metadata && context.graph_handle.is_none() {
+            warn!(peer = %peer, "Dropping inbound metadata stream without metadata store");
+            return;
+        }
         let Some(PeerRead {
             request,
             slot: _slot,
-        }) = read_peer(alpn, &mut stream, peer, net_handle).await
+            metadata: held,
+        }) = read_peer(alpn, &mut stream, peer, net_handle, &self.limits).await
         else {
             return;
         };
@@ -99,6 +101,7 @@ impl OperationsInboundHandler {
             local_node: net_handle.node_id(),
             local_realm: *net_handle.realm_id(),
             now_ms: unix_timestamp_millis(),
+            metadata: self.metadata_node(&request),
             request,
         };
         let answer = match peer_operation(&input) {
@@ -126,7 +129,39 @@ impl OperationsInboundHandler {
                 self.jobs_runtime.request_cancel(*job_id);
             }
         }
-        write_peer(&input, stream, answer).await;
+        let audit = held.as_ref().and_then(|held| held.audit);
+        write_peer(&input, stream, answer, audit).await;
+    }
+
+    /// What this node offers a metadata request, read only as far as the request needs it.
+    fn metadata_node(&self, request: &PeerRequest) -> MetadataNode {
+        let PeerRequest::Metadata { message, .. } = request else {
+            return MetadataNode::default();
+        };
+        let needs = metadata_needs(message);
+        let context = self.context.as_ref();
+        MetadataNode {
+            graph: context.graph_handle.is_some(),
+            indexed: context.storage_handle.range_indexes().is_some(),
+            metadata_bytes: self.rocrate_limits.metadata_bytes,
+            here: needs.view.then(|| context.here()),
+            routing: needs.view.then(|| node_routing(context)),
+            limits: if needs.launch {
+                context.compute_limits()
+            } else {
+                Default::default()
+            },
+            heartbeats: if needs.heartbeats {
+                context.fresh_heartbeats()
+            } else {
+                Default::default()
+            },
+            execution_id: if needs.launch {
+                Ulid::generate()
+            } else {
+                Ulid::nil()
+            },
+        }
     }
 
     fn new(
@@ -141,8 +176,10 @@ impl OperationsInboundHandler {
             context,
             document_sync_reconcile,
             rocrate_limits,
-            frame_budget: Arc::new(Semaphore::new(INBOUND_FRAME_BYTES)),
-            audit_slots: Arc::new(Semaphore::new(AUDIT_INBOUND_LIMIT)),
+            limits: PeerLimits {
+                frame_budget: Arc::new(Semaphore::new(INBOUND_FRAME_BYTES)),
+                audit_slots: Arc::new(Semaphore::new(AUDIT_INBOUND_LIMIT)),
+            },
             jobs_runtime,
         }
     }
@@ -170,199 +207,6 @@ impl OperationsInboundHandler {
                     .trigger_all(self.context.clone());
             }
         }
-    }
-
-    /// Answers one inbound metadata stream under the rocrate byte limit held by
-    /// this handler: jobs and plugins requests here, the rest by the metadata domain.
-    async fn handle_metadata_stream(&self, stream: BiStream, node_id: NodeId) {
-        if self.context.graph_handle.is_none() {
-            warn!(peer = %node_id, "Dropping inbound metadata stream without metadata store");
-            return;
-        }
-        let served = serve_metadata_stream(
-            &self.context,
-            (&self.frame_budget, &self.audit_slots),
-            stream,
-            node_id,
-            self.rocrate_limits.metadata_bytes,
-        );
-        if let Err(err) = served.await {
-            error!(error = ?err, "Failed to process inbound metadata stream");
-        }
-    }
-}
-
-#[tracing::instrument(
-    name = "metadata.remote.inbound",
-    level = "debug",
-    skip(context, limits, stream),
-    fields(
-        peer = ?peer,
-        request = field::Empty,
-        response = field::Empty,
-        read_ms = field::Empty,
-        process_ms = field::Empty,
-        drain_ms = field::Empty,
-        write_ms = field::Empty,
-        elapsed_ms = field::Empty,
-    )
-)]
-async fn serve_metadata_stream(
-    context: &Arc<DriverContext>,
-    limits: (&Arc<Semaphore>, &Arc<Semaphore>),
-    mut stream: BiStream,
-    peer: NodeId,
-    metadata_bytes: u64,
-) -> Result<(), MetadataError> {
-    let (budget, audit_slots) = limits;
-    let total_started = Instant::now();
-    let read_started = Instant::now();
-    let request = inbound_frames::read_request(&mut stream, budget).await?;
-    let span = Span::current();
-    record_elapsed_ms(&span, "read_ms", read_started);
-
-    let process_started = Instant::now();
-    let audit = request.audit;
-    // An audit page is served only within the inbound audit slots.
-    let admission = audit.map(|_| audit_slots.clone().try_acquire_owned().ok());
-    let (response, response_body) = match admission {
-        Some(None) => {
-            let result = Err(MetadataReadError::Unavailable);
-            (
-                MetadataTransportMessage::ForwardedAuditPage { result },
-                None,
-            )
-        }
-        _ => match peer_request(context, peer, request.message).await {
-            Ok(response) => (response, None),
-            Err(message) => serve_request(context, peer, metadata_bytes, message).await,
-        },
-    };
-    record_elapsed_ms(&span, "process_ms", process_started);
-    inbound_frames::write_answer(stream, audit, &response, response_body).await?;
-    drop(request.budget);
-    drop(admission);
-    record_elapsed_ms(&span, "elapsed_ms", total_started);
-    Ok(())
-}
-
-/// Answers a metadata transport request of the jobs or plugins domain, or hands the
-/// request back for the metadata domain.
-/// Answers a metadata request through the serve operation, with what this node offers it.
-async fn serve_request(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    metadata_bytes: u64,
-    message: MetadataTransportMessage,
-) -> ServedReply {
-    let view = needs_view(&message);
-    let serving = ServeNode {
-        local: context.node_and_realm(),
-        graph: context.graph_handle.is_some(),
-        indexed: context.storage_handle.range_indexes().is_some(),
-        metadata_bytes,
-        here: view.then(|| context.here()),
-        routing: view.then(|| node_routing(context)),
-    };
-    let serve = ServeRequestOperation::new(peer, serving, message);
-    match Box::pin(drive(serve, context.as_ref())).await {
-        Ok(reply) => reply,
-        Err(error) => (MetadataTransportMessage::Reject(error.to_string()), None),
-    }
-}
-
-async fn peer_request(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    message: MetadataTransportMessage,
-) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
-    let node = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
-    let message = match AnswerPeer::new(node, peer, message, unix_timestamp_millis()) {
-        Ok(answer) => {
-            let kind = answer.answer();
-            let served = Box::pin(drive(answer, context)).await;
-            return Ok(served.unwrap_or_else(|_| kind.unavailable()));
-        }
-        Err(message) => message,
-    };
-    match message {
-        record @ (MetadataTransportMessage::ForwardJobRecord { .. }
-        | MetadataTransportMessage::ForwardRecordPage { .. }) => {
-            let now_ms = aruna_clock::unix_timestamp_millis();
-            let serving = context.node_and_realm();
-            let serve = ServeRecordOperation::new(peer, record, serving, now_ms);
-            Ok(Box::pin(drive(serve, context.as_ref()))
-                .await
-                .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
-        }
-        MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-            let node = aruna_operations::jobs::node_inputs::launch_node(
-                context.node_and_realm(),
-                &context.compute_limits(),
-                &launch,
-                unix_timestamp_millis(),
-                Ulid::generate(),
-            );
-            let serve = ServeLaunchOperation::new(peer, *launch, node);
-            Ok(Box::pin(drive(serve, context.as_ref()))
-                .await
-                .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable))
-        }
-        MetadataTransportMessage::ForwardJobSubmission {
-            auth_token,
-            submission_id,
-            request,
-        } => {
-            let node = aruna_operations::jobs::node_inputs::ingress_node(
-                context.node_and_realm(),
-                context.fresh_heartbeats(),
-                unix_timestamp_millis(),
-            );
-            let admit =
-                aruna_operations::jobs::lifecycle::admit::forwarded::AdmitForwardedOperation::new(
-                    peer,
-                    auth_token,
-                    submission_id,
-                    *request,
-                    node,
-                );
-            let result = Box::pin(aruna_drivers::driver::drive(admit, context.as_ref())).await;
-            Ok(MetadataTransportMessage::ForwardedJobSubmission { result })
-        }
-        MetadataTransportMessage::ResolveJobInputs {
-            auth_token,
-            request,
-        } => {
-            let result = match aruna_operations::jobs::node_inputs::ingress_node(
-                context.node_and_realm(),
-                context.fresh_heartbeats(),
-                unix_timestamp_millis(),
-            ) {
-                Some(node) => {
-                    let serve =
-                        aruna_operations::jobs::lifecycle::serve_inputs::ServeInputsOperation::new(
-                            peer, auth_token, &node, *request,
-                        );
-                    Box::pin(aruna_drivers::driver::drive(serve, context.as_ref())).await
-                }
-                None => Err(aruna_core::jobs::SubmissionRefusal::Unavailable),
-            };
-            Ok(MetadataTransportMessage::ResolvedJobInputs { result })
-        }
-        MetadataTransportMessage::JobInputPage { submission, digest } => {
-            let page = match context.node_and_realm() {
-                Some((_, realm_id)) => {
-                    let serve = ServePageOperation::new(realm_id, peer, submission, digest);
-                    Box::pin(drive(serve, context.as_ref()))
-                        .await
-                        .ok()
-                        .flatten()
-                }
-                None => None,
-            };
-            Ok(MetadataTransportMessage::InputPageResult { page })
-        }
-        message => Err(message),
     }
 }
 
@@ -813,10 +657,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                 Alpn::DocumentSync => Box::pin(async move {
                     self.accept_document_sync(stream, node_id).await;
                 }),
-                Alpn::Metadata => Box::pin(async move {
-                    self.handle_metadata_stream(stream, node_id).await;
-                }),
-                Alpn::Notification
+                Alpn::Metadata
+                | Alpn::Notification
                 | Alpn::Shard
                 | Alpn::Heartbeat
                 | Alpn::JobControl

@@ -17,6 +17,7 @@ use aruna_core::git::GitNode;
 use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRequest;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::native_reference::{
     NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
 };
@@ -61,9 +62,11 @@ use crate::metadata::materialization_queue::MATERIALIZATION_RETRY_AFTER;
 use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
 use crate::metadata::prune_queue::GRAPH_RETRY_AFTER;
 use crate::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperation};
+use crate::metadata::serve::ServedReply;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
+use crate::node::peer_metadata::{MetadataNode, MetadataPeerOperation};
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
 use crate::node::range_timer::RangeTimerOperation;
@@ -983,6 +986,8 @@ pub struct PeerInput {
     pub local_realm: RealmId,
     pub now_ms: u64,
     pub request: PeerRequest,
+    /// What this node offers a metadata request; empty for every other protocol.
+    pub metadata: MetadataNode,
 }
 
 /// A request as the peer shell read it in its protocol's framing.
@@ -996,6 +1001,11 @@ pub enum PeerRequest {
     Job(JobRequest),
     /// A native reference read or head request.
     Native(NativeReferenceRequest),
+    /// A metadata stream request, and whether the inbound audit slots refused it.
+    Metadata {
+        message: Box<MetadataTransportMessage>,
+        refused: bool,
+    },
 }
 
 /// What a peer operation answers; the shell writes it in its protocol's framing.
@@ -1009,13 +1019,15 @@ pub enum PeerAnswer {
     Job(JobAnswer),
     /// A native reference answer and its bytes, for a read.
     Native(NativeAnswer),
+    /// A metadata reply and, for an export, the body sent after it.
+    Metadata(ServedReply),
     /// The request was kept or dropped without an answer.
     Kept,
 }
 
 impl PeerAnswer {
     /// The answer to a request whose run broke off, where its protocol has one: job control and
-    /// native references answer unavailable, the other protocols close the stream.
+    /// native references answer unavailable, metadata its refusal, the others close the stream.
     pub fn unavailable(alpn: Alpn, failure: &PeerFailure) -> Option<PeerAnswer> {
         match alpn {
             Alpn::JobControl => Some(PeerAnswer::Job(JobAnswer::unavailable(failure))),
@@ -1025,6 +1037,10 @@ impl PeerAnswer {
                     NativeReferenceResponse::Rejected(reject),
                     None,
                 )))
+            }
+            Alpn::Metadata => {
+                let reject = MetadataTransportMessage::Reject(failure.to_string());
+                Some(PeerAnswer::Metadata((reject, None)))
             }
             _ => None,
         }
@@ -1066,6 +1082,8 @@ pub enum PeerOperation {
     Job(JobRequestOperation),
     /// A native reference request this node answers from its own copies.
     Native(NativeAnswerOperation),
+    /// A metadata stream request, answered by the operation its message kind names.
+    Metadata(MetadataPeerOperation),
 }
 
 /// How long a notification request may run with its retries, so a slow store cannot hold the
@@ -1079,7 +1097,8 @@ impl PeerOperation {
             PeerOperation::Heartbeat(_)
             | PeerOperation::Manifest(_)
             | PeerOperation::Job(_)
-            | PeerOperation::Native(_) => None,
+            | PeerOperation::Native(_)
+            | PeerOperation::Metadata(_) => None,
             _ => Some(NOTIFICATION_AUTH_TIMEOUT),
         }
     }
@@ -1109,6 +1128,13 @@ pub fn peer_operation(input: &PeerInput) -> Option<PeerOperation> {
             let ids = Some((input.local_node, input.local_realm));
             let operation = NativeAnswerOperation::new(ids, input.peer, request.clone());
             Some(PeerOperation::Native(operation))
+        }
+        (Alpn::Metadata, PeerRequest::Metadata { message, refused }) => {
+            let (local, message) = ((input.local_node, input.local_realm), *message.clone());
+            let (peer, now_ms, node) = (input.peer, input.now_ms, input.metadata.clone());
+            let operation =
+                MetadataPeerOperation::new(local, peer, now_ms, message, *refused, node);
+            Some(PeerOperation::Metadata(operation))
         }
         (Alpn::Notification, PeerRequest::Frame(frame)) => {
             let deliver = DeliverInput {
@@ -1196,6 +1222,14 @@ impl PeerRun for JobRequestOperation {
     }
 }
 
+impl PeerRun for MetadataPeerOperation {
+    /// A run that broke off is answered with its refusal.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        let reject = |error: IoError| (MetadataTransportMessage::Reject(error.to_string()), None);
+        Ok(PeerAnswer::Metadata(result.unwrap_or_else(reject)))
+    }
+}
+
 impl PeerRun for NativeAnswerOperation {
     /// A run that broke off is answered as unavailable, like any other refusal.
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
@@ -1276,6 +1310,7 @@ macro_rules! each_peer {
             PeerOperation::Manifest($operation) => $body,
             PeerOperation::Job($operation) => $body,
             PeerOperation::Native($operation) => $body,
+            PeerOperation::Metadata($operation) => $body,
         }
     };
 }
@@ -1720,7 +1755,23 @@ mod tests {
             local_realm: RealmId::from_bytes([1; 32]),
             now_ms: 1_000,
             request,
+            metadata: MetadataNode::default(),
         }
+    }
+
+    // A metadata request names its operation; a run that broke off is answered with its refusal.
+    #[test]
+    fn metadata_request_named() {
+        let message = Box::new(MetadataTransportMessage::ForwardedWriteUnavailable);
+        let request = PeerRequest::Metadata {
+            message,
+            refused: false,
+        };
+        let operation = peer_operation(&peer_request(Alpn::Metadata, request));
+        assert!(matches!(operation, Some(PeerOperation::Metadata(_))));
+        let broken = MetadataPeerOperation::answer(Err(IoError::Unfinished));
+        let reject = MetadataTransportMessage::Reject(IoError::Unfinished.to_string());
+        assert_eq!(broken, Ok(PeerAnswer::Metadata((reject, None))));
     }
 
     // A heartbeat frame and a manifest request name their operations; a heartbeat is never
