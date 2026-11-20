@@ -757,9 +757,10 @@ async fn bootstrap_rejects_secret() {
     .await;
     assert!(matches!(result, Err(ServerError::Forbidden)));
 
-    let entries = drive(ListSecretsOperation::new(), &state.get_ctx())
+    let entries = drive(ListSecretsOperation::new(None), &state.get_ctx())
         .await
-        .unwrap();
+        .unwrap()
+        .entries;
     let entry = entries
         .iter()
         .find(|entry| entry.record.enrollment_id == enrollment_id)
@@ -887,9 +888,10 @@ async fn secret_pruning_correct() {
     assert_eq!(listed.secrets[0].enrollment_id, finalizing_id.to_string());
     assert_eq!(listed.secrets[0].claimed_node_id.as_deref(), Some("node-a"));
 
-    let entries = drive(ListSecretsOperation::new(), &state.get_ctx())
+    let entries = drive(ListSecretsOperation::new(None), &state.get_ctx())
         .await
-        .unwrap();
+        .unwrap()
+        .entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].record.enrollment_id, finalizing_id);
 
