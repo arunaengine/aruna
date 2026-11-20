@@ -88,6 +88,9 @@ impl Operation for SyncBatchOperation {
             sync_elapsed: Duration::from_millis(elapsed),
             ..DrainSyncOutcome::default()
         };
+        // Each record's topic and stamp, in the order of the record keys.
+        let stamps = (0..batch.record_keys.len()).map(|index| batch.stamp(index));
+        let guards = self.domains.0.iter().copied().zip(stamps).collect();
         let finished = (batch.record_keys, batch.targets);
         let finish = FinishBatchOperation::new(
             Some(self.serving),
@@ -95,7 +98,8 @@ impl Operation for SyncBatchOperation {
             finished,
             event,
             outcome,
-        );
+        )
+        .guarded(guards);
         self.finishing = true;
         Ok(Next::Call(IoCall::child(finish)))
     }
@@ -115,6 +119,7 @@ mod tests {
             origins: vec![Some(peer)],
             targets: Vec::new(),
             record_keys: vec![b"record".to_vec()],
+            stamps: Vec::new(),
         }
     }
 

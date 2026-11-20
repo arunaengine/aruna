@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -114,8 +114,9 @@ pub struct TimerMemory {
     pub ranges: MaintainCursors,
     /// The open document sync outbox rotation.
     pub rotation: OutboxRotation,
-    /// Outbox records whose op this process already created, so a retry only syncs them.
-    pub published: BTreeSet<Vec<u8>>,
+    /// Outbox records whose op this process already created, with the lineage of the topic they
+    /// were published on, so a retry on that lineage only syncs them.
+    pub published: BTreeMap<Vec<u8>, [u8; 32]>,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.

@@ -23,12 +23,12 @@ use crate::node::outbox::sync_batch::SyncBatchOperation;
 use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
 
 /// What publishing the sub-batches left: the sync outcome, the time the publishes took, the
-/// records this run published and those it deleted after their sync.
+/// records this run published with the lineage their topic had, and those it deleted.
 #[derive(Debug, Default, PartialEq)]
 pub struct PublishedBatches {
     pub outcome: DrainSyncOutcome,
     pub publish_elapsed: Duration,
-    pub published: Vec<Vec<u8>>,
+    pub published: Vec<(Vec<u8>, [u8; 32])>,
     pub deleted: Vec<Vec<u8>>,
 }
 
@@ -39,11 +39,18 @@ enum PublishStep {
     Window,
 }
 
-/// A sub-batch whose sync runs: its record keys and the ordering domains its failure blocks.
+/// A sub-batch whose sync runs, by the ordering domains its failure blocks.
 #[derive(Debug, PartialEq)]
 struct Syncing {
-    record_keys: Vec<Vec<u8>>,
     domains: (Vec<TopicId>, Vec<NodeId>),
+}
+
+/// The publications of `batch` a later drain may rely on: each record with the lineage its
+/// topic had. A record without a known lineage leaves none and publishes again on a retry.
+fn evidence(batch: &DrainSubBatch) -> Vec<(Vec<u8>, [u8; 32])> {
+    (batch.record_keys.iter().enumerate())
+        .filter_map(|(index, key)| Some((key.clone(), batch.stamp(index).lineage?)))
+        .collect()
 }
 
 type PublishTurn = Result<Next<PublishedBatches>, IoError>;
@@ -87,7 +94,7 @@ impl PublishBatchesOperation {
     /// the one before it.
     fn advance(&mut self) -> PublishTurn {
         loop {
-            let Some(mut batch) = self.batches.pop_front() else {
+            let Some(batch) = self.batches.pop_front() else {
                 return match self.awaiting.take() {
                     Some(last) => self.sync_alone(last),
                     None => Ok(Next::Done(std::mem::take(&mut self.out))),
@@ -99,6 +106,9 @@ impl PublishBatchesOperation {
                     None => continue,
                 }
             }
+            let Some(mut batch) = self.without_blocked(batch) else {
+                continue;
+            };
             let documents = std::mem::take(&mut batch.documents);
             let peers = batch.peers.clone();
             let publish = DocumentEffect::PublishDocuments { documents, peers };
@@ -121,9 +131,29 @@ impl PublishBatchesOperation {
         }
     }
 
+    /// Leaves out the entries whose topic or admin origin an earlier failure of this run
+    /// blocked: they stay in the outbox for a retry and keep their own domains blocked.
+    fn without_blocked(&mut self, batch: DrainSubBatch) -> Option<DrainSubBatch> {
+        let outcome = &self.out.outcome;
+        let blocked = |index: usize| {
+            let topic = batch.topics.get(index);
+            let origin = batch.origins.get(index).copied().flatten();
+            topic.is_some_and(|topic| outcome.blocked_topics.contains(topic))
+                || origin.is_some_and(|origin| outcome.blocked_origins.contains(&origin))
+        };
+        let (held, kept): (Vec<usize>, Vec<usize>) =
+            (0..batch.record_keys.len()).partition(|&index| blocked(index));
+        if held.is_empty() {
+            return Some(batch);
+        }
+        if let Some(held) = batch.sync_subset(&held) {
+            self.block(held.ordering_domains());
+        }
+        (!kept.is_empty()).then(|| batch.select(&kept)).flatten()
+    }
+
     fn sync_batch(&mut self, batch: DrainSubBatch) -> SyncBatchOperation {
         self.syncing = Some(Syncing {
-            record_keys: batch.record_keys.clone(),
             domains: batch.ordering_domains(),
         });
         let generation = self.ids.mint(self.now_ms);
@@ -144,9 +174,7 @@ impl PublishBatchesOperation {
         };
         match result {
             Some(Ok(finished)) => {
-                if finished.deleted {
-                    self.out.deleted.extend(syncing.record_keys);
-                }
+                self.out.deleted.extend(finished.deleted);
                 self.out.outcome.merge(finished.outcome);
             }
             _ => {
@@ -175,7 +203,7 @@ impl PublishBatchesOperation {
             Some(Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished {
                 ..
             }))) => {
-                self.out.published.extend(batch.record_keys.iter().cloned());
+                self.out.published.extend(evidence(&batch));
                 self.awaiting = Some(batch);
             }
             Some(Event::Net(NetEvent::DocumentSync(
@@ -198,9 +226,7 @@ impl PublishBatchesOperation {
                 }
                 match batch.sync_subset(&published_indices) {
                     Some(published) if !published.record_keys.is_empty() => {
-                        self.out
-                            .published
-                            .extend(published.record_keys.iter().cloned());
+                        self.out.published.extend(evidence(&published));
                         self.awaiting = Some(published);
                     }
                     Some(_) => {}
@@ -318,6 +344,8 @@ mod tests {
     };
     use aruna_core::structs::placement::record::PlacementRef;
 
+    use crate::sync::outbox::batches::RowStamp;
+
     fn serving() -> (NodeId, RealmId) {
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
         (node, RealmId::from_bytes([3; 32]))
@@ -354,7 +382,15 @@ mod tests {
             origins: vec![None],
             targets: vec![target],
             record_keys: vec![name.to_vec()],
+            stamps: vec![RowStamp {
+                lineage: Some(lineage(name)),
+                digest: None,
+            }],
         }
+    }
+
+    fn lineage(name: &[u8]) -> [u8; 32] {
+        *blake3::hash(name).as_bytes()
     }
 
     fn net(event: DocumentNetEvent) -> IoResult {
@@ -374,15 +410,46 @@ mod tests {
             Ok(Next::Call(IoCall::Child(_)))
         ));
         let finished = FinishedBatch {
-            deleted: true,
+            deleted: vec![b"one".to_vec()],
             ..FinishedBatch::default()
         };
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("the batches finish");
         };
-        assert_eq!(done.published, vec![b"one".to_vec()]);
+        assert_eq!(done.published, vec![(b"one".to_vec(), lineage(b"one"))]);
         assert_eq!(done.deleted, vec![b"one".to_vec()]);
+    }
+
+    // After a failed publish, a later sub-batch leaves out the entries of the blocked topic and
+    // publishes the rest.
+    #[test]
+    fn blocked_entries_skipped() {
+        let mut second = batch(b"one");
+        let other = batch(b"two");
+        second.documents.extend(other.documents);
+        second.topics.extend(other.topics);
+        second.origins.extend(other.origins);
+        second.targets.extend(other.targets);
+        second.record_keys.extend(other.record_keys);
+        second.stamps.extend(other.stamps);
+        let mut run = PublishBatchesOperation::new(serving(), vec![batch(b"one"), second]);
+        run.first().unwrap();
+        let failed = net(DocumentNetEvent::Error {
+            target: None,
+            error: "down".to_string(),
+        });
+        let Ok(Next::Call(IoCall::Effect(effect))) = run.next(failed) else {
+            panic!("the second sub-batch publishes what is not blocked");
+        };
+        let documents = match *effect {
+            Effect::Net(NetEffect::DocumentSync(DocumentEffect::PublishDocuments {
+                documents,
+                ..
+            })) => documents,
+            _ => panic!("expected a publish"),
+        };
+        assert_eq!(documents.len(), 1);
     }
 
     // The second publish runs together with the first batch's sync; a failed publish blocks its
@@ -418,6 +485,6 @@ mod tests {
         };
         assert!(done.outcome.retry_needed);
         assert_eq!(done.outcome.blocked_topics, vec![TopicId::hash(b"two")]);
-        assert_eq!(done.published, vec![b"one".to_vec()]);
+        assert_eq!(done.published, vec![(b"one".to_vec(), lineage(b"one"))]);
     }
 }

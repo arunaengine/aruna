@@ -387,8 +387,8 @@ async fn offline_bound_body() -> Result<(), BoxError> {
     assert_eq!(degraded.last_error, Some(RecoveryError::PeerUnavailable));
     assert!(status.pass_total(RecoveryOutcome::Partial) > 0);
 
-    let drainer = OutboxDrainer::new(drain_context(&outage.live));
-    assert_drain_bound(&outage, &drainer, Some(INCIDENT_LIMIT)).await?;
+    let mut drainer = OutboxDrainer::new(drain_context(&outage.live));
+    assert_drain_bound(&outage, &mut drainer, Some(INCIDENT_LIMIT)).await?;
     stop_driver(cancelled, driver).await?;
     shutdown_nodes(vec![outage.live]).await;
     Ok(())
@@ -424,9 +424,10 @@ async fn recovery_converges(record_count: usize, assert_bound: bool) -> Result<(
     let degraded = status.snapshot();
     assert_eq!(degraded.last_error, Some(RecoveryError::PeerUnavailable));
     assert!(status.pass_total(RecoveryOutcome::Partial) > 0);
-    let drainer = OutboxDrainer::new(drain_context(&outage.live));
-    assert_drain_bound(&outage, &drainer, assert_bound.then_some(INCIDENT_LIMIT)).await?;
-    finish_outage(outage, &drainer, &status, cancelled, driver).await
+    let mut drainer = OutboxDrainer::new(drain_context(&outage.live));
+    let bound = assert_bound.then_some(INCIDENT_LIMIT);
+    assert_drain_bound(&outage, &mut drainer, bound).await?;
+    finish_outage(outage, &mut drainer, &status, cancelled, driver).await
 }
 
 fn spawn_recovery(
@@ -514,7 +515,7 @@ async fn prepare_outage(realm_id: RealmId, record_count: usize) -> Result<Outage
 
 async fn assert_drain_bound(
     outage: &OutageFixture,
-    drainer: &aruna::tasks::incoming::OutboxDrainer,
+    drainer: &mut aruna::tasks::incoming::OutboxDrainer,
     expected_examined: Option<usize>,
 ) -> Result<(), BoxError> {
     let high_water = outbox_keys(&outage.live).await?;
@@ -535,7 +536,7 @@ async fn assert_drain_bound(
 
 async fn finish_outage(
     outage: OutageFixture,
-    drainer: &aruna::tasks::incoming::OutboxDrainer,
+    drainer: &mut aruna::tasks::incoming::OutboxDrainer,
     status: &aruna_operations::shard::recovery::RecoveryStatus,
     cancelled: tokio_util::sync::CancellationToken,
     driver: tokio::task::JoinHandle<()>,
@@ -1027,7 +1028,7 @@ async fn restore_peers(
 }
 
 async fn wait_outbox(
-    drainer: &aruna::tasks::incoming::OutboxDrainer,
+    drainer: &mut aruna::tasks::incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
     wait_drained(
@@ -1046,10 +1047,13 @@ async fn wait_auto_outbox(node: &TestNode) -> Result<(), BoxError> {
 /// Fails only when a whole window passes without the outbox ends changing.
 async fn wait_drained(
     node: &TestNode,
-    drainer: Option<&aruna::tasks::incoming::OutboxDrainer>,
+    drainer: Option<&mut aruna::tasks::incoming::OutboxDrainer>,
     stalled: &str,
 ) -> Result<(), BoxError> {
     let wait_cap = HANG_CAP.saturating_mul(3);
+    // One drainer runs one invocation at a time.
+    let drainer = drainer.map(tokio::sync::Mutex::new);
+    let drainer = drainer.as_ref();
     let first = outbox_snapshot(node).await?;
     let previous = &std::sync::Mutex::new(first);
     loop {
@@ -1058,6 +1062,7 @@ async fn wait_drained(
         }
         let seen = poll_until(wait_cap, move || async move {
             if let Some(drainer) = drainer {
+                let mut drainer = drainer.lock().await;
                 let run = tokio::time::timeout(wait_cap, drainer.run_once()).await;
                 if run.is_err() {
                     return Some(Err("outbox drain invocation stalled".to_string()));

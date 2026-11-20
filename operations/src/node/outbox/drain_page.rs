@@ -35,8 +35,9 @@ use crate::node::outbox::publish_batches::{PublishBatchesOperation, PublishedBat
 use crate::node::outbox::relay_records::{RelayRecordsOperation, RelayedRecords};
 use crate::sync::document_outbox::{OutboxPagePlan, OutboxReadBatch};
 use crate::sync::outbox::batches::{
-    DrainInvocation, DrainSyncOutcome, build_drain_batches, resolve_publish_placement,
+    DrainInvocation, DrainSyncOutcome, RowStamp, build_drain_batches, resolve_publish_placement,
 };
+use crate::sync::outbox::cleanup::{Lineages, lineage_call, lineages, row_digest, standing};
 use crate::sync::outbox::defer::{DrainRecord, classify_deferred_record, partition_drain_records};
 use crate::sync::outbox::rotation::OutboxRotation;
 use crate::sync::reconcile::SyncTopicsOperation;
@@ -66,7 +67,7 @@ pub enum PageEnd {
 pub struct DrainedPage {
     pub invocation: DrainInvocation,
     pub end: PageEnd,
-    pub published: Vec<Vec<u8>>,
+    pub published: Vec<(Vec<u8>, [u8; 32])>,
     pub deleted: Vec<Vec<u8>>,
 }
 
@@ -79,6 +80,7 @@ enum PageStep {
     MissingFinish,
     Available,
     Relay,
+    Lineage,
     Publish,
 }
 
@@ -94,7 +96,9 @@ pub struct DrainPageOperation {
     config: Option<Arc<RealmConfigDocument>>,
     rotation: OutboxRotation,
     limit: usize,
-    published_before: BTreeSet<Vec<u8>>,
+    published_before: BTreeMap<Vec<u8>, [u8; 32]>,
+    digests: BTreeMap<Vec<u8>, [u8; 32]>,
+    topics: Vec<TopicId>,
     page: Option<DrainedPage>,
     batch: Option<OutboxReadBatch>,
     records: Vec<DrainRecord>,
@@ -109,14 +113,14 @@ pub struct DrainPageOperation {
 
 impl DrainPageOperation {
     /// Drains at most `limit` records after the invocation's cursor. `published_before` holds the
-    /// records this process published already, which only sync.
+    /// records this process published, with the lineage each was published on.
     pub fn new(
         serving: (NodeId, RealmId),
         config: Option<Arc<RealmConfigDocument>>,
         rotation: OutboxRotation,
         invocation: DrainInvocation,
         limit: usize,
-        published_before: BTreeSet<Vec<u8>>,
+        published_before: BTreeMap<Vec<u8>, [u8; 32]>,
     ) -> Self {
         let page = DrainedPage {
             invocation,
@@ -130,6 +134,8 @@ impl DrainPageOperation {
             rotation,
             limit,
             published_before,
+            digests: BTreeMap::new(),
+            topics: Vec::new(),
             page: Some(page),
             batch: None,
             records: Vec::new(),
@@ -218,7 +224,12 @@ impl DrainPageOperation {
             invocation.oldest_record_ms = Some(current.min(page_oldest));
         }
         let mut prepared = Vec::with_capacity(records.len());
+        let mut digests = BTreeMap::new();
         for (record_key, mut record) in records {
+            // The row as stored, before the drain resolves its placement and peers.
+            if let Some(digest) = row_digest(&record) {
+                digests.insert(record_key.clone(), digest);
+            }
             invocation.config_drained |=
                 matches!(record.target, DocumentTarget::RealmConfig { .. });
             record.placement =
@@ -226,6 +237,7 @@ impl DrainPageOperation {
             let topic = record.target.sync_topic_id(realm_id, &record.placement);
             prepared.push((record_key, record, topic));
         }
+        self.digests.extend(digests);
         if let Some(page) = self.page.as_mut() {
             page.end = PageEnd::Records {
                 has_more,
@@ -360,9 +372,34 @@ impl DrainPageOperation {
     }
 
     /// Groups the records to publish into sub-batches and publishes them.
+    /// Asks for the lineage of each topic the page publishes on: it binds what the drain keeps
+    /// of a publication and decides whether a kept one still holds.
     fn publish(&mut self) -> PageTurn {
+        let mut topics: Vec<TopicId> = self.to_publish.iter().map(|(_, _, topic)| *topic).collect();
+        topics.sort();
+        topics.dedup();
+        let Some(call) = lineage_call(&topics) else {
+            return self.publish_with(Lineages::new());
+        };
+        self.topics = topics;
+        self.step = PageStep::Lineage;
+        Ok(Next::Call(call))
+    }
+
+    /// Groups the records to publish into sub-batches, stamps each record with its topic's
+    /// lineage and its row's digest, and publishes them.
+    fn publish_with(&mut self, lineages: Lineages) -> PageTurn {
         let to_publish = std::mem::take(&mut self.to_publish);
-        let (groups, subbatches) = build_drain_batches(to_publish, &self.published_before);
+        let standing = standing(&self.published_before, &to_publish, &lineages);
+        let (groups, mut subbatches) = build_drain_batches(to_publish, &standing);
+        for subbatch in &mut subbatches {
+            let entries = subbatch.topics.iter().zip(&subbatch.record_keys);
+            let stamp = |(topic, key): (&TopicId, &Vec<u8>)| RowStamp {
+                lineage: lineages.get(topic).copied().flatten(),
+                digest: self.digests.get(key).copied(),
+            };
+            subbatch.stamps = entries.map(stamp).collect();
+        }
         let invocation = self.invocation()?;
         invocation.groups += groups;
         invocation.subbatches += subbatches.len();
@@ -510,6 +547,10 @@ impl Operation for DrainPageOperation {
                 }
                 self.publish()
             }
+            PageStep::Lineage => {
+                let lineages = lineages(&self.topics, result)?;
+                self.publish_with(lineages)
+            }
             PageStep::Publish => {
                 let elapsed = Duration::from_millis(self.now_ms.saturating_sub(self.started_ms));
                 let blocked = std::mem::take(&mut self.blocked);
@@ -518,7 +559,7 @@ impl Operation for DrainPageOperation {
                 match published {
                     Ok(done) => {
                         page.invocation.publish_elapsed += done.publish_elapsed;
-                        page.invocation.outcome.merge(done.outcome);
+                        page.invocation.merge_outcome(done.outcome);
                         page.published.extend(done.published);
                         page.deleted.extend(done.deleted);
                     }
@@ -529,7 +570,7 @@ impl Operation for DrainPageOperation {
                             "Publishing document sync batches broke off"
                         );
                         page.invocation.publish_elapsed += elapsed;
-                        page.invocation.outcome.merge(blocked);
+                        page.invocation.merge_outcome(blocked);
                     }
                 }
                 self.finished()
@@ -548,7 +589,7 @@ mod tests {
         let serving = (local, RealmId::from_bytes([3; 32]));
         let rotation = OutboxRotation::default();
         let invocation = DrainInvocation::new(&rotation);
-        DrainPageOperation::new(serving, None, rotation, invocation, 8, BTreeSet::new())
+        DrainPageOperation::new(serving, None, rotation, invocation, 8, BTreeMap::new())
     }
 
     fn read(result: Result<OutboxReadBatch, ApplyError>) -> IoResult {
