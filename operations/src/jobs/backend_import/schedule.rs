@@ -130,7 +130,7 @@ type DueTurn = Result<Next<Option<Duration>>, IoError>;
 /// Starts every scheduled rule that is due, as its creator without a session, after finishing
 /// interrupted removals. Outputs when to look again, or `None` while no rule has a schedule and
 /// no removal is left. Missed times run once.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunDueOperation {
     node_id: NodeId,
     retention_ms: u64,

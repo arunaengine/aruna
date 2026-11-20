@@ -37,6 +37,7 @@ use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
+use crate::jobs::backend_import::schedule::RunDueOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::timers::FamilyTimerOperation;
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
@@ -145,6 +146,8 @@ pub struct TimerInput {
     pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
     /// What each local executor backend advertises, filled like `heartbeats`.
     pub limits: BTreeMap<String, ResourceEnvelope>,
+    /// How long a finished import keeps its artifacts, from the node's ROCrate limits.
+    pub artifact_retention_ms: u64,
 }
 
 /// Whether the timer of `key` reads the heartbeats and executor limits; they are copied only
@@ -168,6 +171,7 @@ impl TimerInput {
             group_concurrency: 1,
             heartbeats: BTreeMap::new(),
             limits: BTreeMap::new(),
+            artifact_retention_ms: 0,
         }
     }
 }
@@ -228,6 +232,7 @@ pub enum TimerOperation {
     DrainPruneQueue(PruneRunOperation),
     DrainFamilyOutbox(FamilyTimerOperation),
     DrainWitnessQueue(WitnessDrainOperation),
+    RunBackendImports(RunDueOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -365,6 +370,14 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             let drain = WitnessDrainOperation::new(node, input.now_ms);
             Some(TimerOperation::DrainWitnessQueue(drain))
         }
+        TaskKey::RunBackendImports => Some(match input.facts.serving {
+            Some((node_id, _)) => {
+                let (retention_ms, now_ms) = (input.artifact_retention_ms, input.now_ms);
+                let run = RunDueOperation::new(node_id, retention_ms, now_ms, input.facts.serving);
+                TimerOperation::RunBackendImports(run)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(None)),
+        }),
         _ => None,
     }
 }
@@ -408,6 +421,7 @@ macro_rules! each_timer {
             TimerOperation::DrainPruneQueue($operation) => $body,
             TimerOperation::DrainFamilyOutbox($operation) => $body,
             TimerOperation::DrainWitnessQueue($operation) => $body,
+            TimerOperation::RunBackendImports($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -759,6 +773,13 @@ impl TimerRun for WitnessDrainOperation {
             true
         });
         Ok(TimerPlan::from(remaining.then_some(WITNESS_RETRY_AFTER)))
+    }
+}
+
+impl TimerRun for RunDueOperation {
+    /// The run names when a schedule is due next; a failed run waits for the next rule change.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.unwrap_or(None)))
     }
 }
 
@@ -1363,6 +1384,17 @@ mod tests {
         let retry = Ok(TimerPlan::from(Some(WITNESS_RETRY_AFTER)));
         assert_eq!(WitnessDrainOperation::rearm(Err(IoError::Unfinished)), retry);
         assert_eq!(WitnessDrainOperation::rearm(Ok(false)), Ok(TimerPlan::default()));
+    }
+
+    #[test]
+    fn backend_imports_plan() {
+        // The next due schedule is kept; a failed run or a node without network waits.
+        let due = Some(Duration::from_secs(60));
+        assert_eq!(RunDueOperation::rearm(Ok(due)), Ok(TimerPlan::from(due)));
+        let failed = RunDueOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed, Ok(TimerPlan::default()));
+        let mut idle = timer_operation(&TaskKey::RunBackendImports, &input()).unwrap();
+        assert_eq!(idle.first(), Ok(Next::Done(TimerPlan::default())));
     }
 
     #[test]

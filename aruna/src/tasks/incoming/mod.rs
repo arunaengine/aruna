@@ -690,6 +690,7 @@ impl OperationsTaskHandler {
             group_concurrency: materialization_group_concurrency(),
             heartbeats: (cluster.then(|| self.context.fresh_heartbeats())).unwrap_or_default(),
             limits: (cluster.then(|| self.context.compute_limits())).unwrap_or_default(),
+            artifact_retention_ms: self.rocrate_limits.artifact_retention_ms,
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -881,24 +882,7 @@ impl OperationsTaskHandler {
                 }
                 self.reschedule_timer(TaskKey::MaintainRanges, after).await;
             }),
-            TaskKey::RunBackendImports => Box::pin(async move {
-                let Some(net_handle) = self.context.net_handle.as_ref() else {
-                    warn!("Cannot start backend imports without net handle");
-                    return;
-                };
-                let retention_ms = self.rocrate_limits.artifact_retention_ms;
-                let now = unix_timestamp_millis();
-                let run = aruna_operations::jobs::backend_import::schedule::RunDueOperation::new(
-                    net_handle.node_id(),
-                    retention_ms,
-                    now,
-                    self.context.node_and_realm(),
-                );
-                if let Ok(Some(after)) = aruna_drivers::driver::drive(run, &self.context).await {
-                    self.reschedule_timer(TaskKey::RunBackendImports, after)
-                        .await;
-                }
-            }),
+            TaskKey::RunBackendImports => Box::pin(self.run_trigger(key)),
             TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::DrainWitnessQueue => Box::pin(self.run_trigger(key)),
             TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
