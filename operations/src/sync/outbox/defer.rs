@@ -141,6 +141,26 @@ pub fn partition_drain_records(
     (to_publish, deferred, undeliverable)
 }
 
+/// Holds back each relay that follows a record of its admin origin this page still publishes, so
+/// a holder never takes the later record first. Answers the relays to run now and the held ones,
+/// which wait as deferred records; keys order a page as it was read.
+pub fn hold_relays(
+    to_publish: &[DrainRecord],
+    undeliverable: Vec<DrainRecord>,
+) -> (Vec<DrainRecord>, Vec<DrainRecord>) {
+    let mut first_publish: HashMap<NodeId, &[u8]> = HashMap::new();
+    for (key, record, _) in to_publish {
+        if let Some(origin) = admin_origin(record) {
+            let first = first_publish.entry(origin).or_insert(key);
+            *first = (*first).min(key.as_slice());
+        }
+    }
+    undeliverable.into_iter().partition(|(key, record, _)| {
+        let first = admin_origin(record).and_then(|origin| first_publish.get(&origin));
+        first.is_none_or(|first| key.as_slice() < *first)
+    })
+}
+
 /// The admin origin stream a record belongs to. Origin sequence is ordered
 /// within one origin node.
 pub fn admin_origin(record: &DocumentOutboxRecord) -> Option<NodeId> {

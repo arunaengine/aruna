@@ -38,7 +38,9 @@ use crate::sync::outbox::batches::{
     DrainInvocation, DrainSyncOutcome, RowStamp, build_drain_batches, resolve_publish_placement,
 };
 use crate::sync::outbox::cleanup::{Lineages, lineage_call, lineages, row_digest, standing};
-use crate::sync::outbox::defer::{DrainRecord, classify_deferred_record, partition_drain_records};
+use crate::sync::outbox::defer::{
+    DrainRecord, classify_deferred_record, hold_relays, partition_drain_records,
+};
 use crate::sync::outbox::rotation::OutboxRotation;
 use crate::sync::reconcile::SyncTopicsOperation;
 use crate::sync::shard_placement::sort_node_ids;
@@ -348,7 +350,10 @@ impl DrainPageOperation {
             |topic| existing.contains(&topic),
             |record| classify_deferred_record(config.as_deref(), local, record),
         );
-        invocation.deferred += deferred.len();
+        // A relay after a record of its origin that still publishes waits; partition blocked the
+        // origin, so its later records wait too.
+        let (undeliverable, held) = hold_relays(&to_publish, undeliverable);
+        invocation.deferred += deferred.len() + held.len();
         let stuck_after = OUTBOX_STUCK_AFTER.as_millis() as u64;
         for (_, record, topic) in &deferred {
             let record_ms = record.outbox_id.timestamp_ms();

@@ -159,6 +159,26 @@ fn shared_topic_blocked() {
     assert!(defer.blocked_origins.contains(&origin));
 }
 
+// A relay waits while an earlier record of its origin still publishes on this page; a relay of
+// another origin runs.
+#[test]
+fn later_relay_held() {
+    let (origin, other) = (node(4), node(5));
+    let topic = TopicId::hash(b"relay-topic");
+    let to_publish = [(b"admin/1".to_vec(), admin_record(origin, 1), topic)];
+    let undeliverable = vec![
+        (b"admin/2".to_vec(), admin_record(origin, 2), topic),
+        (b"admin/3".to_vec(), admin_record(other, 1), topic),
+    ];
+    let (now, held) = hold_relays(&to_publish, undeliverable);
+    let keys = |records: &[DrainRecord]| records.iter().map(|(key, ..)| key.clone()).collect();
+    let (now, held): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (keys(&now), keys(&held));
+    assert_eq!(
+        (now, held),
+        (vec![b"admin/3".to_vec()], vec![b"admin/2".to_vec()])
+    );
+}
+
 #[test]
 fn topic_block_spans() {
     let topic = TopicId::hash(b"blocked-topic-pages");
