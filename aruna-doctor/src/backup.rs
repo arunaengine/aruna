@@ -17,9 +17,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use {
     aruna_storage::snapshot::BACKUP_SOCKET,
-    std::fs::OpenOptions,
-    std::io::{BufWriter, Write},
-    std::os::unix::fs::OpenOptionsExt,
+    std::io::{BufWriter, ErrorKind, Write},
     std::os::unix::net::UnixStream,
 };
 
@@ -60,32 +58,32 @@ pub async fn restore(backup_path: String, target_path: String) -> Result<(), Cli
     Ok(())
 }
 
-/// Copies the node's backup stream to `<target>.partial`, checks the whole file and only then
-/// moves it to `target`, so `target` never holds a cut-off backup. Only the owner may read it.
+/// Copies the node's backup stream to an owner-only temporary file beside `target`, checks the
+/// whole file and only then publishes it as `target`, never over a file created meanwhile.
 #[cfg(unix)]
 pub fn backup_file(socket: &Path, target: &Path) -> Result<(u64, SnapshotStats), SnapshotError> {
     if target.exists() {
         return Err(SnapshotError::SnapshotPathExists(target.to_path_buf()));
     }
-    let mut partial = target.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&partial)?;
-    let result = receive_backup(socket, file, &partial);
-    match result {
-        Ok(done) => {
-            std::fs::rename(&partial, target)?;
-            Ok(done)
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    // Every error drops the temporary file, which removes it.
+    let partial = tempfile::Builder::new()
+        .prefix(".backup-")
+        .suffix(".partial")
+        .tempfile_in(dir)?;
+    let done = receive_backup(socket, partial.as_file().try_clone()?, partial.path())?;
+    match partial.persist_noclobber(target) {
+        Ok(_) => {}
+        Err(failed) if failed.error.kind() == ErrorKind::AlreadyExists => {
+            return Err(SnapshotError::SnapshotPathExists(target.to_path_buf()));
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&partial);
-            Err(error)
-        }
+        Err(failed) => return Err(failed.error.into()),
     }
+    File::open(dir)?.sync_all()?;
+    Ok(done)
 }
 
 #[cfg(unix)]
@@ -400,6 +398,38 @@ mod tests {
                 assert!(!target.exists());
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeps_raced_target() {
+        use super::{SnapshotError, backup_file};
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        let bytes = backup_bytes(&source_root, &open_source(&source_root));
+        let socket = dir.path().join("backup.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let target = dir.path().join("raced.backup");
+        let result = std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                // Another writer takes the destination while the backup is received.
+                std::fs::write(&target, "kept").unwrap();
+                stream.write_all(&bytes).unwrap();
+            });
+            let result = backup_file(&socket, &target);
+            server.join().unwrap();
+            result
+        });
+        assert!(matches!(result, Err(SnapshotError::SnapshotPathExists(_))));
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept");
+        let names: Vec<_> = (std::fs::read_dir(dir.path()).unwrap())
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(names.iter().all(|name| !name.ends_with(".partial")), "{names:?}");
     }
 
     #[test]
