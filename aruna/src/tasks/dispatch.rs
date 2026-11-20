@@ -18,7 +18,7 @@ use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::{MintPidOperation, RegisterIdentifiersOperation};
 use aruna_operations::notifications::email_job::EmailJobOperation;
-use aruna_operations::notifications::settings::{BACKOFF_START_MS, DeliveryOutcome};
+use aruna_operations::notifications::settings::{DeliveryOutcome, delivery_outcome};
 use aruna_operations::notifications::webhook_job::WebhookJobOperation;
 
 /// Payload dispatch, mirroring how the task handler matches `TaskKey`. Execution
@@ -137,23 +137,13 @@ async fn run_delivery(
     delivery: impl Future<Output = Result<DeliveryOutcome, IoError>>,
 ) -> JobRunOutcome {
     if ctx.driver.graph_handle.is_none() || ctx.driver.outbound_handle.is_none() {
-        return JobRunOutcome::DeferredFor(
-            JobError::retryable("the metadata transport is unavailable"),
-            Duration::from_millis(BACKOFF_START_MS),
-        );
+        return delivery_outcome(Ok(DeliveryOutcome::unavailable()));
     }
     tokio::select! {
         biased;
         () = ctx.cancel.cancelled() => JobRunOutcome::Cancelled,
         () = ctx.shutdown.cancelled() => JobRunOutcome::Interrupted,
-        outcome = delivery => match outcome {
-            Ok(DeliveryOutcome::Succeeded(payload)) => JobRunOutcome::Succeeded(payload),
-            Ok(DeliveryOutcome::Failed(error)) => JobRunOutcome::Failed(error),
-            Ok(DeliveryOutcome::DeferredFor(error, delay)) => {
-                JobRunOutcome::DeferredFor(error, delay)
-            }
-            Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
-        },
+        outcome = delivery => delivery_outcome(outcome),
     }
 }
 

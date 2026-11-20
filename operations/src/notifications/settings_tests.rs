@@ -23,6 +23,19 @@ use aruna_drivers::driver::{DriverContext, drive};
 use ulid::Ulid;
 
 const SECRET: &[u8] = b"canary-hook-17";
+
+#[test]
+fn delivery_outcomes_mapped() {
+    // A missing transport waits without an attempt; a failed run may pass on a retry.
+    let waits = JobRunOutcome::DeferredFor(
+        JobError::retryable("the metadata transport is unavailable"),
+        Duration::from_millis(BACKOFF_START_MS),
+    );
+    assert_eq!(delivery_outcome(Ok(DeliveryOutcome::unavailable())), waits);
+    let error = IoError::Codec("broken".to_string());
+    let retried = JobRunOutcome::Failed(JobError::retryable(error.to_string()));
+    assert_eq!(delivery_outcome(Err(error)), retried);
+}
 /// A time before the notice expires.
 const NOW_MS: u64 = 1_000;
 
