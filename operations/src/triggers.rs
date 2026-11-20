@@ -12,7 +12,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::GitNode;
 use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
-use aruna_core::node_facts::NodeFacts;
+use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
