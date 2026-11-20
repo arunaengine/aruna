@@ -734,7 +734,9 @@ impl Operation for HoldersTimerOperation {
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<Option<Duration>>, IoError> {
-        Ok(Next::Call(IoCall::child(GetConfigOperation::new(self.realm_id))))
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<Duration>>, IoError> {
@@ -747,7 +749,9 @@ impl Operation for HoldersTimerOperation {
             return Ok(Next::Done(None));
         }
         let config = result.child::<RealmConfigDocument, GetConfigError>()?;
-        let user = config.ok().and_then(|config| is_user_origin(&config, self.node_id));
+        let user = config
+            .ok()
+            .and_then(|config| is_user_origin(&config, self.node_id));
         if user == Some(true) {
             return Ok(Next::Done(None));
         }
@@ -772,7 +776,10 @@ mod tests {
         assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
         let missing = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
         let missing = IoResult::Child(ChildOutcome::new(missing));
-        assert!(matches!(run.next(missing), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            run.next(missing),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let failed = Err::<usize, _>(RefreshHoldersError::Schedule("boom".to_string()));
         let failed = IoResult::Child(ChildOutcome::new(failed));
         let after = Duration::from_millis(limits.holder_refresh_ms);

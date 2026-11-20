@@ -116,10 +116,10 @@ use aruna_operations::s3::multipart::part_upload::UploadPartOperation;
 use aruna_operations::s3::multipart::parts::ListPartsOperation;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::object::attributes::{GetAttributesInput, GetAttributesOperation};
+use aruna_operations::s3::object::delete::DeleteObjectOperation;
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
 };
-use aruna_operations::s3::object::delete::DeleteObjectOperation;
 use aruna_operations::s3::object::head::HeadObjectOperation;
 use aruna_operations::s3::object::list::{ListBucketInput, ListBucketOperation};
 use aruna_operations::s3::object::member::read::{MemberPayload, MemberRead, MemberRequest};
@@ -1669,16 +1669,21 @@ impl S3 for ArunaS3Service {
             .map(BackendStream::new_from_boxed)
             .ok_or_else(|| s3_error!(InvalidRequest, "Missing body"))?;
 
-        let operation = UploadPartOperation::new(aruna_operations::s3::multipart::part_upload::UploadPartInput {
-            bucket: req.input.bucket,
-            key: req.input.key,
-            upload_id,
-            part_number: parse_part_number(req.input.part_number, S3ErrorCode::InvalidArgument)?,
-            content_length: req.input.content_length.map(checked_size).transpose()?,
-            body: Some(body),
-            created_by: user_access.user_identity,
-            expected_checksums: checksum_request.expected.clone(),
-        });
+        let operation = UploadPartOperation::new(
+            aruna_operations::s3::multipart::part_upload::UploadPartInput {
+                bucket: req.input.bucket,
+                key: req.input.key,
+                upload_id,
+                part_number: parse_part_number(
+                    req.input.part_number,
+                    S3ErrorCode::InvalidArgument,
+                )?,
+                content_length: req.input.content_length.map(checked_size).transpose()?,
+                body: Some(body),
+                created_by: user_access.user_identity,
+                expected_checksums: checksum_request.expected.clone(),
+            },
+        );
 
         let result = drive(operation, &self.state)
             .await
@@ -2469,11 +2474,12 @@ impl S3 for ArunaS3Service {
             MemberRead::Local(stale) => stale,
         };
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
-        let operation = HeadObjectOperation::new(aruna_operations::s3::object::head::HeadObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id,
-        });
+        let operation =
+            HeadObjectOperation::new(aruna_operations::s3::object::head::HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+            });
 
         let result = match drive(operation, &self.state).await {
             Ok(result) => result,
@@ -2871,16 +2877,17 @@ impl S3 for ArunaS3Service {
         let replication_key = req.input.key.clone();
         let replicate_latest_delete = version_id.is_none();
 
-        let operation = DeleteObjectOperation::new(aruna_operations::s3::object::delete::DeleteObjectInput {
-            bucket: req.input.bucket,
-            key: req.input.key,
-            version_id,
-            group_id: user_access.group_id,
-            realm_id: self.realm_id,
-            node_id: self.node_id,
-            deleted_by: user_access.user_identity,
-        })
-        .with_restrictions(replication_auth.path_restrictions.clone());
+        let operation =
+            DeleteObjectOperation::new(aruna_operations::s3::object::delete::DeleteObjectInput {
+                bucket: req.input.bucket,
+                key: req.input.key,
+                version_id,
+                group_id: user_access.group_id,
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                deleted_by: user_access.user_identity,
+            })
+            .with_restrictions(replication_auth.path_restrictions.clone());
         let operation = match guards.is_empty() {
             true => operation,
             false => operation.with_fence(guards, Vec::new()),

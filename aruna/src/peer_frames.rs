@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_blob::native;
 use aruna_core::alpn::Alpn;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
-use aruna_blob::native;
 use aruna_net::NetHandle;
 use aruna_net::heartbeat::HeartbeatSlot;
 use aruna_net::job_control;

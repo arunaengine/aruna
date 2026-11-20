@@ -86,8 +86,10 @@ impl OperationsInboundHandler {
             debug!(peer = %peer, "Dropping inbound peer stream without net handle");
             return;
         };
-        let Some(PeerRead { request, slot: _slot }) =
-            read_peer(alpn, &mut stream, peer, net_handle).await
+        let Some(PeerRead {
+            request,
+            slot: _slot,
+        }) = read_peer(alpn, &mut stream, peer, net_handle).await
         else {
             return;
         };

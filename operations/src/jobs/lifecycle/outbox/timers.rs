@@ -76,10 +76,12 @@ impl Operation for FamilyTimerOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<Duration>>, IoError> {
-        let remaining = result.child::<bool, LifecycleError>()?.unwrap_or_else(|error| {
-            warn!(error = %error, "Job family outbox drain failed");
-            true
-        });
+        let remaining = result
+            .child::<bool, LifecycleError>()?
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "Job family outbox drain failed");
+                true
+            });
         Ok(Next::Done(remaining.then_some(OUTBOX_RETRY_AFTER)))
     }
 }
