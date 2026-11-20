@@ -301,6 +301,10 @@ async fn run_node_owned(
                 "Required listener {service:?} exited during background startup"
             ));
         }
+        BackgroundOutcome::DiscardFailed => {
+            failure =
+                Some("Stale execution state was not discarded; the next start retries".into());
+        }
     }
 
     let ServerBindings {
