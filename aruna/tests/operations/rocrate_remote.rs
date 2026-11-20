@@ -12,7 +12,7 @@ use std::time::SystemTime;
 use crate::job_calls::{
     claim_job, insert_job, read_artifact_range, read_job_record, transition_to_running,
 };
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna::tasks::rocrate_jobs::run_export_job;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
@@ -90,6 +90,8 @@ struct Node {
     _root: TempDir,
     net: NetHandle,
     context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 #[tokio::test]
@@ -232,7 +234,7 @@ async fn setup_remote(
     group_id: GroupId,
     version_id: Ulid,
 ) -> Result<(Node, Node, Ulid), Box<dyn std::error::Error>> {
-    let holder = build_node(realm_id, false).await?;
+    let mut holder = build_node(realm_id, false).await?;
     let exporter = build_node(realm_id, true).await?;
     connect(&exporter, &holder).await;
 
@@ -247,7 +249,7 @@ async fn setup_remote(
         &location,
     )
     .await?;
-    initialize_incoming_fixture(holder.context.clone());
+    holder._incoming = initialize_incoming_fixture(holder.context.clone());
 
     let config = seed_exporter(&exporter, holder.net.node_id(), owner, group_id, realm_id).await?;
     // Minted on the exporter so the document lands in a bucket it leads.
@@ -334,6 +336,7 @@ async fn build_node(
         _root: root,
         net,
         context,
+        _incoming: None,
     })
 }
 

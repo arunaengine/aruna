@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use aruna_api::cors::CorsConfig;
 use aruna_api::server::state::ServerState;
-use aruna_api::server::{MAX_BODY_SIZE, Server, ServerConfig};
+use aruna_api::server::{Server, ServerConfig};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -18,6 +18,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, REALM_CONFIG_KEYSPACE,
     S3_BUCKET_KEYSPACE, USER_KEYSPACE,
 };
+use aruna_core::listener::MAX_BODY_SIZE;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::execution::offered_directory::OfferedDirectory;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};

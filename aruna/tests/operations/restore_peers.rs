@@ -45,6 +45,8 @@ struct RecoveryNode {
     net: NetHandle,
     task_handle: TaskHandle,
     context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<aruna::inbound::IncomingFixture>,
 }
 
 async fn make_node(realm_id: RealmId, seed: u8) -> RecoveryNode {
@@ -72,12 +74,13 @@ async fn make_node(realm_id: RealmId, seed: u8) -> RecoveryNode {
         compute_handle: None,
         outbound_handle: None,
     });
-    aruna::inbound::initialize_incoming_fixture(context.clone());
+    let incoming = aruna::inbound::initialize_incoming_fixture(context.clone());
     RecoveryNode {
         _dir: dir,
         net,
         task_handle,
         context,
+        _incoming: incoming,
     }
 }
 

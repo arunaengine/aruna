@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -59,6 +59,8 @@ struct Node {
     _dir: TempDir,
     net: NetHandle,
     context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
@@ -87,11 +89,12 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     Node {
         _dir: dir,
         net,
         context,
+        _incoming: incoming,
     }
 }
 

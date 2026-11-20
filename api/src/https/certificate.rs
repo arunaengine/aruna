@@ -5,14 +5,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
+use aruna_core::listener::{HostRoute, HostRoutes};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, TrustAnchor, UnixTime};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tracing::{error, info};
-
-use super::{HostRoute, HostRoutes};
 
 /// Why a certificate pair was refused. The text never carries the validation
 /// time, so a rejection of the same files reads the same at every check.

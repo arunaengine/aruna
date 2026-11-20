@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::listener::{HostRoute, HostRoutes};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -31,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::certificate::{CertificateError, CertificateStore, ReloadOutcome, check_pair};
 use super::listener::{CombinedListener, HttpsHandle, RoutedListener, serve_routers};
-use super::{HostCheck, HostRoute, HostRoutes, check_host};
+use super::{HostCheck, check_host};
 
 /// 2026-01-01T00:00:00Z, inside every default validity window below.
 const NOW: u64 = 1_767_225_600;
@@ -813,7 +814,7 @@ async fn rest_stack(cors: crate::cors::CorsConfig) -> RestStack {
         state,
         ServerConfig {
             http_addr: plain.local_addr().expect("plain address"),
-            max_body_size: crate::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors,
         },
     );
@@ -1141,7 +1142,7 @@ async fn s3_tls_deadlines() {
 
     // A header that never ends is closed at the initial-request deadline.
     let stack = s3_stack(|server| {
-        server.with_timeouts(crate::s3::server::S3ServerTimeouts {
+        server.with_timeouts(aruna_core::listener::S3ServerTimeouts {
             initial_request: Duration::from_millis(300),
             connection_idle: Duration::from_secs(300),
             stream_lifetime: Duration::from_secs(300),
@@ -1157,7 +1158,7 @@ async fn s3_tls_deadlines() {
 
     // A kept-alive connection without a next request is closed when idle.
     let stack = s3_stack(|server| {
-        server.with_timeouts(crate::s3::server::S3ServerTimeouts {
+        server.with_timeouts(aruna_core::listener::S3ServerTimeouts {
             initial_request: Duration::from_secs(300),
             connection_idle: Duration::from_millis(300),
             stream_lifetime: Duration::from_secs(300),

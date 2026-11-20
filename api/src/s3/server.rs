@@ -33,6 +33,7 @@ use crate::telemetry::{RequestCancelGuard, emit_request_completed, make_request_
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id::NodeId;
+use aruna_core::listener::S3ServerTimeouts;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
@@ -65,8 +66,6 @@ use tokio_util::task::TaskTracker;
 use tracing::instrument::WithSubscriber;
 use tracing::{Instrument, error, info, trace};
 
-const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const STREAM_LIFETIME_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EGRESS_LIMIT: usize = 256;
 const CONTROL_EGRESS_LIMIT: usize = 64;
 const CONTROL_REQUEST_LIMIT: usize = 64;
@@ -77,26 +76,6 @@ pub const S3_MAX_CONNECTIONS: usize = 4_096;
 /// Concurrent S3 requests processed at once, acquired before the expensive
 /// s3s parse/body/storage work.
 pub const MAX_CONCURRENT_REQUESTS: usize = 2_048;
-
-/// Listener deadlines of the S3 plane: how long a connection may stay silent
-/// before its first request, how long a request or response may make no I/O
-/// progress, and the total lifetime of one streamed request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct S3ServerTimeouts {
-    pub initial_request: Duration,
-    pub connection_idle: Duration,
-    pub stream_lifetime: Duration,
-}
-
-impl Default for S3ServerTimeouts {
-    fn default() -> Self {
-        Self {
-            initial_request: INITIAL_REQUEST_TIMEOUT,
-            connection_idle: activity::CONNECTION_IDLE_TIMEOUT,
-            stream_lifetime: STREAM_LIFETIME_TIMEOUT,
-        }
-    }
-}
 
 /// Shares the resolved S3 operation between access checks and request metrics.
 /// Request extensions preserve it across `s3s` routing.

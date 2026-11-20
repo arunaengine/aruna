@@ -9,12 +9,12 @@ pub mod identity;
 pub mod portal;
 pub mod settings;
 
-use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::listener::S3ServerTimeouts;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -151,9 +151,9 @@ pub enum PortalConfig {
     Artifact {
         artifact: PortalArtifactConfig,
         socket_addr: SocketAddr,
-        login: Option<aruna_api::portal::PortalLogin>,
+        login: Option<aruna_wire::portal::PortalLogin>,
         landing: bool,
-        legal: Vec<aruna_api::portal::LegalDocument>,
+        legal: Vec<aruna_wire::portal::LegalDocument>,
     },
 }
 
