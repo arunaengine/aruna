@@ -7,12 +7,12 @@ use aruna_core::structs::execution::job::family::{OutputSet, ProjectedExecution}
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
+use crate::jobs::lifecycle::screen::tests::install;
 use crate::plugins::fixtures::is_child;
 use crate::plugins::rows::encode;
 use crate::plugins::rows::tests::{child_result, values_result};
-use crate::plugins::screen::tests::install;
-use crate::plugins::work::WorkKind;
 use crate::tests::records::{Family, node, payload};
+use aruna_core::install_work::WorkKind;
 use aruna_core::job_request::SubmissionRequest;
 
 fn family() -> JobFamilyId {

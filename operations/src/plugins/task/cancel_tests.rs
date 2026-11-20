@@ -4,9 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::jobs::lifecycle::screen::tests::install;
 use crate::plugins::fixtures::is_child;
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::screen::tests::install;
 use crate::tests::records::{Family, node, user};
 
 fn cancel(family: &Family, local: NodeId) -> CancelTask {

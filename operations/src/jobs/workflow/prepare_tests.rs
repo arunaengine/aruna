@@ -271,7 +271,7 @@ fn task_checked_again() {
     );
     pending.step = PrepareStep::TaskAdmit;
     let admitted = child(Ok::<_, ScreenError>(
-        crate::plugins::screen::tests::install(),
+        crate::jobs::lifecycle::screen::tests::install(),
     ));
     assert!(matches!(pending.next(admitted), Ok(Next::Call(_))));
 }

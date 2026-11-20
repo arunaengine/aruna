@@ -19,14 +19,15 @@ use super::super::check::{CallError, CheckCall, RunScope};
 use super::super::install::{config_answer, config_call, pick_version, read_manifest};
 use super::super::objects::LocalObject;
 use super::super::rows::{StoreError, encode};
-use super::super::screen::{ScreenError, ScreenTask};
 use super::super::submit::digest;
+use super::super::unavailable;
+use super::super::work::{Reserve, WorkError};
 use super::change::{ChangeTask, Changed, TaskChange};
 use super::send::SendTask;
 use super::spec::{TaskIo, task_spec};
-use super::super::unavailable;
-use super::super::work::{Identity, Reserve, WorkError, WorkKind, WorkRow, WorkState};
+use crate::jobs::lifecycle::screen::{ScreenError, ScreenTask};
 use crate::jobs::lifecycle::submit_external::IngressNode;
+use aruna_core::install_work::{Identity, WorkKind, WorkRow, WorkState};
 
 /// Unsettled tasks one install may have at a time.
 pub const TASK_ACTIVE: usize = 2;

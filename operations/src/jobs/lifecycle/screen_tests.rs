@@ -12,11 +12,17 @@ use aruna_core::structs::execution::job::input::{
 };
 use aruna_core::structs::identity::realm::RealmId;
 
+use aruna_core::calls::ChildOutcome;
+use aruna_core::install_work::index_key;
+use aruna_core::rows::encode;
+
 use super::*;
-use crate::plugins::rows::encode;
-use crate::plugins::rows::tests::{child_result, values_result};
-use crate::plugins::work::index_key;
+use crate::tests::calls::values_of;
 use crate::tests::records::{node, payload};
+
+fn child_result(result: Result<PluginInstall, ScreenError>) -> IoResult {
+    IoResult::Child(ChildOutcome::new(result))
+}
 
 const REALM: RealmId = RealmId([3; 32]);
 
@@ -217,10 +223,50 @@ fn screen_reads_account() {
     let mut task = screen(&install, install.account);
     assert!(matches!(task.first(), Ok(Next::Call(IoCall::Read(rows))) if rows.len() == 1));
     // A missing account is not the install's active account.
+    assert_eq!(task.next(values_of(vec![None])), Err(ScreenError::Account));
+}
+
+// An authorization fault leaves the screen undecided; a denial refuses it.
+#[test]
+fn authorize_faults_retry() {
+    use aruna_core::errors::StorageError;
+    let fault = refused(AuthorizeError::Storage(StorageError::TransactionConflict));
+    assert!(matches!(fault, ScreenError::Unavailable(_)));
+    let failed = refused(AuthorizeError::CheckFailed("down".to_string()));
+    assert_eq!(failed, ScreenError::Unavailable("down".to_string()));
+    let denied = refused(AuthorizeError::PermissionDenied);
     assert_eq!(
-        task.next(values_result(vec![None])),
-        Err(ScreenError::Account)
+        denied,
+        ScreenError::Refused("permission denied".to_string())
     );
+}
+
+// The install's own service account passes; a target no grant covers is refused before any
+// authorization runs.
+#[test]
+fn ungranted_target_refused() {
+    use aruna_core::user::validation::{INSTALL_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
+    let install = install();
+    let mut task = screen(&install, install.account);
+    task.first().unwrap();
+    let user = User {
+        user_id: install.account,
+        name: "map-reads".to_string(),
+        subject_ids: Vec::new(),
+        alias_user_ids: Default::default(),
+        attributes: [
+            (SERVICE_GROUP_ATTRIBUTE, install.group_id.to_string()),
+            (INSTALL_ATTRIBUTE, install.install_id.to_string()),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect(),
+    };
+    let row = aruna_core::rows::encode(&user).unwrap().to_vec();
+    let Err(ScreenError::Refused(why)) = task.next(values_of(vec![Some(row)])) else {
+        panic!("an ungranted output is refused");
+    };
+    assert!(why.contains("is not granted on"), "{why}");
 }
 
 #[test]
@@ -248,11 +294,11 @@ fn admit_reads_rows() {
         };
         assert_eq!(&*index[0].1, &index_key(install.install_id, work_id)[..]);
         let key = b"row".to_vec();
-        admit.next(values_result(vec![Some(key)])).unwrap();
-        let found = values_result(vec![Some(encode(&row).unwrap())]);
+        admit.next(values_of(vec![Some(key)])).unwrap();
+        let found = values_of(vec![Some(encode(&row).unwrap().to_vec())]);
         assert!(matches!(admit.next(found), Ok(Next::Call(IoCall::Read(_)))));
-        let task = task.map(|task| encode(&task).unwrap());
-        admit.next(values_result(vec![task]))
+        let task = task.map(|task| encode(&task).unwrap().to_vec());
+        admit.next(values_of(vec![task]))
     };
     // The receiver adopted this family: the launch runs as the install.
     let adopted = TaskRow {

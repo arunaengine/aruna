@@ -32,11 +32,11 @@ use ulid::Ulid;
 use super::plan::{REALM_STAGING, network_access};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicySets, compiled_policies, policy_reads, read_policies};
+use crate::jobs::lifecycle::screen::{AdmitTask, ScreenError, ScreenTask};
 use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::placement::policy::resolve_set::{
     PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
 };
-use crate::plugins::screen::{AdmitTask, ScreenError, ScreenTask};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 

@@ -34,10 +34,10 @@ use super::deferred::{DeferredTarget, Signal, reconsidered};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads, read_policies};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
+use crate::jobs::lifecycle::screen::{ScreenError, ScreenTask};
 use crate::placement::policy::resolve_set::{
     PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
 };
-use crate::plugins::screen::{ScreenError, ScreenTask};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::operation::Operation;

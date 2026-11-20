@@ -41,6 +41,7 @@ pub mod report;
 pub mod reservation;
 mod resolve_inputs;
 pub mod routing;
+pub mod screen;
 pub mod serve_inputs;
 pub mod stage;
 mod submission_rules;

@@ -8,26 +8,28 @@ use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::install_work::{
+    Found, TaskRow, WorkKind, WorkLookup, WorkRow, WorkState, task_place,
+};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::rows::{decode, values};
 use aruna_core::structs::execution::job::family::JobFamilyId;
 use aruna_core::structs::execution::job::input::{
     ExecutionSpec, InputSource, OutputDestination, TagError, named_install, tagged,
 };
 use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
-use aruna_plugin_types::calls::{ErrorKind, HostError};
 use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
-use super::account::{owned, read_user_call, read_user_result};
-use super::check::{Authorize, CallError, matching};
-use super::grants::InstallScope;
-use super::rows::{decode, read_call, values};
-use super::task::row::{TaskRow, task_place};
-use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState};
+use crate::auth::error::AuthorizeError;
+use crate::auth::install_access::{Authorize, granted};
+use crate::users::install_account::{owns_install, read_user_call, read_user_result};
 
 /// Why a task job does not pass; `Unavailable` decides nothing and is asked again.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -117,10 +119,12 @@ pub fn work_admits(
     }
 }
 
-fn refused(error: HostError) -> ScreenError {
-    match error.kind {
-        ErrorKind::Unavailable => ScreenError::Unavailable(error.message),
-        _ => ScreenError::Refused(error.message),
+/// An authorization fault decides nothing and is asked again; any other answer refuses.
+fn refused(error: AuthorizeError) -> ScreenError {
+    match error {
+        AuthorizeError::Storage(error) => ScreenError::Unavailable(error.to_string()),
+        AuthorizeError::CheckFailed(error) => ScreenError::Unavailable(error),
+        error => ScreenError::Refused(error.to_string()),
     }
 }
 
@@ -170,7 +174,11 @@ impl ScreenTask {
             Permission::ObjectsRead => Access::READ,
             _ => Access::WRITE,
         };
-        let patterns = matching(install, permission, &path).map_err(refused)?;
+        let patterns = granted(install, permission, &path);
+        if patterns.is_empty() {
+            let why = format!("{permission} is not granted on {path}");
+            return Err(ScreenError::Refused(why));
+        }
         let check = Authorize::access(install, (permission, access), &path, &patterns);
         Ok(Next::Call(IoCall::child(check)))
     }
@@ -193,18 +201,15 @@ impl Operation for ScreenTask {
 
     fn next(&mut self, result: IoResult) -> Result<Next<PluginInstall>, ScreenError> {
         if self.checked {
-            let checked = result.child::<(), CallError>()?;
-            checked.map_err(|error| refused(error.0))?;
+            let checked = result.child::<(), AuthorizeError>()?;
+            checked.map_err(refused)?;
             return self.advance();
         }
-        let user = read_user_result(result).map_err(|error| ScreenError::Unavailable(error.0))?;
+        let user = read_user_result(result)?;
         let install = self.install()?;
-        let scope = InstallScope {
-            realm_id: self.config.realm_id,
-            group_id: install.group_id,
-            install_id: install.install_id,
-        };
-        if !user.is_some_and(|user| owned(&user, &scope) && !user.is_deactivated()) {
+        let (group_id, install_id) = (install.group_id, install.install_id);
+        let owned = |user: &User| owns_install(user, group_id, install_id);
+        if !user.is_some_and(|user| owned(&user) && !user.is_deactivated()) {
             return Err(ScreenError::Account);
         }
         self.targets = screen_targets(&self.spec, self.config.realm_id, self.ingress).into();
@@ -255,7 +260,6 @@ impl Operation for AdmitTask {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<PluginInstall>, ScreenError> {
-        let unavailable = |error: super::rows::StoreError| ScreenError::Unavailable(error.0);
         match self.phase.take().ok_or(IoError::Unfinished)? {
             AdmitPhase::Screen => {
                 let install = result.child::<PluginInstall, ScreenError>()??;
@@ -269,26 +273,23 @@ impl Operation for AdmitTask {
                 self.phase = Some(AdmitPhase::Work(install, lookup));
                 Ok(Next::Call(ask))
             }
-            AdmitPhase::Work(install, mut lookup) => {
-                match lookup.take(result).map_err(unavailable)? {
-                    Found::Ask(ask) => {
-                        self.phase = Some(AdmitPhase::Work(install, lookup));
-                        Ok(Next::Call(ask))
-                    }
-                    Found::Row(found) => {
-                        let work_id = self.work_id.ok_or(ScreenError::Malformed)?;
-                        let read = read_call(vec![task_place(install.install_id, work_id)]);
-                        let row = found.map(|(_, row)| row);
-                        self.phase = Some(AdmitPhase::Task(install, row));
-                        Ok(Next::Call(read))
-                    }
+            AdmitPhase::Work(install, mut lookup) => match lookup.take(result)? {
+                Found::Ask(ask) => {
+                    self.phase = Some(AdmitPhase::Work(install, lookup));
+                    Ok(Next::Call(ask))
                 }
-            }
+                Found::Row(found) => {
+                    let work_id = self.work_id.ok_or(ScreenError::Malformed)?;
+                    let (space, key) = task_place(install.install_id, work_id);
+                    let read = IoCall::Read(vec![(space.to_string(), Key::from(key))]);
+                    let row = found.map(|(_, row)| row);
+                    self.phase = Some(AdmitPhase::Task(install, row));
+                    Ok(Next::Call(read))
+                }
+            },
             AdmitPhase::Task(install, row) => {
-                let [task] = values::<1>(result).map_err(unavailable)?;
-                let task = (task.map(|bytes| decode::<TaskRow>(&bytes)))
-                    .transpose()
-                    .map_err(unavailable)?;
+                let [task] = values::<1>(result)?;
+                let task = (task.map(|bytes| decode::<TaskRow>(&bytes))).transpose()?;
                 let adopted = task.and_then(|task| task.family);
                 work_admits(&install, row.as_ref(), (adopted, self.family))?;
                 Ok(Next::Done(install))

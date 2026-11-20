@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::plugins::screen::tests::install;
+use crate::jobs::lifecycle::screen::tests::install;
 
 fn recipe() -> Recipe {
     Recipe {
