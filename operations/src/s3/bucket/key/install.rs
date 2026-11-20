@@ -639,7 +639,7 @@ mod tests {
         use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
         use aruna_blob::blob::BlobHandler;
         use aruna_core::effects::StorageEffect;
-        use aruna_core::node_vault::NodeVaultKey;
+        use aruna_core::node::vault::NodeVaultKey;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
         use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
@@ -753,7 +753,7 @@ mod tests {
     async fn install_wakes_parked() {
         use crate::jobs::store::job_calls::ClaimOutcome;
         use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
-        use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+        use aruna_core::node::vault::{VaultEntry, VaultPurpose};
         use aruna_core::structs::execution::job::identity::{JobId, JobState};
         use aruna_core::structs::execution::job::input::JobPayload;
         use aruna_core::structs::execution::job::key_wait::KeyWait;

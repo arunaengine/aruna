@@ -25,7 +25,7 @@ use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::route::JobRouteError;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::DEADLINE_INDEX_KEYSPACE;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;

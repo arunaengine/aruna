@@ -15,7 +15,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::outbound::{
     MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail,
 };

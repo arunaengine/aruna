@@ -14,7 +14,7 @@ use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::metadata::{
     AuthToken, MetadataEffect, MetadataError, MetadataEvent, graph_version,
 };
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::rows::{outside_answer, outside_call, read_row, values};

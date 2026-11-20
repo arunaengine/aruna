@@ -16,7 +16,7 @@ use aruna_core::keyspaces::{
     PENDING_LOCATION_KEYSPACE, TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE,
 };
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};

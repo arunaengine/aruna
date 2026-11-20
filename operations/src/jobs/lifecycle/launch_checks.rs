@@ -10,7 +10,7 @@ use aruna_core::compute::{ExecutorCapability, NetworkAccess};
 use aruna_core::events::LaunchDecline;
 use aruna_core::id::NodeId;
 use aruna_core::job_request;
-use aruna_core::node_state::{
+use aruna_core::node::state::{
     DrainState, DrainStateError, DrainStateOperation, NodeInfoError, ReadInfoOperation,
 };
 use aruna_core::operation::Operation;

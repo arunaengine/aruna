@@ -10,7 +10,7 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::member_read::{MemberAnswer, MemberBody, MemberFetch, MemberMethod, MemberSend};
-use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
+use aruna_core::node::state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{OutboundEffect, OutboundEvent};
 use aruna_core::structs::storage::node_info::NodeUrls;

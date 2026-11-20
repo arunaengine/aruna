@@ -9,7 +9,7 @@ use crate::effects::{
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::key_index::IndexEvent;
 use crate::metadata::MetadataEvent;
-use crate::node_vault::VaultEntry;
+use crate::node::vault::VaultEntry;
 use crate::outbound::OutboundEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{

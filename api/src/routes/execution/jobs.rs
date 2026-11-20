@@ -14,7 +14,7 @@ use crate::job_service::{
 use crate::jobs::family_report;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobKind;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::job::identity::{JobId, SYSTEM_ENTRY_PREFIX};
 use aruna_core::structs::execution::job::input::{

@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use aruna_core::compute::quota::{ComputeQuota, ResourceTotals};
-use aruna_core::node_state::DrainStateOperation;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::DrainStateOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::compute_config::{
     GroupComputeQuota, LocationLink, RealmComputeConfig,

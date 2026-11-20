@@ -4,7 +4,7 @@
 
 use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
-use crate::node_vault::{VaultEntry, VaultPurpose};
+use crate::node::vault::{VaultEntry, VaultPurpose};
 use crate::structs::execution::source_access::SOURCE_WEIGHT;
 use crate::types::GroupId;
 use crate::user::id::UserId;

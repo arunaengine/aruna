@@ -16,7 +16,7 @@ use aruna_core::jobs::{ByteStream, JobEffect, JobEvent};
 use aruna_core::member_read::{
     MemberAnswer, MemberBody, MemberFetch, MemberMethod, MemberSend, TrailerValue,
 };
-use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
+use aruna_core::node::state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{OutboundEffect, OutboundEvent, xml_field};
 use aruna_core::structs::identity::realm::RealmId;

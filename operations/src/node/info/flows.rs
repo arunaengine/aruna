@@ -14,8 +14,8 @@ use aruna_core::events::Event;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
-use aruna_core::node_facts::NodeFacts;
-use aruna_core::node_state::{
+use aruna_core::node::facts::NodeFacts;
+use aruna_core::node::state::{
     DEPARTURE_KEY, DrainState, DrainStateError, DrainStateOperation, NodeInfoError,
     ReadInfoOperation, SetDrainOperation,
 };

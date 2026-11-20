@@ -159,7 +159,7 @@ async fn setup_pattern(pattern: &str) -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::worker::FjallStorage::open(&root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

@@ -14,7 +14,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, ExecutionSignEvent, LaunchDecline, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::scheduling::PlannedInput;

@@ -15,7 +15,7 @@ use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::heartbeat::{Heard, HeldHeartbeat, Here, MAX_HEARTBEAT_AGE};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::node_facts::{NodeFacts, class_labels, permille_of};
+use aruna_core::node::facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation};
 use aruna_core::structs::info::{BlobState, NetState, RequestSummaryState, Status};

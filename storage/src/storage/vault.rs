@@ -6,7 +6,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
-use aruna_core::node_vault::{NodeVaultKey, VaultEntry};
+use aruna_core::node::vault::{NodeVaultKey, VaultEntry};
 
 use super::sealing::fresh_nonce;
 
@@ -87,7 +87,7 @@ mod tests {
     use crate::storage::worker::FjallStorage;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::events::Event;
-    use aruna_core::node_vault::VaultPurpose;
+    use aruna_core::node::vault::VaultPurpose;
     use aruna_core::types::{TxnId, Value};
     use ulid::Ulid;
 
