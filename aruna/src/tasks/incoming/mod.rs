@@ -84,7 +84,6 @@ use aruna_operations::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
     PruneTimerOperation as GraphPruneTimerOperation, jobs_queued,
 };
-use aruna_operations::replication::catch_up::CatchUpCursors;
 use aruna_operations::transfer::sharding::MaintainCursors;
 
 /// Arms the graph prune drain for its next due job at start.
@@ -122,11 +121,8 @@ use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::table::RebuildTableOperation;
 use aruna_operations::queue_backoff::retry_delay_ms;
-use aruna_operations::replication::drain::{
-    ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
-};
+use aruna_operations::replication::drain::RestoreDrainOperation;
 use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
-use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
@@ -209,9 +205,6 @@ pub(crate) struct OperationsTaskHandler {
     // What each converted timer keeps between runs; the operations decide on it. Loss on
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
-    // Where the replication drain's bootstrap work goes on. Loss on restart is fine: the
-    // next drain starts at the first set and range.
-    catch_up: std::sync::Mutex<CatchUpCursors>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
@@ -328,7 +321,6 @@ impl OperationsTaskHandler {
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
-            catch_up: std::sync::Mutex::default(),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             published_records: std::sync::Mutex::new(BTreeSet::new()),
             drain_guard: tokio::sync::Mutex::new(()),
@@ -766,9 +758,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainPruneQueue => Box::pin(async move {
                 self.drain_graph_queue().await;
             }),
-            TaskKey::DrainReplicationQueue => Box::pin(async move {
-                self.drain_replication_queue().await;
-            }),
+            TaskKey::DrainReplicationQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainRefreshQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),

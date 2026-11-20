@@ -50,6 +50,8 @@ use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
 use crate::plugins::work::PruneKeepingWork;
+use crate::replication::catch_up::CatchUpCursors;
+use crate::replication::drain_timer::ReplicationTimerOperation;
 use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
 use crate::replication::mirror_repair::drain::DrainRepairsOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
@@ -65,6 +67,8 @@ pub struct TimerMemory {
     pub cursor: Option<Vec<u8>>,
     /// A count the timer advances on every run, such as a heartbeat sequence.
     pub sequence: u64,
+    /// Where the replication drain's bootstrap work goes on.
+    pub catch_up: CatchUpCursors,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -183,6 +187,7 @@ pub enum TimerOperation {
     PublishUsageSnapshots(PublishUsageOperation),
     PublishNodeInfo(InfoTimerOperation),
     DrainProjectionQueue(ProjectionRunOperation),
+    DrainReplicationQueue(ReplicationTimerOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -297,6 +302,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainProjectionQueue => Some(TimerOperation::DrainProjectionQueue(
             ProjectionRunOperation::new(input.local_node),
         )),
+        TaskKey::DrainReplicationQueue => Some(TimerOperation::DrainReplicationQueue(
+            ReplicationTimerOperation::new(input),
+        )),
         _ => None,
     }
 }
@@ -325,6 +333,7 @@ macro_rules! each_timer {
             TimerOperation::PublishUsageSnapshots($operation) => $body,
             TimerOperation::PublishNodeInfo($operation) => $body,
             TimerOperation::DrainProjectionQueue($operation) => $body,
+            TimerOperation::DrainReplicationQueue($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -629,6 +638,12 @@ impl TimerRun for ProjectionRunOperation {
             reason: error.to_string(),
         })?;
         Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for ReplicationTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
     }
 }
 
@@ -1091,6 +1106,12 @@ mod tests {
         assert_eq!(more, Ok(TimerPlan::from(Some(Duration::ZERO))));
         let failed = ProjectionRunOperation::rearm(Err(IoError::Unfinished));
         assert_eq!(failed.unwrap_err().retry_after, PROJECTION_RETRY_AFTER);
+    }
+
+    #[test]
+    fn replication_key_named() {
+        let operation = timer_operation(&TaskKey::DrainReplicationQueue, &input());
+        assert!(matches!(operation, Some(TimerOperation::DrainReplicationQueue(_))));
     }
 
     #[test]

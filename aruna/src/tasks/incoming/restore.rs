@@ -570,42 +570,6 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn drain_replication_queue(&self) {
-        // A failed drain leaves the cursors where they were.
-        let cursors = (self.catch_up.lock())
-            .map(|cursors| cursors.clone())
-            .unwrap_or_default();
-        let drain = ProcessBatchOperation::new(
-            MetadataPages,
-            node_routing(&self.context),
-            self.context.node_and_realm(),
-        )
-        .with_catch_up(cursors);
-        let drained = drive(drain, &self.context).await;
-        if let (Ok(result), Ok(mut cursors)) = (drained.as_ref(), self.catch_up.lock()) {
-            *cursors = result.catch_up.clone();
-        }
-        match drained {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainReplicationQueue, Duration::ZERO)
-                    .await;
-            }
-            Ok(result) => {
-                if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainReplicationQueue, after)
-                        .await;
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainReplicationQueue, error = ?error, "Failed to drain blob replication queue");
-                self.reschedule_timer(TaskKey::DrainReplicationQueue, REPLICATION_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
-}
-
-impl OperationsTaskHandler {
     /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
     pub(super) async fn drain_link_queue(&self) {
         let drain = aruna_operations::jobs::repository::link_queue::DrainLinksOperation::new(
