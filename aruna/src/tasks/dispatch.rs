@@ -12,6 +12,7 @@ use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 
 use super::job_host::{run_backend_import, run_hosted, run_staging_job, run_storage_purge};
+use crate::plugin_host::plugin_work::run_plugin_work;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
@@ -111,15 +112,7 @@ pub(crate) async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> 
             let job = EmailJobOperation::new(spec.clone(), delivery_node(ctx), now_ms);
             Box::pin(run_delivery(ctx, drive(job, &ctx.driver))).await
         }
-        JobPayload::PluginWork(_) => {
-            let handled = (ctx.handlers.iter()).find_map(|handler| handler.run(ctx, payload));
-            match handled {
-                Some(run) => run.await,
-                None => JobRunOutcome::Failed(JobError::permanent(
-                    "no handler is registered for this payload",
-                )),
-            }
-        }
+        JobPayload::PluginWork(spec) => Box::pin(run_plugin_work(ctx, spec)).await,
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(
             "execution payload dispatched through the in-process seam",

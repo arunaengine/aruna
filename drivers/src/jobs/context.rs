@@ -1,5 +1,5 @@
-//! The context one job run gets from the job runner, and the seams to payload handlers and to
-//! the reconciler of lost external attempts.
+//! The context one job run gets from the job runner, and the seam to the reconciler of lost
+//! external attempts.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -7,14 +7,13 @@ use std::sync::Arc;
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::identity::JobId;
-use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::JobRecord;
 use futures_util::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
 use crate::driver::DriverContext;
 use crate::jobs::executor::RangeTurns;
-use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
+use aruna_core::jobs::ProgressReporter;
 
 pub struct JobContext {
     pub driver: Arc<DriverContext>,
@@ -28,19 +27,6 @@ pub struct JobContext {
     pub shutdown: CancellationToken,
     pub progress: ProgressReporter,
     pub range_turns: RangeTurns,
-    /// Runs the payload kinds that other domains own, as the node wiring registered them.
-    pub handlers: Vec<Arc<dyn PayloadHandler>>,
-}
-
-/// Runs the jobs of a payload kind that `jobs` does not own. The node wiring registers one per
-/// owning domain.
-pub trait PayloadHandler: Send + Sync {
-    /// Runs one job, or `None` when this handler does not own the payload.
-    fn run<'a>(
-        &'a self,
-        ctx: &'a JobContext,
-        payload: &'a JobPayload,
-    ) -> Option<BoxFuture<'a, JobRunOutcome>>;
 }
 
 /// Reconciliation seam for lost external attempts. A lost lease or node restart must never

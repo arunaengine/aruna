@@ -214,7 +214,7 @@ async fn cancel_runs_import() {
         claimed,
         token,
         (CancellationToken::new(), None),
-        (CancellationToken::new(), RangeTurns::default(), Vec::new()),
+        (CancellationToken::new(), RangeTurns::default()),
     )
     .await;
 
@@ -256,7 +256,7 @@ async fn cancel_after_claim() {
         claimed,
         token,
         (CancellationToken::new(), None),
-        (CancellationToken::new(), RangeTurns::default(), Vec::new()),
+        (CancellationToken::new(), RangeTurns::default()),
     )
     .await;
 
@@ -281,7 +281,7 @@ async fn zombie_skips_cleanup() {
         claimed,
         stale_token,
         (cancel.clone(), None),
-        (CancellationToken::new(), RangeTurns::default(), Vec::new()),
+        (CancellationToken::new(), RangeTurns::default()),
     ));
     poll_until(WAIT_CAP, || {
         std::future::ready(marker.exists().then_some(()))

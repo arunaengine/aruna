@@ -36,7 +36,6 @@ use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
 use crate::config::{Config, open_storage, resolve_config};
-use crate::plugin_host::plugin_work::PluginWorkHandler;
 use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
 
@@ -97,7 +96,6 @@ impl Acquired {
         task_handle: TaskHandle,
     ) -> Self {
         let jobs_runtime = JobsRuntime::new_paused();
-        jobs_runtime.register_handler(Arc::new(PluginWorkHandler));
         Self {
             storage_handle,
             task_handle,

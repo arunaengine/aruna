@@ -50,7 +50,6 @@ pub fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobCont
             },
         ),
         range_turns: Default::default(),
-        handlers: Default::default(),
     }
 }
 

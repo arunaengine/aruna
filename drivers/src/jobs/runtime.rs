@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 use super::executor::RangeTurns;
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
 use crate::jobs::context::ExternalReconciler;
-use crate::jobs::context::PayloadHandler;
 use aruna_core::jobs::ProgressReporter;
 
 struct RunningJob {
@@ -100,7 +99,6 @@ pub struct JobsRuntime {
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
     range_turns: RangeTurns,
-    handlers: Mutex<Vec<Arc<dyn PayloadHandler>>>,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -152,7 +150,6 @@ impl JobsRuntime {
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
             range_turns: RangeTurns::default(),
-            handlers: Mutex::default(),
         })
     }
 
@@ -169,21 +166,6 @@ impl JobsRuntime {
 
     pub fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
         *self.reconciler.lock().expect("reconciler mutex poisoned") = Some(reconciler);
-    }
-
-    /// Adds the runner of payload kinds another domain owns; the node wiring calls it at start.
-    pub fn register_handler(&self, handler: Arc<dyn PayloadHandler>) {
-        self.handlers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(handler);
-    }
-
-    /// The registered runners of payload kinds other domains own.
-    pub fn handlers(&self) -> Vec<Arc<dyn PayloadHandler>> {
-        (self.handlers.lock())
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     pub fn running_count(&self) -> usize {

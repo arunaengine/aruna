@@ -33,7 +33,7 @@ use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::effect_adapters::job::{JobHost, with_job_host};
 use aruna_drivers::jobs::context::ExternalReconciler;
-use aruna_drivers::jobs::context::{JobContext, PayloadHandler};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_drivers::jobs::executor::{RangeTurns, run_cleanup};
 use aruna_drivers::jobs::runtime::{Admission, JobShutdownReport, JobsRuntime, RecoveredAdmission};
 use aruna_operations::jobs::runtime_steps::{
@@ -90,7 +90,6 @@ pub fn spawn_job(runtime: &Arc<JobsRuntime>, context: Arc<DriverContext>, record
     let runtime = runtime.clone();
     let shutdown = runtime.shutdown_signal();
     let turns = runtime.turns();
-    let handlers = runtime.handlers();
     tokio::spawn(async move {
         // A panicking payload is turned into a failure inside `supervise`; this guard
         // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -99,7 +98,7 @@ pub fn spawn_job(runtime: &Arc<JobsRuntime>, context: Arc<DriverContext>, record
             record,
             slot.claim_token,
             (slot.cancel, slot.progress),
-            (shutdown, turns, handlers),
+            (shutdown, turns),
         ))
         .catch_unwind()
         .await;
@@ -330,11 +329,7 @@ pub(crate) async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     (cancel, progress): (CancellationToken, Option<ProgressReporter>),
-    (shutdown, range_turns, handlers): (
-        CancellationToken,
-        RangeTurns,
-        Vec<Arc<dyn PayloadHandler>>,
-    ),
+    (shutdown, range_turns): (CancellationToken, RangeTurns),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -394,7 +389,6 @@ pub(crate) async fn run_job(
         shutdown,
         progress: progress.clone(),
         range_turns,
-        handlers,
     };
 
     let SuperviseResult::Outcome(outcome) = supervise(&context, job_id, token, &record, &ctx).await
