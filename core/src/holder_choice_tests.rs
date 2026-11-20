@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    HEARTBEAT_STALE_MS, HolderCandidate, HolderChoiceError, HolderChoiceOperation, candidate,
-    link_bandwidth, pick,
+    HEARTBEAT_STALE_MS, HolderCandidate, HolderChoiceError, HolderChoiceOperation,
+    PickHolderOperation, candidate, link_bandwidth, pick,
 };
 use crate::calls::{IoCall, IoResult, Next};
 use crate::document::DocumentTarget;
@@ -111,6 +111,22 @@ fn free_slots_win() {
     let three = || vec![holder(1, 10, 0), holder(2, 20, 0), holder(3, 30, 0)];
     assert_eq!(pick(three(), 0), Some(holder(3, 30, 0)));
     assert_eq!(pick(three(), 1), Some(holder(2, 20, 0)));
+}
+
+// The pick operation chooses with the entropy the runner gave its run, so the same seed and
+// candidates choose the same holder when the run is replayed.
+#[test]
+fn seeded_pick_replays() {
+    let three = || vec![holder(1, 10, 0), holder(2, 20, 0), holder(3, 30, 0)];
+    for (seed, chosen) in [(0, holder(3, 30, 0)), (1, holder(2, 20, 0))] {
+        let mut picking = PickHolderOperation::new(&[node(1), node(2), node(3)], 5);
+        picking.seed(seed);
+        let choice = HolderChoiceOperation::new(&[node(1), node(2), node(3)], 5);
+        assert_eq!(picking.first(), Ok(Next::Call(IoCall::child(choice))));
+        let candidates: Result<_, HolderChoiceError> = Ok(three());
+        let candidates = IoResult::Child(crate::calls::ChildOutcome::new(candidates));
+        assert_eq!(picking.next(candidates), Ok(Next::Done(Some(chosen))));
+    }
 }
 
 #[test]
