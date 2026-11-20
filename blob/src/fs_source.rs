@@ -147,15 +147,18 @@ fn walk_entries(
                 let resolved = root.resolve(&directory)?;
                 let looped = ancestors(&directory).any(|up| listed.get(up) == Some(&resolved));
                 let from = walk.resume_name().map(ToOwned::to_owned);
-                let children = match looped {
-                    true => Vec::new(),
+                // The names the rest of the page can take, one more to tell whether it is full,
+                // and one for the resume name, which the walk already passed on a refill.
+                let window = (limit + 2).saturating_sub(entries.len()).max(2);
+                let (children, more) = match looped {
+                    true => (Vec::new(), false),
                     false => {
                         let scan = (from.as_deref(), &mut seen, examined);
-                        local_children(&root, &resolved, scan)?
+                        local_children(&root, &resolved, scan, window)?
                     }
                 };
                 listed.insert(directory, resolved);
-                walk.listed(children);
+                walk.listed_window(children, more);
                 continue;
             }
             Step::Entry { path, child } => (path, child),
@@ -211,18 +214,22 @@ fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     parents.chain((!path.is_empty()).then_some(""))
 }
 
-/// The names in the local directory `resolved` from the name `from` on; their metadata waits
-/// until the walk visits them. The page fails once it examined more than `examined` entries.
+/// The first `window` names in the local directory `resolved` from the name `from` on, and whether
+/// more follow; their metadata waits until the walk visits them. The page fails once it examined
+/// more than `examined` entries.
 fn local_children(
     root: &OfferedRoot,
     resolved: &Path,
     (from, seen, examined): (Option<&str>, &mut usize, usize),
-) -> Result<Vec<LocalChild>, StagingSourceError> {
+    window: usize,
+) -> Result<(Vec<LocalChild>, bool), StagingSourceError> {
     let reader = root
         .directory
         .read_dir(resolved)
         .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
-    let mut children = Vec::new();
+    // The largest kept name on top, so a smaller one replaces it once the window is full.
+    let mut names = std::collections::BinaryHeap::new();
+    let mut more = false;
     for entry in reader {
         let entry = entry.map_err(|error| StagingSourceError::ListError(error.to_string()))?;
         *seen += 1;
@@ -243,13 +250,20 @@ fn local_children(
         if from.is_some_and(|from| name.as_str() < from) {
             continue;
         }
-        children.push(Child {
+        names.push(name);
+        if names.len() > window {
+            names.pop();
+            more = true;
+        }
+    }
+    let children = (names.into_sorted_vec().into_iter())
+        .map(|name| Child {
             name,
             is_dir: false,
             value: None,
-        });
-    }
-    Ok(children)
+        })
+        .collect();
+    Ok((children, more))
 }
 
 pub(crate) async fn read_local(
@@ -481,17 +495,25 @@ pub(crate) mod tests {
         let root = OfferedRoot::open(dir.path().to_str().unwrap()).unwrap();
         let resolved = root.resolve("").unwrap();
         let mut seen = 0;
-        let wide = local_children(&root, &resolved, (None, &mut seen, 3));
+        let wide = local_children(&root, &resolved, (None, &mut seen, 3), 10);
         assert!(matches!(wide, Err(StagingSourceError::InvalidListing(_))));
         assert_eq!(
             seen, 4,
             "the scan stopped at the first entry over the bound"
         );
         let mut seen = 0;
-        let rest = local_children(&root, &resolved, (Some("d"), &mut seen, 10)).unwrap();
-        let mut names: Vec<String> = rest.into_iter().map(|child| child.name).collect();
-        names.sort();
+        let scan = (Some("d"), &mut seen, 10);
+        let (rest, more) = local_children(&root, &resolved, scan, 10).unwrap();
+        let names: Vec<String> = rest.into_iter().map(|child| child.name).collect();
         assert_eq!(names, ["d", "e"]);
+        assert!(!more);
+        // A small page keeps only its window of the first names, and knows more follow.
+        let mut seen = 0;
+        let scan = (None, &mut seen, 10);
+        let (first, more) = local_children(&root, &resolved, scan, 2).unwrap();
+        let names: Vec<String> = first.into_iter().map(|child| child.name).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(more, "the names past the window are told");
     }
 
     // Empty directories still cost traversal, so a page fails once its bounds are spent.

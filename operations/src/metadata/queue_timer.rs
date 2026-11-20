@@ -111,10 +111,8 @@ pub struct PruneRunOperation {
 
 impl PruneRunOperation {
     pub fn new(input: &TimerInput) -> Self {
-        // The prune reads only whether this node runs tasks, so no credential key is needed.
         let scope = NodeScope {
             node: input.serving,
-            credential_key: None,
             has_blob: input.has_blob,
             has_tasks: input.has_tasks,
         };

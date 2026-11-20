@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod batches;
 pub mod defer;
 pub mod record;
 pub mod rotation;

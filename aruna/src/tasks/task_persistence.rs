@@ -316,6 +316,58 @@ mod tests {
         assert_ne!(Some(row.admission), fired);
     }
 
+    // A shorten whose row was refused keeps its live wake; a later shorten that keeps that wake
+    // writes the missing row at the kept deadline, so a restart still wakes early.
+    #[tokio::test]
+    async fn kept_wake_stored() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        // The first shorten armed admission 7, but storage refused its row.
+        let early = Duration::from_secs(5);
+        let (_, holder) = task_handle.shorten_owned(key.clone(), early, 7).await;
+        assert_eq!(holder, Some(7));
+        let later = TaskEffect::ShortenTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        change_timer(&storage, Some(&task_handle), later, false).await;
+        let row = read_timer(&storage, &key).await.expect("reads");
+        let row = row.expect("the kept wake owns a row");
+        assert_eq!(row.admission, 7);
+        assert!(row.due_unix_millis <= aruna_clock::unix_timestamp_millis() + 5_000);
+    }
+
+    // A kept wake never postpones a stored row due earlier, such as one startup could not read.
+    #[tokio::test]
+    async fn earlier_row_kept() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        let stored = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(5),
+        };
+        persist_task_effect(&storage, &stored)
+            .await
+            .expect("timer persists");
+        let before = read_timer(&storage, &key).await.expect("reads");
+        // A wake from memory, due later than the row, holds the key.
+        let kept = Duration::from_secs(60);
+        let (_, holder) = task_handle.shorten_owned(key.clone(), kept, 7).await;
+        assert_eq!(holder, Some(7));
+        let later = TaskEffect::ShortenTimer {
+            key: key.clone(),
+            after: Duration::from_secs(120),
+        };
+        change_timer(&storage, Some(&task_handle), later, false).await;
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
+    }
+
     // Two resets with the same deadline are two admissions: the first one's firing leaves the
     // row the second one wrote.
     #[tokio::test]

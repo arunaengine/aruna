@@ -294,33 +294,57 @@ pub fn signing_bytes<T: Signable>(payload: &T) -> Result<Vec<u8>, FederationErro
     payload.signing_bytes()
 }
 
+/// A signature over a payload's signing bytes and the key behind it, made by the holder of the
+/// node's federation key and attached to the payload by [`Signed::with_signature`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FederationSignature {
+    pub signer: Signer,
+    pub signature: String,
+}
+
+/// Signs domain-tagged `bytes` with the realm key on a management node or the delegated issuer
+/// key on a server.
+pub fn sign_bytes(
+    bytes: &[u8],
+    capabilities: &NodeCapabilities,
+) -> Result<FederationSignature, FederationError> {
+    let (key, signer) = match capabilities {
+        NodeCapabilities::Management {
+            realm_signing_key, ..
+        } => (realm_signing_key, Signer::Realm),
+        NodeCapabilities::Server {
+            issuer_signing_key,
+            delegation_signature,
+            ..
+        } => (
+            issuer_signing_key,
+            Signer::Delegated {
+                issuer_pubkey: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(issuer_signing_key.verifying_key().to_bytes()),
+                delegation_signature: delegation_signature.clone(),
+            },
+        ),
+        NodeCapabilities::User { .. } => return Err(FederationError::NoSigningKey),
+    };
+    let signature = sign_hex(key, bytes);
+    Ok(FederationSignature { signer, signature })
+}
+
 impl<T: Signable> Signed<T> {
     /// Signs with the realm key on a management node or the delegated issuer key on a server.
     pub fn sign(payload: T, capabilities: &NodeCapabilities) -> Result<Self, FederationError> {
         let bytes = signing_bytes(&payload)?;
-        let (key, signer) = match capabilities {
-            NodeCapabilities::Management {
-                realm_signing_key, ..
-            } => (realm_signing_key, Signer::Realm),
-            NodeCapabilities::Server {
-                issuer_signing_key,
-                delegation_signature,
-                ..
-            } => (
-                issuer_signing_key,
-                Signer::Delegated {
-                    issuer_pubkey: base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .encode(issuer_signing_key.verifying_key().to_bytes()),
-                    delegation_signature: delegation_signature.clone(),
-                },
-            ),
-            NodeCapabilities::User { .. } => return Err(FederationError::NoSigningKey),
-        };
-        Ok(Self {
+        let signature = sign_bytes(&bytes, capabilities)?;
+        Ok(Self::with_signature(payload, signature))
+    }
+
+    /// `payload` with a signature made over its signing bytes.
+    pub fn with_signature(payload: T, signature: FederationSignature) -> Self {
+        Self {
             payload,
-            signer,
-            signature: sign_hex(key, &bytes),
-        })
+            signer: signature.signer,
+            signature: signature.signature,
+        }
     }
 
     /// Accepts only a payload naming `realm_id`, signed by that realm's key or its delegate.

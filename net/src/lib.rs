@@ -129,6 +129,8 @@ struct NetInner {
     heartbeats: Arc<heartbeat::HeartbeatTable>,
     peer_contacts: contacts::PeerContacts,
     issuer_keys: issuer_keys::IssuerKeys,
+    /// The realm or issuer key this node signs federation payloads with, installed at start.
+    federation_keys: std::sync::OnceLock<aruna_core::structs::identity::auth::NodeCapabilities>,
     /// Test hook: the payload of the next answer a frame request drops as if lost.
     #[cfg(feature = "test-hooks")]
     dropped_answer: parking_lot::Mutex<Option<Vec<u8>>>,
@@ -574,6 +576,21 @@ impl NetHandle {
     /// The trusted issuer keys this node checked.
     pub fn issuer_keys(&self) -> &issuer_keys::IssuerKeys {
         &self.inner.issuer_keys
+    }
+
+    /// Installs the key this node signs federation payloads with; a second install is ignored.
+    pub fn install_federation_keys(
+        &self,
+        capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
+    ) {
+        let _ = self.inner.federation_keys.set(capabilities);
+    }
+
+    /// The key this node signs federation payloads with, once installed.
+    pub fn federation_keys(
+        &self,
+    ) -> Option<&aruna_core::structs::identity::auth::NodeCapabilities> {
+        self.inner.federation_keys.get()
     }
 
     /// Test hook: the next frame request whose answer payload is `payload` fails as if the
@@ -1145,6 +1162,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DelegationSign(_)) => "delegation_sign",
         Effect::Net(NetEffect::AvoidHolder { .. }) => "avoid_holder",
         Effect::Net(NetEffect::CursorSign(_)) => "cursor_sign",
+        Effect::Net(NetEffect::FederationSign(_)) => "federation_sign",
+        Effect::Net(NetEffect::OpenCredential(_)) => "open_credential",
         Effect::Net(NetEffect::SealPosition(_)) => "seal_position",
         Effect::Net(NetEffect::OpenPosition(_)) => "open_position",
         Effect::Net(NetEffect::DrawSecret(_)) => "draw_secret",

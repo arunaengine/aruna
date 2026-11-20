@@ -10,6 +10,8 @@ pub mod counter_check;
 pub mod heartbeat;
 pub mod info;
 pub mod info_timer;
+pub mod outbox_finish;
+pub mod peer_metadata;
 pub mod placement_timer;
 pub mod presence_timer;
 pub mod range_timer;

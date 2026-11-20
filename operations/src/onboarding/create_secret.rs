@@ -15,7 +15,7 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::secret_state::secret_state_entry;
+use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
 pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
 /// Prefixes the expiry index: one row per secret, soonest expiry first.
@@ -34,13 +34,7 @@ pub struct CreateSecretInput {
 #[derive(Clone, Debug, PartialEq)]
 enum Stage {
     Config,
-    /// Counts the owner's outstanding secrets page by page against `cap`.
-    Count {
-        cap: u32,
-        enrolled: Vec<String>,
-        /// Secrets counted by the pages already read.
-        pending: u32,
-    },
+    Count(SlotCount),
     Write,
 }
 
@@ -51,6 +45,7 @@ pub struct CreateSecretOperation {
     input: CreateSecretInput,
     stage: Stage,
     pages: PrefixPages,
+    now: u64,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -94,6 +89,7 @@ impl CreateSecretOperation {
             input,
             stage: Stage::Config,
             pages: secret_pages(),
+            now: 0,
         }
     }
 
@@ -128,39 +124,107 @@ impl CreateSecretOperation {
         }
         // Unclaimed secrets already occupy a slot: two mints followed by
         // two enrollments would otherwise cross the cap.
-        self.stage = Stage::Count {
-            cap,
-            enrolled,
-            pending: 0,
-        };
+        let scope = (owner, self.input.record.enrollment_id, self.now);
+        self.stage = Stage::Count(SlotCount::new(cap, enrolled, scope));
         Ok(Next::Call(self.pages.call()))
     }
 
     fn handle_page(&mut self, result: IoResult) -> CreateTurn {
-        let Stage::Count {
-            cap,
-            enrolled,
-            pending,
-        } = &mut self.stage
-        else {
+        let Stage::Count(count) = &mut self.stage else {
             return Err(CreateSecretError::NotFinished);
         };
-        let rows = self.pages.take(result)?;
-        *pending = pending.saturating_add(pending_devices(
-            &rows,
-            self.input.record.mode.owner(),
-            self.input.record.enrollment_id,
+        match count.step::<CreateSecretError>(&mut self.pages, result)? {
+            Counted::Call(call) => Ok(Next::Call(call)),
+            Counted::Done => self.write_record(),
+            Counted::Exceeded(limit) => Err(CreateSecretError::DeviceCapExceeded { limit }),
+        }
+    }
+}
+
+/// Counts the secrets of one owner that still hold a device slot, page by page inside the
+/// caller's write transaction: an unexpired one, or an expired one an enrollment is finalizing.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SlotCount {
+    cap: u32,
+    enrolled: Vec<String>,
+    /// The owner, the secret being created or reserved, and the time that decides expiry.
+    scope: (UserId, Ulid, u64),
+    /// Secrets counted by the pages already read.
+    pending: u32,
+    /// Expired candidates of the last page, whose states are being read.
+    expired: Vec<OnboardingSecretRecord>,
+}
+
+/// What a counting step asks for next.
+pub(crate) enum Counted {
+    Call(IoCall),
+    Done,
+    Exceeded(u32),
+}
+
+impl SlotCount {
+    pub(crate) fn new(cap: u32, enrolled: Vec<String>, scope: (UserId, Ulid, u64)) -> Self {
+        Self {
+            cap,
             enrolled,
-        ));
-        if enrolled.len() as u32 + *pending >= *cap {
-            return Err(CreateSecretError::DeviceCapExceeded { limit: *cap });
+            scope,
+            pending: 0,
+            expired: Vec::new(),
+        }
+    }
+
+    /// Takes one page of secret records, or the states of a page's expired candidates.
+    pub(crate) fn step<E: From<IoError> + From<ConversionError>>(
+        &mut self,
+        pages: &mut PrefixPages,
+        result: IoResult,
+    ) -> Result<Counted, E> {
+        if self.expired.is_empty() {
+            let rows = pages.take(result)?;
+            let (owner, skip, now) = self.scope;
+            let (live, expired): (Vec<_>, Vec<_>) = slot_candidates(&rows, owner, skip)
+                .filter(|record| !self.enrolled_claim(record))
+                .partition(|record| record.expires_at >= now);
+            self.pending = self.pending.saturating_add(live.len() as u32);
+            if !expired.is_empty() && !self.over_cap() {
+                let reads = (expired.iter())
+                    .map(|record| {
+                        let key = secret_state_key(record.enrollment_id);
+                        (ONBOARDING_KEYSPACE.to_string(), key)
+                    })
+                    .collect();
+                self.expired = expired;
+                return Ok(Counted::Call(IoCall::Read(reads)));
+            }
+        } else {
+            let expired = std::mem::take(&mut self.expired);
+            let states = result.values()?;
+            for (record, state) in expired.iter().zip(&states) {
+                let state = resolve_secret_state(record, state.as_ref())?;
+                if matches!(state, OnboardingSecretState::Finalizing { .. }) {
+                    self.pending = self.pending.saturating_add(1);
+                }
+            }
+        }
+        if self.over_cap() {
+            return Ok(Counted::Exceeded(self.cap));
         }
         // The range is followed to its end: a slot this owner holds may
         // sit behind any number of other owners' records.
-        match self.pages.done() {
-            true => self.write_record(),
-            false => Ok(Next::Call(self.pages.call())),
-        }
+        Ok(match pages.done() {
+            true => Counted::Done,
+            false => Counted::Call(pages.call()),
+        })
+    }
+
+    fn over_cap(&self) -> bool {
+        self.enrolled.len() as u32 + self.pending >= self.cap
+    }
+
+    /// Whether `record` was claimed by a node that already joined: the realm config counts it.
+    fn enrolled_claim(&self, record: &OnboardingSecretRecord) -> bool {
+        (record.claimed_node_id.as_ref())
+            .is_some_and(|node_id| self.enrolled.iter().any(|enrolled| enrolled == node_id))
     }
 }
 
@@ -179,26 +243,15 @@ pub(crate) fn enrolled_devices(config: Option<&RealmConfigDocument>, owner: User
         .unwrap_or_default()
 }
 
-/// Secrets that still occupy a device slot for `owner`, skipping `skip` and any
-/// secret whose claiming node already joined: those are counted through the
-/// realm config instead of a second time here.
-pub(crate) fn pending_devices(
+/// The secret records of `owner` among `values`, except `skip`.
+fn slot_candidates(
     values: &[(Key, Value)],
-    owner: Option<UserId>,
+    owner: UserId,
     skip: Ulid,
-    enrolled: &[String],
-) -> u32 {
-    values
-        .iter()
+) -> impl Iterator<Item = OnboardingSecretRecord> {
+    (values.iter())
         .filter_map(|(_, bytes)| postcard::from_bytes::<OnboardingSecretRecord>(bytes).ok())
-        .filter(|record| record.enrollment_id != skip && record.mode.owner() == owner)
-        .filter(|record| {
-            !record
-                .claimed_node_id
-                .as_ref()
-                .is_some_and(|node_id| enrolled.iter().any(|enrolled| enrolled == node_id))
-        })
-        .count() as u32
+        .filter(move |record| record.enrollment_id != skip && record.mode.owner() == Some(owner))
 }
 
 impl Operation for CreateSecretOperation {
@@ -207,6 +260,10 @@ impl Operation for CreateSecretOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now = now_ms;
     }
 
     fn first(&mut self) -> CreateTurn {
@@ -227,7 +284,7 @@ impl Operation for CreateSecretOperation {
                 let [value] = values::<1>(result)?;
                 self.handle_config(value)
             }
-            Stage::Count { .. } => self.handle_page(result),
+            Stage::Count(_) => self.handle_page(result),
             Stage::Write => {
                 result.done()?;
                 Ok(Next::Done(self.input.record.clone()))
@@ -448,6 +505,56 @@ mod tests {
         for _ in 0..count {
             write_secret(context, &device_record(owner)).await;
         }
+    }
+
+    // Only a live secret holds a slot: an expired one counts only while an enrollment finalizes it.
+    #[tokio::test]
+    async fn cap_skips_expired() {
+        let owner = UserId::local(Ulid::generate(), realm());
+        let (_dir, context) = context_with_cap(Some(1), &[]).await;
+        let expired = OnboardingSecretRecord {
+            expires_at: 10,
+            ..device_record(owner)
+        };
+        write_secret(&context, &expired).await;
+        let available = aruna_core::onboarding::OnboardingSecretState::Available;
+        let (key_space, key, value) =
+            crate::onboarding::secret_state::secret_state_entry(expired.enrollment_id, available)
+                .unwrap();
+        let state_row = StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(state_row).await;
+        mint(&context, owner)
+            .await
+            .expect("an expired secret holds no slot");
+
+        let other = UserId::local(Ulid::generate(), realm());
+        let finalizing = OnboardingSecretRecord {
+            expires_at: 10,
+            ..device_record(other)
+        };
+        write_secret(&context, &finalizing).await;
+        let state = aruna_core::onboarding::OnboardingSecretState::Finalizing {
+            node_id: "node-a".to_string(),
+        };
+        let (key_space, key, value) =
+            crate::onboarding::secret_state::secret_state_entry(finalizing.enrollment_id, state)
+                .unwrap();
+        let state_row = StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(state_row).await;
+        assert!(matches!(
+            mint(&context, other).await,
+            Err(CreateSecretError::DeviceCapExceeded { limit: 1 })
+        ));
     }
 
     // The owner's record lies beyond a page of other owners.

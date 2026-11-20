@@ -62,8 +62,9 @@ enum TaskCommand {
         key: TaskKey,
         after: Duration,
         stamp: Option<u64>,
-        /// The event, and whether this change armed a new wake rather than keeping one.
-        response: oneshot::Sender<(TaskEvent, bool)>,
+        /// The event, and the admission whose wake holds the key: this one when it armed, else
+        /// the earlier one it kept.
+        response: oneshot::Sender<(TaskEvent, Option<u64>)>,
     },
     ScheduleIdleTimer {
         key: TaskKey,
@@ -394,31 +395,31 @@ impl SchedulerState {
         TaskEvent::TimerScheduled { key, after }
     }
 
-    /// Moves the wake of `key` earlier; answers whether it armed a new wake with `stamp`, rather
-    /// than keeping an earlier live one that owns its own row.
+    /// Moves the wake of `key` earlier; answers the admission whose wake holds the key: `stamp`
+    /// when it armed a new wake, else the earlier live one it kept.
     fn shorten_timer(
         &mut self,
         (key, stamp): (TaskKey, Option<u64>),
         after: Duration,
         now: Instant,
-    ) -> (TaskEvent, bool) {
+    ) -> (TaskEvent, Option<u64>) {
         let Some(requested_deadline) = now.checked_add(after) else {
             let message = "timer deadline overflow".to_string();
             let key = Some(key);
-            return (TaskEvent::Error { key, message }, false);
+            return (TaskEvent::Error { key, message }, None);
         };
 
         if let Some(existing) = self.timers_by_key.get(&key)
             && existing.deadline <= requested_deadline
         {
             let after = existing.deadline.saturating_duration_since(now);
-            return (TaskEvent::TimerScheduled { key, after }, false);
+            return (TaskEvent::TimerScheduled { key, after }, existing.stamp);
         }
 
         let Some(id) = self.allocate_timer_id(requested_deadline) else {
             let message = "timer id space exhausted".to_string();
             let key = Some(key);
-            return (TaskEvent::Error { key, message }, false);
+            return (TaskEvent::Error { key, message }, None);
         };
 
         self.remove_timer(&key);
@@ -431,7 +432,7 @@ impl SchedulerState {
             },
         );
 
-        (TaskEvent::TimerScheduled { key, after }, true)
+        (TaskEvent::TimerScheduled { key, after }, stamp)
     }
 
     fn schedule_idle_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
@@ -818,7 +819,7 @@ impl TaskHandle {
         key: TaskKey,
         after: Duration,
         stamp: Option<u64>,
-    ) -> (TaskEvent, bool) {
+    ) -> (TaskEvent, Option<u64>) {
         let command_key = key.clone();
         let (response, result) = oneshot::channel();
         let command = TaskCommand::ShortenTimer {
@@ -828,16 +829,21 @@ impl TaskHandle {
             response,
         };
         if self.command_tx.send(command).await.is_err() {
-            return (scheduler_unavailable(command_key), false);
+            return (scheduler_unavailable(command_key), None);
         }
-        (result.await).unwrap_or_else(|_| (scheduler_unavailable(command_key), false))
+        (result.await).unwrap_or_else(|_| (scheduler_unavailable(command_key), None))
     }
 
-    /// Moves the wake of `key` earlier as admission `stamp`; answers whether the scheduler armed
-    /// that admission, so the caller writes its row, or kept an earlier wake that owns its own.
-    pub async fn shorten_owned(&self, key: TaskKey, after: Duration, stamp: u64) -> (Event, bool) {
-        let (event, armed) = self.shorten_timer(key, after, Some(stamp)).await;
-        (Event::Task(event), armed)
+    /// Moves the wake of `key` earlier as admission `stamp`; answers the admission whose wake
+    /// holds the key: `stamp` when the scheduler armed it, else the earlier wake it kept.
+    pub async fn shorten_owned(
+        &self,
+        key: TaskKey,
+        after: Duration,
+        stamp: u64,
+    ) -> (Event, Option<u64>) {
+        let (event, holder) = self.shorten_timer(key, after, Some(stamp)).await;
+        (Event::Task(event), holder)
     }
 
     /// Hands a timer change to the scheduler with the due time of the durable row it wrote, so

@@ -545,13 +545,48 @@ async fn renewal_rearm_kept() {
     use aruna_core::federation::PUBLISH_INTERVAL;
 
     let (_temp_dir, handler, task_handle) = refusing_handler();
-    handler.publish_registration().await;
     let key = TaskKey::PublishRegistration;
+    handler.run_trigger(key.clone()).await;
     let after = armed_after(&task_handle, key, PUBLISH_INTERVAL * 2).await;
     assert!(
         after <= PUBLISH_INTERVAL,
         "the renewal stays armed in memory"
     );
+}
+
+// A prompt publication a settings change armed while the renewal ran stays: the run's rearm
+// never postpones it to the full interval, in the scheduler or in its row.
+#[tokio::test]
+async fn renewal_keeps_prompt() {
+    use aruna_core::federation::PUBLISH_INTERVAL;
+    use aruna_storage::task_timers::read_timer;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    let key = TaskKey::PublishRegistration;
+    let prompt = TaskEffect::ShortenTimer {
+        key: key.clone(),
+        after: Duration::from_secs(5),
+    };
+    change_timer(&storage, Some(&task_handle), prompt, false).await;
+    handler.run_trigger(key.clone()).await;
+    let after = armed_after(&task_handle, key.clone(), PUBLISH_INTERVAL).await;
+    assert!(after <= Duration::from_secs(5), "the prompt stays armed");
+    let row = read_timer(&storage, &key).await.expect("reads");
+    let limit = aruna_clock::unix_timestamp_millis() + 5_000;
+    assert!(row.is_some_and(|row| row.due_unix_millis <= limit));
 }
 
 // The backend import pass armed at start stays armed in memory when its row cannot be stored,

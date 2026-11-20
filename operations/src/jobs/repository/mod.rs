@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
@@ -12,7 +13,7 @@ use aruna_core::repository::credential::RepositoryCredential;
 use aruna_core::repository::kind::descriptor;
 use aruna_core::repository::link::LinkFailure;
 use aruna_core::repository::remote::{
-    JobStop, NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, RemoteRequest, StopReason,
+    JobStop, RemoteAnswer, RemoteCall, RemoteFailure, RemoteRequest, StopReason,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::identity::JobId;
@@ -237,19 +238,17 @@ pub fn ensure_supported(
 /// Seals a user's token for the connector's endpoint, and for `link_id` when a link keeps it;
 /// `nonce` must never repeat under the node's credential key.
 pub fn seal_token(
-    scope: &NodeScope,
+    key: Option<CredentialEncryptionKey>,
     user: aruna_core::user::id::UserId,
     view: &ConnectorView,
     link_id: Option<Ulid>,
     token: &str,
     nonce: [u8; 24],
 ) -> Result<RepositoryCredential, TransferError> {
-    let key = scope
-        .credential_key
-        .as_ref()
-        .ok_or_else(|| TransferError::Retryable("node credential key unavailable".into()))?;
+    let unavailable = || TransferError::Retryable("node credential key unavailable".into());
+    let key = key.ok_or_else(unavailable)?;
     Ok(RepositoryCredential::seal_link(
-        (key, nonce),
+        (&key, nonce),
         user,
         view.connector.group_id,
         view.connector.connector_id,

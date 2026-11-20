@@ -170,8 +170,8 @@ impl Intent {
     }
 }
 
-/// Applies a JSON merge patch to `target`, as a dataset patch call does. The SDK's fake host
-/// keeps its own copy; `merge_cases.json` holds both to the same cases.
+/// Applies a JSON merge patch to `target`, as a dataset patch call does. The SDK's fake host uses
+/// it too, and `merge_cases.json` holds it and the other SDKs' fakes to the same cases.
 pub fn merge_into(target: &mut Value, patch: Value) {
     let Value::Object(changes) = patch else {
         *target = patch;

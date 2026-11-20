@@ -622,7 +622,7 @@ pub async fn create_link(
     }
     let link_id = Ulid::generate();
     let secret = seal_token(
-        &context.node_scope(),
+        context.credential_key(),
         auth.user_id,
         &view,
         Some(link_id),

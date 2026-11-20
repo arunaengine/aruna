@@ -3,6 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::inbound_frames;
 use aruna_blob::native;
 use aruna_core::alpn::Alpn;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
@@ -20,12 +24,29 @@ use aruna_net::shard_manifest::{
 use aruna_net::streams::BiStream;
 use aruna_operations::shard::incoming::ManifestAnswer;
 use aruna_operations::triggers::{PeerAnswer, PeerFailure, PeerInput, PeerRequest};
-use tracing::{debug, warn};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, error, warn};
 
 /// A peer request as its protocol frames it, with the admission it holds while it is served.
 pub(crate) struct PeerRead {
     pub(crate) request: PeerRequest,
     pub(crate) slot: Option<HeartbeatSlot>,
+    pub(crate) metadata: Option<MetadataHeld>,
+}
+
+/// What metadata requests share while they are served: the payload bytes and the audit slots.
+#[derive(Debug)]
+pub(crate) struct PeerLimits {
+    pub(crate) frame_budget: Arc<Semaphore>,
+    pub(crate) audit_slots: Arc<Semaphore>,
+}
+
+/// The frame bytes and audit slot a metadata request holds until its answer is written.
+pub(crate) struct MetadataHeld {
+    _budget: OwnedSemaphorePermit,
+    _audit_slot: Option<OwnedSemaphorePermit>,
+    /// An audit request keeps one deadline for every step after it was read.
+    pub(crate) audit: Option<Instant>,
 }
 
 /// Reads the request of one converted protocol in its framing; a refused or broken read is
@@ -35,6 +56,7 @@ pub(crate) async fn read_peer(
     stream: &mut BiStream,
     peer: NodeId,
     net_handle: &NetHandle,
+    limits: &PeerLimits,
 ) -> Option<PeerRead> {
     let (request, slot) = match alpn {
         Alpn::Heartbeat => {
@@ -86,12 +108,49 @@ pub(crate) async fn read_peer(
             }
             (PeerRequest::Frame(frame), None)
         }
+        Alpn::Metadata => return read_metadata(stream, peer, limits).await,
         other => {
             warn!(peer = %peer, alpn = ?other, "No peer table framing for this protocol");
             return None;
         }
     };
-    Some(PeerRead { request, slot })
+    Some(PeerRead {
+        request,
+        slot,
+        metadata: None,
+    })
+}
+
+/// Reads a metadata request within the frame budget; an audit page past the audit slots is read
+/// as refused.
+async fn read_metadata(
+    stream: &mut BiStream,
+    peer: NodeId,
+    limits: &PeerLimits,
+) -> Option<PeerRead> {
+    let read = match inbound_frames::read_request(stream, &limits.frame_budget).await {
+        Ok(read) => read,
+        Err(error) => {
+            error!(peer = %peer, error = ?error, "Failed to read inbound metadata request");
+            return None;
+        }
+    };
+    let slots = limits.audit_slots.clone();
+    let admitted = read.audit.map(|_| slots.try_acquire_owned().ok());
+    let request = PeerRequest::Metadata {
+        message: Box::new(read.message),
+        refused: matches!(admitted, Some(None)),
+    };
+    let held = MetadataHeld {
+        _budget: read.budget,
+        _audit_slot: admitted.flatten(),
+        audit: read.audit,
+    };
+    Some(PeerRead {
+        request,
+        slot: None,
+        metadata: Some(held),
+    })
 }
 
 /// Writes the answer of one converted protocol in its framing and closes the stream.
@@ -99,9 +158,14 @@ pub(crate) async fn write_peer(
     input: &PeerInput,
     mut stream: BiStream,
     answer: Result<PeerAnswer, PeerFailure>,
+    audit: Option<Instant>,
 ) {
     let peer = input.peer;
     let written = match (input.alpn, answer) {
+        (Alpn::Metadata, Ok(PeerAnswer::Metadata((response, body)))) => {
+            let written = inbound_frames::write_answer(stream, audit, &response, body).await;
+            written.map_err(|error| error.to_string())
+        }
         (Alpn::JobControl, Ok(PeerAnswer::Job(answer))) => {
             job_control::write_answer(stream, peer, &answer.response, answer.body).await;
             Ok(())

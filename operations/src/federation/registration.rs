@@ -5,13 +5,15 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
-use aruna_core::federation::{RealmKpis, RealmTotals, Registration, Signed, Withdrawal};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
+use aruna_core::federation::{
+    FederationSignature, PUBLISH_INTERVAL, RealmKpis, RealmTotals, Registration, Signable, Signed,
+    Withdrawal, signing_bytes,
+};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{HttpMethod, HttpRequest, OutboundEffect, OutboundEvent};
-use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use thiserror::Error;
 use tracing::warn;
@@ -57,31 +59,56 @@ struct SignedRequest {
 
 #[derive(Debug, PartialEq)]
 enum SendStep {
+    Sign,
+    SignTotals,
     Config,
     Publication,
     Totals,
 }
 
+/// A publication payload while the adapter signs it.
+#[derive(Debug, PartialEq)]
+enum Unsigned {
+    Registration(Registration),
+    Withdrawal(Withdrawal),
+}
+
 type SendTurn = Result<Next<()>, RegistrationError>;
 
 /// Sends one publication unless the settings changed since it was decided; counting takes time.
-/// A refused totals report only warns: a registry from before that route keeps the registration.
+/// The net adapter signs each body with the node's key, which never enters this operation. A
+/// refused totals report, or totals that cannot be signed, only warn.
 #[derive(Debug, PartialEq)]
 pub(crate) struct SendRegistrationOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    capabilities: NodeCapabilities,
     publication: Publication,
     counts: RegistrationCounts,
     now: u64,
+    unsigned: Option<Unsigned>,
     request: Option<SignedRequest>,
     step: SendStep,
+}
+
+/// The call that asks the net adapter to sign `payload` with the node's federation key.
+fn sign_call<T: Signable>(payload: &T) -> Result<IoCall, RegistrationError> {
+    let bytes = signing_bytes(payload).map_err(failed)?;
+    Ok(IoCall::from(Effect::Net(NetEffect::FederationSign(bytes))))
+}
+
+/// The signature the net adapter answered, or why it could not sign.
+fn signature(result: IoResult) -> Result<Result<FederationSignature, String>, IoError> {
+    let Event::Net(NetEvent::FederationSigned(signed)) = result.event()? else {
+        let expected = "NetEvent::FederationSigned";
+        let got = "another event";
+        return Err(IoError::Unexpected { expected, got });
+    };
+    Ok(signed)
 }
 
 impl SendRegistrationOperation {
     pub(crate) fn new(
         (realm_id, node_id): (RealmId, NodeId),
-        capabilities: NodeCapabilities,
         publication: Publication,
         counts: RegistrationCounts,
         now: u64,
@@ -89,60 +116,96 @@ impl SendRegistrationOperation {
         Self {
             realm_id,
             node_id,
-            capabilities,
             publication,
             counts,
             now,
+            unsigned: None,
             request: None,
-            step: SendStep::Config,
+            step: SendStep::Sign,
         }
     }
 
-    fn sign(&self) -> Result<Option<SignedRequest>, RegistrationError> {
-        let (method, registry_url, body, totals) = match &self.publication {
-            Publication::Nothing => return Ok(None),
+    /// The payload this publication sends, or `None` for nothing.
+    fn payload(&self) -> Option<Unsigned> {
+        match &self.publication {
+            Publication::Nothing => None,
             Publication::Register {
-                registry_url,
                 descriptor,
                 nodes_configured,
-            } => {
-                let registration = Registration {
-                    descriptor: descriptor.clone(),
-                    kpis: RealmKpis {
-                        nodes_configured: *nodes_configured,
-                        ..self.counts.kpis
-                    },
-                    observed_at: self.now,
-                    issued_at: self.now,
-                };
-                let signed = Signed::sign(registration, &self.capabilities).map_err(failed)?;
+                ..
+            } => Some(Unsigned::Registration(Registration {
+                descriptor: descriptor.clone(),
+                kpis: RealmKpis {
+                    nodes_configured: *nodes_configured,
+                    ..self.counts.kpis
+                },
+                observed_at: self.now,
+                issued_at: self.now,
+            })),
+            Publication::Withdraw { .. } => Some(Unsigned::Withdrawal(Withdrawal {
+                realm_id: self.realm_id,
+                issued_at: self.now,
+            })),
+        }
+    }
+
+    /// The request the signed payload makes, and the totals it still has to sign.
+    fn signed(&mut self, signature: FederationSignature) -> SendTurn {
+        let (method, registry_url, body) = match (self.unsigned.take(), &self.publication) {
+            (Some(Unsigned::Registration(payload)), Publication::Register { registry_url, .. }) => {
+                let signed = Signed::with_signature(payload, signature);
                 let body = serde_json::to_vec(&signed).map_err(failed)?;
-                (HttpMethod::Put, registry_url, body, self.signed_totals())
+                (HttpMethod::Put, registry_url, body)
             }
-            Publication::Withdraw { registry_url, .. } => {
-                let withdrawal = Withdrawal {
-                    realm_id: self.realm_id,
-                    issued_at: self.now,
-                };
-                let signed = Signed::sign(withdrawal, &self.capabilities).map_err(failed)?;
+            (Some(Unsigned::Withdrawal(payload)), Publication::Withdraw { registry_url, .. }) => {
+                let signed = Signed::with_signature(payload, signature);
                 let body = serde_json::to_vec(&signed).map_err(failed)?;
-                (HttpMethod::Delete, registry_url, body, None)
+                (HttpMethod::Delete, registry_url, body)
             }
+            _ => return Err(IoError::Unfinished.into()),
         };
         let url = realm_url(registry_url, &self.realm_id).map_err(RegistrationError::Failed)?;
-        Ok(Some(SignedRequest {
+        self.request = Some(SignedRequest {
             method,
             url,
             body,
-            totals,
-        }))
+            totals: None,
+        });
+        match (method, self.counts.totals) {
+            (HttpMethod::Put, Some(totals)) => match sign_call(&totals) {
+                Ok(call) => {
+                    self.step = SendStep::SignTotals;
+                    Ok(Next::Call(call))
+                }
+                Err(error) => {
+                    warn!(error = %error, "Signing realm totals failed");
+                    self.read_config()
+                }
+            },
+            _ => self.read_config(),
+        }
     }
 
-    fn signed_totals(&self) -> Option<Vec<u8>> {
-        let signed = Signed::sign(self.counts.totals?, &self.capabilities)
+    /// Attaches the totals signature; totals that cannot be signed are left out.
+    fn totals_signed(&mut self, signature: Result<FederationSignature, String>) -> SendTurn {
+        let signed = signature
             .inspect_err(|error| warn!(error = %error, "Signing realm totals failed"))
-            .ok()?;
-        serde_json::to_vec(&signed).ok()
+            .ok()
+            .zip(self.counts.totals)
+            .and_then(|(signature, totals)| {
+                serde_json::to_vec(&Signed::with_signature(totals, signature)).ok()
+            });
+        if let Some(request) = self.request.as_mut() {
+            request.totals = signed;
+        }
+        self.read_config()
+    }
+
+    fn read_config(&mut self) -> SendTurn {
+        self.step = SendStep::Config;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
     }
 
     fn send_totals(&mut self) -> SendTurn {
@@ -201,17 +264,32 @@ impl Operation for SendRegistrationOperation {
     type Error = RegistrationError;
 
     fn first(&mut self) -> SendTurn {
-        self.request = self.sign()?;
-        if self.request.is_none() {
-            return Ok(Next::Done(()));
-        }
-        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
-            self.realm_id,
-        ))))
+        let call = match self.payload() {
+            None => return Ok(Next::Done(())),
+            Some(Unsigned::Registration(payload)) => {
+                let call = sign_call(&payload)?;
+                self.unsigned = Some(Unsigned::Registration(payload));
+                call
+            }
+            Some(Unsigned::Withdrawal(payload)) => {
+                let call = sign_call(&payload)?;
+                self.unsigned = Some(Unsigned::Withdrawal(payload));
+                call
+            }
+        };
+        Ok(Next::Call(call))
     }
 
     fn next(&mut self, result: IoResult) -> SendTurn {
         match self.step {
+            SendStep::Sign => {
+                let signature = signature(result)?.map_err(RegistrationError::Failed)?;
+                self.signed(signature)
+            }
+            SendStep::SignTotals => {
+                let signature = signature(result)?;
+                self.totals_signed(signature)
+            }
             SendStep::Config => {
                 let current = result.child::<RealmConfigDocument, GetConfigError>()?;
                 let current = current.map_err(failed)?;
@@ -259,7 +337,6 @@ fn known<T, E: std::fmt::Display>(count: Result<T, E>, name: &'static str) -> Op
 pub struct PublishRegistrationOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    capabilities: NodeCapabilities,
     publication: Publication,
     counts: RegistrationCounts,
     now: u64,
@@ -267,11 +344,10 @@ pub struct PublishRegistrationOperation {
 }
 
 impl PublishRegistrationOperation {
-    pub fn new(realm_id: RealmId, node_id: NodeId, capabilities: NodeCapabilities) -> Self {
+    pub fn new(realm_id: RealmId, node_id: NodeId) -> Self {
         Self {
             realm_id,
             node_id,
-            capabilities,
             publication: Publication::Nothing,
             counts: RegistrationCounts::default(),
             now: 0,
@@ -282,13 +358,8 @@ impl PublishRegistrationOperation {
     fn send(&mut self) -> SendTurn {
         self.step = PublishStep::Send;
         let publication = std::mem::replace(&mut self.publication, Publication::Nothing);
-        let send = SendRegistrationOperation::new(
-            (self.realm_id, self.node_id),
-            self.capabilities.clone(),
-            publication,
-            self.counts,
-            self.now,
-        );
+        let key = (self.realm_id, self.node_id);
+        let send = SendRegistrationOperation::new(key, publication, self.counts, self.now);
         Ok(Next::Call(IoCall::child(send)))
     }
 }
@@ -378,13 +449,45 @@ fn realm_url(registry_url: &Url, realm_id: &RealmId) -> Result<Url, String> {
         .map_err(|error| error.to_string())
 }
 
+/// One registry renewal timer run: publishes what this node decides and plans the next renewal,
+/// also after a failed one, so a transient failure never lets the registration lapse.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenewalTimerOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+}
+
+impl RenewalTimerOperation {
+    pub fn new(realm_id: RealmId, node_id: NodeId) -> Self {
+        Self { realm_id, node_id }
+    }
+}
+
+impl Operation for RenewalTimerOperation {
+    type Output = Option<Duration>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<Duration>>, IoError> {
+        let publish = PublishRegistrationOperation::new(self.realm_id, self.node_id);
+        Ok(Next::Call(IoCall::child(publish)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Duration>>, IoError> {
+        if let Err(error) = result.child::<(), RegistrationError>()? {
+            warn!(%error, "Failed to publish registry registration");
+        }
+        Ok(Next::Done(Some(PUBLISH_INTERVAL)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use aruna_core::calls::ChildOutcome;
     use aruna_core::federation::{
-        AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
+        AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, sign_bytes,
     };
     use aruna_core::outbound::OutboundError;
+    use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use ed25519_dalek::SigningKey;
 
@@ -460,7 +563,39 @@ mod tests {
             }),
         };
         let key = (realm(), node());
-        SendRegistrationOperation::new(key, capabilities(), publication, counts, NOW)
+        SendRegistrationOperation::new(key, publication, counts, NOW)
+    }
+
+    /// The signature event the net adapter answers `bytes` with on a node holding `key`.
+    fn signed_by(key: Option<NodeCapabilities>, bytes: &[u8]) -> IoResult {
+        let key = key.ok_or_else(|| "this node holds no federation signing key".to_string());
+        let signed = key.and_then(|key| sign_bytes(bytes, &key).map_err(|error| error.to_string()));
+        IoResult::Event(Box::new(Event::Net(NetEvent::FederationSigned(signed))))
+    }
+
+    /// Starts `send` and answers its signing calls with `key`, up to its first other turn.
+    fn start_with(send: &mut SendRegistrationOperation, key: Option<NodeCapabilities>) -> SendTurn {
+        let mut turn = send.first();
+        while let Ok(Next::Call(IoCall::Effect(effect))) = &turn
+            && let Effect::Net(NetEffect::FederationSign(bytes)) = effect.as_ref()
+        {
+            let answer = signed_by(key.clone(), bytes);
+            turn = send.next(answer);
+        }
+        turn
+    }
+
+    fn start(send: &mut SendRegistrationOperation) -> SendTurn {
+        start_with(send, Some(capabilities()))
+    }
+
+    // A node without a signing key sends nothing: its registration fails before any request.
+    #[test]
+    fn unsigned_publication_fails() {
+        let mut send = operation(register(), true);
+        let failed = start_with(&mut send, None);
+        let expected = "this node holds no federation signing key".to_string();
+        assert_eq!(failed, Err(RegistrationError::Failed(expected)));
     }
 
     fn current(registration: RegistrationMode) -> IoResult {
@@ -497,7 +632,7 @@ mod tests {
     fn registers_then_totals() {
         let mut send = operation(register(), true);
         let read = IoCall::child(GetConfigOperation::new(realm()));
-        assert_eq!(send.first(), Ok(Next::Call(read)));
+        assert_eq!(start(&mut send), Ok(Next::Call(read)));
         let request = sent(send.next(current(RegistrationMode::Enabled)));
         let route = format!("https://registry.example.org/v1/realms/{}", realm());
         assert_eq!(
@@ -513,7 +648,7 @@ mod tests {
     #[test]
     fn changed_settings_stop() {
         let mut send = operation(register(), false);
-        send.first().unwrap();
+        start(&mut send).unwrap();
         let answer = send.next(current(RegistrationMode::Disabled));
         assert_eq!(answer, Ok(Next::Done(())));
     }
@@ -521,13 +656,13 @@ mod tests {
     #[test]
     fn refused_publication_fails() {
         let mut send = operation(register(), true);
-        send.first().unwrap();
+        start(&mut send).unwrap();
         send.next(current(RegistrationMode::Enabled)).unwrap();
         let answer = send.next(answered(Ok(403)));
         let expected = "registry answered 403 Forbidden".to_string();
         assert_eq!(answer, Err(RegistrationError::Failed(expected)));
         let mut unreachable = operation(register(), false);
-        unreachable.first().unwrap();
+        start(&mut unreachable).unwrap();
         unreachable
             .next(current(RegistrationMode::Enabled))
             .unwrap();
@@ -542,7 +677,7 @@ mod tests {
             issued_at: 1,
         };
         let mut send = operation(withdraw, true);
-        send.first().unwrap();
+        start(&mut send).unwrap();
         let request = sent(send.next(current(RegistrationMode::Disabled)));
         assert_eq!(request.method, HttpMethod::Delete);
         assert_eq!(send.next(answered(Ok(204))), Ok(Next::Done(())));
@@ -563,7 +698,7 @@ mod tests {
     }
 
     fn publisher() -> PublishRegistrationOperation {
-        let mut publish = PublishRegistrationOperation::new(realm(), node(), capabilities());
+        let mut publish = PublishRegistrationOperation::new(realm(), node());
         publish.stamp(NOW * 1_000);
         publish
     }
@@ -580,7 +715,7 @@ mod tests {
 
     fn sends(publication: Publication, counts: RegistrationCounts) -> SendTurn {
         let key = (realm(), node());
-        let send = SendRegistrationOperation::new(key, capabilities(), publication, counts, NOW);
+        let send = SendRegistrationOperation::new(key, publication, counts, NOW);
         Ok(Next::Call(IoCall::child(send)))
     }
 

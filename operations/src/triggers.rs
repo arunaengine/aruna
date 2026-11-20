@@ -12,15 +12,18 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::offer::BackendLimits;
 use aruna_core::document::ShardTransportMessage;
+use aruna_core::federation::PUBLISH_INTERVAL;
 use aruna_core::git::GitNode;
 use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRequest;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::native_reference::{
     NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
 };
 use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
@@ -40,6 +43,7 @@ use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::device::publish_queue::DrainOutcome;
 use crate::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
+use crate::federation::registration::RenewalTimerOperation;
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::backend_import::schedule::RunDueOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
@@ -50,6 +54,7 @@ use crate::jobs::node_inputs::witness_node;
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::records::prune::pass::PruneFamiliesOperation;
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
+use crate::jobs::repository::link_queue::LinkRunOperation;
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::device::drain::{
     DrainPublishOperation, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, drain_publish_queue,
@@ -58,10 +63,12 @@ use crate::metadata::materialization_queue::MATERIALIZATION_RETRY_AFTER;
 use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
 use crate::metadata::prune_queue::GRAPH_RETRY_AFTER;
 use crate::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperation};
+use crate::metadata::serve::ServedReply;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::catch_up::{CATCH_UP_REFRESH, CatchUpOperation, next_pass};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
+use crate::node::peer_metadata::{MetadataNode, MetadataPeerOperation};
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
 use crate::node::range_timer::RangeTimerOperation;
@@ -81,6 +88,7 @@ use crate::replication::catch_up::CatchUpCursors;
 use crate::replication::drain_timer::ReplicationTimerOperation;
 use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
 use crate::replication::mirror_repair::drain::DrainRepairsOperation;
+use crate::s3::bucket::audit_retry::AuditTimerOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
@@ -175,6 +183,12 @@ pub struct TimerNeeds {
     /// The fresh heartbeats and executor limits.
     pub cluster: bool,
     pub cores: bool,
+}
+
+/// Whether the timer of `key` rearms with a shorten after a run, so a wake armed while it ran,
+/// such as the prompt publication of a settings change, is never postponed.
+pub fn keeps_earlier(key: &TaskKey) -> bool {
+    matches!(key, TaskKey::PublishRegistration)
 }
 
 /// The costly inputs the timer of `key` reads.
@@ -281,6 +295,9 @@ pub enum TimerOperation {
     DrainWitnessQueue(WitnessDrainOperation),
     RunBackendImports(RunDueOperation),
     MaintainRanges(RangeTimerOperation),
+    PublishRegistration(RenewalTimerOperation),
+    DrainLinkQueue(LinkRunOperation),
+    RecordAudit(AuditTimerOperation),
     RefreshBlobHolders(HoldersTimerOperation),
     DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
@@ -439,6 +456,28 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
         }),
+        // The net adapter signs with the node's key, so no key enters this input.
+        TaskKey::PublishRegistration => Some(match input.serving {
+            Some((node_id, realm_id)) => {
+                let renewal = RenewalTimerOperation::new(realm_id, node_id);
+                TimerOperation::PublishRegistration(renewal)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(Some(PUBLISH_INTERVAL))),
+        }),
+        // The connector opens stored tokens through the net adapter, so no key enters this scope.
+        TaskKey::DrainLinkQueue => {
+            let scope = NodeScope {
+                node: input.serving,
+                has_blob: input.has_blob,
+                has_tasks: input.has_tasks,
+            };
+            let drain = LinkRunOperation::new(scope);
+            Some(TimerOperation::DrainLinkQueue(drain))
+        }
+        TaskKey::RecordAudit { .. } => {
+            let store = AuditTimerOperation::new(key.clone());
+            Some(TimerOperation::RecordAudit(store))
+        }
         TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
             input,
         ))),
@@ -506,6 +545,9 @@ macro_rules! each_timer {
             TimerOperation::DrainWitnessQueue($operation) => $body,
             TimerOperation::RunBackendImports($operation) => $body,
             TimerOperation::MaintainRanges($operation) => $body,
+            TimerOperation::PublishRegistration($operation) => $body,
+            TimerOperation::DrainLinkQueue($operation) => $body,
+            TimerOperation::RecordAudit($operation) => $body,
             TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
@@ -889,6 +931,26 @@ impl TimerRun for RunDueOperation {
     }
 }
 
+impl TimerRun for RenewalTimerOperation {
+    /// A renewal runs again after the publication interval, also after a failed run.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.unwrap_or(Some(PUBLISH_INTERVAL));
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for AuditTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
+    }
+}
+
+impl TimerRun for LinkRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
+    }
+}
+
 impl TimerRun for RangeTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(|error| TimerFailure {
@@ -958,6 +1020,8 @@ pub struct PeerInput {
     pub local_realm: RealmId,
     pub now_ms: u64,
     pub request: PeerRequest,
+    /// What this node offers a metadata request; empty for every other protocol.
+    pub metadata: MetadataNode,
 }
 
 /// A request as the peer shell read it in its protocol's framing.
@@ -971,6 +1035,11 @@ pub enum PeerRequest {
     Job(JobRequest),
     /// A native reference read or head request.
     Native(NativeReferenceRequest),
+    /// A metadata stream request, and whether the inbound audit slots refused it.
+    Metadata {
+        message: Box<MetadataTransportMessage>,
+        refused: bool,
+    },
 }
 
 /// What a peer operation answers; the shell writes it in its protocol's framing.
@@ -984,13 +1053,15 @@ pub enum PeerAnswer {
     Job(JobAnswer),
     /// A native reference answer and its bytes, for a read.
     Native(NativeAnswer),
+    /// A metadata reply and, for an export, the body sent after it.
+    Metadata(ServedReply),
     /// The request was kept or dropped without an answer.
     Kept,
 }
 
 impl PeerAnswer {
     /// The answer to a request whose run broke off, where its protocol has one: job control and
-    /// native references answer unavailable, the other protocols close the stream.
+    /// native references answer unavailable, metadata its refusal, the others close the stream.
     pub fn unavailable(alpn: Alpn, failure: &PeerFailure) -> Option<PeerAnswer> {
         match alpn {
             Alpn::JobControl => Some(PeerAnswer::Job(JobAnswer::unavailable(failure))),
@@ -1000,6 +1071,10 @@ impl PeerAnswer {
                     NativeReferenceResponse::Rejected(reject),
                     None,
                 )))
+            }
+            Alpn::Metadata => {
+                let reject = MetadataTransportMessage::Reject(failure.to_string());
+                Some(PeerAnswer::Metadata((reject, None)))
             }
             _ => None,
         }
@@ -1041,6 +1116,8 @@ pub enum PeerOperation {
     Job(JobRequestOperation),
     /// A native reference request this node answers from its own copies.
     Native(NativeAnswerOperation),
+    /// A metadata stream request, answered by the operation its message kind names.
+    Metadata(MetadataPeerOperation),
 }
 
 /// How long a notification request may run with its retries, so a slow store cannot hold the
@@ -1054,7 +1131,8 @@ impl PeerOperation {
             PeerOperation::Heartbeat(_)
             | PeerOperation::Manifest(_)
             | PeerOperation::Job(_)
-            | PeerOperation::Native(_) => None,
+            | PeerOperation::Native(_)
+            | PeerOperation::Metadata(_) => None,
             _ => Some(NOTIFICATION_AUTH_TIMEOUT),
         }
     }
@@ -1084,6 +1162,13 @@ pub fn peer_operation(input: &PeerInput) -> Option<PeerOperation> {
             let ids = Some((input.local_node, input.local_realm));
             let operation = NativeAnswerOperation::new(ids, input.peer, request.clone());
             Some(PeerOperation::Native(operation))
+        }
+        (Alpn::Metadata, PeerRequest::Metadata { message, refused }) => {
+            let (local, message) = ((input.local_node, input.local_realm), *message.clone());
+            let (peer, now_ms, node) = (input.peer, input.now_ms, input.metadata.clone());
+            let operation =
+                MetadataPeerOperation::new(local, peer, now_ms, message, *refused, node);
+            Some(PeerOperation::Metadata(operation))
         }
         (Alpn::Notification, PeerRequest::Frame(frame)) => {
             let deliver = DeliverInput {
@@ -1171,6 +1256,14 @@ impl PeerRun for JobRequestOperation {
     }
 }
 
+impl PeerRun for MetadataPeerOperation {
+    /// A run that broke off is answered with its refusal.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        let reject = |error: IoError| (MetadataTransportMessage::Reject(error.to_string()), None);
+        Ok(PeerAnswer::Metadata(result.unwrap_or_else(reject)))
+    }
+}
+
 impl PeerRun for NativeAnswerOperation {
     /// A run that broke off is answered as unavailable, like any other refusal.
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
@@ -1251,6 +1344,7 @@ macro_rules! each_peer {
             PeerOperation::Manifest($operation) => $body,
             PeerOperation::Job($operation) => $body,
             PeerOperation::Native($operation) => $body,
+            PeerOperation::Metadata($operation) => $body,
         }
     };
 }
@@ -1615,6 +1709,18 @@ mod tests {
     }
 
     #[test]
+    fn renewal_without_network() {
+        // A node without a network keeps its renewal armed; a broken run also renews later.
+        let mut idle = timer_operation(&TaskKey::PublishRegistration, &input()).unwrap();
+        let next = TimerPlan::from(Some(PUBLISH_INTERVAL));
+        assert_eq!(idle.first(), Ok(Next::Done(next.clone())));
+        assert_eq!(
+            RenewalTimerOperation::rearm(Err(IoError::Unfinished)),
+            Ok(next)
+        );
+    }
+
+    #[test]
     fn prune_key_named() {
         let operation = timer_operation(&TaskKey::PruneNotifications, &input());
         assert_eq!(
@@ -1683,7 +1789,23 @@ mod tests {
             local_realm: RealmId::from_bytes([1; 32]),
             now_ms: 1_000,
             request,
+            metadata: MetadataNode::default(),
         }
+    }
+
+    // A metadata request names its operation; a run that broke off is answered with its refusal.
+    #[test]
+    fn metadata_request_named() {
+        let message = Box::new(MetadataTransportMessage::ForwardedWriteUnavailable);
+        let request = PeerRequest::Metadata {
+            message,
+            refused: false,
+        };
+        let operation = peer_operation(&peer_request(Alpn::Metadata, request));
+        assert!(matches!(operation, Some(PeerOperation::Metadata(_))));
+        let broken = MetadataPeerOperation::answer(Err(IoError::Unfinished));
+        let reject = MetadataTransportMessage::Reject(IoError::Unfinished.to_string());
+        assert_eq!(broken, Ok(PeerAnswer::Metadata((reject, None))));
     }
 
     // A heartbeat frame and a manifest request name their operations; a heartbeat is never

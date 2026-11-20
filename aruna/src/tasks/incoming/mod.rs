@@ -10,15 +10,13 @@ use std::time::{Duration, Instant};
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::document::{
-    DocumentEffect, DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord,
-    DocumentSyncPublish, DocumentTarget,
+    DocumentEffect, DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget,
 };
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::identity::JobExecutionClass;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
-use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -45,7 +43,7 @@ impl Drop for OutboxBarrier {
 }
 
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, node_routing};
-use aruna_drivers::effect_adapters::task::change_timer;
+use aruna_drivers::effect_adapters::task::{arm_unless_stored, change_timer};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
@@ -98,11 +96,9 @@ use crate::tasks::task_persistence::restore_task_timers;
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 use aruna_drivers::driver::node_facts;
-use aruna_operations::notifications::email::RefreshMailOperation;
 use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use aruna_operations::notifications::prune::RestorePruneOperation;
 use aruna_operations::notifications::watch::digest::InterestOperation;
-use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::table::RebuildTableOperation;
 use aruna_operations::queue_backoff::retry_delay_ms;
 use aruna_operations::replication::drain::RestoreDrainOperation;
@@ -111,15 +107,19 @@ use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
+use aruna_operations::sync::outbox::batches::{
+    DrainInvocation, DrainSubBatch, DrainSyncOutcome, build_drain_batches,
+    resolve_publish_placement,
+};
 use aruna_operations::sync::outbox::defer::{
-    DrainDeferState, DrainRecord, admin_origin, classify_deferred_record, partition_drain_records,
+    DrainRecord, classify_deferred_record, partition_drain_records,
 };
 use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::outbox::rotation::OutboxRotation;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
-    TimerInput, TimerMemory, TimerPlan, timer_needs, timer_operation,
+    TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
 };
 use aruna_storage::task_timers::delete_persisted_timer;
 use folder_pass::{restore_publish_timer, restore_sync_timers};
@@ -136,7 +136,6 @@ pub mod restore;
 pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-const DRAIN_SUBBATCH_RECORDS: usize = 512;
 /// Outbox records remembered as published; past it they are forgotten and published once
 /// more, which only costs log space.
 const MAX_PUBLISHED_RECORDS: usize = 65_536;
@@ -201,57 +200,6 @@ pub(crate) struct OperationsTaskHandler {
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
     // Signs registry publications; `None` where no node identity was supplied.
-    node_capabilities: Option<NodeCapabilities>,
-}
-
-struct DrainSubBatch {
-    peers: Vec<aruna_core::id::NodeId>,
-    documents: Vec<DocumentSyncPublish>,
-    topics: Vec<irokle::TopicId>,
-    /// Admin origin of each entry, so a blocked publish also blocks the rest of
-    /// that origin's sequence.
-    origins: Vec<Option<aruna_core::id::NodeId>>,
-    targets: Vec<DocumentTarget>,
-    record_keys: Vec<Vec<u8>>,
-}
-
-#[derive(Default)]
-struct DrainSyncOutcome {
-    sync_elapsed: Duration,
-    project_elapsed: Duration,
-    delete_elapsed: Duration,
-    retry_needed: bool,
-    deleted: usize,
-    /// Ordering domains to block for the rest of the rotation.
-    blocked_topics: Vec<irokle::TopicId>,
-    blocked_origins: Vec<aruna_core::id::NodeId>,
-}
-
-type StuckRecord = (
-    u64,
-    DocumentTarget,
-    irokle::TopicId,
-    aruna_core::structs::placement::record::PlacementRef,
-);
-
-struct DrainInvocation {
-    outcome: DrainSyncOutcome,
-    defer: DrainDeferState,
-    cursor: Option<Vec<u8>>,
-    reached_end: bool,
-    scan_elapsed: Duration,
-    publish_elapsed: Duration,
-    records: usize,
-    deferred: usize,
-    stuck: usize,
-    oldest_stuck: Option<StuckRecord>,
-    undeliverable: usize,
-    groups: usize,
-    subbatches: usize,
-    pages: usize,
-    oldest_record_ms: Option<u64>,
-    read_failed: bool,
-    config_drained: bool,
 }
 
 enum DrainPage {
@@ -276,13 +224,7 @@ impl OperationsTaskHandler {
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
-            node_capabilities: None,
         }
-    }
-
-    fn with_node_capabilities(mut self, capabilities: Option<NodeCapabilities>) -> Self {
-        self.node_capabilities = capabilities;
-        self
     }
 
     fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -467,7 +409,11 @@ impl OperationsTaskHandler {
     /// Re-arms a timer in memory even when storage cannot persist it, so an outage does not end
     /// the retries; the persisted copy is best effort.
     async fn keep_retrying(&self, key: TaskKey, after: std::time::Duration) {
-        let effect = TaskEffect::ResetTimer { key, after };
+        self.rearm_live(TaskEffect::ResetTimer { key, after }).await;
+    }
+
+    /// Applies a timer arming in memory even when storage cannot persist it.
+    async fn rearm_live(&self, effect: TaskEffect) {
         let storage = &self.context.storage_handle;
         let task_handle = self.context.task_handle.as_ref();
         if let Event::Task(TaskEvent::Error { key, message }) =
@@ -625,7 +571,11 @@ impl OperationsTaskHandler {
             return;
         };
         // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
-        self.keep_retrying(key, after).await;
+        let effect = match keeps_earlier(&key) {
+            true => TaskEffect::ShortenTimer { key, after },
+            false => TaskEffect::ResetTimer { key, after },
+        };
+        self.rearm_live(effect).await;
     }
 
     /// What a timer kept from its last run, empty for its first run since the start.
@@ -717,28 +667,17 @@ impl OperationsTaskHandler {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
                 }
             }),
-            key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
-                use aruna_operations::s3::bucket::audit_retry::{AUDIT_RETRY, StoreAuditOperation};
-                // The key change already applies; only its record waits for storage.
-                let store = StoreAuditOperation::new(key.clone());
-                if let Err(error) = drive(store, &self.context).await {
-                    warn!(error = %error, "Bucket key audit record still not stored");
-                    self.keep_retrying(key, AUDIT_RETRY).await;
-                }
-            }),
+            // The key change already applies; only its record waits for storage.
+            TaskKey::RecordAudit { .. } => Box::pin(self.run_trigger(key)),
             TaskKey::DeliverKeyWakes => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishRegistration => Box::pin(async move {
-                self.publish_registration().await;
-            }),
+            TaskKey::PublishRegistration => Box::pin(self.run_trigger(key)),
             TaskKey::PruneConnectorReferences => Box::pin(self.run_trigger(key)),
             TaskKey::MaintainRanges => Box::pin(self.run_trigger(key)),
             TaskKey::RunBackendImports => Box::pin(self.run_trigger(key)),
             TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::DrainWitnessQueue => Box::pin(self.run_trigger(key)),
             TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainLinkQueue => Box::pin(async move {
-                self.drain_link_queue().await;
-            }),
+            TaskKey::DrainLinkQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCaptures => Box::pin(self.run_trigger(key)),
             TaskKey::ReconcileSyncedFolders => Box::pin(async move {
                 let after = match folder_pass::reconcile_folders(&self.context).await {
