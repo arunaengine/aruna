@@ -156,9 +156,6 @@ use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::table::RebuildTableOperation;
 use aruna_operations::queue_backoff::retry_delay_ms;
-use aruna_operations::realm::announce_presence::{
-    AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
-};
 use aruna_operations::replication::drain::{
     ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
 };
@@ -862,30 +859,7 @@ impl OperationsTaskHandler {
 
     fn timer_work(&self, key: TaskKey) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         match key {
-            TaskKey::RealmPresence { realm_id, node_id } => Box::pin(async move {
-                // A User-kind device is DHT read-only and never publishes
-                // presence. An unreadable config is bootstrap, which announces.
-                let config = drive(GetConfigOperation::new(realm_id), &self.context).await;
-                let origin = config.ok().and_then(|config| {
-                    aruna_operations::forward::routing::is_user_origin(&config, node_id)
-                });
-                if origin == Some(true) {
-                    return;
-                }
-                let op = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-                    realm_id,
-                    node_id,
-                    schedule_refresh: true,
-                });
-                if let Err(err) = drive(op, self.context.as_ref()).await {
-                    error!(error = ?err, "Failed to process realm presence timer event");
-                    self.reschedule_timer(
-                        TaskKey::RealmPresence { realm_id, node_id },
-                        PRESENCE_REFRESH_AFTER,
-                    )
-                    .await;
-                }
-            }),
+            TaskKey::RealmPresence { .. } => Box::pin(self.run_trigger(key)),
             TaskKey::SyncPlacements { .. } => Box::pin(self.run_trigger(key)),
             TaskKey::DrainSyncOutbox => Box::pin(async move {
                 self.drain_sync_outbox().await;

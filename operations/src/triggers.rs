@@ -20,6 +20,7 @@ use thiserror::Error;
 
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
+use crate::node::presence_timer::PresenceTimerOperation;
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::holder::HolderRead;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
@@ -117,6 +118,7 @@ pub enum TimerOperation {
     DrainWatchEvents(WatchDrainOperation),
     DrainAppliedSync(AppliedDrainOperation),
     SyncPlacements(PlacementTimerOperation),
+    RealmPresence(PresenceTimerOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -140,6 +142,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::SyncPlacements { realm_id, node_id } => Some(TimerOperation::SyncPlacements(
             PlacementTimerOperation::new(*realm_id, *node_id, input),
         )),
+        TaskKey::RealmPresence { realm_id, node_id } => Some(TimerOperation::RealmPresence(
+            PresenceTimerOperation::new(*realm_id, *node_id),
+        )),
         _ => None,
     }
 }
@@ -154,6 +159,7 @@ macro_rules! each_timer {
             TimerOperation::DrainWatchEvents($operation) => $body,
             TimerOperation::DrainAppliedSync($operation) => $body,
             TimerOperation::SyncPlacements($operation) => $body,
+            TimerOperation::RealmPresence($operation) => $body,
         }
     };
 }
@@ -274,6 +280,12 @@ impl TimerRun for AppliedDrainOperation {
 
 impl TimerRun for PlacementTimerOperation {
     /// The operation plans its own next run; a failed run reads as a storage failure.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for PresenceTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
     }
