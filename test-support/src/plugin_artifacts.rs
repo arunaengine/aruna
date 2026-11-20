@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::PublishedPlugin;
 use aruna_drivers::driver::drive;
-use aruna_operations::plugins::copy_rows::StoreCopy;
+use aruna_operations::plugins::copy::rows::StoreCopy;
 use aruna_operations::plugins::install::InstallRequest;
 use aruna_operations::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use aruna_plugin_types::artifact::{ArtifactDigest, attach_manifest, read_manifest};

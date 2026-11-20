@@ -21,7 +21,7 @@ use ulid::Ulid;
 
 use super::artifacts::managers;
 use super::check::{CallError, RunScope};
-use super::host_steps::{
+use super::host::steps::{
     CheckConfigured, CheckReply, ConfiguredCall, ConnectionAsk, ConnectionPlan, PrepareConnection,
     ReplyPlan,
 };

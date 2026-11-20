@@ -377,7 +377,7 @@ async fn fill(
     );
     acquired
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::derive(
+        .open_vault(aruna_core::node::vault::NodeVaultKey::derive(
             &config.node_state.net_secret_key,
         ));
     // Only holders of the realm signing key derive the realm keys; storage opens with them.

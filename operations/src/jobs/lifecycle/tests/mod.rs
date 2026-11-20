@@ -27,7 +27,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use crate::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
+use crate::jobs::lifecycle::admit::here::{AcceptedSubmission, placement_failure};
 use crate::jobs::lifecycle::cancel::{CancelFamilyOperation, PublishDeletionOperation};
 use crate::jobs::lifecycle::family_reads::{
     FamilyLogOperation, FamilyReportOperation, FamilyStatusOperation, SessionJobOperation,

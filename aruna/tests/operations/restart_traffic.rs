@@ -19,7 +19,7 @@ use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::shard::restore::RestoreTopicsOperation;
-use aruna_operations::shard::restore_plan::RESTORE_TOPIC_COUNT;
+use aruna_operations::shard::restore::plan::RESTORE_TOPIC_COUNT;
 use tempfile::TempDir;
 use ulid::Ulid;
 

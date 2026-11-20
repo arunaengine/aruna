@@ -15,7 +15,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::SubmissionId;
 use tracing::{debug, warn};
 
-use super::admit_here::AcceptedSubmission;
+use super::admit::here::AcceptedSubmission;
 use aruna_core::job_request::{RequestIdentity, SubmissionRequest, SubmitJobError};
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,
@@ -24,10 +24,9 @@ use aruna_core::metadata::protocol::{
 /// Upper bound of one forwarded request; the transport's own step limits end it earlier.
 const FORWARD_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Forwards the complete request and its preassigned identity one hop. The holder revalidates
-/// the caller and recomputes the identity itself, so this node never becomes the authority for
-/// a job it does not hold. A holder that read the request and refused it answers for every
-/// holder; an unreachable or unwilling one leaves the next to try.
+/// Forwards the request and its preassigned identity one hop; the holder revalidates both, so this
+/// node is never the authority for a job it does not hold. A holder that read and refused it
+/// answers for all; an unreachable or unwilling one leaves the next to try.
 #[derive(Debug, PartialEq)]
 pub(super) struct ForwardSubmissionOperation {
     submission_id: SubmissionId,

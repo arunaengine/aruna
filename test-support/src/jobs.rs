@@ -26,7 +26,7 @@ use aruna_operations::jobs::store::job_calls::{
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
 use aruna_operations::jobs::store::park_wake::AwaitOutcome;
 use aruna_operations::jobs::store::{JobMutation, RunDelete, row_calls};
-use aruna_operations::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+use aruna_operations::jobs::submit::execution::{ExecutionSubmission, SubmitExecutionOperation};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ulid::Ulid;

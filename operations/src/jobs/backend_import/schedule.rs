@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::jobs::records::pages::ServingNode;
-use crate::jobs::submit_local::SubmitLocalOperation;
+use crate::jobs::submit::local::SubmitLocalOperation;
 use crate::s3::imports::cron::next_due;
 use crate::s3::imports::remove::RemoveImportOperation;
 use crate::s3::imports::{ImportRuleError, ListImportsOperation};

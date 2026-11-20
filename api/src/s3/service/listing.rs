@@ -493,7 +493,7 @@ impl ArunaS3Service {
 #[cfg(test)]
 mod tests {
     use aruna_core::structs::storage::blob::BlobHeadKey;
-    use aruna_operations::s3::object::member_merge::merged_marker as scoped_marker;
+    use aruna_operations::s3::object::member::merge::merged_marker as scoped_marker;
 
     #[test]
     fn prefix_token_precedence() {

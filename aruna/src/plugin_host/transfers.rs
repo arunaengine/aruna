@@ -23,7 +23,7 @@ use aruna_drivers::driver::{drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::placement::policy::gate::GateOperation;
-use aruna_operations::plugins::copy_steps::read_locked;
+use aruna_operations::plugins::copy::steps::read_locked;
 use aruna_operations::plugins::transfer_steps::{
     KeepReply, PrepareDownload, PrepareUpload, TransferEnd, TransferWork, UploadReply, account,
     check_answer, send_end, source_gone, write_failure,

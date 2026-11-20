@@ -28,7 +28,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_drivers::driver::drive;
-use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::local_run::LocalExecutionConfig;
 use aruna_operations::jobs::route::JobRouteError;

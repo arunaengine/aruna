@@ -9,7 +9,7 @@ use crate::tests::distributed::{
 };
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::relay::tool::{Holder, pick_node};
-use aruna_operations::relay::tool_route::HolderSearchOperation;
+use aruna_operations::relay::tool::route::HolderSearchOperation;
 use axum::http::StatusCode;
 use serde_json::json;
 use std::time::Duration;
@@ -144,7 +144,7 @@ fn auth_parts(auth: &AuthContext, directed: Option<NodeId>) -> http::request::Pa
     parts.extensions.insert(Some(token));
     if let Some(node_id) = directed {
         let value = http::HeaderValue::try_from(node_id.to_string()).unwrap();
-        let header = aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER;
+        let header = aruna_operations::s3::object::member::rest::RELAY_NODE_HEADER;
         parts.headers.insert(header, value);
     }
     parts

@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::heartbeat::HeartbeatEffect;
 use aruna_core::holder_choice::{HolderCandidate, HolderChoiceError, PickHolderOperation};
 use aruna_core::id::NodeId;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;

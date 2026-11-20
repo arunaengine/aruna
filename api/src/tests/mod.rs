@@ -1,6 +1,5 @@
-//! Groups the shared test fixtures: assistant, datasets, distributed buckets and their members,
-//! execution and realm states, routes, storage routing and users. The metadata fixtures are public
-//! under `test-hooks`.
+//! Groups the shared test fixtures of assistant, datasets, distributed buckets, execution, realm,
+//! routes, storage routing and users; the metadata fixtures are public under `test-hooks`.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

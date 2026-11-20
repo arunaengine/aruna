@@ -32,7 +32,7 @@ use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::held::HeldReservations;
 use super::outbox::schedule_outbox_drain;
 use super::reservation::ReleaseExecutionOperation;
-use super::witness_arm::ArmFamilyOperation;
+use super::witness::arm::ArmFamilyOperation;
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -137,10 +137,9 @@ enum PublishState {
 
 type PublishStep = Result<Next<bool>, LifecycleError>;
 
-/// Publishes one state of the local execution. The sequence and the previous
-/// digest are derived from the records already stored, so a replay of the same
-/// state is idempotent and a lost publication never breaks the chain. Only the
-/// receipted executor publishes; it signs the update through `NetEffect::ExecutionSign`.
+/// Publishes one local execution state; sequence and previous digest come from stored records, so
+/// a replay is idempotent and a lost publication never breaks the chain. Only the receipted
+/// executor publishes, signing through `NetEffect::ExecutionSign`.
 #[derive(Debug, PartialEq)]
 pub struct PublishStateOperation {
     chain: ExecutionChain,

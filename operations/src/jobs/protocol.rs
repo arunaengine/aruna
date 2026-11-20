@@ -18,16 +18,16 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::user::id::UserId;
 use bytes::Bytes;
 
-use super::job_artifacts::{
+use super::job::artifacts::{
     ArtifactLookup, ArtifactRangeOperation, ArtifactRead, OwnedArtifact, OwnedArtifactOperation,
 };
-use super::job_cancel::{
+use super::job::cancel::{
     CancelJobOutcome, CancelOwnedOperation, CancelReport, MatchingRunsOperation,
 };
-use super::job_reads::{
+use super::job::reads::{
     JobOwnerOperation, JobReadError, LocalStatusOperation, RecordData, RecordDataOperation,
 };
-use super::job_reports::{JobReportLookup, JobReportOperation, ReportQuery};
+use super::job::reports::{JobReportLookup, JobReportOperation, ReportQuery};
 use super::key_locks::KeyCheckError;
 use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::cancel::CancelFamilyOperation;
@@ -636,7 +636,7 @@ impl Operation for JobRequestOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::jobs::job_reads::tests::{auth_of, child, is_child, job_id, node, owner, realm};
+    use crate::jobs::job::reads::tests::{auth_of, child, is_child, job_id, node, owner, realm};
     use aruna_core::structs::execution::job::identity::JobState;
     use aruna_core::structs::execution::job::local::{JobProgress, WorkspaceMode};
     use ulid::Ulid;
@@ -783,7 +783,7 @@ mod pure_tests {
     }
 
     fn record() -> JobRecord {
-        crate::jobs::job_reads::tests::record_of(crate::jobs::job_reads::tests::probe())
+        crate::jobs::job::reads::tests::record_of(crate::jobs::job::reads::tests::probe())
     }
 
     fn report(outcome: CancelJobOutcome, running: Vec<JobId>) -> IoResult {

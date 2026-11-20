@@ -7,7 +7,6 @@ pub mod client;
 pub mod deliver;
 pub mod dispatch;
 pub mod email;
-pub mod email_job;
 pub mod enqueue;
 pub mod holder;
 pub mod inbox;
@@ -29,7 +28,6 @@ mod tests;
 pub mod user_call;
 pub mod watch;
 pub mod webhook;
-pub mod webhook_job;
 
 use aruna_core::calls::{IoError, IoResult};
 use aruna_core::events::Event;

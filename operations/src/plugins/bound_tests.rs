@@ -79,7 +79,7 @@ async fn node_binding_checks() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let name = SecretName::try_from("api-key".to_string()).unwrap();
     let bearer = SecretKind::parse("bearer").unwrap();
     let local = fixture.actor.node_id;
@@ -165,7 +165,7 @@ async fn slots_bind() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let input = crate::secrets::node::NodeChange {
         realm_id: fixture.actor.realm_id,
         node_id: fixture.actor.node_id,

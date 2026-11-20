@@ -20,12 +20,12 @@ use aruna_core::types::Key;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
 
-use super::witness_arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
+use super::witness::arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::route::JobRouteError;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::DEADLINE_INDEX_KEYSPACE;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
@@ -469,7 +469,7 @@ mod tests {
 
     // Other request digests count as conflicts; without a stored plan the newest launch places.
     #[test]
-    fn reads_conflicts_and_launch() {
+    fn conflicts_and_launch() {
         let fixture = Family::new([2u8; 32]);
         let family = fixture.family();
         let mut details = ReportDetailsOperation::new(family, &projection(&fixture), None);

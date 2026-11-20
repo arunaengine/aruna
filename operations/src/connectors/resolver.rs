@@ -604,7 +604,7 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let storage_handle =
             storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -671,7 +671,7 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let storage_handle =
             storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -872,7 +872,7 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let storage_handle =
             storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -972,7 +972,7 @@ mod tests {
         let tempdir = tempdir().unwrap();
         let storage_handle =
             storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,

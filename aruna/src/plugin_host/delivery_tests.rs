@@ -27,7 +27,7 @@ use aruna_operations::plugins::finished::NotifyDue;
 use aruna_operations::plugins::finished::drop_completion;
 use aruna_operations::plugins::finished::retry_run;
 use aruna_operations::plugins::finished::waits_for;
-use aruna_operations::plugins::host_calls::call_intent;
+use aruna_operations::plugins::host::calls::call_intent;
 use aruna_operations::plugins::job_work::SettleWork;
 use aruna_operations::plugins::runs::admit;
 use aruna_operations::plugins::runs::list_runs;

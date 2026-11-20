@@ -19,8 +19,8 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult};
-use aruna_operations::s3::object::member_write::CopyPath;
-use aruna_operations::s3::object::member_write::{
+use aruna_operations::s3::object::member::write::CopyPath;
+use aruna_operations::s3::object::member::write::{
     CopyPathError, CopyPathOperation, answered_metadata, answered_policies, copy_headers,
     source_read,
 };
@@ -34,7 +34,7 @@ use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 use super::{header, passed_headers, xml_field};
 use crate::s3::error::{IntoS3Error, guard_error};
 use crate::s3::service::ArunaS3Service;
-use aruna_operations::s3::object::member_read::{
+use aruna_operations::s3::object::member::read::{
     MemberPayload as ForwardBody, MemberRequest as ForwardRequest, MemberTarget as Forward,
 };
 

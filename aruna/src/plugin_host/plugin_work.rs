@@ -16,8 +16,8 @@ use ulid::Ulid;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
-use aruna_operations::plugins::copy_steps::{CopyWork, LockedSource, PrepareCopy, copy_locked};
-use aruna_operations::plugins::work_calls::{AdmitWork, AdmittedWork, WorkRefusal};
+use aruna_operations::plugins::copy::steps::{CopyWork, LockedSource, PrepareCopy, copy_locked};
+use aruna_operations::plugins::work::calls::{AdmitWork, AdmittedWork, WorkRefusal};
 
 use super::transfers::{Download, Upload, download_work, upload_work};
 use aruna_operations::transfer::copy::CopyObjectOperation;

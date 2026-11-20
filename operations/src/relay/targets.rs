@@ -8,7 +8,7 @@ use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::rows::read_row;

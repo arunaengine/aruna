@@ -20,7 +20,7 @@ use aruna_core::keyspaces::{
     BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE, UPLOAD_KEYSPACE,
 };
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values as row_values;
 use aruna_core::structs::identity::realm::RealmId;

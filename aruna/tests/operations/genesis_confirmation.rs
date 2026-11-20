@@ -17,7 +17,7 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_net::NetHandle;
 use aruna_operations::shard::recovery::RecoveryStop;
 use aruna_operations::shard::restore::RestorePassOperation;
-use aruna_operations::shard::restore_plan::{ShardRestoreCursor, ShardRestorePass};
+use aruna_operations::shard::restore::plan::{ShardRestoreCursor, ShardRestorePass};
 use irokle::oplog::Oplog;
 use irokle::storage::Storage;
 use irokle::{ReplicationPolicy, TopicGenesis};

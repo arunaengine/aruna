@@ -17,7 +17,7 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     METADATA_INDEX_KEYSPACE, NODE_SUBJECT_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
-use aruna_core::node_facts::NodeFacts;
+use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::Operation;
 use aruna_core::placement::held_buckets;
 use aruna_core::placement::resolver::build_view;

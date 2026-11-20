@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
     RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
     UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::storage_entries::outbox_write_entry;

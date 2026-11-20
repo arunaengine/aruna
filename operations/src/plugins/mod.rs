@@ -11,8 +11,7 @@ pub mod check;
 pub mod cleanup;
 pub mod clock;
 pub mod copies;
-pub mod copy_rows;
-pub mod copy_steps;
+pub mod copy;
 pub mod creates;
 pub mod dataset;
 pub mod decide;
@@ -23,8 +22,7 @@ pub mod forward;
 pub mod grants;
 pub mod held;
 pub mod hooks;
-pub mod host_calls;
-pub mod host_steps;
+pub mod host;
 pub mod install;
 pub mod intents;
 pub mod job_work;
@@ -55,7 +53,6 @@ pub mod sweep;
 pub mod transfer_steps;
 pub mod waiting;
 pub mod work;
-pub mod work_calls;
 
 use aruna_plugin_types::calls::{ErrorKind, HostError};
 

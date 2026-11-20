@@ -11,7 +11,7 @@ use aruna_drivers::driver::drive;
 use serde_json::json;
 
 use super::*;
-use crate::plugins::host_calls::call_intent;
+use crate::plugins::host::calls::call_intent;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::page_result;
 use crate::plugins::rows::tests::values_result;

@@ -435,7 +435,7 @@ async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1739,7 +1739,7 @@ async fn sweeps_demoted_backend() {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
     let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();

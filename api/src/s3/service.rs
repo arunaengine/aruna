@@ -44,8 +44,8 @@ use self::listing::{
 };
 use self::multipart::parse_upload_marker;
 use self::object::object_range_request;
-use aruna_operations::s3::object::member_merge::MergeResume as Resume;
-use aruna_operations::s3::object::member_write::CopyPath;
+use aruna_operations::s3::object::member::merge::MergeResume as Resume;
+use aruna_operations::s3::object::member::write::CopyPath;
 
 use crate::object_key::ObjectKey;
 use crate::s3::auth::map_authorize_error;
@@ -129,7 +129,7 @@ use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjec
 use aruna_operations::s3::object::get::GetObjectInput as GOI;
 use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
-use aruna_operations::s3::object::member_read::{MemberPayload, MemberRead, MemberRequest};
+use aruna_operations::s3::object::member::read::{MemberPayload, MemberRead, MemberRequest};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed};

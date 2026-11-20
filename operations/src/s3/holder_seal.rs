@@ -171,7 +171,7 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, KEY_COPY_KEYSPACE};
-    use aruna_core::node_vault::NodeVaultKey;
+    use aruna_core::node::vault::NodeVaultKey;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::storage::encryption::{

@@ -689,7 +689,7 @@ mod tests {
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PATHS_INDEX_KEYSPACE, PURGE_FENCE_KEYSPACE,
         REPLICATION_OBLIGATION_KEYSPACE, SOURCE_INDEX_KEYSPACE, USAGE_STATS_KEYSPACE,
     };
-    use aruna_core::node_vault::NodeVaultKey;
+    use aruna_core::node::vault::NodeVaultKey;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::execution::source_connector::{

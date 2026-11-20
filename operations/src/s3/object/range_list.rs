@@ -10,7 +10,7 @@ use aruna_core::events::Event;
 use aruna_core::heartbeat::HeartbeatEffect;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::node_state::{NodeInfoError, NodeUrlsOperation};
+use aruna_core::node::state::{NodeInfoError, NodeUrlsOperation};
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{
     OutboundEffect, OutboundEvent, RangeAccess, RangeAnswer, RangeListing, RangePage, RangeRefusal,

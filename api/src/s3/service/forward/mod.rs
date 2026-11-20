@@ -31,11 +31,11 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
-use aruna_operations::s3::object::member_read::MemberTarget as Forward;
-use aruna_operations::s3::object::member_read::{
+use aruna_operations::s3::object::member::read::MemberTarget as Forward;
+use aruna_operations::s3::object::member::read::{
     MemberPayload as ForwardBody, MemberRequest as ForwardRequest, TrailerChecksum,
 };
-use aruna_operations::s3::object::member_write::{ForwardDeletesOperation, WriteTargetOperation};
+use aruna_operations::s3::object::member::write::{ForwardDeletesOperation, WriteTargetOperation};
 use http::{HeaderMap, Method};
 use s3s::dto::{
     DeleteObjectOutput, DeletedObject, ETag, Error as S3DeleteError, PutObjectOutput, StreamingBlob,

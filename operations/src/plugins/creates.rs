@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::host_calls::{CallEnd, CallFailure, RecordCall};
-use super::host_steps::{Granted, ProceedPlan, ReadyCreate};
+use super::host::calls::{CallEnd, CallFailure, RecordCall};
+use super::host::steps::{Granted, ProceedPlan, ReadyCreate};
 use super::rows::{StoreError, decode, done, encode, read_call, row, values};
 use super::unavailable;
 use crate::auth::error::AuthorizeError;

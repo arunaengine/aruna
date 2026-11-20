@@ -9,7 +9,7 @@ use crate::effects::{
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::key_index::IndexEvent;
 use crate::metadata::MetadataEvent;
-use crate::node_vault::VaultEntry;
+use crate::node::vault::VaultEntry;
 use crate::outbound::OutboundEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
@@ -153,9 +153,6 @@ pub enum SubOperationEvent {
     /// BLAKE3 digests of the saved payloads of a user's vault heads; empty without a vault.
     VaultHeld {
         result: Result<Vec<[u8; 32]>, String>,
-    },
-    KeyRequestsOpened {
-        request_ids: Vec<Ulid>,
     },
     /// The emission stored no notification; its failure as text.
     NotificationsFailed {
@@ -1115,7 +1112,6 @@ impl Event {
                     TokenRevoked,
                     UserUpdated,
                     VaultHeld,
-                    KeyRequestsOpened,
                     NotificationsFailed,
                 }
             ),
