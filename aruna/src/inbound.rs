@@ -11,7 +11,7 @@ use aruna_blob::blob::inbound::{InboundError, refuse_stream};
 use aruna_blob::native;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
+use aruna_core::document::{AppliedStep, DocumentEvictedDocument, DocumentTarget};
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
@@ -37,12 +37,10 @@ use aruna_net::streams::BiStream;
 use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
-use aruna_operations::metadata::after_sync::{
-    AfterSyncOperation, DeferSyncOperation, MetadataTimings,
-};
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
 use aruna_operations::metadata::serve::forwards::needs_view;
 use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
+use aruna_operations::node::applied_drain::SettleAppliedOperation;
 use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
@@ -475,7 +473,11 @@ async fn reconcile_inbound_topics(
     };
     let run_started = Instant::now();
     let topic_count = topics.len();
-    let reconcile = ReconcileTopicsOperation::new(*net_handle.realm_id(), topics).reloading_peers();
+    // Each apply stores its metadata follow-up in its own transaction, so a cleanup refused
+    // after the cursor moved is never lost; the applied drain owns it from there.
+    let reconcile = ReconcileTopicsOperation::new(*net_handle.realm_id(), topics)
+        .reloading_peers()
+        .queuing_followups(net_handle.node_id(), AppliedStep::Metadata);
     let targets = match drive(reconcile, context).await {
         Ok(targets) => targets,
         Err(err) => {
@@ -487,7 +489,8 @@ async fn reconcile_inbound_topics(
     let applied = targets.applied();
     debug!(applied, "Reconciled inbound document sync events");
     if applied == 0 {
-        return true;
+        // A pass that applied nothing still hands on work an earlier pass could not.
+        return settle_followups(context).await;
     }
     let dashboard_changed = targets
         .targets
@@ -527,34 +530,33 @@ async fn reconcile_inbound_topics(
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");
     }
-    let after = AfterSyncOperation::new(Some(net_handle.node_id()), targets.clone());
-    let timings = match drive(after, context).await {
-        Ok(timings) => timings,
-        Err(error) => {
-            // The cursor moved past these events, so a rerun only comes from the node drain.
-            warn!(%error, "Metadata follow-ups of a document sync stopped; the drain reruns them");
-            let (node_id, realm_id) = (net_handle.node_id(), Some(*net_handle.realm_id()));
-            let defer = DeferSyncOperation::new(Ulid::generate(), node_id, realm_id, targets);
-            if let Err(error) = drive(defer, context).await {
-                error!(%error, "Metadata follow-ups of a document sync were not handed on");
-            }
-            MetadataTimings::default()
-        }
-    };
+    let followups_started = Instant::now();
+    let settled = settle_followups(context).await;
     info!(
         event = "pipeline.reconcile.summary",
         topics = topic_count,
         applied,
         reconcile_ms = duration_ms(reconcile_elapsed),
-        project_ms = duration_ms(timings.project),
-        prune_ms = duration_ms(timings.prune),
+        followups_ms = duration_ms(followups_started.elapsed()),
         total_ms = duration_ms(run_started.elapsed()),
         "Inbound document sync reconcile summary"
     );
     if dashboard_changed {
         context.notify_dashboard_change();
     }
-    true
+    settled
+}
+
+/// Runs the follow-ups the applies stored, which the applied drain owns. A pass whose leftover
+/// work the drain's timer did not take fails, so it runs again and arms it then.
+pub(crate) async fn settle_followups(context: &DriverContext) -> bool {
+    match drive(SettleAppliedOperation::new(), context).await {
+        Ok(settled) => settled,
+        Err(error) => {
+            warn!(%error, "Queued follow-ups of a document sync were not settled");
+            false
+        }
+    }
 }
 
 /// Lifecycle owner for a test-installed inbound handler: it holds the job

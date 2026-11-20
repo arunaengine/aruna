@@ -318,61 +318,13 @@ async fn retained_outbox_timer() {
     assert_eq!(restored_key, TaskKey::DrainSyncOutbox);
 }
 
+// The outbox runs the follow-ups its applies stored and owns none itself: a graph cleanup that
+// storage refuses keeps its queued obligation for the drain, with no write after the apply.
 #[tokio::test]
-async fn tombstones_are_return() {
-    let temp_dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let context = Arc::new(DriverContext {
-        storage_handle: storage.clone(),
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    });
-    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let document_id = Ulid::from_parts(17, 1);
-    let tombstone = GraphLifecycleRecord::deleted(
-        "urn:graph:tombstone-before-retry".to_string(),
-        RealmId::from_bytes([3; 32]),
-        Ulid::from_parts(18, 1),
-        document_id,
-        19,
-    );
-
-    let outcome = handler
-        .finish_sync_batch(
-            &TaskKey::DrainSyncOutbox,
-            Vec::new(),
-            Vec::new(),
-            Event::Net(NetEvent::DocumentSync(
-                DocumentNetEvent::DocumentsReconciled {
-                    applied: 1,
-                    targets: vec![DocumentTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id: Ulid::from_parts(20, 1),
-                    }],
-                    metadata_create_events: Vec::new(),
-                    metadata_graph_tombstones: vec![tombstone.clone()],
-                },
-            )),
-            DrainSyncOutcome::default(),
-        )
-        .await;
-
-    assert!(outcome.retry_needed);
-    let jobs = read_graph_jobs(&storage).await;
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].graph_iri, tombstone.graph_iri);
-}
-
-// A tombstone run that fails after an outbox drain goes to the node drain, which runs that
-// cleanup again; the outbox records of the batch are gone by then.
-#[tokio::test]
-async fn failed_tombstones_deferred() {
-    use aruna_core::document::{AppliedStep, AppliedSync};
+async fn refused_cleanup_kept() {
+    use aruna_core::document::{
+        AppliedStep, AppliedSync, DocumentReconcileResult, applied_sync_entry,
+    };
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{APPLIED_SYNC_KEYSPACE, PRUNE_JOB_KEYSPACE};
     use aruna_test_support::metadata::refusing;
@@ -381,10 +333,39 @@ async fn failed_tombstones_deferred() {
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
     let realm_id = RealmId::from_bytes([65u8; 32]);
-    let net = make_net_handle(realm_id, &storage, [65u8; 32]).await;
+    let tombstone = GraphLifecycleRecord::deleted(
+        "urn:graph:tombstone-kept".to_string(),
+        realm_id,
+        Ulid::from_parts(21, 1),
+        Ulid::from_parts(21, 2),
+        3,
+    );
+    let queued = AppliedSync {
+        id: Ulid::from_parts(22, 1),
+        node_id: node(1),
+        realm_id: Some(realm_id),
+        result: DocumentReconcileResult {
+            metadata_graph_tombstones: vec![tombstone.clone()],
+            ..DocumentReconcileResult::default()
+        },
+        next: AppliedStep::Metadata,
+    };
+    let (space, key, value) = applied_sync_entry(&queued).expect("row encodes");
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: space,
+            key,
+            value,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected write event: {other:?}"),
+    }
     let context = Arc::new(DriverContext {
         storage_handle: refusing(storage.clone(), PRUNE_JOB_KEYSPACE),
-        net_handle: Some(net.clone()),
+        net_handle: None,
         blob_handle: None,
         graph_handle: None,
         task_handle: None,
@@ -392,13 +373,6 @@ async fn failed_tombstones_deferred() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let tombstone = GraphLifecycleRecord::deleted(
-        "urn:graph:tombstone-deferred".to_string(),
-        realm_id,
-        Ulid::from_parts(21, 1),
-        Ulid::from_parts(21, 2),
-        3,
-    );
 
     handler
         .finish_sync_batch(
@@ -434,10 +408,7 @@ async fn failed_tombstones_deferred() {
     let applied: Vec<AppliedSync> = (values.iter())
         .map(|(_, value)| AppliedSync::from_bytes(value.as_ref()).expect("row decodes"))
         .collect();
-    assert_eq!(applied.len(), 1);
-    assert_eq!(applied[0].next, AppliedStep::Metadata);
-    assert_eq!(applied[0].result.metadata_graph_tombstones, vec![tombstone]);
-    net.shutdown().await;
+    assert_eq!(applied, vec![queued]);
 }
 
 #[tokio::test]

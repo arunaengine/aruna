@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::document::DocumentReconcileResult;
-use aruna_operations::metadata::after_sync::DeferSyncOperation;
+use crate::inbound::settle_followups;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 
 impl DrainInvocation {
@@ -714,7 +713,8 @@ impl OperationsTaskHandler {
                 *net_handle.realm_id(),
                 topics.into_iter().collect(),
                 peers,
-            );
+            )
+            .queuing_metadata(net_handle.node_id());
             let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
                 drive(sync, self.context.as_ref()).await,
             )));
@@ -933,7 +933,8 @@ impl OperationsTaskHandler {
         let (batch_topics, batch_origins) = subbatch.ordering_domains();
         let sync_started = Instant::now();
         let sync =
-            SyncTopicsOperation::new(*net_handle.realm_id(), subbatch.topics, subbatch.peers);
+            SyncTopicsOperation::new(*net_handle.realm_id(), subbatch.topics, subbatch.peers)
+                .queuing_metadata(net_handle.node_id());
         let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
             drive(sync, self.context.as_ref()).await,
         )));
@@ -1111,63 +1112,6 @@ pub async fn drive_sync_drain(context: Arc<DriverContext>) {
 }
 
 impl OperationsTaskHandler {
-    async fn project_create_events(
-        &self,
-        retry_key: &TaskKey,
-        targets: Vec<DocumentTarget>,
-        metadata_create_events: Vec<aruna_core::metadata::MetadataEventRecord>,
-    ) -> Result<(), ()> {
-        if !metadata_create_events.is_empty() {
-            let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
-            let project = ProjectEventsOperation::new(metadata_create_events, local_node_id);
-            if let Err(error) = drive(project, &self.context).await {
-                warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
-                return Err(());
-            }
-            return Ok(());
-        }
-
-        let mut create_event_targets = Vec::new();
-        for target in targets {
-            let DocumentTarget::MetadataCreateEvent {
-                document_id,
-                event_id,
-                ..
-            } = target
-            else {
-                continue;
-            };
-            create_event_targets.push((document_id, event_id));
-        }
-        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
-        let project = ProjectLoggedOperation::new(create_event_targets, false, local_node);
-        if let Err(error) = drive(project, &self.context).await {
-            warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
-            return Err(());
-        }
-        Ok(())
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Hands deleted graphs whose cleanup failed to the node drain, which runs it again: the
-    /// outbox records go, so no later drain of this batch would.
-    async fn defer_tombstones(&self, tombstones: Vec<aruna_core::metadata::GraphLifecycleRecord>) {
-        let Some(net) = self.context.net_handle.as_ref() else {
-            error!("Deleted metadata graphs were not cleaned up and no node drain retries them");
-            return;
-        };
-        let result = DocumentReconcileResult {
-            metadata_graph_tombstones: tombstones,
-            ..DocumentReconcileResult::default()
-        };
-        let (node_id, realm_id) = (net.node_id(), Some(*net.realm_id()));
-        let defer = DeferSyncOperation::new(ulid::Ulid::generate(), node_id, realm_id, result);
-        if let Err(error) = drive(defer, self.context.as_ref()).await {
-            error!(%error, "Deleted metadata graphs were not handed to the node drain");
-        }
-    }
-
     pub(super) async fn finish_sync_batch(
         &self,
         retry_key: &TaskKey,
@@ -1179,18 +1123,8 @@ impl OperationsTaskHandler {
         match event {
             Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
                 targets,
-                metadata_create_events,
-                metadata_graph_tombstones,
                 ..
             })) => {
-                let tombstones = TombstonesOperation::new(metadata_graph_tombstones.clone());
-                if let Err(error) = drive(tombstones, self.context.as_ref()).await {
-                    warn!(
-                        error = ?error,
-                        "Failed to prune deleted metadata graphs; the node drain retries them"
-                    );
-                    self.defer_tombstones(metadata_graph_tombstones).await;
-                }
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {
@@ -1212,12 +1146,13 @@ impl OperationsTaskHandler {
                 if let Err(error) = drive(refresh, self.context.as_ref()).await {
                     warn!(%error, "Mail settings refresh stopped after an outbox drain");
                 }
+                // Each apply stored its metadata follow-up with it, and the applied drain owns it;
+                // the records stay for a rerun while its leftover work has no armed timer.
                 let project_started = Instant::now();
-                let projected = self
-                    .project_create_events(retry_key, targets, metadata_create_events)
-                    .await;
+                let settled = settle_followups(self.context.as_ref()).await;
                 outcome.project_elapsed = project_started.elapsed();
-                if projected.is_err() {
+                if !settled {
+                    warn!(task_id = ?retry_key, "Metadata follow-ups of an outbox drain wait");
                     outcome.retry_needed = true;
                     return outcome;
                 }

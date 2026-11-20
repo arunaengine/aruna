@@ -5,19 +5,12 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::{
-    AppliedStep, AppliedSync, DocumentReconcileResult, DocumentTarget, applied_sync_entry,
-    schedule_applied_drain,
-};
-use aruna_core::events::Event;
+use aruna_core::document::{DocumentReconcileResult, DocumentTarget};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::task::TaskEvent;
 use thiserror::Error;
-use tracing::{error, warn};
-use ulid::Ulid;
+use tracing::error;
 
 use crate::metadata::projection::{
     LoggedProjection, MetadataProjectionError, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
@@ -190,62 +183,12 @@ impl Operation for AfterSyncOperation {
     }
 }
 
-/// Hands the metadata follow-up of an applied reconcile to the node drain after it failed where
-/// it ran first: the row starts at the metadata step, and the drain is armed to run now.
-#[derive(Debug, PartialEq)]
-pub struct DeferSyncOperation {
-    applied: Option<AppliedSync>,
-}
-
-impl DeferSyncOperation {
-    pub fn new(
-        id: Ulid,
-        node_id: NodeId,
-        realm_id: Option<RealmId>,
-        result: DocumentReconcileResult,
-    ) -> Self {
-        let next = AppliedStep::Metadata;
-        let applied = AppliedSync {
-            id,
-            node_id,
-            realm_id,
-            result,
-            next,
-        };
-        Self {
-            applied: Some(applied),
-        }
-    }
-}
-
-impl Operation for DeferSyncOperation {
-    type Output = ();
-    type Error = IoError;
-
-    fn first(&mut self) -> Result<Next<()>, IoError> {
-        let applied = self.applied.take().ok_or(IoError::Unfinished)?;
-        let entry = applied_sync_entry(&applied);
-        let entry = entry.map_err(|error| IoError::Codec(error.to_string()))?;
-        Ok(Next::Call(IoCall::Write(vec![entry])))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        if let IoResult::Done = result {
-            return Ok(Next::Call(IoCall::from(schedule_applied_drain())));
-        }
-        // The stored row is the handover; a drain that is not armed now runs it later.
-        if let Event::Task(TaskEvent::Error { message, .. }) = result.event()? {
-            warn!(%message, "Failed to arm the applied sync drain for a deferred follow-up");
-        }
-        Ok(Next::Done(()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{APPLIED_SYNC_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_drivers::driver::DriverContext;
@@ -253,6 +196,7 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use aruna_test_support::metadata::refusing;
     use tempfile::tempdir;
+    use ulid::Ulid;
 
     async fn read_timer(
         storage: &aruna_storage::storage::handle::StorageHandle,
@@ -397,28 +341,6 @@ mod tests {
         assert!(matches!(after.await, Err(AfterSyncError::Wake(_))));
         let queued = aruna_test_support::metadata::prune_jobs_exist(&context).await;
         assert!(queued.expect("prune jobs read"));
-    }
-
-    // A follow-up deferred to the node drain is stored at its metadata step.
-    #[tokio::test]
-    async fn deferred_rerun_stored() {
-        let temp_dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
-        let context = aruna_drivers::testing::test_context(storage.clone());
-        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
-        let (id, result) = (ulid::Ulid::from_parts(5, 1), empty());
-        let queue = DeferSyncOperation::new(id, node_id, None, result.clone());
-
-        aruna_drivers::driver::drive(queue, &context).await.unwrap();
-
-        let key = id.to_bytes().to_vec();
-        let row = aruna_drivers::testing::read_value(&storage, APPLIED_SYNC_KEYSPACE, key).await;
-        let applied = AppliedSync::from_bytes(row.expect("row stored").as_ref()).unwrap();
-        assert_eq!(
-            (applied.next, applied.result),
-            (AppliedStep::Metadata, result)
-        );
     }
 
     #[test]

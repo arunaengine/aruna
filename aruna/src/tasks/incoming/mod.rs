@@ -93,8 +93,7 @@ use aruna_operations::metadata::materialization_queue::{
     RequeueParkedOperation, materialization_group_concurrency,
 };
 use aruna_operations::metadata::projection::{
-    DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
-    ProjectLoggedOperation, ProjectionTimerOperation, ReplayPageOperation,
+    DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectionTimerOperation, ReplayPageOperation,
 };
 use aruna_operations::plugins::work::PruneKeepingWork;
 use aruna_operations::replication::catch_up::CatchUpCursors;
@@ -119,7 +118,7 @@ async fn replay_event_log(
 }
 use aruna_operations::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
-    PruneTimerOperation as GraphPruneTimerOperation, TombstonesOperation, jobs_queued,
+    PruneTimerOperation as GraphPruneTimerOperation, jobs_queued,
 };
 
 /// Arms the graph prune drain for its next due job at start.
