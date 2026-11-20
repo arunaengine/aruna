@@ -276,18 +276,17 @@ impl Store {
             return Err(StoreError::NotFound);
         }
         let current = self.admin(realm_id)?;
-        let mut holders = Vec::new();
-        for item in self.admin.iter() {
-            let (key, value) = item.into_inner()?;
-            let state: AdminState = postcard::from_bytes(&value)?;
-            if key.as_ref() != realm_id.as_bytes() {
-                holders.extend(state.namespace);
-            }
-        }
+        // Only a change that claims a namespace this realm does not hold reads the others.
+        let claims = (next.namespace.as_ref())
+            .is_some_and(|namespace| current.namespace.as_ref() != Some(namespace));
+        let holders = match claims {
+            true => self.namespace_holders(realm_id)?,
+            false => Vec::new(),
+        };
         let after = transition(&current, next, |namespace| {
             holders.iter().any(|held| held == namespace)
         })?;
-        let sequence = self.audit.prefix(realm_id.as_bytes()).count() as u64;
+        let sequence = self.next_audit(realm_id)?;
         let mut key = realm_id.as_bytes().to_vec();
         key.extend_from_slice(&sequence.to_be_bytes());
         let record = AuditRecord {
@@ -305,6 +304,30 @@ impl Store {
         batch.insert(&self.audit, key, postcard::to_allocvec(&record)?);
         batch.commit()?;
         Ok(after)
+    }
+
+    /// The namespaces other realms hold.
+    fn namespace_holders(&self, realm_id: &RealmId) -> Result<Vec<String>, StoreError> {
+        let mut holders = Vec::new();
+        for item in self.admin.iter() {
+            let (key, value) = item.into_inner()?;
+            let state: AdminState = postcard::from_bytes(&value)?;
+            if key.as_ref() != realm_id.as_bytes() {
+                holders.extend(state.namespace);
+            }
+        }
+        Ok(holders)
+    }
+
+    /// The sequence after the realm's last audit record, read from its last key alone, so a
+    /// change never counts the realm's whole history.
+    fn next_audit(&self, realm_id: &RealmId) -> Result<u64, StoreError> {
+        let Some(last) = self.audit.prefix(realm_id.as_bytes()).next_back() else {
+            return Ok(0);
+        };
+        let (key, _) = last.into_inner()?;
+        let sequence = key.get(32..).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok());
+        Ok(sequence.map_or(0, |sequence| u64::from_be_bytes(sequence).saturating_add(1)))
     }
 
     /// The realm's admin changes, oldest first.
@@ -476,6 +499,31 @@ pub(crate) mod tests {
         assert!(matches!(store.stored_entry(&realm), Err(StoreError::Encoding(_))));
         assert!(matches!(store.entries(1), Err(StoreError::Encoding(_))));
         assert!(matches!(store.totals(&realm), Err(StoreError::Encoding(_))));
+    }
+
+    // The next audit record follows the realm's last one, so a gap in its history never makes a
+    // change overwrite a record it did not write.
+    #[test]
+    fn audit_follows_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = realm_id();
+        store.register(&realm, &entry(100, 100), 100).unwrap();
+        let noted = |note: &str| AdminState {
+            note: note.to_string(),
+            ..AdminState::default()
+        };
+        for note in ["a", "b", "c"] {
+            store.update_admin(&realm, noted(note), "test", 101).unwrap();
+        }
+        let mut first = realm.as_bytes().to_vec();
+        first.extend_from_slice(&0u64.to_be_bytes());
+        store.audit.remove(first).unwrap();
+        store.update_admin(&realm, noted("d"), "test", 102).unwrap();
+        let notes: Vec<_> = (store.audit(&realm).unwrap().into_iter())
+            .map(|record| record.after.note)
+            .collect();
+        assert_eq!(notes, ["b", "c", "d"]);
     }
 
     #[test]
