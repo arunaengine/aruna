@@ -50,6 +50,7 @@ pub fn reclaim_plan(outcome: Option<&ReclaimOutcome>, memory: &TimerMemory) -> (
     let fresh = TimerMemory {
         attempts: 0,
         cursor: cursor.clone(),
+        ..TimerMemory::default()
     };
     match (outcome.capped, outcome.failed) {
         (true, _) => (plan(RECLAIM_SWEEP_RETRY, fresh), false),

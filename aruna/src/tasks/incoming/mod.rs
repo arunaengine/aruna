@@ -64,17 +64,14 @@ use aruna_operations::device::sync::{
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
-use aruna_operations::jobs::JOB_PRUNE_PAGE;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
 use aruna_operations::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use aruna_operations::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
-use aruna_operations::jobs::lifecycle::updates::SETTLE_RETRY_AFTER;
-use aruna_operations::jobs::lifecycle::updates::SettleTerminalsOperation;
 use aruna_operations::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
 use aruna_operations::jobs::node_inputs::witness_node;
 use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
-use aruna_operations::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
 use aruna_operations::metadata::device::drain::{PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use aruna_operations::metadata::materialization_queue::{
@@ -82,34 +79,12 @@ use aruna_operations::metadata::materialization_queue::{
     MaterializationBatchOperation, MetadataDrainResult, NEXT_BATCH_AFTER, NextTimerOperation,
     RequeueParkedOperation, materialization_group_concurrency,
 };
-use aruna_operations::metadata::projection::{
-    DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectionTimerOperation, ReplayPageOperation,
-};
-use aruna_operations::plugins::work::PruneKeepingWork;
-use aruna_operations::replication::catch_up::CatchUpCursors;
-use aruna_operations::transfer::sharding::MaintainCursors;
-
-/// Replays the whole event log into the registry projection, one page at a time.
-async fn replay_event_log(
-    context: &aruna_drivers::driver::DriverContext,
-) -> Result<usize, aruna_operations::metadata::projection::MetadataProjectionError> {
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut after = None;
-    let mut projected = 0usize;
-    loop {
-        let page = ReplayPageOperation::new(after, local_node);
-        let (count, next) = aruna_drivers::driver::drive(page, context).await?;
-        projected = projected.saturating_add(count);
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(projected),
-        }
-    }
-}
+use aruna_operations::metadata::projection::ProjectionTimerOperation;
 use aruna_operations::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
     PruneTimerOperation as GraphPruneTimerOperation, jobs_queued,
 };
+use aruna_operations::transfer::sharding::MaintainCursors;
 
 /// Arms the graph prune drain for its next due job at start.
 async fn restore_graph_prune(
@@ -146,16 +121,9 @@ use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::table::RebuildTableOperation;
 use aruna_operations::queue_backoff::retry_delay_ms;
-use aruna_operations::replication::drain::{
-    ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
-};
-use aruna_operations::replication::mirror_repair::REPAIR_RETRY_AFTER;
-use aruna_operations::replication::mirror_repair::drain::{
-    DrainRepairsOperation, RestoreTimerOperation,
-};
-use aruna_operations::replication::page::deliver::MetadataPages;
+use aruna_operations::replication::drain::RestoreDrainOperation;
+use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
-use aruna_operations::s3::object::metadata::REFRESH_RETRY_AFTER;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
@@ -237,9 +205,6 @@ pub(crate) struct OperationsTaskHandler {
     // What each converted timer keeps between runs; the operations decide on it. Loss on
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
-    // Where the replication drain's bootstrap work goes on. Loss on restart is fine: the
-    // next drain starts at the first set and range.
-    catch_up: std::sync::Mutex<CatchUpCursors>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
@@ -251,8 +216,6 @@ pub(crate) struct OperationsTaskHandler {
     // When a device may next fetch the realm documents, and how many attempts
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
-    // Sequence of the last heartbeat this process sent; the startup revision orders restarts.
-    heartbeat_sequence: std::sync::atomic::AtomicU64,
     // Signs registry publications; `None` where no node identity was supplied.
     node_capabilities: Option<NodeCapabilities>,
 }
@@ -358,13 +321,11 @@ impl OperationsTaskHandler {
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
-            catch_up: std::sync::Mutex::default(),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             published_records: std::sync::Mutex::new(BTreeSet::new()),
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
-            heartbeat_sequence: std::sync::atomic::AtomicU64::new(0),
             node_capabilities: None,
         }
     }
@@ -730,6 +691,7 @@ impl OperationsTaskHandler {
             facts: node_facts(&self.context),
             routing: aruna_drivers::driver::node_routing(&self.context),
             has_blob: self.context.blob_handle.is_some(),
+            running: Some(self.jobs_runtime.running_jobs()),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -787,27 +749,17 @@ impl OperationsTaskHandler {
             TaskKey::DrainSyncOutbox => Box::pin(async move {
                 self.drain_sync_outbox().await;
             }),
-            TaskKey::PublishUsageSnapshots => Box::pin(async move {
-                self.publish_usage_snapshots().await;
-            }),
-            TaskKey::PublishNodeInfo => Box::pin(async move {
-                self.publish_node_info().await;
-            }),
-            TaskKey::DrainProjectionQueue => Box::pin(async move {
-                self.drain_projection_queue().await;
-            }),
+            TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
+            TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainProjectionQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainMaterializationQueue => Box::pin(async move {
                 self.drain_materialization_queue().await;
             }),
             TaskKey::DrainPruneQueue => Box::pin(async move {
                 self.drain_graph_queue().await;
             }),
-            TaskKey::DrainReplicationQueue => Box::pin(async move {
-                self.drain_replication_queue().await;
-            }),
-            TaskKey::DrainRefreshQueue => Box::pin(async move {
-                self.drain_refresh_queue().await;
-            }),
+            TaskKey::DrainReplicationQueue => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainRefreshQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
             TaskKey::PublishWatchInterest => Box::pin(self.run_trigger(key)),
@@ -816,12 +768,8 @@ impl OperationsTaskHandler {
             TaskKey::DrainJobQueue => Box::pin(async move {
                 self.drain_job_queue().await;
             }),
-            TaskKey::PruneJobs => Box::pin(async move {
-                self.prune_jobs().await;
-            }),
-            TaskKey::DrainMirrorRepair => Box::pin(async move {
-                self.drain_mirror_repair().await;
-            }),
+            TaskKey::PruneJobs => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainMirrorRepair => Box::pin(self.run_trigger(key)),
             TaskKey::SweepHiddenBlobs => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCleanupQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainReclaimQueue => Box::pin(async move {
@@ -961,15 +909,11 @@ impl OperationsTaskHandler {
             TaskKey::DrainWitnessQueue => Box::pin(async move {
                 self.drain_witness_queue().await;
             }),
-            TaskKey::SettleJobTerminals => Box::pin(async move {
-                self.settle_job_terminals().await;
-            }),
+            TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
             TaskKey::DrainLinkQueue => Box::pin(async move {
                 self.drain_link_queue().await;
             }),
-            TaskKey::DrainCaptures => Box::pin(async move {
-                self.drain_captures().await;
-            }),
+            TaskKey::DrainCaptures => Box::pin(self.run_trigger(key)),
             TaskKey::ReconcileSyncedFolders => Box::pin(async move {
                 let after = match folder_pass::reconcile_folders(&self.context).await {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,

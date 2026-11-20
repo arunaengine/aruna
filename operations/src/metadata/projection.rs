@@ -1569,6 +1569,63 @@ impl Operation for ProjectionTimerOperation {
     }
 }
 
+/// One projection timer run: drains a page of pending markers and, when the queue held none,
+/// replays the whole event log page by page as the fallback. Outputs when the timer runs again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionRunOperation {
+    local_node: Option<NodeId>,
+    replaying: bool,
+}
+
+type RunTurn = Result<Next<Option<Duration>>, IoError>;
+
+impl ProjectionRunOperation {
+    pub fn new(local_node: Option<NodeId>) -> Self {
+        Self {
+            local_node,
+            replaying: false,
+        }
+    }
+
+    fn replay_page(&mut self, after: Option<Key>) -> RunTurn {
+        self.replaying = true;
+        let page = ReplayPageOperation::new(after, self.local_node);
+        Ok(Next::Call(IoCall::child(page)))
+    }
+}
+
+impl Operation for ProjectionRunOperation {
+    type Output = Option<Duration>;
+    type Error = IoError;
+
+    fn first(&mut self) -> RunTurn {
+        let drain = DrainProjectionOperation::new(self.local_node);
+        Ok(Next::Call(IoCall::child(drain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> RunTurn {
+        if self.replaying {
+            return match result.child::<(usize, Option<Key>), MetadataProjectionError>()? {
+                Ok((_, Some(next))) => self.replay_page(Some(next)),
+                Ok((_, None)) => Ok(Next::Done(None)),
+                Err(error) => {
+                    warn!(%error, "Failed to replay metadata event log fallback");
+                    Ok(Next::Done(Some(PROJECTION_RETRY_AFTER)))
+                }
+            };
+        }
+        match result.child::<PendingProjectionResult, MetadataProjectionError>()? {
+            Ok(drained) if drained.has_more => Ok(Next::Done(Some(Duration::ZERO))),
+            Ok(drained) if drained.markers_examined == 0 => self.replay_page(None),
+            Ok(_) => Ok(Next::Done(None)),
+            Err(error) => {
+                warn!(%error, "Failed to drain metadata projection queue");
+                Ok(Next::Done(Some(PROJECTION_RETRY_AFTER)))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "projection_tests.rs"]
 mod tests;

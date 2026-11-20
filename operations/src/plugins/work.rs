@@ -442,7 +442,7 @@ impl Operation for HoldsJob {
 /// One job prune pass that keeps a due plugin work job while [`holds_job`] says so, at the run's
 /// start time. It deletes only checked jobs; held jobs do not fill a window, and a round that
 /// deleted nothing while more jobs were due goes on after its checked window.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PruneKeepingWork {
     page_size: usize,
     now_ms: Option<u64>,
@@ -454,7 +454,7 @@ pub struct PruneKeepingWork {
     phase: KeepPhase,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum KeepPhase {
     Due,
     Holds(JobId),

@@ -110,7 +110,7 @@ impl Operation for RepairRecordOperation {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DrainPhase {
     Scanning,
     Repairing,
@@ -120,7 +120,7 @@ enum DrainPhase {
 
 /// One pass over the due repair records. A failed record moves behind its retry delay and keeps
 /// the error; only a failure to change the record itself ends the pass.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainRepairsOperation {
     local_node: NodeId,
     /// The time of the pass, from the runner's first stamp.
