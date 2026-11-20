@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::outbox::publish_from_outbox;
 use super::*;
 use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::effects::StorageEffect;
@@ -25,6 +24,7 @@ use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
+use aruna_operations::sync::outbox::batches::publish_from_outbox;
 use aruna_operations::sync::outbox::record::outbox_key;
 use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::documents::restore_outbox_timers;

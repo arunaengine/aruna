@@ -6,85 +6,6 @@ use super::*;
 use crate::inbound::settle_followups;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 
-impl DrainInvocation {
-    pub(super) fn new(rotation: &OutboxRotation) -> Self {
-        Self {
-            outcome: DrainSyncOutcome::default(),
-            defer: DrainDeferState {
-                deferred_topics: rotation.blocked_topics.clone(),
-                blocked_origins: rotation.blocked_origins.clone(),
-                undeliverable_topics: rotation.undeliverable_topics.clone(),
-                ..DrainDeferState::default()
-            },
-            cursor: rotation.cursor.clone(),
-            reached_end: false,
-            scan_elapsed: Duration::ZERO,
-            publish_elapsed: Duration::ZERO,
-            records: 0,
-            deferred: 0,
-            stuck: 0,
-            oldest_stuck: None,
-            undeliverable: 0,
-            groups: 0,
-            subbatches: 0,
-            pages: 0,
-            oldest_record_ms: None,
-            read_failed: false,
-            config_drained: false,
-        }
-    }
-
-    pub(super) fn has_unvisited(&self) -> bool {
-        !self.reached_end && !self.read_failed
-    }
-}
-
-impl DrainSyncOutcome {
-    pub(super) fn merge(&mut self, other: DrainSyncOutcome) {
-        self.sync_elapsed += other.sync_elapsed;
-        self.project_elapsed += other.project_elapsed;
-        self.delete_elapsed += other.delete_elapsed;
-        self.retry_needed |= other.retry_needed;
-        self.deleted += other.deleted;
-        self.blocked_topics.extend(other.blocked_topics);
-        self.blocked_origins.extend(other.blocked_origins);
-    }
-}
-
-pub(super) fn publish_from_outbox(
-    event_id: ulid::Ulid,
-    target: DocumentTarget,
-    event: DocumentOutboxEvent,
-    placement: aruna_core::structs::placement::record::PlacementRef,
-    allow_genesis: bool,
-) -> DocumentSyncPublish {
-    match event {
-        DocumentOutboxEvent::Upsert { bytes, change } => DocumentSyncPublish::Upsert {
-            event_id,
-            target,
-            bytes,
-            change,
-            allow_genesis,
-        },
-        DocumentOutboxEvent::Delete { change } => DocumentSyncPublish::Delete {
-            event_id,
-            target,
-            change,
-            allow_genesis,
-        },
-        DocumentOutboxEvent::AdminOperation {
-            event,
-            origin_signature,
-        } => DocumentSyncPublish::AdminOperation {
-            target,
-            event,
-            placement,
-            allow_genesis,
-            origin_signature,
-        },
-    }
-}
-
 /// The realm configuration the drain decides with: `None` on a node that has none yet, where the
 /// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
 /// rather than let an unknown membership publish.
@@ -114,57 +35,6 @@ pub(super) async fn load_drain_config(
             "the realm configuration read answered {}",
             other.label()
         )),
-    }
-}
-
-/// Resolves the shard placement a drained record publishes under: a real ref is
-/// kept, a NIL ref (from admin-operation emitters) is resolved from the realm
-/// config. Shared realm targets ignore placement, so resolving is harmless.
-pub(super) fn resolve_publish_placement(
-    config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-    target: &DocumentTarget,
-    current: aruna_core::structs::placement::record::PlacementRef,
-) -> aruna_core::structs::placement::record::PlacementRef {
-    if current != aruna_core::structs::placement::record::PlacementRef::NIL {
-        return current;
-    }
-    match config {
-        Some(config) => {
-            aruna_core::placement::target_placement_ref(config, target, Default::default())
-        }
-        None => aruna_core::structs::placement::record::PlacementRef::NIL,
-    }
-}
-
-impl DrainSubBatch {
-    pub(super) fn sync_subset(&self, indices: &[usize]) -> Option<Self> {
-        let mut topics = Vec::with_capacity(indices.len());
-        let mut origins = Vec::with_capacity(indices.len());
-        let mut targets = Vec::with_capacity(indices.len());
-        let mut record_keys = Vec::with_capacity(indices.len());
-        for &index in indices {
-            topics.push(*self.topics.get(index)?);
-            origins.push(*self.origins.get(index)?);
-            targets.push(self.targets.get(index)?.clone());
-            record_keys.push(self.record_keys.get(index)?.clone());
-        }
-        Some(Self {
-            peers: self.peers.clone(),
-            documents: Vec::new(),
-            topics,
-            origins,
-            targets,
-            record_keys,
-        })
-    }
-
-    /// Ordering domains blocked together when a publish or sync leaves records
-    /// behind.
-    pub(super) fn ordering_domains(&self) -> (Vec<irokle::TopicId>, Vec<aruna_core::id::NodeId>) {
-        (
-            self.topics.clone(),
-            self.origins.iter().flatten().copied().collect(),
-        )
     }
 }
 
@@ -502,7 +372,7 @@ impl OperationsTaskHandler {
                 .published_records
                 .lock()
                 .expect("published records poisoned");
-            Self::build_drain_batches(to_publish, &published)
+            build_drain_batches(to_publish, &published)
         };
         invocation.groups += groups;
         invocation.subbatches += subbatches.len();
@@ -729,66 +599,6 @@ impl OperationsTaskHandler {
             .await;
         outcome.merge(sync_outcome);
         (publish_elapsed, outcome)
-    }
-}
-
-/// Sub-batches keyed by whether their records only sync and by their sorted peers.
-type PublishGroups = BTreeMap<
-    (bool, Vec<aruna_core::id::NodeId>),
-    (Vec<aruna_core::id::NodeId>, Vec<DrainSubBatch>),
->;
-
-impl OperationsTaskHandler {
-    /// Groups records by peers into sub-batches. A record already published by this process
-    /// goes into a sub-batch without documents, which only syncs.
-    fn build_drain_batches(
-        records: Vec<DrainRecord>,
-        published: &BTreeSet<Vec<u8>>,
-    ) -> (usize, Vec<DrainSubBatch>) {
-        let mut publish_groups: PublishGroups = BTreeMap::new();
-        for (record_key, record, topic) in records {
-            let origin = admin_origin(&record);
-            let sync_only = published.contains(&record_key);
-            let document = (!sync_only).then(|| {
-                publish_from_outbox(
-                    record.outbox_id,
-                    record.target.clone(),
-                    record.event,
-                    record.placement,
-                    record.allow_genesis,
-                )
-            });
-            let mut peer_key = record.peers.clone();
-            aruna_operations::sync::shard_placement::sort_node_ids(&mut peer_key);
-            let (peers, subbatches) = publish_groups
-                .entry((sync_only, peer_key))
-                .or_insert_with(|| (record.peers.clone(), Vec::new()));
-            if subbatches
-                .last()
-                .is_none_or(|subbatch| subbatch.record_keys.len() >= DRAIN_SUBBATCH_RECORDS)
-            {
-                subbatches.push(DrainSubBatch {
-                    peers: peers.clone(),
-                    documents: Vec::new(),
-                    topics: Vec::new(),
-                    origins: Vec::new(),
-                    targets: Vec::new(),
-                    record_keys: Vec::new(),
-                });
-            }
-            let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
-            subbatch.documents.extend(document);
-            subbatch.topics.push(topic);
-            subbatch.origins.push(origin);
-            subbatch.targets.push(record.target);
-            subbatch.record_keys.push(record_key);
-        }
-        let groups = publish_groups.len();
-        let subbatches = publish_groups
-            .into_values()
-            .flat_map(|(_, subbatches)| subbatches)
-            .collect();
-        (groups, subbatches)
     }
 }
 

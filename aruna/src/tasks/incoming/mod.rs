@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::document::{
-    DocumentEffect, DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord,
-    DocumentSyncPublish, DocumentTarget,
+    DocumentEffect, DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget,
 };
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -110,8 +109,12 @@ use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
+use aruna_operations::sync::outbox::batches::{
+    DrainInvocation, DrainSubBatch, DrainSyncOutcome, build_drain_batches,
+    resolve_publish_placement,
+};
 use aruna_operations::sync::outbox::defer::{
-    DrainDeferState, DrainRecord, admin_origin, classify_deferred_record, partition_drain_records,
+    DrainRecord, classify_deferred_record, partition_drain_records,
 };
 use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::outbox::rotation::OutboxRotation;
@@ -135,7 +138,6 @@ pub mod restore;
 pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-const DRAIN_SUBBATCH_RECORDS: usize = 512;
 /// Outbox records remembered as published; past it they are forgotten and published once
 /// more, which only costs log space.
 const MAX_PUBLISHED_RECORDS: usize = 65_536;
@@ -200,56 +202,6 @@ pub(crate) struct OperationsTaskHandler {
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
     // Signs registry publications; `None` where no node identity was supplied.
-}
-
-struct DrainSubBatch {
-    peers: Vec<aruna_core::id::NodeId>,
-    documents: Vec<DocumentSyncPublish>,
-    topics: Vec<irokle::TopicId>,
-    /// Admin origin of each entry, so a blocked publish also blocks the rest of
-    /// that origin's sequence.
-    origins: Vec<Option<aruna_core::id::NodeId>>,
-    targets: Vec<DocumentTarget>,
-    record_keys: Vec<Vec<u8>>,
-}
-
-#[derive(Default)]
-struct DrainSyncOutcome {
-    sync_elapsed: Duration,
-    project_elapsed: Duration,
-    delete_elapsed: Duration,
-    retry_needed: bool,
-    deleted: usize,
-    /// Ordering domains to block for the rest of the rotation.
-    blocked_topics: Vec<irokle::TopicId>,
-    blocked_origins: Vec<aruna_core::id::NodeId>,
-}
-
-type StuckRecord = (
-    u64,
-    DocumentTarget,
-    irokle::TopicId,
-    aruna_core::structs::placement::record::PlacementRef,
-);
-
-struct DrainInvocation {
-    outcome: DrainSyncOutcome,
-    defer: DrainDeferState,
-    cursor: Option<Vec<u8>>,
-    reached_end: bool,
-    scan_elapsed: Duration,
-    publish_elapsed: Duration,
-    records: usize,
-    deferred: usize,
-    stuck: usize,
-    oldest_stuck: Option<StuckRecord>,
-    undeliverable: usize,
-    groups: usize,
-    subbatches: usize,
-    pages: usize,
-    oldest_record_ms: Option<u64>,
-    read_failed: bool,
-    config_drained: bool,
 }
 
 enum DrainPage {
