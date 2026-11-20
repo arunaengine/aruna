@@ -203,7 +203,7 @@ mod tests {
     // A run's input, a grouped read and a raw byte result leave only labels, outcomes and sizes
     // in the record, never the private data they carry.
     #[test]
-    fn private_data_kept_out() {
+    fn private_data_hidden() {
         use aruna_core::events::{GroupEvent, GroupResult, StorageEvent};
         let private = "inbox entry of ann";
         let read = Event::Storage(StorageEvent::ReadResult {
