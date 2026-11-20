@@ -537,6 +537,32 @@ fn rewrites_current_pointer() {
 }
 
 #[test]
+fn unreadable_version_stops() {
+    // A newer version that does not decode stops the delete before the head is read or changed.
+    let user_id = test_user_id();
+    let target_version_id = Ulid::from_bytes([1u8; 16]);
+    let mut op = DeleteObjectOperation::new(DeleteObjectInput {
+        bucket: "bucket".to_string(),
+        key: "key".to_string(),
+        version_id: Some(target_version_id),
+        group_id: Ulid::generate(),
+        realm_id: RealmId::from_bytes([1u8; 32]),
+        node_id: iroh::SecretKey::generate().public(),
+        deleted_by: user_id,
+    });
+    op.first().unwrap();
+    op.next(read(None)).unwrap();
+    op.next(read(Some(deleted_version_value(user_id)))).unwrap();
+    let newer = VersionKey::new("bucket", "key", Ulid::from_bytes([9u8; 16]));
+    let rows = vec![
+        deleted_version_entry("bucket", "key", target_version_id, user_id),
+        (newer.to_bytes().unwrap().into(), vec![0xffu8].into()),
+    ];
+    let turn = op.next(IoResult::Page { rows, next: None });
+    assert!(matches!(turn, Err(DeleteObjectError::ConversionError(_))), "{turn:?}");
+}
+
+#[test]
 fn removes_final_pointer() {
     let user_id = test_user_id();
     let target_version_id = Ulid::from_bytes([1u8; 16]);
