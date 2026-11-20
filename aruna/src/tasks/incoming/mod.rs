@@ -44,7 +44,7 @@ impl Drop for OutboxBarrier {
     }
 }
 
-use aruna_drivers::driver::{DriverContext, drive, drive_retry};
+use aruna_drivers::driver::{DriverContext, drive, drive_retry, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
@@ -59,10 +59,15 @@ use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, Job
 use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
 use aruna_operations::metadata::materialization_queue::{
-    NextTimerOperation, RequeueParkedOperation, materialization_group_concurrency,
+    NextTimerOperation, RequeueParkedOperation, UNKNOWN_CORES,
 };
 use aruna_operations::metadata::projection::ProjectionTimerOperation;
 use aruna_operations::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
+
+/// The logical cores this host offers, as the operating system reports them.
+fn host_cores() -> usize {
+    std::thread::available_parallelism().map_or(UNKNOWN_CORES, |cores| cores.get())
+}
 
 /// Arms the graph prune drain for its next due job at start.
 async fn restore_graph_prune(
@@ -112,7 +117,7 @@ use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
-    TimerInput, TimerMemory, TimerPlan, needs_cluster, timer_operation,
+    TimerInput, TimerMemory, TimerPlan, timer_needs, timer_operation,
 };
 use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_stamped};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
@@ -634,27 +639,21 @@ impl OperationsTaskHandler {
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
     async fn run_trigger(&self, key: TaskKey) {
         let memory = self.kept_memory(&key);
-        let cluster = needs_cluster(&key);
+        let needs = timer_needs(&key);
+        let context = self.context.as_ref();
         let input = TimerInput {
             now_ms: unix_timestamp_millis(),
-            local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
+            local_node: context.net_handle.as_ref().map(|net| net.node_id()),
+            serving: context.node_and_realm(),
             memory: memory.clone(),
-            facts: node_facts(&self.context),
-            routing: aruna_drivers::driver::node_routing(&self.context),
-            has_blob: self.context.blob_handle.is_some(),
-            running: Some(self.jobs_runtime.running_jobs()),
-            has_tasks: self.context.task_handle.is_some(),
-            group_concurrency: materialization_group_concurrency(),
-            heartbeats: if cluster {
-                self.context.fresh_heartbeats()
-            } else {
-                Default::default()
-            },
-            limits: if cluster {
-                self.context.compute_limits()
-            } else {
-                Default::default()
-            },
+            facts: (needs.facts.then(|| node_facts(context))).unwrap_or_default(),
+            routing: (needs.routing.then(|| node_routing(context))).unwrap_or_default(),
+            has_blob: context.blob_handle.is_some(),
+            running: needs.running.then(|| self.jobs_runtime.running_jobs()),
+            has_tasks: context.task_handle.is_some(),
+            host_cores: (needs.cores.then(host_cores)).unwrap_or(UNKNOWN_CORES),
+            heartbeats: (needs.cluster.then(|| context.fresh_heartbeats())).unwrap_or_default(),
+            limits: (needs.cluster.then(|| context.compute_limits())).unwrap_or_default(),
             rocrate_limits: self.rocrate_limits.clone(),
         };
         let Some(operation) = timer_operation(&key, &input) else {

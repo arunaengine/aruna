@@ -14,7 +14,7 @@ use tracing::warn;
 use crate::metadata::materialization_queue::{
     JobsExistOperation, MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER,
     MaterializationBatchOperation, MetadataDrainResult, MetadataMaterializationError,
-    NEXT_BATCH_AFTER,
+    NEXT_BATCH_AFTER, group_concurrency,
 };
 use crate::metadata::prune_jobs::DuePrune;
 use crate::metadata::prune_queue::{
@@ -53,12 +53,12 @@ pub struct MaterializationRunOperation {
 impl MaterializationRunOperation {
     pub fn new(input: &TimerInput) -> Self {
         let node = GitNode {
-            ids: input.facts.serving,
+            ids: input.serving,
             routing: input.routing.clone(),
         };
         Self {
             node,
-            concurrency: input.group_concurrency,
+            concurrency: group_concurrency(input.host_cores),
             has_tasks: input.has_tasks,
             stage: QueueStage::Batch,
         }
@@ -113,7 +113,7 @@ impl PruneRunOperation {
     pub fn new(input: &TimerInput) -> Self {
         // The prune reads only whether this node runs tasks, so no credential key is needed.
         let scope = NodeScope {
-            node: input.facts.serving,
+            node: input.serving,
             credential_key: None,
             has_blob: input.has_blob,
             has_tasks: input.has_tasks,

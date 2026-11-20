@@ -44,7 +44,7 @@ type RangeTurn = Result<Next<TimerPlan>, IoError>;
 impl RangeTimerOperation {
     pub fn new(input: &TimerInput) -> Self {
         Self {
-            ids: input.facts.serving,
+            ids: input.serving,
             fresh: input.heartbeats.clone(),
             capacity: input.routing.catalog.capacity(),
             now_ms: input.now_ms,
