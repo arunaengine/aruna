@@ -154,9 +154,6 @@ pub enum SubOperationEvent {
     VaultHeld {
         result: Result<Vec<[u8; 32]>, String>,
     },
-    KeyRequestsOpened {
-        request_ids: Vec<Ulid>,
-    },
     /// The emission stored no notification; its failure as text.
     NotificationsFailed {
         reason: String,
@@ -1115,7 +1112,6 @@ impl Event {
                     TokenRevoked,
                     UserUpdated,
                     VaultHeld,
-                    KeyRequestsOpened,
                     NotificationsFailed,
                 }
             ),
