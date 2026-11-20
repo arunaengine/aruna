@@ -213,6 +213,24 @@ async fn drain_keeps_timer() {
     assert!(after > Duration::from_secs(3000));
 }
 
+/// Finishes one synced batch through its operation, as the outbox drain does.
+async fn finish_batch(
+    handler: &OperationsTaskHandler,
+    record_keys: Vec<Vec<u8>>,
+    requested: Vec<DocumentTarget>,
+    synced: Event,
+    outcome: DrainSyncOutcome,
+) -> DrainSyncOutcome {
+    use aruna_operations::node::finish_batch::FinishBatchOperation;
+
+    let context = handler.context.as_ref();
+    let (serving, generation) = (context.node_and_realm(), ulid::Ulid::generate());
+    let batch = (record_keys, requested);
+    let finish = FinishBatchOperation::new(serving, generation, batch, synced, outcome);
+    let finished = drive(finish, context).await.expect("the batch finishes");
+    finished.outcome
+}
+
 #[tokio::test]
 async fn outbox_sync_retry() {
     let temp_dir = tempdir().expect("temp dir");
@@ -244,18 +262,17 @@ async fn outbox_sync_retry() {
 
     write_outbox_record(&storage, &record).await;
 
-    let outcome = handler
-        .finish_sync_batch(
-            &TaskKey::DrainSyncOutbox,
-            vec![key.clone()],
-            Vec::new(),
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
-                target: Some(record.target.clone()),
-                error: "only 1/2 peers synced".to_string(),
-            })),
-            DrainSyncOutcome::default(),
-        )
-        .await;
+    let outcome = finish_batch(
+        &handler,
+        vec![key.clone()],
+        Vec::new(),
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
+            target: Some(record.target.clone()),
+            error: "only 1/2 peers synced".to_string(),
+        })),
+        DrainSyncOutcome::default(),
+    )
+    .await;
 
     assert!(outcome.retry_needed);
     let retained = read_outbox_record(&storage, &key)
@@ -294,18 +311,17 @@ async fn retained_outbox_timer() {
     let key = outbox_key(&record).to_vec();
     write_outbox_record(&storage, &record).await;
 
-    let outcome = handler
-        .finish_sync_batch(
-            &TaskKey::DrainSyncOutbox,
-            vec![key.clone()],
-            Vec::new(),
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
-                target: Some(record.target.clone()),
-                error: "sync failed before all peers acknowledged".to_string(),
-            })),
-            DrainSyncOutcome::default(),
-        )
-        .await;
+    let outcome = finish_batch(
+        &handler,
+        vec![key.clone()],
+        Vec::new(),
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
+            target: Some(record.target.clone()),
+            error: "sync failed before all peers acknowledged".to_string(),
+        })),
+        DrainSyncOutcome::default(),
+    )
+    .await;
     assert!(outcome.retry_needed);
     assert_eq!(
         read_outbox_record(&storage, &key)
@@ -374,22 +390,21 @@ async fn refused_cleanup_kept() {
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
-    handler
-        .finish_sync_batch(
-            &TaskKey::DrainSyncOutbox,
-            Vec::new(),
-            Vec::new(),
-            Event::Net(NetEvent::DocumentSync(
-                DocumentNetEvent::DocumentsReconciled {
-                    applied: 1,
-                    targets: Vec::new(),
-                    metadata_create_events: Vec::new(),
-                    metadata_graph_tombstones: vec![tombstone.clone()],
-                },
-            )),
-            DrainSyncOutcome::default(),
-        )
-        .await;
+    finish_batch(
+        &handler,
+        Vec::new(),
+        Vec::new(),
+        Event::Net(NetEvent::DocumentSync(
+            DocumentNetEvent::DocumentsReconciled {
+                applied: 1,
+                targets: Vec::new(),
+                metadata_create_events: Vec::new(),
+                metadata_graph_tombstones: vec![tombstone.clone()],
+            },
+        )),
+        DrainSyncOutcome::default(),
+    )
+    .await;
 
     assert!(read_graph_jobs(&storage).await.is_empty());
     let rows = storage
@@ -722,22 +737,21 @@ async fn drain_reconcile_wakes() {
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
-    let outcome = handler
-        .finish_sync_batch(
-            &TaskKey::DrainSyncOutbox,
-            Vec::new(),
-            vec![DocumentTarget::RealmConfig { realm_id }],
-            Event::Net(NetEvent::DocumentSync(
-                DocumentNetEvent::DocumentsReconciled {
-                    applied: 0,
-                    targets: Vec::new(),
-                    metadata_create_events: Vec::new(),
-                    metadata_graph_tombstones: Vec::new(),
-                },
-            )),
-            DrainSyncOutcome::default(),
-        )
-        .await;
+    let outcome = finish_batch(
+        &handler,
+        Vec::new(),
+        vec![DocumentTarget::RealmConfig { realm_id }],
+        Event::Net(NetEvent::DocumentSync(
+            DocumentNetEvent::DocumentsReconciled {
+                applied: 0,
+                targets: Vec::new(),
+                metadata_create_events: Vec::new(),
+                metadata_graph_tombstones: Vec::new(),
+            },
+        )),
+        DrainSyncOutcome::default(),
+    )
+    .await;
 
     assert!(!outcome.retry_needed);
     tokio::time::timeout(Duration::from_secs(2), revisions.changed())
@@ -835,26 +849,25 @@ async fn drain_reconcile_summary() {
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
-    let outcome = handler
-        .finish_sync_batch(
-            &TaskKey::DrainSyncOutbox,
-            Vec::new(),
-            Vec::new(),
-            Event::Net(NetEvent::DocumentSync(
-                DocumentNetEvent::DocumentsReconciled {
-                    applied: 1,
-                    targets: vec![DocumentTarget::NodeUsage {
-                        realm_id,
-                        node_id: remote,
-                        group_id: None,
-                    }],
-                    metadata_create_events: Vec::new(),
-                    metadata_graph_tombstones: Vec::new(),
-                },
-            )),
-            DrainSyncOutcome::default(),
-        )
-        .await;
+    let outcome = finish_batch(
+        &handler,
+        Vec::new(),
+        Vec::new(),
+        Event::Net(NetEvent::DocumentSync(
+            DocumentNetEvent::DocumentsReconciled {
+                applied: 1,
+                targets: vec![DocumentTarget::NodeUsage {
+                    realm_id,
+                    node_id: remote,
+                    group_id: None,
+                }],
+                metadata_create_events: Vec::new(),
+                metadata_graph_tombstones: Vec::new(),
+            },
+        )),
+        DrainSyncOutcome::default(),
+    )
+    .await;
 
     assert!(!outcome.retry_needed);
     let summary = match storage
@@ -929,22 +942,21 @@ async fn drain_reconcile_config() {
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
 
-    let outcome = handler
-        .finish_sync_batch(
-            &TaskKey::DrainSyncOutbox,
-            Vec::new(),
-            vec![DocumentTarget::RealmConfig { realm_id }],
-            Event::Net(NetEvent::DocumentSync(
-                DocumentNetEvent::DocumentsReconciled {
-                    applied: 0,
-                    targets: Vec::new(),
-                    metadata_create_events: Vec::new(),
-                    metadata_graph_tombstones: Vec::new(),
-                },
-            )),
-            DrainSyncOutcome::default(),
-        )
-        .await;
+    let outcome = finish_batch(
+        &handler,
+        Vec::new(),
+        vec![DocumentTarget::RealmConfig { realm_id }],
+        Event::Net(NetEvent::DocumentSync(
+            DocumentNetEvent::DocumentsReconciled {
+                applied: 0,
+                targets: Vec::new(),
+                metadata_create_events: Vec::new(),
+                metadata_graph_tombstones: Vec::new(),
+            },
+        )),
+        DrainSyncOutcome::default(),
+    )
+    .await;
 
     assert!(!outcome.retry_needed);
     match storage

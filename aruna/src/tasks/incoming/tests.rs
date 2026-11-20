@@ -3,8 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+use aruna_core::document::{
+    DocumentChange, DocumentChangeKind, DocumentNetEvent, DocumentOutboxEvent,
+    DocumentOutboxRecord, DocumentSyncRevision,
+};
 use aruna_core::effects::StorageEffect;
+use aruna_core::events::NetEvent;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
 use aruna_core::metadata::GraphLifecycleRecord;
@@ -24,7 +28,9 @@ use aruna_net::NetHandle;
 use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
-use aruna_operations::sync::outbox::batches::publish_from_outbox;
+use aruna_operations::sync::outbox::batches::{
+    DrainSubBatch, DrainSyncOutcome, publish_from_outbox,
+};
 use aruna_operations::sync::outbox::record::outbox_key;
 use aruna_storage::storage::worker::FjallStorage;
 use aruna_test_support::documents::restore_outbox_timers;
