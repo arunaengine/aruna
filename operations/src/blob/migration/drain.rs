@@ -200,7 +200,7 @@ pub struct MigrationRun {
     pub cursor: Option<Key>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum RunStep {
     Queue,
     Progress(Key),
@@ -214,7 +214,7 @@ enum RunStep {
 }
 
 /// Advances the unfinished migrations of one page of queued buckets by one page each.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProcessMigrationsOperation {
     routing: NodeRouting,
     serving: Serving,

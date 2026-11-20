@@ -255,9 +255,6 @@ pub(crate) struct OperationsTaskHandler {
     // Where a capped reclaim sweep resumes. Loss on restart is fine: the next
     // sweep starts from the head and reaches the tail over the ticks after it.
     reclaim_cursor: std::sync::Mutex<Option<Key>>,
-    // Queued bucket the next migration run resumes after. Loss on restart is fine: the
-    // next run starts at the head of the queue.
-    migration_cursor: std::sync::Mutex<Option<Key>>,
     // Where the replication drain's bootstrap work goes on. Loss on restart is fine: the
     // next drain starts at the first set and range.
     catch_up: std::sync::Mutex<CatchUpCursors>,
@@ -405,7 +402,6 @@ impl OperationsTaskHandler {
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
             reclaim_cursor: std::sync::Mutex::new(None),
-            migration_cursor: std::sync::Mutex::new(None),
             catch_up: std::sync::Mutex::default(),
             wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
@@ -816,6 +812,7 @@ impl OperationsTaskHandler {
             local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
             memory: memory.clone(),
             facts: node_facts(&self.context),
+            routing: aruna_drivers::driver::node_routing(&self.context),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -908,32 +905,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainReclaimQueue => Box::pin(async move {
                 self.drain_blob_reclaim().await;
             }),
-            TaskKey::MigrateCompression => Box::pin(async move {
-                let start = (self.migration_cursor.lock())
-                    .expect("migration cursor mutex poisoned")
-                    .clone();
-                let run = aruna_operations::blob::migration::drain::ProcessMigrationsOperation::new(
-                    aruna_drivers::driver::node_routing(&self.context),
-                    self.context.node_and_realm(),
-                    start,
-                );
-                let run = drive(run, &self.context).await;
-                let after = match run {
-                    Ok(run) => {
-                        *(self.migration_cursor.lock()).expect("migration cursor mutex poisoned") =
-                            run.cursor;
-                        run.next
-                    }
-                    Err(message) => {
-                        warn!(message = %message, "Compression migration run failed");
-                        Some(RECLAIM_SWEEP_RETRY)
-                    }
-                };
-                if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::MigrateCompression, after)
-                        .await;
-                }
-            }),
+            TaskKey::MigrateCompression => Box::pin(self.run_trigger(key)),
             TaskKey::RefreshBlobHolders => Box::pin(async move {
                 self.refresh_blob_holders().await;
             }),

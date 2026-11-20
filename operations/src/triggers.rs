@@ -14,10 +14,14 @@ use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::task::TaskKey;
+use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 
+use crate::blob::migration::drain::ProcessMigrationsOperation;
+use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
@@ -67,6 +71,8 @@ pub struct TimerInput {
     pub memory: TimerMemory,
     /// What only this node's handles and host know.
     pub facts: NodeFacts,
+    /// This node's routing rules and backend catalog.
+    pub routing: NodeRouting,
 }
 
 impl TimerInput {
@@ -77,6 +83,7 @@ impl TimerInput {
             local_node,
             memory: TimerMemory::default(),
             facts: NodeFacts::default(),
+            routing: NodeRouting::default(),
         }
     }
 }
@@ -119,6 +126,7 @@ pub enum TimerOperation {
     DrainAppliedSync(AppliedDrainOperation),
     SyncPlacements(PlacementTimerOperation),
     RealmPresence(PresenceTimerOperation),
+    MigrateCompression(ProcessMigrationsOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -145,6 +153,12 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::RealmPresence { realm_id, node_id } => Some(TimerOperation::RealmPresence(
             PresenceTimerOperation::new(*realm_id, *node_id),
         )),
+        TaskKey::MigrateCompression => {
+            let after = input.memory.cursor.clone().map(Key::from);
+            let routing = input.routing.clone();
+            let run = ProcessMigrationsOperation::new(routing, input.facts.serving, after);
+            Some(TimerOperation::MigrateCompression(run))
+        }
         _ => None,
     }
 }
@@ -160,6 +174,7 @@ macro_rules! each_timer {
             TimerOperation::DrainAppliedSync($operation) => $body,
             TimerOperation::SyncPlacements($operation) => $body,
             TimerOperation::RealmPresence($operation) => $body,
+            TimerOperation::MigrateCompression($operation) => $body,
         }
     };
 }
@@ -288,6 +303,25 @@ impl TimerRun for PlacementTimerOperation {
 impl TimerRun for PresenceTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for ProcessMigrationsOperation {
+    /// The run plans its next start and the queue key it resumes after; a failed run keeps its
+    /// cursor and runs again after the reclaim retry.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let run = result.map_err(|error| TimerFailure {
+            retry_after: RECLAIM_SWEEP_RETRY,
+            reason: error.to_string(),
+        })?;
+        let memory = TimerMemory {
+            attempts: 0,
+            cursor: run.cursor.map(|key| key.to_vec()),
+        };
+        Ok(TimerPlan {
+            after: run.next,
+            memory,
+        })
     }
 }
 
@@ -560,6 +594,8 @@ impl Operation for PeerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::migration::drain::MigrationRun;
+    use crate::blob::migration::shared::MigrationError;
 
     fn input() -> TimerInput {
         TimerInput::new(1_000, None)
@@ -569,6 +605,27 @@ mod tests {
     fn unconverted_keys_absent() {
         assert!(timer_operation(&TaskKey::DrainJobQueue, &input()).is_none());
         assert!(timer_operation(&TaskKey::PruneJobs, &input()).is_none());
+    }
+
+    #[test]
+    fn migration_resumes_cursor() {
+        // The kept queue key is where the next run resumes; a failure keeps it unchanged.
+        let run = MigrationRun {
+            next: Some(Duration::ZERO),
+            cursor: Some(Key::from(b"bucket".to_vec())),
+        };
+        let plan = ProcessMigrationsOperation::rearm(Ok(run)).unwrap();
+        assert_eq!(plan.after, Some(Duration::ZERO));
+        assert_eq!(plan.memory.cursor.as_deref(), Some(&b"bucket"[..]));
+        let mut input = input();
+        input.memory = plan.memory;
+        let mut operation = timer_operation(&TaskKey::MigrateCompression, &input).unwrap();
+        let Ok(Next::Call(IoCall::Page { after, .. })) = operation.first() else {
+            panic!("expected the queue page read");
+        };
+        assert_eq!(after, Some(Key::from(b"bucket".to_vec())));
+        let failed = ProcessMigrationsOperation::rearm(Err(MigrationError::failed("boom")));
+        assert_eq!(failed.unwrap_err().retry_after, RECLAIM_SWEEP_RETRY);
     }
 
     #[test]
