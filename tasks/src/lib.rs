@@ -23,6 +23,8 @@ use tracing::{error, warn};
 
 const TASK_COMMAND_BUFFER: usize = 1024;
 const HANDLER_WARN_AFTER: Duration = Duration::from_secs(30);
+/// Handlers of distinct keys run at most this many at once; later deadlines wait their turn.
+const HANDLER_LIMIT: usize = 64;
 
 #[async_trait]
 pub trait InboundTaskHandler: Send + Sync {
@@ -122,6 +124,7 @@ struct SchedulerState {
     drained_waiters: Vec<oneshot::Sender<()>>,
     next_timer_id: u64,
     next_run_id: u64,
+    handler_limit: usize,
 }
 
 struct TimerEntry {
@@ -163,7 +166,12 @@ impl SchedulerState {
             drained_waiters: Vec::new(),
             next_timer_id: 1,
             next_run_id: 1,
+            handler_limit: HANDLER_LIMIT,
         }
+    }
+
+    fn at_capacity(&self) -> bool {
+        self.running_by_id.len() >= self.handler_limit
     }
 
     fn allocate_timer_id(&mut self, deadline: Instant) -> Option<u64> {
@@ -271,9 +279,9 @@ impl SchedulerState {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        let next_timer = self
-            .timers_by_deadline
-            .first_key_value()
+        // With every slot taken a completion wakes the loop, so overdue timers cause no spin.
+        let next_timer = (self.timers_by_deadline.first_key_value())
+            .filter(|_| !self.at_capacity())
             .map(|(&(deadline, _), _)| deadline);
         let next_running_warning = self
             .running_warn_deadlines
@@ -290,7 +298,7 @@ impl SchedulerState {
 
     fn dispatch_due_timers(&mut self, now: Instant, command_tx: &mpsc::WeakSender<TaskCommand>) {
         while let Some((&(deadline, timer_id), key)) = self.timers_by_deadline.first_key_value() {
-            if deadline > now {
+            if deadline > now || self.at_capacity() {
                 break;
             }
 
@@ -1766,6 +1774,49 @@ mod tests {
             second.drained(),
             "the second drain must observe the same completion"
         );
+    }
+
+    #[tokio::test]
+    async fn handlers_wait_capacity() {
+        let mut state = SchedulerState::new(Arc::new(AtomicBool::new(false)));
+        state.handler_limit = 2;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        state.inbound_handler = Some(Arc::new(CountingGatedHandler {
+            runs: Arc::new(AtomicUsize::new(0)),
+            started: Arc::new(Notify::new()),
+            gate: gate.clone(),
+        }));
+        let (command_tx, mut command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+        let weak = command_tx.downgrade();
+        let now = Instant::now();
+        for key in [
+            TaskKey::DrainSyncOutbox,
+            TaskKey::DrainPruneQueue,
+            TaskKey::DrainRefreshQueue,
+        ] {
+            state.reset_timer(key, Duration::ZERO, now);
+        }
+        state.dispatch_due_timers(now, &weak);
+        assert_eq!(state.running_by_id.len(), 2);
+        assert!(state.timers_by_key.contains_key(&TaskKey::DrainRefreshQueue));
+        assert!(
+            state.next_deadline().is_none_or(|deadline| deadline > now),
+            "a full scheduler does not wake for the waiting deadline"
+        );
+        gate.add_permits(1);
+        let Some(TaskCommand::HandlerCompleted {
+            run_id,
+            key,
+            elapsed,
+        }) = command_rx.recv().await
+        else {
+            panic!("a handler completes");
+        };
+        state.complete_handler(run_id, key, elapsed, Instant::now(), &weak);
+        state.dispatch_due_timers(Instant::now(), &weak);
+        assert_eq!(state.running_by_id.len(), 2);
+        assert!(state.timers_by_key.is_empty(), "the waiting deadline ran");
+        gate.add_permits(2);
     }
 
     // A drain waiter that the scheduler drops without a completion is not a
