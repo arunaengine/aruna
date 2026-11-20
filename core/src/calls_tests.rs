@@ -22,6 +22,7 @@ struct Script {
     mode: TransactionMode,
     then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
+    rolled_back: bool,
 }
 
 impl Script {
@@ -65,6 +66,10 @@ impl Operation for Script {
     fn abort(&mut self) -> Vec<IoCall> {
         std::mem::take(&mut self.cleanup)
     }
+
+    fn rolled_back(&mut self) {
+        self.rolled_back = true;
+    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -76,6 +81,7 @@ fn script(calls: Vec<IoCall>) -> Script {
         mode: TransactionMode::None,
         then: Vec::new(),
         cleanup: Vec::new(),
+        rolled_back: false,
     }
 }
 
@@ -524,6 +530,7 @@ fn conflict_marks_retry() {
         error: StorageError::TransactionConflict,
     };
     assert!(operation.step(Event::Storage(conflict)).is_empty());
+    assert!(operation.operation.rolled_back, "a refused commit is told");
     let Err(error) = operation.finalize() else {
         panic!("a lost commit fails");
     };

@@ -625,6 +625,16 @@ impl<P: Operation> CallRun<P> {
                 }
                 other => {
                     // The commit was sent: the runner owns its outcome, so no abort follows.
+                    // A refused commit is certain, so the operation may release what it opened.
+                    if matches!(
+                        &other,
+                        Event::Storage(StorageEvent::Error {
+                            error: StorageError::TransactionConflict
+                                | StorageError::TransactionNotFound,
+                        })
+                    ) {
+                        self.operation.rolled_back();
+                    }
                     self.state = State::Committing(output, calls);
                     self.fail(failure("StorageEvent::TransactionCommitted", other))
                 }

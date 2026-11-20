@@ -751,6 +751,11 @@ impl Operation for CreateMultipartOperation {
         calls.into_iter().collect()
     }
 
+    /// A refused commit recorded nothing, so the abort releases the provider upload again.
+    fn rolled_back(&mut self) {
+        self.committing = false;
+    }
+
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
@@ -1359,6 +1364,23 @@ mod pure_tests {
         operation.next(IoResult::Done).unwrap();
         assert!(matches!(operation.next(IoResult::Done), Ok(Next::Done(_))));
         assert!(operation.abort().is_empty());
+    }
+
+    #[test]
+    fn refused_commit_aborts() {
+        // A commit refused for certain recorded nothing, so the provider upload is aborted.
+        let mut operation = CreateMultipartOperation::new(input(snapshot()));
+        operation.first().unwrap();
+        operation.next(ungoverned_bucket()).unwrap();
+        operation.next(fence_clear()).unwrap();
+        let upload = provider_upload(BackendRef::node_default(), "bucket");
+        operation.next(opened(Some(upload.clone()))).unwrap();
+        operation.next(fence_clear()).unwrap();
+        operation.next(plain_settings()).unwrap();
+        operation.next(IoResult::Done).unwrap();
+        assert!(matches!(operation.next(IoResult::Done), Ok(Next::Done(_))));
+        operation.rolled_back();
+        assert_eq!(aborted(&operation.abort()), Some(&upload));
     }
 
     /// An import rule writing `archive/` keys of `bucket` to `raw/` with `pattern`.
