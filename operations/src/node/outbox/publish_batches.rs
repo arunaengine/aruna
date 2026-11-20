@@ -20,8 +20,8 @@ use tracing::warn;
 
 use crate::node::outbox::finish_batch::FinishedBatch;
 use crate::node::outbox::sync_batch::SyncBatchOperation;
-use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
-use crate::sync::outbox::cleanup::Publication;
+use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome, RowStamp};
+use crate::sync::outbox::cleanup::{Publication, lineage_call, lineages};
 
 /// What publishing the sub-batches left: the sync outcome, the time the publishes took, the
 /// records this run published with the lineage their topic had, and those it deleted.
@@ -38,6 +38,7 @@ enum PublishStep {
     Sync,
     Publish,
     Window,
+    Lineage,
 }
 
 /// A sub-batch whose sync runs, by the ordering domains its failure blocks.
@@ -57,6 +58,11 @@ fn evidence(batch: &DrainSubBatch) -> Vec<(Vec<u8>, Publication)> {
     (batch.record_keys.iter().enumerate())
         .filter_map(|(index, key)| Some((key.clone(), publication(index)?)))
         .collect()
+}
+
+/// Whether a record of `batch` lacks the lineage of its topic.
+fn lacks_lineage(batch: &DrainSubBatch) -> bool {
+    (0..batch.record_keys.len()).any(|index| batch.stamp(index).lineage.is_none())
 }
 
 /// Whether two sub-batches hold records of one topic or one admin origin, so their order counts.
@@ -99,6 +105,9 @@ pub struct PublishBatchesOperation {
     syncing: Option<Syncing>,
     window_publish: Option<Option<Event>>,
     window_sync: Option<Option<Result<FinishedBatch, IoError>>>,
+    /// Whether the awaiting batch already asked for the lineages it lacked.
+    lineage_asked: bool,
+    topics: Vec<TopicId>,
     out: PublishedBatches,
     step: PublishStep,
     ids: IdMint,
@@ -116,6 +125,8 @@ impl PublishBatchesOperation {
             syncing: None,
             window_publish: None,
             window_sync: None,
+            lineage_asked: false,
+            topics: Vec::new(),
             out: PublishedBatches::default(),
             step: PublishStep::Sync,
             ids: IdMint::default(),
@@ -128,6 +139,10 @@ impl PublishBatchesOperation {
     /// the one before it.
     fn advance(&mut self) -> PublishTurn {
         loop {
+            // A publication onto a topic without a genesis before it has a lineage only now.
+            if !self.lineage_asked && self.awaiting.as_ref().is_some_and(lacks_lineage) {
+                return self.ask_lineage();
+            }
             let Some(batch) = self.batches.pop_front() else {
                 return match self.awaiting.take() {
                     Some(last) => self.sync_alone(last),
@@ -144,6 +159,7 @@ impl PublishBatchesOperation {
                 return self.sync_alone(before);
             }
             if batch.documents.is_empty() {
+                self.lineage_asked = false;
                 match self.awaiting.replace(batch) {
                     Some(before) => return self.sync_alone(before),
                     None => continue,
@@ -194,6 +210,49 @@ impl PublishBatchesOperation {
             self.block(held.ordering_domains());
         }
         (!kept.is_empty()).then(|| batch.select(&kept)).flatten()
+    }
+
+    /// Asks for the lineages the awaiting batch lacks before it syncs, so its finish can match
+    /// them and a later drain can rely on its publication.
+    fn ask_lineage(&mut self) -> PublishTurn {
+        self.lineage_asked = true;
+        let Some(batch) = self.awaiting.as_ref() else {
+            return self.advance();
+        };
+        let mut topics: Vec<TopicId> = (0..batch.record_keys.len())
+            .filter(|&index| batch.stamp(index).lineage.is_none())
+            .filter_map(|index| batch.topics.get(index).copied())
+            .collect();
+        topics.sort();
+        topics.dedup();
+        let Some(call) = lineage_call(&topics) else {
+            return self.advance();
+        };
+        self.topics = topics;
+        self.step = PublishStep::Lineage;
+        Ok(Next::Call(call))
+    }
+
+    /// Fills the lineages the awaiting batch lacked and keeps the publications they complete.
+    fn lineage_known(&mut self, result: IoResult) -> PublishTurn {
+        let current = lineages(&self.topics, result)?;
+        let Some(batch) = self.awaiting.as_mut() else {
+            return self.advance();
+        };
+        let entries = batch.record_keys.len();
+        batch.stamps.resize(entries, RowStamp::default());
+        let mut filled = Vec::new();
+        for (index, stamp) in batch.stamps.iter_mut().enumerate() {
+            let topic = batch.topics.get(index);
+            if stamp.lineage.is_none() {
+                stamp.lineage = topic.and_then(|topic| current.get(topic).copied().flatten());
+                filled.extend(stamp.lineage.map(|_| index));
+            }
+        }
+        if let Some(filled) = batch.sync_subset(&filled) {
+            self.out.published.extend(evidence(&filled));
+        }
+        self.advance()
     }
 
     fn sync_batch(&mut self, batch: DrainSubBatch) -> SyncBatchOperation {
@@ -253,6 +312,7 @@ impl PublishBatchesOperation {
             }))) => {
                 self.out.published.extend(evidence(&batch));
                 self.awaiting = Some(batch);
+                self.lineage_asked = false;
             }
             Some(Event::Net(NetEvent::DocumentSync(
                 DocumentNetEvent::DocumentsPartiallyPublished {
@@ -290,6 +350,7 @@ impl PublishBatchesOperation {
                     && !ready.record_keys.is_empty()
                 {
                     self.awaiting = Some(ready);
+                    self.lineage_asked = false;
                 }
             }
             Some(Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. }))) => {
@@ -388,6 +449,7 @@ impl Operation for PublishBatchesOperation {
                 self.synced(result.child::<FinishedBatch, IoError>().ok());
                 self.advance()
             }
+            (PublishStep::Lineage, result) => self.lineage_known(result),
         }
     }
 }
@@ -399,9 +461,8 @@ mod tests {
         DocumentChange, DocumentChangeKind, DocumentSyncPublish, DocumentSyncRevision,
         DocumentTarget,
     };
+    use aruna_core::events::ShardNetEvent;
     use aruna_core::structs::placement::record::PlacementRef;
-
-    use crate::sync::outbox::batches::RowStamp;
 
     fn serving() -> (NodeId, RealmId) {
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();
@@ -482,6 +543,31 @@ mod tests {
         };
         assert_eq!(done.published, vec![kept(b"one", b"one")]);
         assert_eq!(done.deleted, vec![b"one".to_vec()]);
+    }
+
+    // A record published onto a topic its publish created has no lineage before the publish; the
+    // run learns it before the sync, so the finish can delete the row and a retry can rely on it.
+    #[test]
+    fn missing_lineage_filled() {
+        let mut first = batch(b"one");
+        first.stamps[0].lineage = None;
+        let mut run = PublishBatchesOperation::new(serving(), vec![first]);
+        run.first().unwrap();
+        let published = net(DocumentNetEvent::DocumentsPublished {
+            targets: Vec::new(),
+        });
+        let query = run.next(published);
+        assert!(matches!(query, Ok(Next::Call(IoCall::Group(_)))));
+        let root = ShardNetEvent::Root(Ok(lineage(b"one")));
+        let root = Event::Net(NetEvent::Shard(Box::new(root)));
+        let results = vec![GroupResult::Done(Box::new(root))];
+        let sync = run.next(IoResult::Group(GroupEvent::Finished { results }));
+        assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
+        let synced = Ok::<_, IoError>(FinishedBatch::default());
+        let Ok(Next::Done(done)) = run.next(IoResult::Child(ChildOutcome::new(synced))) else {
+            panic!("the batch finishes");
+        };
+        assert_eq!(done.published, vec![kept(b"one", b"one")]);
     }
 
     // A batch sharing an admin origin with the one before it waits for that sync instead of
