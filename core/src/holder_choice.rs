@@ -67,6 +67,7 @@ pub fn pick(mut candidates: Vec<HolderCandidate>, seed: u128) -> Option<HolderCa
     if candidates.is_empty() {
         return None;
     }
+    let seed = sample_seed(seed);
     let len = candidates.len() as u128;
     let first = candidates.swap_remove((seed % len) as usize);
     if candidates.is_empty() {
@@ -80,6 +81,17 @@ pub fn pick(mut candidates: Vec<HolderCandidate>, seed: u128) -> Option<HolderCa
             false => first,
         },
     )
+}
+
+/// `seed` spread over all its bits. Run entropy keeps its low bits zero for id counters, so taking
+/// it modulo a candidate count unmixed would always draw the first candidates.
+fn sample_seed(seed: u128) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-holder-pick-v1\0");
+    hasher.update(&seed.to_le_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    u128::from_le_bytes(bytes)
 }
 
 /// The bandwidth from `from` to `to`: unlimited within one location, the configured link

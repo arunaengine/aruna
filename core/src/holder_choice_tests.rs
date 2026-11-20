@@ -107,10 +107,31 @@ fn free_slots_win() {
         );
     }
     assert_eq!(pick(Vec::new(), 3), None);
-    // The seed alone decides which two of more candidates are compared.
+    // The seed decides which two of more candidates are compared; the fewest slots never win.
     let three = || vec![holder(1, 10, 0), holder(2, 20, 0), holder(3, 30, 0)];
-    assert_eq!(pick(three(), 0), Some(holder(3, 30, 0)));
-    assert_eq!(pick(three(), 1), Some(holder(2, 20, 0)));
+    let winners: std::collections::BTreeSet<_> = (0..64)
+        .filter_map(|seed| pick(three(), seed))
+        .map(|chosen| chosen.free_slots)
+        .collect();
+    assert_eq!(winners, [20, 30].into());
+}
+
+// Run entropy has zero low bits, so equal holders must still each win over consecutive runs.
+#[test]
+fn run_seeds_balance() {
+    let equal = || vec![holder(1, 10, 0), holder(2, 10, 0)];
+    let picks: Vec<_> = (0..64)
+        .filter_map(|slot| pick(equal(), crate::id_mint::run_entropy(7, slot)))
+        .map(|chosen| chosen.node_id)
+        .collect();
+    let first = picks.iter().filter(|chosen| **chosen == node(1)).count();
+    assert!((16..=48).contains(&first), "node one won {first} of 64");
+    let seed = crate::id_mint::run_entropy(7, 3);
+    assert_eq!(
+        pick(equal(), seed),
+        pick(equal(), seed),
+        "a seed picks the same again"
+    );
 }
 
 // The pick operation chooses with the entropy the runner gave its run, so the same seed and
@@ -118,7 +139,8 @@ fn free_slots_win() {
 #[test]
 fn seeded_pick_replays() {
     let three = || vec![holder(1, 10, 0), holder(2, 20, 0), holder(3, 30, 0)];
-    for (seed, chosen) in [(0, holder(3, 30, 0)), (1, holder(2, 20, 0))] {
+    for seed in 0..4 {
+        let chosen = pick(three(), seed).expect("a candidate is chosen");
         let mut picking = PickHolderOperation::new(&[node(1), node(2), node(3)], 5);
         picking.seed(seed);
         let choice = HolderChoiceOperation::new(&[node(1), node(2), node(3)], 5);
