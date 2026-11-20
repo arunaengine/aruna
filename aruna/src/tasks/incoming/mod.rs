@@ -29,13 +29,6 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-/// The unverified data link posting the next pass continues after; a restart begins again at
-/// the start.
-static UNVERIFIED_CURSOR: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
-
-/// Where range maintenance goes on; a restart begins again at the start.
-static RANGE_CURSORS: std::sync::Mutex<Option<MaintainCursors>> = std::sync::Mutex::new(None);
-
 #[cfg(debug_assertions)]
 struct OutboxBarrier {
     marker: std::path::PathBuf,
@@ -68,14 +61,12 @@ use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
 use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
-use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
 use aruna_operations::metadata::device::drain::{PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use aruna_operations::metadata::materialization_queue::{
     NextTimerOperation, RequeueParkedOperation, materialization_group_concurrency,
 };
 use aruna_operations::metadata::projection::ProjectionTimerOperation;
 use aruna_operations::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
-use aruna_operations::transfer::sharding::MaintainCursors;
 
 /// Arms the graph prune drain for its next due job at start.
 async fn restore_graph_prune(
@@ -827,61 +818,7 @@ impl OperationsTaskHandler {
                 self.publish_registration().await;
             }),
             TaskKey::PruneConnectorReferences => Box::pin(self.run_trigger(key)),
-            TaskKey::MaintainRanges => Box::pin(async move {
-                use aruna_operations::transfer::sharding::{maintain_ranges, maintain_retry};
-                let context = &self.context;
-                let kept = (RANGE_CURSORS.lock().ok()).and_then(|cursors| cursors.clone());
-                let mut after = match aruna_drivers::driver::drive(
-                    maintain_ranges(
-                        context.node_and_realm(),
-                        &context.fresh_heartbeats(),
-                        context.here().capacity,
-                        kept.unwrap_or_default(),
-                    ),
-                    context,
-                )
-                .await
-                {
-                    Ok(pass) => {
-                        let (after, imports, cursors) = pass.finish();
-                        if let Ok(mut kept) = RANGE_CURSORS.lock() {
-                            *kept = Some(cursors);
-                        }
-                        for start in imports {
-                            let started =
-                                aruna_operations::jobs::handed_imports::StartKeptOperation::new(
-                                    start,
-                                    context.node_and_realm(),
-                                    unix_timestamp_millis(),
-                                );
-                            if let Err(error) = aruna_drivers::driver::drive(started, context).await
-                            {
-                                warn!(%error, "Handed over imports could not start");
-                            }
-                        }
-                        after
-                    }
-                    Err(error) => {
-                        warn!(%error, "Range maintenance could not finish a pass");
-                        maintain_retry()
-                    }
-                };
-                // Version links metadata could not verify in a set are retried a page per pass.
-                let resume = (UNVERIFIED_CURSOR.lock().ok()).and_then(|cursor| cursor.clone());
-                let retry = RetryUnverifiedOperation::new(context.node_and_realm(), resume);
-                match aruna_drivers::driver::drive(retry, context).await {
-                    Ok(next) => {
-                        if next.is_some() {
-                            after = std::time::Duration::ZERO;
-                        }
-                        if let Ok(mut cursor) = UNVERIFIED_CURSOR.lock() {
-                            *cursor = next;
-                        }
-                    }
-                    Err(error) => warn!(%error, "Unverified data links could not be retried"),
-                }
-                self.reschedule_timer(TaskKey::MaintainRanges, after).await;
-            }),
+            TaskKey::MaintainRanges => Box::pin(self.run_trigger(key)),
             TaskKey::RunBackendImports => Box::pin(self.run_trigger(key)),
             TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::DrainWitnessQueue => Box::pin(self.run_trigger(key)),

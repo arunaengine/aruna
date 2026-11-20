@@ -55,6 +55,7 @@ use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
+use crate::node::range_timer::RangeTimerOperation;
 use crate::node::usage_publish::PublishUsageOperation;
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::holder::HolderRead;
@@ -76,11 +77,12 @@ use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::staging::native_source::{NativeAnswer, NativeAnswerOperation};
+use crate::transfer::sharding::{MaintainCursors, maintain_retry};
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
 /// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
 /// every decision about it stays with the timer's operation; a restart starts it afresh.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimerMemory {
     pub attempts: u32,
     pub cursor: Option<Vec<u8>>,
@@ -88,6 +90,8 @@ pub struct TimerMemory {
     pub sequence: u64,
     /// Where the replication drain's bootstrap work goes on.
     pub catch_up: CatchUpCursors,
+    /// Where range maintenance goes on.
+    pub ranges: MaintainCursors,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -107,7 +111,7 @@ impl TimerMemory {
 }
 
 /// When a timer runs again, `None` while it waits for work, and what it keeps until then.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimerPlan {
     pub after: Option<Duration>,
     pub memory: TimerMemory,
@@ -153,7 +157,7 @@ pub struct TimerInput {
 /// Whether the timer of `key` reads the heartbeats and executor limits; they are copied only
 /// for such a timer, since most runs never look at them.
 pub fn needs_cluster(key: &TaskKey) -> bool {
-    matches!(key, TaskKey::DrainWitnessQueue)
+    matches!(key, TaskKey::DrainWitnessQueue | TaskKey::MaintainRanges)
 }
 
 impl TimerInput {
@@ -233,6 +237,7 @@ pub enum TimerOperation {
     DrainFamilyOutbox(FamilyTimerOperation),
     DrainWitnessQueue(WitnessDrainOperation),
     RunBackendImports(RunDueOperation),
+    MaintainRanges(RangeTimerOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -378,6 +383,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
         }),
+        TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
+            input,
+        ))),
         _ => None,
     }
 }
@@ -422,6 +430,7 @@ macro_rules! each_timer {
             TimerOperation::DrainFamilyOutbox($operation) => $body,
             TimerOperation::DrainWitnessQueue($operation) => $body,
             TimerOperation::RunBackendImports($operation) => $body,
+            TimerOperation::MaintainRanges($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -780,6 +789,15 @@ impl TimerRun for RunDueOperation {
     /// The run names when a schedule is due next; a failed run waits for the next rule change.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         Ok(TimerPlan::from(result.unwrap_or(None)))
+    }
+}
+
+impl TimerRun for RangeTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(|error| TimerFailure {
+            retry_after: maintain_retry(),
+            reason: error.to_string(),
+        })
     }
 }
 
