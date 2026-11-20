@@ -770,11 +770,11 @@ mod tests {
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use aruna_test_support::metadata::{
-        process_graph_tombstones, process_prune_batch, prune_jobs_exist,
+        process_graph_tombstones, process_prune_batch, prune_jobs_exist, refusing,
     };
     use tempfile::tempdir;
 
-    use crate::tests::metadata::{refusing, storage_key_exists};
+    use crate::tests::metadata::storage_key_exists;
     use aruna_drivers::testing::write_entries;
 
     fn lifecycle(graph_iri: &str) -> GraphLifecycleRecord {

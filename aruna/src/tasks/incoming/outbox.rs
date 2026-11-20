@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::document::DocumentReconcileResult;
+use aruna_operations::metadata::after_sync::DeferSyncOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 
 impl DrainInvocation {
@@ -1148,6 +1150,24 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
+    /// Hands deleted graphs whose cleanup failed to the node drain, which runs it again: the
+    /// outbox records go, so no later drain of this batch would.
+    async fn defer_tombstones(&self, tombstones: Vec<aruna_core::metadata::GraphLifecycleRecord>) {
+        let Some(net) = self.context.net_handle.as_ref() else {
+            error!("Deleted metadata graphs were not cleaned up and no node drain retries them");
+            return;
+        };
+        let result = DocumentReconcileResult {
+            metadata_graph_tombstones: tombstones,
+            ..DocumentReconcileResult::default()
+        };
+        let (node_id, realm_id) = (net.node_id(), Some(*net.realm_id()));
+        let defer = DeferSyncOperation::new(ulid::Ulid::generate(), node_id, realm_id, result);
+        if let Err(error) = drive(defer, self.context.as_ref()).await {
+            error!(%error, "Deleted metadata graphs were not handed to the node drain");
+        }
+    }
+
     pub(super) async fn finish_sync_batch(
         &self,
         retry_key: &TaskKey,
@@ -1163,9 +1183,13 @@ impl OperationsTaskHandler {
                 metadata_graph_tombstones,
                 ..
             })) => {
-                let tombstones = TombstonesOperation::new(metadata_graph_tombstones);
+                let tombstones = TombstonesOperation::new(metadata_graph_tombstones.clone());
                 if let Err(error) = drive(tombstones, self.context.as_ref()).await {
-                    warn!(error = ?error, "Failed to prune deleted metadata graphs");
+                    warn!(
+                        error = ?error,
+                        "Failed to prune deleted metadata graphs; the node drain retries them"
+                    );
+                    self.defer_tombstones(metadata_graph_tombstones).await;
                 }
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);

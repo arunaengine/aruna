@@ -1,8 +1,11 @@
-//! Runs the metadata materialization and graph prune passes and exports RO-Crates for tests.
+//! Runs the metadata materialization and graph prune passes, exports RO-Crates and refuses
+//! writes to one keyspace for tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::events::Event;
+use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::git::GitNode;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
@@ -15,6 +18,7 @@ use aruna_operations::metadata::prune_queue::{
     GraphDrainResult, MetadataGraphError, PruneBatchOperation, TombstoneProcessingResult,
     TombstonesOperation, jobs_queued,
 };
+use aruna_storage::StorageHandle;
 
 /// Runs one pass of the metadata materialization drain, as the drain task does.
 pub async fn process_materialization_batch(
@@ -77,4 +81,43 @@ pub async fn export_rocrate_jsonld(
             other.label()
         ))),
     }
+}
+
+/// A storage that forwards every effect to `real`, except writes and deletes that touch
+/// `key_space`, which it refuses as a failed write.
+pub fn refusing(real: StorageHandle, key_space: &'static str) -> StorageHandle {
+    let (handle, receivers) = StorageHandle::new();
+    for receiver in [receivers.foreground, receivers.bulk] {
+        let real = real.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("proxy runtime builds");
+            while let Ok((effect, response, ..)) = receiver.recv() {
+                let touched = match &effect {
+                    StorageEffect::Write { key_space: space, .. }
+                    | StorageEffect::Delete { key_space: space, .. } => space == key_space,
+                    StorageEffect::BatchWrite { writes, .. } => {
+                        writes.iter().any(|(space, ..)| space == key_space)
+                    }
+                    StorageEffect::BatchDelete { deletes, .. } => {
+                        deletes.iter().any(|(space, _)| space == key_space)
+                    }
+                    _ => false,
+                };
+                if touched {
+                    let error = StorageError::WriteError("refused by the test".to_string());
+                    response.send(StorageEvent::Error { error });
+                    continue;
+                }
+                let Event::Storage(event) = runtime.block_on(real.send_storage_effect(effect))
+                else {
+                    panic!("storage answers with storage events");
+                };
+                response.send(event);
+            }
+        });
+    }
+    handle
 }

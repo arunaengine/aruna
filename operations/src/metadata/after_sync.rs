@@ -244,7 +244,6 @@ impl Operation for DeferSyncOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::metadata::refusing;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{APPLIED_SYNC_KEYSPACE, TASK_TIMER_KEYSPACE};
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -252,6 +251,7 @@ mod tests {
     use aruna_drivers::driver::DriverContext;
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use aruna_test_support::metadata::refusing;
     use tempfile::tempdir;
 
     async fn read_timer(
