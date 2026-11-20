@@ -121,6 +121,14 @@ TRIGGER_MATCHES = (
     ("aruna/src/inbound.rs", "Alpn::"),
 )
 TRIGGER_IMPLS = (("aruna/src/plugin_host/broker.rs", "Broker"),)
+# The one helper an arm without an inline async block may hand its work to, and the table that
+# helper must look the operation up in before it drives it.
+TRIGGER_HELPERS = {
+    "aruna/src/tasks/incoming/mod.rs": ("run_trigger", "timer_operation"),
+    "aruna/src/inbound.rs": ("serve_peer", "peer_operation"),
+}
+CALL_RE = re.compile(r"(?<![\w!])([a-z_]\w*)\s*\(")
+DRIVE_ANY = re.compile(r"\bdrive(?:_retry(?:_until)?)?\s*\(")
 SIMILAR_NAMES = (
     "*backoff*",
     "now_ms",
@@ -562,12 +570,26 @@ def trigger_arms(sources):
         arms = [(pattern, body) for pattern, body in match_arms(masked) if prefix in pattern]
         if not arms:
             found.append(f"{rel}: no {prefix} dispatch")
+        helper, table = TRIGGER_HELPERS.get(rel, ("", ""))
+        handed = False
         for pattern, body in arms:
-            if ASYNC_RE.search(body) and not one_drive(body):
-                found.append(f"{rel}: {SPACE_RE.sub(' ', pattern.strip())}")
+            name = SPACE_RE.sub(" ", pattern.strip())
+            if ASYNC_RE.search(body):
+                if not one_drive(body):
+                    found.append(f"{rel}: {name}")
+                continue
+            # A helper future returned without an inline async block must be the table helper.
+            for call in CALL_RE.findall(body):
+                if call == helper:
+                    handed = True
+                elif call != "pin":
+                    found.append(f"{rel}: {name} hands off to {call}")
+        if handed:
+            found.extend(helper_shape(rel, masked, helper, table))
     for rel, trait in TRIGGER_IMPLS:
         source = sources.get(rel)
         if not source:
+            found.append(f"{rel}: no {trait} impl source")
             continue
         impl_re = re.compile(r"\bimpl\b[^{;]*\b" + trait + r"\s+for\b[^{;]*\{")
         for impl in impl_re.finditer(source.masked):
@@ -576,6 +598,18 @@ def trigger_arms(sources):
                 if body[:keyword].rstrip().endswith("async") and not one_drive(body[start:end]):
                     found.append(f"{rel}: {trait}::{name}")
     return found
+
+
+def helper_shape(rel, masked, helper, table):
+    """Findings for a table helper that does not look its operation up once and drive it."""
+    for name, _, start, end in function_bodies(masked):
+        if name == helper:
+            body = masked[start:end]
+            lookups = len(re.findall(r"\b" + table + r"\s*\(", body))
+            if lookups == 1 and DRIVE_ANY.search(body):
+                return []
+            return [f"{rel}: {helper} does not drive one {table} operation"]
+    return [f"{rel}: no {helper} helper"]
 
 
 def one_drive(body):

@@ -644,11 +644,15 @@ async fn restore_registration_timer(
         after: aruna_core::federation::PUBLISH_INTERVAL,
     };
     let _held = hold_change(&effect).await;
-    if let Err(message) = persist_task_effect(storage, &effect).await {
-        warn!(message = %message, "Failed to persist registry publication timer");
-    }
+    let stamp = match persist_stamped(storage, &effect).await {
+        Ok(stamp) => stamp,
+        Err(message) => {
+            warn!(message = %message, "Failed to persist registry publication timer");
+            None
+        }
+    };
     if let Event::Task(TaskEvent::Error { message, .. }) =
-        task_handle.send_effect(Effect::Task(effect)).await
+        task_handle.send_stamped(effect, stamp).await
     {
         warn!(message = %message, "Failed to arm registry publication timer");
     }
@@ -711,6 +715,7 @@ async fn arm_prune_timer(context: &DriverContext) {
 mod stop_tests {
     use super::*;
     use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::task_timers::persist_task_effect;
     use tempfile::tempdir;
 
     async fn restore_queues() -> (tempfile::TempDir, TaskHandle, TaskQueues, Shutdown) {

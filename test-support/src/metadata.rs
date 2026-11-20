@@ -12,7 +12,7 @@ use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::metadata::materialization_queue::{
     JobsExistOperation, MaterializationBatchOperation, MetadataDrainResult,
-    MetadataMaterializationError, materialization_group_concurrency,
+    MetadataMaterializationError, UNKNOWN_CORES, group_concurrency,
 };
 use aruna_operations::metadata::prune_queue::{
     GraphDrainResult, MetadataGraphError, PruneBatchOperation, TombstoneProcessingResult,
@@ -28,7 +28,8 @@ pub async fn process_materialization_batch(
         ids: context.node_and_realm(),
         routing: node_routing(context),
     };
-    let concurrency = materialization_group_concurrency();
+    let cores = std::thread::available_parallelism().map_or(UNKNOWN_CORES, |cores| cores.get());
+    let concurrency = group_concurrency(cores);
     let link_timer = context.task_handle.is_some();
     drive(
         MaterializationBatchOperation::new(node, concurrency, link_timer),

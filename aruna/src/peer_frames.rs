@@ -136,7 +136,11 @@ pub(crate) async fn write_peer(
             close_stream(&mut stream).await;
             written
         }
-        _ => Ok(()),
+        (Alpn::Heartbeat, Ok(PeerAnswer::Kept)) => Ok(()),
+        (Alpn::Heartbeat, Err(failure)) => Err(failure.to_string()),
+        (Alpn::JobControl | Alpn::NativeReference, Err(failure)) => Err(failure.to_string()),
+        (alpn, Ok(_)) => Err(format!("unexpected {alpn:?} answer")),
+        (alpn, Err(failure)) => Err(format!("no {alpn:?} framing for a failed run: {failure}")),
     };
     if let Err(error) = written {
         warn!(peer = %peer, alpn = ?input.alpn, error = %error, "Failed to write peer answer");
