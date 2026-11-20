@@ -2023,11 +2023,14 @@ impl MaterializationJobOperation {
                 status.dataset_digest =
                     (plan.revision.as_ref()).and_then(|revision| revision.dataset_digest);
                 let validation_write = profile_validation_entry(&status)?;
-                self.mark(event, MaterializedCreateEvent {
-                    raw_revision: plan.revision,
-                    raw_state_write: plan.state_write,
-                    validation_write: Some(validation_write),
-                })
+                self.mark(
+                    event,
+                    MaterializedCreateEvent {
+                        raw_revision: plan.revision,
+                        raw_state_write: plan.state_write,
+                        validation_write: Some(validation_write),
+                    },
+                )
             }
             JobStage::Raw => {
                 let plan = result.child::<RawEventPlan, RawReadError>()??;
@@ -2041,11 +2044,14 @@ impl MaterializationJobOperation {
                 | MetadataEvent::ApplyRoCrateResult { .. }
                 | MetadataEvent::EntityUpsertResult { .. } => {
                     plan.cache(&mut self.cache);
-                    self.mark(event, MaterializedCreateEvent {
-                        raw_revision: plan.revision,
-                        raw_state_write: plan.state_write,
-                        validation_write: None,
-                    })
+                    self.mark(
+                        event,
+                        MaterializedCreateEvent {
+                            raw_revision: plan.revision,
+                            raw_state_write: plan.state_write,
+                            validation_write: None,
+                        },
+                    )
                 }
                 other => Err(unexpected(other)),
             },
