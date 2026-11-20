@@ -757,28 +757,6 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    /// Retries the terminal publications receipted executions still owe. The
-    /// reservation row keeps the obligation durable, so the retry re-arms until
-    /// every one of them is published and its capacity released.
-    pub(super) async fn settle_job_terminals(&self) {
-        let context = self.context.as_ref();
-        let settle =
-            SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
-        let pending = match drive(settle, context).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::SettleJobTerminals, error = %error, "Failed to settle terminal job publications");
-                true
-            }
-        };
-        if pending {
-            self.reschedule_timer(TaskKey::SettleJobTerminals, SETTLE_RETRY_AFTER)
-                .await;
-        }
-    }
-}
-
-impl OperationsTaskHandler {
     /// Replicates locally published job-family records to the other holders.
     /// The pass is bounded, so a large backlog re-arms instead of blocking.
     pub(super) async fn drain_family_outbox(&self) {

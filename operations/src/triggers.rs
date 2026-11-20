@@ -21,6 +21,7 @@ use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::blob::cleanup_timer::CleanupTimerOperation;
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
@@ -28,6 +29,7 @@ use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
+use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
@@ -161,6 +163,7 @@ pub enum TimerOperation {
     DrainCleanupQueue(CleanupTimerOperation),
     DrainRefreshQueue(DrainRefreshOperation),
     DrainCaptures(CaptureDrainOperation),
+    SettleJobTerminals(SettleTerminalsOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -216,6 +219,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             let node = GitNode { ids, routing };
             Some(TimerOperation::DrainCaptures(CaptureDrainOperation::new(node)))
         }
+        TaskKey::SettleJobTerminals => Some(TimerOperation::SettleJobTerminals(
+            SettleTerminalsOperation::new(input.facts.serving, input.now_ms),
+        )),
         _ => None,
     }
 }
@@ -238,6 +244,7 @@ macro_rules! each_timer {
             TimerOperation::DrainCleanupQueue($operation) => $body,
             TimerOperation::DrainRefreshQueue($operation) => $body,
             TimerOperation::DrainCaptures($operation) => $body,
+            TimerOperation::SettleJobTerminals($operation) => $body,
         }
     };
 }
@@ -462,6 +469,17 @@ impl TimerRun for CaptureDrainOperation {
             reason: error.to_string(),
         })?;
         Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for SettleTerminalsOperation {
+    /// A pending or failed settle retries; the reservation rows keep the obligation durable.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let pending = result.unwrap_or_else(|error| {
+            warn!(%error, "Failed to settle terminal job publications");
+            true
+        });
+        Ok(TimerPlan::from(pending.then_some(SETTLE_RETRY_AFTER)))
     }
 }
 
@@ -735,6 +753,7 @@ impl Operation for PeerOperation {
 mod tests {
     use super::*;
     use crate::blob::hidden::HiddenSweepOutcome;
+    use crate::jobs::lifecycle::LifecycleError;
     use crate::s3::object::metadata::ReferenceRefreshError;
     use crate::s3::object::metadata_drain::ReferenceDrainResult;
     use crate::blob::migration::drain::MigrationRun;
@@ -843,6 +862,17 @@ mod tests {
         assert_eq!(CaptureDrainOperation::rearm(Ok(after)), Ok(TimerPlan::from(after)));
         let failed = CaptureDrainOperation::rearm(Err(IoError::Unfinished));
         assert_eq!(failed.unwrap_err().retry_after, CAPTURE_RETRY_AFTER);
+    }
+
+    #[test]
+    fn terminal_settle_plans() {
+        // A pending or failed settle retries; a finished one waits for the next obligation.
+        let retry = Ok(TimerPlan::from(Some(SETTLE_RETRY_AFTER)));
+        assert_eq!(SettleTerminalsOperation::rearm(Ok(true)), retry);
+        let error = LifecycleError::Codec("broken".to_string());
+        assert_eq!(SettleTerminalsOperation::rearm(Err(error)), retry);
+        let settled = SettleTerminalsOperation::rearm(Ok(false));
+        assert_eq!(settled, Ok(TimerPlan::default()));
     }
 
     #[test]
