@@ -62,6 +62,16 @@ async fn request_session(
 ) -> Result<S3Session, CliError> {
     let body = serde_json::json!({ "group_id": group_id });
     let token: SessionTokenResponse = api.send(Method::POST, "access/s3/sessions", &body).await?;
+    resolve_session(api, fallback, token).await
+}
+
+/// The session of `token` at the endpoint its issuer names, else the one `api`'s node
+/// publishes or `fallback`; without an endpoint the session is revoked.
+async fn resolve_session(
+    api: &Api,
+    fallback: Option<&str>,
+    token: SessionTokenResponse,
+) -> Result<S3Session, CliError> {
     let mut session = S3Session {
         token,
         endpoint: String::new(),
@@ -203,11 +213,9 @@ impl S3Access {
         let path = format!("access/s3/sessions/{}/refresh", token.access_key_id);
         let body = serde_json::json!({});
         match self.api.send(Method::POST, &path, &body).await {
-            Ok(fresh) => {
-                if let Some(session) = self.session.as_mut() {
-                    session.token = fresh;
-                    self.client = s3_client(session);
-                }
+            Ok(token) => {
+                let fresh = resolve_session(&self.api, self.fallback.as_deref(), token).await?;
+                return self.adopt(fresh).await;
             }
             Err(error) => {
                 // Only a refresh the node finds too early keeps the old pair until its expiry; an
@@ -222,10 +230,15 @@ impl S3Access {
     }
 
     /// Takes a new session for the same group from the same node; the node refuses to refresh
-    /// an expired one. One from another issuer or endpoint is revoked, as uploads lock records
-    /// of the held destination.
+    /// an expired one.
     async fn reacquire(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
         let fresh = request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
+        self.adopt(fresh).await
+    }
+
+    /// Holds a refreshed or new session of the held issuer and endpoint. One of another is
+    /// revoked, as uploads lock records of the held destination.
+    async fn adopt(&mut self, fresh: S3Session) -> Result<aws_sdk_s3::Client, CliError> {
         let issuer = (self.session.as_ref()).map(|held| &held.token.issuer_node.node_id);
         if fresh.endpoint != self.endpoint || issuer != Some(&fresh.token.issuer_node.node_id) {
             revoke_session(&self.api, &fresh).await;
@@ -1074,6 +1087,21 @@ mod tests {
             assert!(lines[0].starts_with("POST ") && lines[0].contains("/held/refresh "));
             assert!(lines[1].starts_with("POST ") && lines[1].contains("/access/s3/sessions "));
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_moved_refresh() {
+        // A refresh to another endpoint ends the transfer and revokes the rotated session.
+        let (base, seen) = serve(moved_session).await;
+        let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
+        let mut access = held_access(&base, soon);
+        let error = access.client().await.unwrap_err();
+        assert!(matches!(error, CliError::Routing(_)), "{error}");
+        let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
+        assert_eq!(held.map(String::as_str), Some("held"));
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines[0].starts_with("POST ") && lines[0].contains("/held/refresh "));
+        assert!(lines[1].starts_with("DELETE ") && lines[1].contains("/moved "));
     }
 
     #[tokio::test]
