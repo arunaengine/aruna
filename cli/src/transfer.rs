@@ -222,9 +222,18 @@ impl S3Access {
     }
 
     /// Takes a new session for the same group from the same node; the node refuses to refresh
-    /// an expired one, and the caller's token gives the new one the same restrictions.
+    /// an expired one. One from another issuer or endpoint is revoked, as uploads lock records
+    /// of the held destination.
     async fn reacquire(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
         let fresh = request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
+        let issuer = (self.session.as_ref()).map(|held| &held.token.issuer_node.node_id);
+        if fresh.endpoint != self.endpoint || issuer != Some(&fresh.token.issuer_node.node_id) {
+            revoke_session(&self.api, &fresh).await;
+            return Err(CliError::routing(format!(
+                "the S3 destination of group {} changed during the transfer; rerun to continue",
+                self.group_id
+            )));
+        }
         self.client = s3_client(&fresh);
         self.session = Some(fresh);
         Ok(self.client.clone())
@@ -1048,6 +1057,43 @@ mod tests {
         let lines = seen.lock().unwrap().clone();
         assert!(lines[0].starts_with("POST ") && lines[0].contains("/held/refresh "));
         assert!(lines[1].starts_with("POST ") && lines[1].contains("/access/s3/sessions "));
+    }
+
+    /// A new session at another endpoint; revokes answer empty.
+    fn moved_session(line: &str) -> (u16, String) {
+        if line.starts_with("DELETE ") {
+            return (204, String::new());
+        }
+        let later = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+        let mut token = session_token("moved", later, "node");
+        token.issuer_node.s3_endpoint = Some("http://moved.example".into());
+        (200, serde_json::to_string(&token).unwrap())
+    }
+
+    /// A new session at the same endpoint from another node.
+    fn other_issuer(line: &str) -> (u16, String) {
+        if line.starts_with("DELETE ") {
+            return (204, String::new());
+        }
+        let later = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+        let token = session_token("moved", later, "other");
+        (200, serde_json::to_string(&token).unwrap())
+    }
+
+    #[tokio::test]
+    async fn refuses_moved_destination() {
+        // An upload locks the record of the held destination, so a moved session is revoked.
+        let lapsed = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+        for reply in [moved_session as fn(&str) -> (u16, String), other_issuer] {
+            let (base, seen) = serve(reply).await;
+            let mut access = held_access(&base, lapsed);
+            let error = access.client().await.unwrap_err();
+            assert!(matches!(error, CliError::Routing(_)), "{error}");
+            let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
+            assert_eq!(held.map(String::as_str), Some("held"));
+            let lines = seen.lock().unwrap().clone();
+            assert!(lines[1].starts_with("DELETE ") && lines[1].contains("/moved "));
+        }
     }
 
     #[test]
