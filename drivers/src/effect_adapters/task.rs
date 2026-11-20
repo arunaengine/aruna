@@ -80,10 +80,19 @@ async fn apply_change(
         let Some(task_handle) = task_handle else {
             return refused_handle();
         };
-        let (event, armed) = task_handle
+        let (event, holder) = task_handle
             .shorten_owned(key.clone(), *after, admission)
             .await;
-        if armed && let Err(message) = write_owned(storage, key, *after, admission).await {
+        let written = match &event {
+            Event::Task(TaskEvent::TimerScheduled { after, .. }) if holder == Some(admission) => {
+                write_owned(storage, key, *after, admission).await
+            }
+            Event::Task(TaskEvent::TimerScheduled { after, .. }) => {
+                own_row(storage, key, *after, holder).await
+            }
+            _ => Ok(()),
+        };
+        if let Err(message) = written {
             warn!(key = ?key, %message, "Timer kept in memory only");
             if !keep_live {
                 return refused(message);
@@ -109,6 +118,23 @@ async fn apply_change(
         Some(task_handle) => task_handle.send_stamped(effect, Some(admission)).await,
         None => refused_handle(),
     }
+}
+
+/// Makes sure the wake of admission `holder`, due after `after`, is stored for `key`: a row an
+/// earlier refused write left missing or later is written now. An earlier row stays.
+async fn own_row(
+    storage: &StorageHandle,
+    key: &TaskKey,
+    after: Duration,
+    holder: Option<u64>,
+) -> Result<(), String> {
+    let holder = holder.unwrap_or(NO_ADMISSION);
+    let due = unix_timestamp_millis().saturating_add(after.as_millis() as u64);
+    let row = read_timer(storage, key).await?;
+    if row.is_some_and(|row| row.admission == holder || row.due_unix_millis < due) {
+        return Ok(());
+    }
+    write_owned(storage, key, after, holder).await
 }
 
 /// The error of a timer change on a node without a task handle.
