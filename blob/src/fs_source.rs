@@ -115,7 +115,12 @@ pub(crate) async fn list_local(
     let (root, path) = access_parts(access)?;
     tokio::task::spawn_blocking(move || {
         let walk = Walk::new(&path, after, recursive);
-        walk_entries(&root, walk, (limit, recursive, files_only), MAX_LOCAL_EXAMINED)
+        walk_entries(
+            &root,
+            walk,
+            (limit, recursive, files_only),
+            MAX_LOCAL_EXAMINED,
+        )
     })
     .await
     .map_err(|error| StagingSourceError::ListError(error.to_string()))?
