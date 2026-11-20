@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod job;
+
 use std::collections::BTreeSet;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -204,5 +206,5 @@ impl Operation for RemoveEmailOperation {
 }
 
 #[cfg(test)]
-#[path = "email_tests.rs"]
+#[path = "tests.rs"]
 mod tests;

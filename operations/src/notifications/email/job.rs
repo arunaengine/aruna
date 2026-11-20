@@ -227,5 +227,5 @@ impl Operation for EmailJobOperation {
 }
 
 #[cfg(test)]
-#[path = "email_job_tests.rs"]
+#[path = "job_tests.rs"]
 mod tests;

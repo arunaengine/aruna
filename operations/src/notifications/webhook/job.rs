@@ -119,5 +119,5 @@ impl Operation for WebhookJobOperation {
 }
 
 #[cfg(test)]
-#[path = "webhook_job_tests.rs"]
+#[path = "job_tests.rs"]
 mod tests;
