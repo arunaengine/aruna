@@ -32,7 +32,9 @@ use crate::document::{
 };
 use crate::effects::{Effect, StorageEffect};
 use crate::events::{Event, StorageEvent};
-use crate::keyspaces::{APPLIED_SYNC_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, SYNC_REVISION_KEYSPACE};
+use crate::keyspaces::{
+    APPLIED_SYNC_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, SYNC_REVISION_KEYSPACE,
+};
 use crate::metadata::{
     GraphLifecycleRecord, MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord,
     MetadataLifecycleRecord,

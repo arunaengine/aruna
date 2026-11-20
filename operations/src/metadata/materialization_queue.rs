@@ -13,7 +13,8 @@ use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     CAPTURE_SEQUENCE_KEYSPACE, DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
-    MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
     ApplyRoCrateRequest, DeadLetterRecord, MaterializationState, MaterializationStatusRecord,
@@ -662,7 +663,8 @@ fn plan_rows(
                         let sequence = sequences.entry(document_id).or_default();
                         let key = capture_key(document_id, *sequence);
                         *sequence = sequence.saturating_add(1);
-                        plan.writes.push((space, key, ByteView::from(capture.to_bytes()?)));
+                        plan.writes
+                            .push((space, key, ByteView::from(capture.to_bytes()?)));
                         counted.insert(document_id, *sequence);
                     }
                     plan.deletes.push((
@@ -765,7 +767,8 @@ fn plan_rows(
     for (document_id, next) in counted {
         let key = ByteView::from(document_id.to_bytes().to_vec());
         let value = ByteView::from(next.to_be_bytes().to_vec());
-        plan.writes.push((CAPTURE_SEQUENCE_KEYSPACE.to_string(), key, value));
+        plan.writes
+            .push((CAPTURE_SEQUENCE_KEYSPACE.to_string(), key, value));
     }
     Ok((plan, superseding.keys().copied().collect()))
 }

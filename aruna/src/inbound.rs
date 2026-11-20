@@ -37,7 +37,9 @@ use aruna_net::streams::BiStream;
 use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
-use aruna_operations::metadata::after_sync::AfterSyncOperation;
+use aruna_operations::metadata::after_sync::{
+    AfterSyncOperation, DeferSyncOperation, MetadataTimings,
+};
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
 use aruna_operations::metadata::serve::forwards::needs_view;
 use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
@@ -525,8 +527,20 @@ async fn reconcile_inbound_topics(
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");
     }
-    let after = AfterSyncOperation::new(Some(net_handle.node_id()), targets);
-    let timings = drive(after, context).await.unwrap_or_default();
+    let after = AfterSyncOperation::new(Some(net_handle.node_id()), targets.clone());
+    let timings = match drive(after, context).await {
+        Ok(timings) => timings,
+        Err(error) => {
+            // The cursor moved past these events, so a rerun only comes from the node drain.
+            warn!(%error, "Metadata follow-ups of a document sync stopped; the drain reruns them");
+            let (node_id, realm_id) = (net_handle.node_id(), Some(*net_handle.realm_id()));
+            let defer = DeferSyncOperation::new(Ulid::generate(), node_id, realm_id, targets);
+            if let Err(error) = drive(defer, context).await {
+                error!(%error, "Metadata follow-ups of a document sync were not handed on");
+            }
+            MetadataTimings::default()
+        }
+    };
     info!(
         event = "pipeline.reconcile.summary",
         topics = topic_count,

@@ -5,12 +5,19 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::{DocumentReconcileResult, DocumentTarget};
+use aruna_core::document::{
+    AppliedStep, AppliedSync, DocumentReconcileResult, DocumentTarget, applied_sync_entry,
+    schedule_applied_drain,
+};
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord};
 use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::task::TaskEvent;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, warn};
+use ulid::Ulid;
 
 use crate::metadata::projection::{
     LoggedProjection, MetadataProjectionError, PROJECTION_RETRY_AFTER, ProjectEventsOperation,
@@ -47,8 +54,8 @@ pub enum AfterSyncError {
 }
 
 /// Projects the create events a reconcile applied, then queues prunes for deleted graphs. A
-/// failed projection arms the projection drain; only a failed handover or prune ends in an
-/// error, for a caller that retries. Its timings come from the runner's clock.
+/// failed projection arms the projection drain; a failed handover or prune is an error for a
+/// caller that retries, the handover only after the prunes ran. Timings use the runner clock.
 #[derive(Debug, PartialEq)]
 pub struct AfterSyncOperation {
     node_id: Option<NodeId>,
@@ -62,6 +69,8 @@ pub struct AfterSyncOperation {
     pruning_ms: u64,
     now_ms: u64,
     timings: MetadataTimings,
+    /// A projection retry that was not scheduled, reported once the prunes ran.
+    unscheduled: Option<MetadataProjectionError>,
 }
 
 impl AfterSyncOperation {
@@ -82,6 +91,7 @@ impl AfterSyncOperation {
             pruning_ms: 0,
             now_ms: 0,
             timings: MetadataTimings::default(),
+            unscheduled: None,
         }
     }
 
@@ -163,13 +173,16 @@ impl Operation for AfterSyncOperation {
                 Ok(Next::Call(IoCall::child(wake)))
             }
             SyncStage::Wake => {
-                let woken = result.child::<(), MetadataProjectionError>()?;
-                woken.map_err(AfterSyncError::Wake)?;
+                // The prunes do not depend on the projection, so they run before the error.
+                self.unscheduled = result.child::<(), MetadataProjectionError>()?.err();
                 Ok(self.prune())
             }
             SyncStage::Prune => {
                 let pruned = result.child::<TombstoneProcessingResult, MetadataGraphError>()?;
                 pruned.map_err(AfterSyncError::Prune)?;
+                if let Some(error) = self.unscheduled.take() {
+                    return Err(AfterSyncError::Wake(error));
+                }
                 self.timings.prune = elapsed(self.pruning_ms, self.now_ms);
                 Ok(Next::Done(self.timings))
             }
@@ -177,15 +190,68 @@ impl Operation for AfterSyncOperation {
     }
 }
 
+/// Hands the metadata follow-up of an applied reconcile to the node drain after it failed where
+/// it ran first: the row starts at the metadata step, and the drain is armed to run now.
+#[derive(Debug, PartialEq)]
+pub struct DeferSyncOperation {
+    applied: Option<AppliedSync>,
+}
+
+impl DeferSyncOperation {
+    pub fn new(
+        id: Ulid,
+        node_id: NodeId,
+        realm_id: Option<RealmId>,
+        result: DocumentReconcileResult,
+    ) -> Self {
+        let next = AppliedStep::Metadata;
+        let applied = AppliedSync {
+            id,
+            node_id,
+            realm_id,
+            result,
+            next,
+        };
+        Self {
+            applied: Some(applied),
+        }
+    }
+}
+
+impl Operation for DeferSyncOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let applied = self.applied.take().ok_or(IoError::Unfinished)?;
+        let entry = applied_sync_entry(&applied);
+        let entry = entry.map_err(|error| IoError::Codec(error.to_string()))?;
+        Ok(Next::Call(IoCall::Write(vec![entry])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if let IoResult::Done = result {
+            return Ok(Next::Call(IoCall::from(schedule_applied_drain())));
+        }
+        // The stored row is the handover; a drain that is not armed now runs it later.
+        if let Event::Task(TaskEvent::Error { message, .. }) = result.event()? {
+            warn!(%message, "Failed to arm the applied sync drain for a deferred follow-up");
+        }
+        Ok(Next::Done(()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
+    use aruna_core::keyspaces::{APPLIED_SYNC_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_drivers::driver::DriverContext;
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use aruna_test_support::metadata::refusing;
     use tempfile::tempdir;
 
     async fn read_timer(
@@ -274,8 +340,8 @@ mod tests {
         );
     }
 
-    // A failed projection is handed to the projection drain; only a failed handover or prune
-    // ends in an error, so the applied drain runs the follow-up again instead of dropping it.
+    // A failed projection is handed to the projection drain; a failed handover or prune ends
+    // in an error, so the applied drain runs the follow-up again instead of dropping it.
     #[test]
     fn failed_projection_retries() {
         let mut result = empty();
@@ -291,8 +357,68 @@ mod tests {
         after.next(failed).unwrap();
         assert_eq!(after.stage, SyncStage::Wake);
         let unscheduled = child(Err::<(), _>(MetadataProjectionError::PlacementFenced));
+        assert!(matches!(
+            after.next(unscheduled),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(after.stage, SyncStage::Prune);
+        let pruned = child(Ok::<_, MetadataGraphError>(
+            TombstoneProcessingResult::default(),
+        ));
         let failed = AfterSyncError::Wake(MetadataProjectionError::PlacementFenced);
-        assert_eq!(after.next(unscheduled), Err(failed));
+        assert_eq!(after.next(pruned), Err(failed));
+    }
+
+    // A projection retry that could not be scheduled still lets the tombstones of the batch
+    // queue their prune jobs; the error comes after them.
+    #[tokio::test]
+    async fn failed_wake_prunes() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let refused = refusing(storage.clone(), TASK_TIMER_KEYSPACE);
+        let context = aruna_drivers::testing::test_context(refused);
+        let (realm_id, group_id) = (RealmId::from_bytes([7u8; 32]), Ulid::from_parts(3, 1));
+        let document_id = Ulid::from_parts(3, 3);
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let tombstone =
+            GraphLifecycleRecord::deleted(graph_iri, realm_id, group_id, document_id, 2);
+        let result = DocumentReconcileResult {
+            targets: vec![DocumentTarget::MetadataCreateEvent {
+                document_id: ulid::Ulid::from_parts(4, 1),
+                event_id: ulid::Ulid::from_parts(4, 2),
+            }],
+            metadata_create_events: Vec::new(),
+            metadata_graph_tombstones: vec![tombstone],
+        };
+
+        let after = aruna_drivers::driver::drive(AfterSyncOperation::new(None, result), &context);
+
+        assert!(matches!(after.await, Err(AfterSyncError::Wake(_))));
+        let queued = aruna_test_support::metadata::prune_jobs_exist(&context).await;
+        assert!(queued.expect("prune jobs read"));
+    }
+
+    // A follow-up deferred to the node drain is stored at its metadata step.
+    #[tokio::test]
+    async fn deferred_rerun_stored() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = aruna_drivers::testing::test_context(storage.clone());
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let (id, result) = (ulid::Ulid::from_parts(5, 1), empty());
+        let queue = DeferSyncOperation::new(id, node_id, None, result.clone());
+
+        aruna_drivers::driver::drive(queue, &context).await.unwrap();
+
+        let key = id.to_bytes().to_vec();
+        let row = aruna_drivers::testing::read_value(&storage, APPLIED_SYNC_KEYSPACE, key).await;
+        let applied = AppliedSync::from_bytes(row.expect("row stored").as_ref()).unwrap();
+        assert_eq!(
+            (applied.next, applied.result),
+            (AppliedStep::Metadata, result)
+        );
     }
 
     #[test]

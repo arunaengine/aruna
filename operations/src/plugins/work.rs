@@ -541,8 +541,9 @@ impl Operation for PruneKeepingWork {
             }
             KeepPhase::Prune => {
                 let outcome = result.child::<JobPruneOutcome, PruneError>()??;
-                // Cleanups held every checked job; only deleted jobs count against the pass.
-                if outcome.pruned == 0 && outcome.has_more && self.after.is_some() {
+                // Cleanups held every checked job and nothing was deleted; only deleted rows count.
+                let empty = outcome.pruned == 0 && outcome.deleted_rows == 0;
+                if empty && outcome.has_more && self.after.is_some() {
                     self.start = self.after.clone();
                     return self.due();
                 }

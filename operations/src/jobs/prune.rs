@@ -34,6 +34,8 @@ pub struct JobPruneOutcome {
     pub pruned: usize,
     pub has_more: bool,
     pub next_due_after: Option<Duration>,
+    /// Rows the pass deleted, also those of a job whose record stays for a later pass.
+    pub deleted_rows: usize,
 }
 
 /// A prune step failed; the rows stay for the next pass.
@@ -233,6 +235,7 @@ impl PruneJobsOperation {
 
     fn finish(&mut self) -> PruneNext {
         let deletes = std::mem::take(&mut self.deletes);
+        self.outcome.deleted_rows = deletes.len();
         self.call(PruneStep::Deletes, IoCall::child(RowBatch::delete(deletes)))
     }
 
@@ -1010,6 +1013,51 @@ pub(crate) mod tests {
         assert!(gone.is_none());
         let held = read_job_record(&context, JobId::from_bytes([1u8; 16]), None);
         assert!(held.await.unwrap().is_some(), "held jobs stay");
+    }
+
+    #[tokio::test]
+    async fn partial_prune_continues() {
+        // A job whose staging rows fill the pass keeps the run going, also when held jobs follow.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
+        let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 20);
+        let large = JobId::from_bytes([9u8; 16]);
+        insert_job(&context, &terminal_record(large, finished))
+            .await
+            .unwrap();
+        let writes = (1..=6u8)
+            .map(|seed| {
+                let mut row = large.to_bytes().to_vec();
+                row.push(seed);
+                let row = ByteView::from(row);
+                (
+                    STAGING_QUEUE_KEYSPACE.to_string(),
+                    row,
+                    ByteView::from(Vec::new()),
+                )
+            })
+            .collect();
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        for seed in 1..=4u8 {
+            let job_id = JobId::from_bytes([seed; 16]);
+            insert_job(&context, &execution_record(job_id, finished + 10))
+                .await
+                .unwrap();
+            insert_job(&context, &cleanup_record(job_id)).await.unwrap();
+        }
+
+        let prune = crate::plugins::work::PruneKeepingWork::new(1);
+        let outcome = drive(prune, &context).await.unwrap();
+
+        assert_eq!((outcome.pruned, outcome.deleted_rows), (0, 4));
+        assert!(outcome.has_more, "the rest of the large job is next");
+        assert_eq!(count(&context, STAGING_QUEUE_KEYSPACE).await, 2);
     }
 
     #[tokio::test]
