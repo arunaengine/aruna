@@ -798,8 +798,8 @@ mod link_tests {
     fn drops_coverage_count() {
         let (_, deletes, _) = delete("keep");
         for space in [COVERAGE_COUNT_KEYSPACE, COUNT_QUEUE_KEYSPACE] {
-            let dropped = (deletes.iter())
-                .any(|(key_space, key)| key_space == space && &key[..] == b"x");
+            let dropped =
+                (deletes.iter()).any(|(key_space, key)| key_space == space && &key[..] == b"x");
             assert!(dropped, "{space} keeps the deleted bucket's row");
         }
     }

@@ -425,7 +425,10 @@ mod tests {
             run: Some(previous),
             ..counted(4, Some(9))
         };
-        let answers = vec![answer("node-a", counted(7, Some(20))), answer("node-b", old)];
+        let answers = vec![
+            answer("node-a", counted(7, Some(20))),
+            answer("node-b", old),
+        ];
 
         let joined = join_counts("photos", answers.clone(), Vec::new(), None).expect("joined");
         assert_eq!((joined.status, joined.observed), (CountStatus::Finished, 7));
@@ -433,6 +436,9 @@ mod tests {
         assert_eq!(joined.unreached, ["node-b"]);
 
         let joined = join_counts("photos", answers, Vec::new(), Some(previous)).expect("joined");
-        assert_eq!((joined.observed, joined.unreached), (4, vec!["node-a".to_string()]));
+        assert_eq!(
+            (joined.observed, joined.unreached),
+            (4, vec!["node-a".to_string()])
+        );
     }
 }
