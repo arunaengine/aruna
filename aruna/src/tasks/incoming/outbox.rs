@@ -4,6 +4,7 @@
 
 use super::*;
 use aruna_operations::node::outbox_finish::FinishBatchOperation;
+use aruna_operations::node::outbox_sync::SyncBatchOperation;
 
 /// The realm configuration the drain decides with: `None` on a node that has none yet, where the
 /// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
@@ -608,34 +609,30 @@ impl OperationsTaskHandler {
         net_handle: &aruna_net::NetHandle,
         subbatch: Option<DrainSubBatch>,
     ) -> DrainSyncOutcome {
-        let mut outcome = DrainSyncOutcome::default();
         let Some(subbatch) = subbatch else {
-            return outcome;
+            return DrainSyncOutcome::default();
         };
-        let requested_targets = subbatch.targets.clone();
-        let (batch_topics, batch_origins) = subbatch.ordering_domains();
-        let sync_started = Instant::now();
-        let sync =
-            SyncTopicsOperation::new(*net_handle.realm_id(), subbatch.topics, subbatch.peers)
-                .queuing_metadata(net_handle.node_id());
-        let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
-            drive(sync, self.context.as_ref()).await,
-        )));
-        outcome.sync_elapsed = sync_started.elapsed();
-        let mut outcome = self
-            .finish_sync_batch(
-                retry_key,
-                subbatch.record_keys,
-                requested_targets,
-                event,
-                outcome,
-            )
-            .await;
-        if outcome.retry_needed {
-            outcome.blocked_topics.extend(batch_topics);
-            outcome.blocked_origins.extend(batch_origins);
+        let record_keys = subbatch.record_keys.clone();
+        let (topics, origins) = subbatch.ordering_domains();
+        let serving = (net_handle.node_id(), *net_handle.realm_id());
+        let sync = SyncBatchOperation::new(serving, ulid::Ulid::generate(), subbatch);
+        match drive(sync, self.context.as_ref()).await {
+            Ok(finished) => {
+                if finished.deleted {
+                    self.forget_published(&record_keys);
+                }
+                finished.outcome
+            }
+            Err(error) => {
+                warn!(task_id = ?retry_key, %error, "Syncing a document sync batch broke off");
+                DrainSyncOutcome {
+                    retry_needed: true,
+                    blocked_topics: topics,
+                    blocked_origins: origins,
+                    ..DrainSyncOutcome::default()
+                }
+            }
         }
-        outcome
     }
 }
 
