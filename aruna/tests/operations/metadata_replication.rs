@@ -403,9 +403,9 @@ async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
 
 // Drives the hand-driven node's outbox drain until it is empty.
 async fn drain_until_empty(node: &TestNode) -> Result<(), Box<dyn std::error::Error>> {
-    let drainer = OutboxDrainer::new(node.context.clone());
+    let drainer = tokio::sync::Mutex::new(OutboxDrainer::new(node.context.clone()));
     wait_for_convergence("outbox never drained", || async {
-        drainer.run_once().await;
+        drainer.lock().await.run_once().await;
         let remaining = read_outbox_records(&node.context.storage_handle, &[], None, 16).await?;
         Ok(remaining.records.len())
     })
