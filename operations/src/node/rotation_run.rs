@@ -10,12 +10,11 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::document_apply::ApplyError;
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::task::{TaskEvent, TaskKey};
 use tracing::{error, warn};
 
 use crate::node::drain_page::{DrainPageOperation, DrainedPage, PageEnd};
@@ -23,6 +22,7 @@ use crate::sync::document_outbox::OutboxTailsOperation;
 use crate::sync::outbox::batches::{DrainInvocation, OutboxLimits};
 use crate::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use crate::sync::outbox::rotation::OutboxRotation;
+use crate::sync::shard_placement::schedule_retry_after;
 use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
 
 /// Outbox records remembered as published; past it they are forgotten and published once
@@ -162,19 +162,14 @@ impl RotationRunOperation {
                 "Document sync outbox records are stuck: this node holds their buckets but their shard topic geneses have never arrived"
             );
         }
-        let placements = match (invocation.config_drained, self.serving) {
-            (true, Some((node_id, realm_id))) => {
-                Some(TaskKey::SyncPlacements { realm_id, node_id })
-            }
-            _ => None,
-        };
+        let wake = (invocation.config_drained).then_some(self.serving).flatten();
         self.invocation = Some(invocation);
-        let Some(key) = placements else {
+        let Some((node_id, realm_id)) = wake else {
             return self.decide();
         };
         self.step = RunStep::Placements;
-        let after = Duration::ZERO;
-        Ok(Next::Call(IoCall::from(Effect::Task(TaskEffect::ResetTimer { key, after }))))
+        let wake = schedule_retry_after(realm_id, node_id, Duration::ZERO);
+        Ok(Next::Call(IoCall::from(wake)))
     }
 
     fn decide(&mut self) -> RunTurn {
@@ -311,6 +306,20 @@ mod tests {
         };
         assert_eq!(plan.after, Some(Duration::from_millis(retry_delay_ms(2))));
         assert_eq!(plan.memory.rotation.retry_attempts, 3);
+    }
+
+    // A realm config that cannot be decoded postpones the drain instead of reading as absent,
+    // where the bootstrap rules would let a record publish without verified membership.
+    #[test]
+    fn unreadable_config_waits() {
+        let mut run = RotationRunOperation::new(&input(serving(), 0));
+        run.first().unwrap();
+        let broken = aruna_core::types::Value::from(vec![0xff]);
+        let Ok(Next::Done(plan)) = run.next(IoResult::Values(vec![Some(broken)])) else {
+            panic!("an unreadable config ends the run");
+        };
+        assert_eq!(plan.after, Some(Duration::from_millis(retry_delay_ms(0))));
+        assert_eq!(plan.memory.rotation.retry_attempts, 1);
     }
 
     // An empty outbox drops the rotation and with it the retry ladder, and arms no drain.

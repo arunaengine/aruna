@@ -178,4 +178,39 @@ mod tests {
         assert_eq!(rotation.close_plan().1, None);
         assert_eq!(rotation.retry_attempts, 0);
     }
+
+    // A retry that reached the rotation's end closes it, so progress in a clean suffix restarts
+    // the ladder; a retry in the middle keeps the cursor and blocks and climbs the ladder.
+    #[test]
+    fn retry_suffix_closes() {
+        let totals = RotationTotals {
+            deleted: 1,
+            retry_invocations: 1,
+            invocations: 2,
+            ..RotationTotals::default()
+        };
+        let mut rotation = OutboxRotation {
+            boundary: Some(b"last".to_vec()),
+            cursor: Some(b"first".to_vec()),
+            continuations: 4,
+            ..closing(totals, 0)
+        };
+        let after = Some(Duration::from_millis(retry_delay_ms(0)));
+        assert_eq!(rotation.finish_retry(true), after);
+        assert!(rotation.boundary.is_none() && rotation.cursor.is_none());
+        assert_eq!((rotation.retry_attempts, rotation.continuations), (1, 0));
+
+        let topic = TopicId::hash(b"midpoint-retry-topic");
+        let mut rotation = OutboxRotation {
+            boundary: Some(b"last".to_vec()),
+            cursor: Some(b"middle".to_vec()),
+            ..closing(RotationTotals::default(), 3)
+        };
+        rotation.blocked_topics.insert(topic);
+        let after = Some(Duration::from_millis(retry_delay_ms(3)));
+        assert_eq!(rotation.finish_retry(false), after);
+        assert_eq!(rotation.cursor.as_deref(), Some(b"middle".as_slice()));
+        assert!(rotation.blocked_topics.contains(&topic));
+        assert_eq!(rotation.retry_attempts, 4);
+    }
 }
