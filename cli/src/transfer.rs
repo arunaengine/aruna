@@ -354,8 +354,7 @@ pub async fn upload(
             .map_err(|error| CliError::Io(std::io::Error::other(error)))??
     };
     let named = (access.endpoint.as_str(), bucket, key, blake3.as_str());
-    let record_path = upload_record(records, named, &parts);
-    let (mut record, kept) = claim_record(record_path.clone()).await?;
+    let (mut record, kept) = claim_record(upload_record(records, named, &parts)).await?;
     let resumed = match kept {
         Some(upload_id) => (stored_parts(&client, bucket, key, &upload_id).await?)
             .map(|stored| (upload_id, stored)),
@@ -431,9 +430,7 @@ pub async fn upload(
         .send()
         .await
         .map_err(s3_error)?;
-    // The emptied record of a finished transfer is harmless if it cannot be removed.
-    keep_id(&mut record, "")?;
-    let _ = std::fs::remove_file(&record_path);
+    finish_record(&mut record)?;
     Ok(Uploaded {
         size,
         blake3,
@@ -498,6 +495,12 @@ async fn claim_record(path: PathBuf) -> Result<(std::fs::File, Option<String>), 
     Ok(claimed
         .await
         .map_err(|error| CliError::Io(std::io::Error::other(error)))??)
+}
+
+/// Marks a claimed record finished. The emptied file stays, so a run waiting on its lock and
+/// every later run lock this same file.
+fn finish_record(record: &mut std::fs::File) -> std::io::Result<()> {
+    keep_id(record, "")
 }
 
 /// Replaces the upload id in a claimed record; an empty id marks the transfer as finished.
@@ -755,6 +758,20 @@ mod tests {
         assert_eq!(kept.as_deref(), Some("upload-1"));
         keep_id(&mut record, "").unwrap();
         drop(record);
+        assert_eq!(claim_record(path).await.unwrap().1, None);
+    }
+
+    #[tokio::test]
+    async fn finished_record_stays() {
+        // A finished transfer keeps its emptied record, so a waiting run locks the same file.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("record.upload");
+        let (mut record, _) = claim_record(path.clone()).await.unwrap();
+        keep_id(&mut record, "upload-1").unwrap();
+        finish_record(&mut record).unwrap();
+        assert!(path.exists(), "the record stays while its lock is held");
+        drop(record);
+        assert!(path.exists());
         assert_eq!(claim_record(path).await.unwrap().1, None);
     }
 
