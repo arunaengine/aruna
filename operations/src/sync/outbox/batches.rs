@@ -179,7 +179,7 @@ pub fn resolve_publish_placement(
 
 /// What publishing and syncing sub-batches left: the time spent, the records deleted and the
 /// ordering domains to block for the rest of the rotation.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DrainSyncOutcome {
     pub sync_elapsed: Duration,
     pub project_elapsed: Duration,
@@ -208,7 +208,7 @@ pub type StuckRecord = (u64, DocumentTarget, TopicId, PlacementRef);
 
 /// One bounded invocation of an open rotation: where it reads, what it blocks and what it
 /// counted.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainInvocation {
     pub outcome: DrainSyncOutcome,
     pub defer: DrainDeferState,

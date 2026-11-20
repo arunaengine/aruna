@@ -18,7 +18,7 @@ pub type DrainRecord = (Vec<u8>, DocumentOutboxRecord, TopicId);
 /// Per-invocation defer state. The block sets are seeded from the open rotation;
 /// `topic_exists` and `topic_held` deliberately are not, so holdership and
 /// genesis presence are re-read every invocation.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DrainDeferState {
     pub topic_exists: HashMap<TopicId, bool>,
     pub topic_held: HashMap<TopicId, bool>,

@@ -3,9 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_operations::node::finish_batch::FinishBatchOperation;
-use aruna_operations::node::publish_batches::PublishBatchesOperation;
-use aruna_operations::node::relay_records::RelayRecordsOperation;
+use aruna_operations::node::drain_page::{DrainPageOperation, PageEnd};
 
 /// The realm configuration the drain decides with: `None` on a node that has none yet, where the
 /// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
@@ -82,70 +80,6 @@ impl OutboxBarrier {
 }
 
 impl OperationsTaskHandler {
-    async fn read_drain_page(
-        &self,
-        retry_key: &TaskKey,
-        rotation: &OutboxRotation,
-        invocation: &mut DrainInvocation,
-    ) -> DrainPage {
-        let page_limit = OUTBOX_DRAIN_SIZE.min(
-            self.outbox_limits
-                .records
-                .saturating_sub(invocation.records),
-        );
-        let scan_started = Instant::now();
-        let read = OutboxPagePlan {
-            prefix: Vec::new(),
-            start_after: invocation.cursor.clone(),
-            limit: page_limit,
-        };
-        let mut batch = match drive(PlanOperation::new(read), self.context.as_ref()).await {
-            Ok(batch) => batch,
-            Err(error) => {
-                warn!(task_id = ?retry_key, error = %error, "Failed to read document sync outbox record");
-                invocation.read_failed = true;
-                return DrainPage::Stop;
-            }
-        };
-        if batch.records.iter().any(|(_, record)| matches!(&record.event,
-            DocumentOutboxEvent::AdminOperation { event, .. }
-                if matches!(event.op, aruna_core::admin_documents::AdminDocumentOperation::GroupDeleted { .. })))
-            && let Err(error) = aruna_drivers::driver::drive(
-                aruna_operations::groups::deletion::coordinator::SyncDecisionOperation,
-                self.context.as_ref(),
-            )
-            .await
-        {
-            warn!(error = %error, "Group deletion decision is not durable; retaining outbox");
-            invocation.read_failed = true;
-            invocation.outcome.retry_needed = true;
-            return DrainPage::Stop;
-        }
-        invocation.scan_elapsed += scan_started.elapsed();
-        let has_more = batch.has_more;
-        invocation.cursor = batch.next_start_after;
-        let boundary_reached = rotation.at_end(invocation.cursor.as_deref());
-        batch.records.retain(|(key, _)| rotation.admits(key));
-        if !batch.records.is_empty() {
-            return DrainPage::Records {
-                records: batch.records,
-                has_more,
-                boundary_reached,
-            };
-        }
-        if boundary_reached || !has_more {
-            invocation.reached_end = true;
-            DrainPage::Stop
-        } else if invocation.cursor.is_some() {
-            DrainPage::Skip
-        } else {
-            invocation.reached_end = true;
-            DrainPage::Stop
-        }
-    }
-}
-
-impl OperationsTaskHandler {
     async fn run_drain(&self) {
         let retry_key = TaskKey::DrainSyncOutbox;
         let drain_started = Instant::now();
@@ -172,37 +106,55 @@ impl OperationsTaskHandler {
             return;
         };
         let mut invocation = DrainInvocation::new(&rotation);
+        let (serving, config) = ((net_handle.node_id(), realm_id), realm_config.map(Arc::new));
         loop {
             if invocation.records >= self.outbox_limits.records
                 || invocation.pages >= self.outbox_limits.pages
             {
                 break;
             }
-            match self
-                .read_drain_page(&retry_key, &rotation, &mut invocation)
-                .await
-            {
-                DrainPage::Records {
-                    records,
+            let left = self.outbox_limits.records.saturating_sub(invocation.records);
+            let limit = OUTBOX_DRAIN_SIZE.min(left);
+            let published = (self.published_records.lock())
+                .expect("published records poisoned")
+                .clone();
+            let (before, undeliverable) = (invocation.clone(), invocation.undeliverable);
+            let page = DrainPageOperation::new(
+                serving,
+                config.clone(),
+                rotation.clone(),
+                invocation,
+                limit,
+                published,
+            );
+            let page = match drive(page, self.context.as_ref()).await {
+                Ok(page) => page,
+                Err(error) => {
+                    warn!(task_id = ?retry_key, %error, "Draining an outbox page broke off");
+                    invocation = before;
+                    invocation.read_failed = true;
+                    invocation.outcome.retry_needed = true;
+                    break;
+                }
+            };
+            // A relayed record left this node, so it never counts as undeliverable.
+            let left = page.invocation.undeliverable.saturating_sub(undeliverable) as u64;
+            UNDELIVERABLE_RECORD_COUNT.fetch_add(left, std::sync::atomic::Ordering::Relaxed);
+            self.note_published(&page.published);
+            self.forget_published(&page.deleted);
+            invocation = page.invocation;
+            match page.end {
+                PageEnd::Records {
                     has_more,
                     boundary_reached,
                 } => {
-                    self.process_drain_page(
-                        &retry_key,
-                        net_handle,
-                        realm_config.as_ref(),
-                        realm_id,
-                        records,
-                        &mut invocation,
-                    )
-                    .await;
                     if boundary_reached || !has_more {
                         invocation.reached_end = true;
                         break;
                     }
                 }
-                DrainPage::Skip => continue,
-                DrainPage::Stop => break,
+                PageEnd::Skip => continue,
+                PageEnd::Stop => break,
             }
         }
 
@@ -301,223 +253,6 @@ impl OperationsTaskHandler {
                 .lock()
                 .expect("outbox rotation mutex poisoned"),
         )
-    }
-}
-
-impl OperationsTaskHandler {
-    async fn process_drain_page(
-        &self,
-        retry_key: &TaskKey,
-        net_handle: &aruna_net::NetHandle,
-        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-        realm_id: RealmId,
-        records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
-        invocation: &mut DrainInvocation,
-    ) {
-        invocation.pages += 1;
-        invocation.records += records.len();
-        if let Some(page_oldest) = records
-            .iter()
-            .map(|(_, record)| record.outbox_id.timestamp_ms())
-            .min()
-        {
-            invocation.oldest_record_ms = Some(
-                invocation
-                    .oldest_record_ms
-                    .map_or(page_oldest, |current| current.min(page_oldest)),
-            );
-        }
-        let records = self
-            .prepare_drain_records(retry_key, net_handle, config, realm_id, records, invocation)
-            .await;
-        let (to_publish, deferred, undeliverable) = partition_drain_records(
-            records,
-            &mut invocation.defer,
-            !self.is_device(config),
-            |topic| net_handle.sync_topic_exists(topic).unwrap_or(false),
-            |record| classify_deferred_record(config, net_handle.node_id(), record),
-        );
-        invocation.deferred += deferred.len();
-        let now_ms = unix_timestamp_millis();
-        for (_, record, topic) in &deferred {
-            let record_ms = record.outbox_id.timestamp_ms();
-            if now_ms.saturating_sub(record_ms) < OUTBOX_STUCK_AFTER.as_millis() as u64 {
-                continue;
-            }
-            invocation.stuck += 1;
-            if invocation
-                .oldest_stuck
-                .as_ref()
-                .is_none_or(|(oldest_ms, ..)| record_ms < *oldest_ms)
-            {
-                invocation.oldest_stuck =
-                    Some((record_ms, record.target.clone(), *topic, record.placement));
-            }
-        }
-        let shared = config.cloned().map(Arc::new);
-        let relay = RelayRecordsOperation::new(net_handle.node_id(), shared, undeliverable);
-        match drive(relay, self.context.as_ref()).await {
-            Ok(relayed) => {
-                // A relayed record left this node, so it never counts as undeliverable.
-                let left = relayed.left as u64;
-                UNDELIVERABLE_RECORD_COUNT.fetch_add(left, std::sync::atomic::Ordering::Relaxed);
-                invocation.undeliverable += relayed.left;
-            }
-            Err(error) => warn!(%error, "Relaying undeliverable outbox records broke off"),
-        }
-
-        let (groups, subbatches) = {
-            let published = self
-                .published_records
-                .lock()
-                .expect("published records poisoned");
-            build_drain_batches(to_publish, &published)
-        };
-        invocation.groups += groups;
-        invocation.subbatches += subbatches.len();
-        let (publish_elapsed, outcome) = self
-            .publish_drain_batches(retry_key, net_handle, subbatches)
-            .await;
-        invocation.publish_elapsed += publish_elapsed;
-        invocation.outcome.merge(outcome);
-    }
-}
-
-impl OperationsTaskHandler {
-    async fn prepare_drain_records(
-        &self,
-        retry_key: &TaskKey,
-        net_handle: &aruna_net::NetHandle,
-        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-        realm_id: RealmId,
-        records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
-        invocation: &mut DrainInvocation,
-    ) -> Vec<DrainRecord> {
-        let mut records: Vec<DrainRecord> = records
-            .into_iter()
-            .map(|(record_key, mut record)| {
-                invocation.config_drained |=
-                    matches!(record.target, DocumentTarget::RealmConfig { .. });
-                record.placement =
-                    resolve_publish_placement(config, &record.target, record.placement);
-                let topic = record.target.sync_topic_id(realm_id, &record.placement);
-                (record_key, record, topic)
-            })
-            .collect();
-
-        // Pull a missing shard genesis from stamped ex-holders and live holders.
-        // Only current or draining former holders may adopt it for publication.
-        let mut missing_topics: BTreeMap<
-            Vec<aruna_core::id::NodeId>,
-            (Vec<aruna_core::id::NodeId>, BTreeSet<irokle::TopicId>),
-        > = BTreeMap::new();
-        for (_, record, topic) in &records {
-            if !record.target.uses_shard_topic()
-                || invocation.defer.deferred_topics.contains(topic)
-                || !config.is_none_or(|config| {
-                    aruna_core::placement::holds_placement(
-                        config,
-                        &record.placement,
-                        net_handle.node_id(),
-                    ) || aruna_core::placement::is_draining_holder(
-                        config,
-                        &record.placement,
-                        net_handle.node_id(),
-                    )
-                })
-                || net_handle.sync_topic_exists(*topic).unwrap_or(false)
-            {
-                continue;
-            }
-            let mut bootstrap_peers = record.peers.clone();
-            if let Some(config) = config {
-                for holder in
-                    aruna_core::placement::resolve_shard_holders(config, &record.placement)
-                {
-                    if !bootstrap_peers.contains(&holder) {
-                        bootstrap_peers.push(holder);
-                    }
-                }
-            }
-            bootstrap_peers.retain(|peer| *peer != net_handle.node_id());
-            if bootstrap_peers.is_empty() {
-                continue;
-            }
-            let mut peer_key = bootstrap_peers.clone();
-            aruna_operations::sync::shard_placement::sort_node_ids(&mut peer_key);
-            missing_topics
-                .entry(peer_key)
-                .or_insert_with(|| (bootstrap_peers, BTreeSet::new()))
-                .1
-                .insert(*topic);
-        }
-        for (_, (peers, topics)) in missing_topics {
-            let sync = SyncTopicsOperation::new(
-                *net_handle.realm_id(),
-                topics.into_iter().collect(),
-                peers,
-            )
-            .queuing_metadata(net_handle.node_id());
-            let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
-                drive(sync, self.context.as_ref()).await,
-            )));
-            let outcome = self
-                .finish_sync_batch(retry_key, Vec::new(), Vec::new(), event, Default::default())
-                .await;
-            invocation.outcome.merge(outcome);
-        }
-
-        // Publish to the bucket's sync members (admitted targets and retained departing holders included), but
-        // keep stamped peers above as genesis sources: a target must see writes made during the window.
-        if let Some(config) = config {
-            let now_ms = aruna_clock::unix_timestamp_millis();
-            for (_, record, _) in &mut records {
-                if !record.target.uses_shard_topic() {
-                    continue;
-                }
-                let members =
-                    aruna_core::placement::bucket_membership(config, &record.placement, now_ms)
-                        .members;
-                if !members.is_empty() {
-                    record.peers = members;
-                }
-            }
-        }
-        records
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Publishes and syncs the sub-batches through their operation and keeps which records this
-    /// process published; a run that broke off retries every sub-batch and blocks its domains.
-    async fn publish_drain_batches(
-        &self,
-        retry_key: &TaskKey,
-        net_handle: &aruna_net::NetHandle,
-        subbatches: Vec<DrainSubBatch>,
-    ) -> (Duration, DrainSyncOutcome) {
-        let mut blocked = DrainSyncOutcome {
-            retry_needed: true,
-            ..DrainSyncOutcome::default()
-        };
-        for subbatch in &subbatches {
-            let (topics, origins) = subbatch.ordering_domains();
-            blocked.blocked_topics.extend(topics);
-            blocked.blocked_origins.extend(origins);
-        }
-        let serving = (net_handle.node_id(), *net_handle.realm_id());
-        let publish = PublishBatchesOperation::new(serving, subbatches);
-        match drive(publish, self.context.as_ref()).await {
-            Ok(done) => {
-                self.note_published(&done.published);
-                self.forget_published(&done.deleted);
-                (done.publish_elapsed, done.outcome)
-            }
-            Err(error) => {
-                warn!(task_id = ?retry_key, %error, "Publishing document sync batches broke off");
-                (Duration::ZERO, blocked)
-            }
-        }
     }
 }
 
@@ -672,37 +407,6 @@ pub async fn drive_sync_drain(context: Arc<DriverContext>) {
     }
     if let Err(error) = drive(OutboxTimerOperation::new(), context.as_ref()).await {
         warn!(%error, "Failed to restore document sync outbox timer");
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Finishes one synced sub-batch through its operation, and forgets the records it deleted.
-    pub(super) async fn finish_sync_batch(
-        &self,
-        retry_key: &TaskKey,
-        record_keys: Vec<Vec<u8>>,
-        requested_targets: Vec<DocumentTarget>,
-        event: Event,
-        outcome: DrainSyncOutcome,
-    ) -> DrainSyncOutcome {
-        let (serving, generation) = (self.context.node_and_realm(), ulid::Ulid::generate());
-        let batch = (record_keys.clone(), requested_targets);
-        let finish = FinishBatchOperation::new(serving, generation, batch, event, outcome);
-        match drive(finish, self.context.as_ref()).await {
-            Ok(finished) => {
-                if finished.deleted {
-                    self.forget_published(&record_keys);
-                }
-                finished.outcome
-            }
-            Err(error) => {
-                warn!(task_id = ?retry_key, %error, "Finishing a document sync batch broke off");
-                DrainSyncOutcome {
-                    retry_needed: true,
-                    ..DrainSyncOutcome::default()
-                }
-            }
-        }
     }
 }
 

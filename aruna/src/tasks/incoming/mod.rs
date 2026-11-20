@@ -2,18 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::document::{
-    DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget,
-};
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::identity::JobExecutionClass;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
@@ -92,7 +90,6 @@ async fn restore_graph_prune(
     }
 }
 use crate::tasks::task_persistence::restore_task_timers;
-use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 use aruna_drivers::driver::node_facts;
 use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
@@ -103,19 +100,10 @@ use aruna_operations::queue_backoff::retry_delay_ms;
 use aruna_operations::replication::drain::RestoreDrainOperation;
 use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
-use aruna_operations::sync::document_outbox::{
-    OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
-};
-use aruna_operations::sync::outbox::batches::{
-    DrainInvocation, DrainSubBatch, DrainSyncOutcome, build_drain_batches,
-    resolve_publish_placement,
-};
-use aruna_operations::sync::outbox::defer::{
-    DrainRecord, classify_deferred_record, partition_drain_records,
-};
+use aruna_operations::sync::document_outbox::{OutboxTailsOperation, OutboxTimerOperation};
+use aruna_operations::sync::outbox::batches::DrainInvocation;
 use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::outbox::rotation::OutboxRotation;
-use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
     TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
@@ -158,9 +146,6 @@ const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
 const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_TICKS: usize = 12;
-/// How long a record may wait for its shard topic's genesis before the drain
-/// stops treating the wait as normal and says so at error level.
-const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy)]
 struct OutboxLimits {
@@ -201,16 +186,6 @@ pub(crate) struct OperationsTaskHandler {
     // Signs registry publications; `None` where no node identity was supplied.
 }
 
-enum DrainPage {
-    Records {
-        records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
-        has_more: bool,
-        boundary_reached: bool,
-    },
-    Skip,
-    Stop,
-}
-
 impl OperationsTaskHandler {
     pub(crate) fn new(context: Arc<DriverContext>, jobs_runtime: Arc<JobsRuntime>) -> Self {
         Self {
@@ -245,22 +220,6 @@ impl OperationsTaskHandler {
             continuation_streak,
         };
         self
-    }
-
-    /// Whether this node is a device: configured with a kind that holds no
-    /// sync topic. Unknown kinds count as infrastructure.
-    fn is_device(
-        &self,
-        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-    ) -> bool {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            return false;
-        };
-        config
-            .and_then(|config| {
-                aruna_operations::realm::mutate_placement::node_kind(config, net_handle.node_id())
-            })
-            .is_some_and(|kind| !kind.is_sync_eligible())
     }
 
     /// Re-arms the outbox drain on the rotation's retry ladder, which counts the attempt. The
