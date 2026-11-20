@@ -946,10 +946,9 @@ enum HandoffStep {
     Release,
 }
 
-/// Hands an external execution to reconciliation without re-queuing it. Rotating the token
-/// fences the old supervisor; the expired replacement claim keeps the unchanged state and
-/// attempt intent discoverable by the lease sweep. A job interrupted while still staging has no
-/// attempt intent, so its lease is released instead of waiting for the sweep's attempt charge.
+/// Hands an external execution to reconciliation without re-queuing: a new token fences the old
+/// supervisor and the expired claim leaves state and intent to the lease sweep. A job still
+/// staging has no intent, so its lease is released instead of waiting for the sweep.
 #[derive(Debug, PartialEq)]
 pub struct HandoffOperation {
     job_id: JobId,
@@ -1036,10 +1035,9 @@ impl Operation for HandoffOperation {
     }
 }
 
-/// Write-ahead attempt intent: record the deterministic external identity BEFORE any external
-/// submit so a lost attempt can be adopted by name. A committed cancellation wins this gate.
-/// `execution_id` binds the fenced attempt to the physical execution a target already
-/// receipted; `None` mints a fresh one for a purely local attempt.
+/// Write-ahead attempt intent: the external identity is recorded BEFORE any submit, so a lost
+/// attempt is adopted by name; a committed cancellation wins. `execution_id` binds a receipted
+/// physical execution; `None` mints a fresh one for a local attempt.
 pub fn record_attempt_intent(
     job_id: JobId,
     token: Ulid,

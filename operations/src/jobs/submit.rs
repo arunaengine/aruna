@@ -88,10 +88,9 @@ enum SubmitState {
 
 type Step = Result<Next<SubmitJobResult>, SubmitJobError>;
 
-/// Call-driven submit; a live `job_dedup_index` entry short-circuits to the
-/// existing id (matching plan digest) or raises `JobPlanConflict` (differing
-/// digest), a dangling entry creates fresh; at-least-once, so consumers must be idempotent.
-/// Every check reads in the write transaction the job row commits in.
+/// Submits once: a live `job_dedup_index` entry answers its id for the same plan digest or
+/// `JobPlanConflict` for another, a dangling one creates fresh. At least once, so consumers are
+/// idempotent; every check reads in the write transaction the job row commits in.
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,

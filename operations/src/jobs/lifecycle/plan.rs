@@ -92,10 +92,9 @@ enum PlanStep {
     Grant(NodeId),
 }
 
-/// Builds and runs one planning round: the advertisement of every member, the pinned inputs
-/// with their holders, the policies, and whether the submitter may run on each node. Targets
-/// already declined for this request are excluded before ranking; an unread advertisement may
-/// hold the only legal target, so the round is then a continuation, not a conclusive refusal.
+/// Runs one planning round over member advertisements, pinned inputs and holders, policies and
+/// per-node grants; declined targets are excluded. An unread advertisement may hold the only
+/// legal target, so the round then continues instead of refusing.
 #[derive(Debug, PartialEq)]
 pub struct BuildPlanOperation {
     round: PlanRound,
@@ -520,11 +519,9 @@ fn pinned_inputs(
     Ok(inputs)
 }
 
-/// The source endpoint owns the stored bucket/key/version, and every node the DHT lists for
-/// the same content hash holds a registered copy, so running next to one saves the transfer; a
+/// Adds the copies the DHT lists for the content hash to the holders, source endpoint first,
+/// without repeats and up to the planner's bound; running next to one saves the transfer, and a
 /// failed lookup leaves the source as the only route.
-/// Adds the registered copies to the holder list, keeping the source endpoint
-/// first, dropping repeats, and stopping at the bound the planner accepts.
 fn merge_holders(
     config: &RealmConfigDocument,
     holders: &mut Vec<InputHolder>,

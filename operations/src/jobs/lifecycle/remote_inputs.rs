@@ -35,10 +35,9 @@ pub struct ResolveCaller {
 type RemoteAnswers = Vec<(InputSelection, CapturedInput)>;
 type RemoteNext = Result<Next<RemoteAnswers>, SubmitJobError>;
 
-/// The inputs of another node, resolved and granted by that node for the caller's own bearer.
-/// Every input must name its exact version, so nothing depends on a remote head. Each request
-/// carries the inputs that fit one batch and the node answers a prefix of them, so the rest go
-/// out again until every input is answered.
+/// Another node's inputs, resolved and granted there for the caller's bearer, each at its exact
+/// version. A request carries one batch and the node answers a prefix, so the rest go out again
+/// until every input is answered.
 #[derive(Debug, PartialEq)]
 pub struct RemoteInputsOperation {
     node: NodeId,

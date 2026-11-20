@@ -61,10 +61,9 @@ enum CapabilityStep {
     Drain,
 }
 
-/// The executor capability of this node that runs `intent`. The node must be a sync-eligible
-/// realm member that is not leaving or draining, and its executor must fit the spec. The
-/// durable operator flag is read directly: a stale heartbeat document must never re-enable
-/// offers this node was drained out of.
+/// The executor capability of this node for `intent`: a sync-eligible member, not leaving or
+/// draining, whose executor fits the spec. The durable operator flag is read directly, so a stale
+/// heartbeat never re-enables offers this node was drained out of.
 #[derive(Debug, PartialEq)]
 pub(crate) struct LocalCapabilityOperation {
     config: RealmConfigDocument,
@@ -231,11 +230,9 @@ enum CheckStep {
     Policies,
 }
 
-/// Checks one offered launch in order: this node's capability, the governed-data gate (a
-/// node that stopped admitting governed data declines every new execution target), the
-/// stored submitter's WRITE grant on the group here, and the placement policies this target
-/// can resolve against its own subject. No bearer token replicates, so the grant is read from
-/// this node's replicated permissions. An error leaves the offer undecided.
+/// Checks one launch offer in order: capability, the governed-data gate, the stored submitter's
+/// WRITE grant here (from replicated permissions, as no token replicates) and the placement
+/// policies this target resolves for its subject. An error leaves the offer undecided.
 #[derive(Debug, PartialEq)]
 pub(crate) struct LaunchChecksOperation {
     check: LaunchCheck,

@@ -1,6 +1,5 @@
-//! Decides one launch offer at the execution target: spec, submitter, placement and fit are
-//! checked, the receipt is signed and committed with its reservation; a replay answers with the
-//! stored receipt and a family that already ran here is declined.
+//! Decides one launch offer at the target: checks spec, submitter, placement and fit, then signs
+//! and commits the receipt with its reservation; a replay answers it, a rerun family is declined.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

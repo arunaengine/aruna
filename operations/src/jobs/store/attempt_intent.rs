@@ -25,10 +25,9 @@ enum IntentStep {
     Delete,
 }
 
-/// Records the intent `draft` under the next attempt epoch, bound to the claim token `token`,
-/// with a fresh control row for `execution_id` and the `launch` facts of that epoch. An intent
-/// already recorded for the same attempt answers with its rows; a different one, or a
-/// committed cancellation, refuses.
+/// Records `draft` under the next attempt epoch for claim `token`, with a fresh control row for
+/// `execution_id` and that epoch's `launch` facts. The same recorded intent answers its rows; a
+/// different one, or a committed cancellation, refuses.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RecordIntentOperation {
     job_id: JobId,

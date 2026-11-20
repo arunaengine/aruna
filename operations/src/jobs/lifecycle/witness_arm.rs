@@ -119,10 +119,9 @@ enum ArmState {
     Delete,
 }
 
-/// Arms this node's fallback for one family. Rank zero is due immediately; a
-/// later rank waits `base_delay * rank` plus its own jitter. An earlier existing
-/// deadline is kept, so re-arming can only ever bring a round forward. The deadline is read
-/// and replaced in one write transaction, then the witness drain wakes.
+/// Arms this node's fallback for one family: rank zero now, a later rank after
+/// `base_delay * rank` plus jitter. An earlier deadline is kept, so re-arming only brings a round
+/// forward; it is replaced in one write transaction, then the witness drain wakes.
 #[derive(Debug, PartialEq)]
 pub struct ArmFamilyOperation {
     family: JobFamilyId,

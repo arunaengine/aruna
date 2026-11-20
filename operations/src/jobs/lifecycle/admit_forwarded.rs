@@ -1,6 +1,5 @@
-//! Serves one forwarded submission. The caller's token, the identity and this node's own holder
-//! standing are all revalidated before anything is committed, and the request is never
-//! forwarded a second hop.
+//! Serves one forwarded submission: token, identity and this node's holder standing are
+//! revalidated before any commit, and the request is never forwarded a second hop.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

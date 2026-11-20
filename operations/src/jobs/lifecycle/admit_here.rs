@@ -185,12 +185,9 @@ enum AdmitStep {
     Observed,
 }
 
-/// Signs the immutable spec and its claim for the minted alias and commits them. The answered
-/// alias is canonical at this accept: a fresh admission holds the only claim, and a replay
-/// settles on the already-reduced claim. A replay never reads the quota view, and a lost
-/// transaction against a concurrent submission of the group decides the quota again.
-/// Scheduling and replication are armed only after the claim is durable, so a failed commit
-/// never leaves a round pointing at a family that is absent.
+/// Signs and commits the spec and claim of the minted alias, canonical at this accept; a replay
+/// settles on the reduced claim without the quota view, a lost transaction decides it again.
+/// Scheduling and replication arm only after the durable claim, so no round names an absent family.
 #[derive(Debug, PartialEq)]
 pub(super) struct AdmitHereOperation {
     admission: LocalAdmission,

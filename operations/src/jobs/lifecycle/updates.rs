@@ -137,10 +137,9 @@ enum PublishState {
 
 type PublishStep = Result<Next<bool>, LifecycleError>;
 
-/// Publishes one state of the local execution. The sequence and the previous
-/// digest are derived from the records already stored, so a replay of the same
-/// state is idempotent and a lost publication never breaks the chain. Only the
-/// receipted executor publishes; it signs the update through `NetEffect::ExecutionSign`.
+/// Publishes one local execution state; sequence and previous digest come from stored records, so
+/// a replay is idempotent and a lost publication never breaks the chain. Only the receipted
+/// executor publishes, signing through `NetEffect::ExecutionSign`.
 #[derive(Debug, PartialEq)]
 pub struct PublishStateOperation {
     chain: ExecutionChain,
