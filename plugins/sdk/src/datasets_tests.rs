@@ -59,11 +59,11 @@ fn merge_cases() {
         serde_json::from_str(include_str!("../merge_cases.json")).unwrap();
     for (target, patch, merged) in cases {
         let mut result = target.clone();
-        crate::host::fake::merge_into(&mut result, patch.clone());
+        aruna_plugin_types::calls::merge_into(&mut result, patch.clone());
         assert_eq!(result, merged, "{target} {patch}");
         if let (Value::Object(old), Value::Object(new)) = (&target, &merged) {
             let mut again = target.clone();
-            crate::host::fake::merge_into(&mut again, Value::Object(merge_patch(old, new)));
+            aruna_plugin_types::calls::merge_into(&mut again, Value::Object(merge_patch(old, new)));
             assert_eq!(
                 &again, &merged,
                 "a save's patch turns {target} into {merged}"

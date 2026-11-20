@@ -22,6 +22,8 @@ pub const S3_REGION: &str = "us-east-1";
 const MAX_PARTS: u64 = 10_000;
 const PART_UPLOADS: usize = 4;
 const PARTIAL_SUFFIX: &str = ".aruna-part";
+/// The message of the node's refusal to refresh an expired session.
+const SESSION_EXPIRED: &str = "session has expired";
 const REFRESH_BEFORE: chrono::TimeDelta =
     chrono::TimeDelta::seconds(CLIENT_REFRESH_WINDOW.as_secs() as i64);
 
@@ -183,40 +185,57 @@ impl S3Access {
     /// The client, after refreshing a session that is about to expire, or taking a new one for
     /// the same group from the same node once it expired, as after a long wait for a record.
     pub async fn client(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
-        let Some(session) = &mut self.session else {
+        let Some(session) = &self.session else {
             return Ok(self.client.clone());
         };
+        let token = session.token.clone();
+        let zero = chrono::TimeDelta::zero();
         let now = chrono::Utc::now();
-        if expires_within(&session.token.expires_at, now, chrono::TimeDelta::zero()) {
-            // The node refuses to refresh an expired session; the caller's token gives the new
-            // one the same restrictions.
-            let fresh =
-                request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
-            self.client = s3_client(&fresh);
-            *session = fresh;
+        if expires_within(&token.expires_at, now, zero) {
+            return self.reacquire().await;
+        }
+        if !expires_within(&token.expires_at, now, REFRESH_BEFORE) {
             return Ok(self.client.clone());
         }
-        if !expires_within(&session.token.expires_at, now, REFRESH_BEFORE) {
-            return Ok(self.client.clone());
+        if !token.restrictions.is_empty() {
+            return Err(cannot_refresh(&token.expires_at));
         }
-        if !session.token.restrictions.is_empty() {
-            return Err(cannot_refresh(&session.token.expires_at));
-        }
-        let path = format!("access/s3/sessions/{}/refresh", session.token.access_key_id);
-        match self
-            .api
-            .send::<SessionTokenResponse>(Method::POST, &path, &serde_json::json!({}))
-            .await
-        {
+        let path = format!("access/s3/sessions/{}/refresh", token.access_key_id);
+        let body = serde_json::json!({});
+        match self.api.send(Method::POST, &path, &body).await {
             Ok(fresh) => {
-                session.token = fresh;
-                self.client = s3_client(session);
+                if let Some(session) = self.session.as_mut() {
+                    session.token = fresh;
+                    self.client = s3_client(session);
+                }
             }
-            // The node may see the refresh window later; the old pair works until expiry.
-            Err(_)
-                if !expires_within(&session.token.expires_at, now, chrono::TimeDelta::zero()) => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                // The issuer refused an expired session, or it lapsed during the call.
+                let lapsed = expires_within(&token.expires_at, chrono::Utc::now(), zero);
+                if lapsed || refused_expired(&error) {
+                    return self.reacquire().await;
+                }
+                // The node may see the refresh window later; the old pair works until expiry.
+            }
         }
+        Ok(self.client.clone())
+    }
+
+    /// Takes a new session for the same group from the same node; the node refuses to refresh
+    /// an expired one. One from another issuer or endpoint is revoked, as uploads lock records
+    /// of the held destination.
+    async fn reacquire(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
+        let fresh = request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
+        let issuer = (self.session.as_ref()).map(|held| &held.token.issuer_node.node_id);
+        if fresh.endpoint != self.endpoint || issuer != Some(&fresh.token.issuer_node.node_id) {
+            revoke_session(&self.api, &fresh).await;
+            return Err(CliError::routing(format!(
+                "the S3 destination of group {} changed during the transfer; rerun to continue",
+                self.group_id
+            )));
+        }
+        self.client = s3_client(&fresh);
+        self.session = Some(fresh);
         Ok(self.client.clone())
     }
 
@@ -226,6 +245,14 @@ impl S3Access {
             revoke_session(&self.api, session).await;
         }
     }
+}
+
+/// Whether the node refused a refresh because the session already expired.
+fn refused_expired(error: &CliError) -> bool {
+    let CliError::Api(error) = error else {
+        return false;
+    };
+    error.status == 409 && error.body.error == SESSION_EXPIRED
 }
 
 fn cannot_refresh(expires_at: &str) -> CliError {
@@ -734,6 +761,8 @@ mod tests {
     use aruna_wire::session::{
         SessionGroupResponse, SessionIssuerResponse, SessionRestrictionResponse,
     };
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn splits_into_parts() {
@@ -915,6 +944,156 @@ mod tests {
             error.to_string().contains("cannot reach the API"),
             "{error}"
         );
+    }
+
+    const S3_ENDPOINT: &str = "http://s3.example";
+
+    /// An unrestricted session token of `node` that expires at `expires_at`.
+    fn session_token(key: &str, expires_at: String, node: &str) -> SessionTokenResponse {
+        SessionTokenResponse {
+            access_key_id: key.into(),
+            secret_access_key: "secret".into(),
+            session_token: "token".into(),
+            expires_at,
+            group: SessionGroupResponse { id: "g".into() },
+            restrictions: Vec::new(),
+            issuer_node: SessionIssuerResponse {
+                node_id: node.into(),
+                s3_endpoint: Some(S3_ENDPOINT.into()),
+            },
+        }
+    }
+
+    /// Access through the API at `base` with a held session that expires at `expires_at`.
+    fn held_access(base: &str, expires_at: chrono::DateTime<chrono::Utc>) -> S3Access {
+        let token = session_token("held", expires_at.to_rfc3339(), "node");
+        let session = S3Session {
+            token,
+            endpoint: S3_ENDPOINT.into(),
+        };
+        S3Access {
+            api: Api::new(base, Some("bearer".into())).unwrap(),
+            client: s3_client(&session),
+            session: Some(session),
+            endpoint: S3_ENDPOINT.into(),
+            group_id: "g".into(),
+            fallback: None,
+        }
+    }
+
+    /// A local API that answers each request by `reply` from its request line and keeps the
+    /// lines it saw.
+    async fn serve(reply: fn(&str) -> (u16, String)) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let lines = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let line = read_request(&mut stream).await;
+                let (status, body) = reply(&line);
+                lines.lock().unwrap().push(line);
+                let length = body.len();
+                let head = format!(
+                    "HTTP/1.1 {status} Reply\r\ncontent-type: application/json\r\n\
+                     content-length: {length}\r\nconnection: close\r\n\r\n"
+                );
+                let reply = format!("{head}{body}");
+                stream.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (base, seen)
+    }
+
+    /// The request line of one request, read with its head and body.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let (mut bytes, mut chunk) = (Vec::new(), [0u8; 1024]);
+        let head = loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+            if read == 0 {
+                break bytes.len();
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes[..head]).to_string();
+        let length = (text.lines())
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while bytes.len() < head + length {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        text.lines().next().unwrap_or_default().to_string()
+    }
+
+    /// A refresh refused as expired, and a new session of the same node at the same endpoint.
+    fn refused_refresh(line: &str) -> (u16, String) {
+        if line.contains("/refresh ") {
+            let refusal = serde_json::json!({ "error": SESSION_EXPIRED, "code": "Conflict" });
+            return (409, refusal.to_string());
+        }
+        let later = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+        let token = session_token("fresh", later, "node");
+        (200, serde_json::to_string(&token).unwrap())
+    }
+
+    #[tokio::test]
+    async fn reacquires_refused_refresh() {
+        // The issuer refuses a refresh that reaches it after expiry; the old pair is not kept.
+        let (base, seen) = serve(refused_refresh).await;
+        let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
+        let mut access = held_access(&base, soon);
+        access.client().await.unwrap();
+        let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
+        assert_eq!(held.map(String::as_str), Some("fresh"));
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines[0].starts_with("POST ") && lines[0].contains("/held/refresh "));
+        assert!(lines[1].starts_with("POST ") && lines[1].contains("/access/s3/sessions "));
+    }
+
+    /// A new session at another endpoint; revokes answer empty.
+    fn moved_session(line: &str) -> (u16, String) {
+        if line.starts_with("DELETE ") {
+            return (204, String::new());
+        }
+        let later = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+        let mut token = session_token("moved", later, "node");
+        token.issuer_node.s3_endpoint = Some("http://moved.example".into());
+        (200, serde_json::to_string(&token).unwrap())
+    }
+
+    /// A new session at the same endpoint from another node.
+    fn other_issuer(line: &str) -> (u16, String) {
+        if line.starts_with("DELETE ") {
+            return (204, String::new());
+        }
+        let later = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
+        let token = session_token("moved", later, "other");
+        (200, serde_json::to_string(&token).unwrap())
+    }
+
+    #[tokio::test]
+    async fn refuses_moved_destination() {
+        // An upload locks the record of the held destination, so a moved session is revoked.
+        let lapsed = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+        for reply in [moved_session as fn(&str) -> (u16, String), other_issuer] {
+            let (base, seen) = serve(reply).await;
+            let mut access = held_access(&base, lapsed);
+            let error = access.client().await.unwrap_err();
+            assert!(matches!(error, CliError::Routing(_)), "{error}");
+            let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
+            assert_eq!(held.map(String::as_str), Some("held"));
+            let lines = seen.lock().unwrap().clone();
+            assert!(lines[1].starts_with("DELETE ") && lines[1].contains("/moved "));
+        }
     }
 
     #[test]

@@ -212,14 +212,7 @@ pub async fn install_task_queues(
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
 ) -> TaskQueues {
-    install_task_handler(
-        context,
-        task_handle,
-        jobs_runtime,
-        rocrate_limits,
-        true,
-    )
-    .await
+    install_task_handler(context, task_handle, jobs_runtime, rocrate_limits, true).await
 }
 
 /// Test convenience: installs the inbound handler, then restores and starts
@@ -232,15 +225,10 @@ pub async fn start_task_queues(
     jobs_runtime: Arc<JobsRuntime>,
     shutdown: &Shutdown,
 ) {
-    install_task_queues(
-        context,
-        task_handle,
-        jobs_runtime,
-        RoCrateLimits::default(),
-    )
-    .await
-    .restore_and_start(shutdown)
-    .await;
+    install_task_queues(context, task_handle, jobs_runtime, RoCrateLimits::default())
+        .await
+        .restore_and_start(shutdown)
+        .await;
 }
 
 async fn install_task_handler(
@@ -724,7 +712,10 @@ mod stop_tests {
         assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
         let (holder, after) = held_renewal(&task_handle).await;
         assert_eq!(holder, before.map(|row| row.admission));
-        assert!(after <= Duration::from_secs(60), "the stored due time is armed");
+        assert!(
+            after <= Duration::from_secs(60),
+            "the stored due time is armed"
+        );
 
         let fresh_dir = tempdir().expect("temp dir");
         let fresh = FjallStorage::open(fresh_dir.path().to_str().expect("temp path"))

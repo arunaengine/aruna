@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use aruna_plugin_types::calls::merge_into;
 use serde_json::{Map, Value};
 
 use crate::Level;
@@ -140,26 +141,6 @@ impl Fake {
             marked: version.starts_with('m'),
             version,
         })
-    }
-}
-
-/// Applies a JSON merge patch by the host's rules; `merge_cases.json` holds both to the same cases.
-pub(crate) fn merge_into(target: &mut Value, patch: Value) {
-    let Value::Object(changes) = patch else {
-        *target = patch;
-        return;
-    };
-    if !target.is_object() {
-        *target = Value::Object(Map::new());
-    }
-    let Value::Object(fields) = target else {
-        return;
-    };
-    for (key, value) in changes {
-        match value {
-            Value::Null => drop(fields.remove(&key)),
-            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
-        }
     }
 }
 
