@@ -17,7 +17,7 @@
     "pure_async_refs": 0,
     "silent_skips": 0,
     "state_clones": 0,
-    "test_sleeps": 5,
+    "test_sleeps": 4,
     "trigger_arms": 40,
     "upward_refs": 0
   }
