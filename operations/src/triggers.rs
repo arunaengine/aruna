@@ -21,6 +21,7 @@ use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 
+use crate::blob::cleanup_timer::CleanupTimerOperation;
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
 use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
@@ -93,6 +94,8 @@ pub struct TimerInput {
     pub facts: NodeFacts,
     /// This node's routing rules and backend catalog.
     pub routing: NodeRouting,
+    /// Whether this node has blob storage.
+    pub has_blob: bool,
 }
 
 impl TimerInput {
@@ -104,6 +107,7 @@ impl TimerInput {
             memory: TimerMemory::default(),
             facts: NodeFacts::default(),
             routing: NodeRouting::default(),
+            has_blob: false,
         }
     }
 }
@@ -150,6 +154,7 @@ pub enum TimerOperation {
     SweepHiddenBlobs(ProcessHiddenOperation),
     PruneConnectorReferences(PruneReferencesOperation),
     DeliverKeyWakes(DeliverWakesOperation),
+    DrainCleanupQueue(CleanupTimerOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -193,6 +198,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             let deliver = DeliverWakesOperation::new(start, input.facts.serving);
             Some(TimerOperation::DeliverKeyWakes(deliver))
         }
+        TaskKey::DrainCleanupQueue => Some(TimerOperation::DrainCleanupQueue(
+            CleanupTimerOperation::new(input),
+        )),
         _ => None,
     }
 }
@@ -212,6 +220,7 @@ macro_rules! each_timer {
             TimerOperation::SweepHiddenBlobs($operation) => $body,
             TimerOperation::PruneConnectorReferences($operation) => $body,
             TimerOperation::DeliverKeyWakes($operation) => $body,
+            TimerOperation::DrainCleanupQueue($operation) => $body,
         }
     };
 }
@@ -332,6 +341,12 @@ impl TimerRun for AppliedDrainOperation {
 
 impl TimerRun for PlacementTimerOperation {
     /// The operation plans its own next run; a failed run reads as a storage failure.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for CleanupTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
     }

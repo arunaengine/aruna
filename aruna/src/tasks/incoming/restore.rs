@@ -939,30 +939,6 @@ impl OperationsTaskHandler {
         self.reschedule_timer(TaskKey::PruneJobs, after).await;
     }
 
-    pub(super) async fn drain_blob_cleanup(&self) {
-        let node = CleanupNode {
-            routing: node_routing(&self.context),
-            has_blob: self.context.blob_handle.is_some(),
-        };
-        let after = match drive(ProcessCleanupOperation::new(node), &self.context).await {
-            Ok(outcome) if outcome.failed > 0 => BLOB_CLEANUP_RETRY,
-            Ok(outcome) if outcome.more => std::time::Duration::from_secs(1),
-            Ok(_) => BLOB_CLEANUP_AFTER,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to drain blob cleanup");
-                BLOB_CLEANUP_RETRY
-            }
-        };
-        // The parts a reclaimed upload frees become cleanup rows, so the sweep
-        // rides the same timer that drains them.
-        let sweep = SweepUploadsOperation::new(unix_timestamp_millis());
-        if let Err(error) = drive(sweep, &self.context).await {
-            warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to sweep stale multipart uploads");
-        }
-        self.reschedule_timer(TaskKey::DrainCleanupQueue, after)
-            .await;
-    }
-
     pub(super) async fn drain_blob_reclaim(&self) {
         let key = TaskKey::DrainReclaimQueue;
         let memory = self.kept_memory(&key);

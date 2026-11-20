@@ -53,10 +53,6 @@ impl Drop for OutboxBarrier {
 
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::blob::cleanup::{
-    BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, CleanupNode, ProcessCleanupOperation,
-    SweepUploadsOperation,
-};
 use aruna_operations::blob::holders::RefreshHoldersOperation;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
@@ -733,6 +729,7 @@ impl OperationsTaskHandler {
             memory: memory.clone(),
             facts: node_facts(&self.context),
             routing: aruna_drivers::driver::node_routing(&self.context),
+            has_blob: self.context.blob_handle.is_some(),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -826,9 +823,7 @@ impl OperationsTaskHandler {
                 self.drain_mirror_repair().await;
             }),
             TaskKey::SweepHiddenBlobs => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainCleanupQueue => Box::pin(async move {
-                self.drain_blob_cleanup().await;
-            }),
+            TaskKey::DrainCleanupQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainReclaimQueue => Box::pin(async move {
                 self.drain_blob_reclaim().await;
             }),
