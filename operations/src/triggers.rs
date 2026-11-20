@@ -21,6 +21,7 @@ use aruna_core::native_reference::{
 };
 use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::identity::realm::RealmId;
@@ -33,6 +34,7 @@ use tracing::{debug, warn};
 
 use crate::blob::cleanup_timer::CleanupTimerOperation;
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
+use crate::blob::holders::HoldersTimerOperation;
 use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
@@ -150,8 +152,8 @@ pub struct TimerInput {
     pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
     /// What each local executor backend advertises, filled like `heartbeats`.
     pub limits: BTreeMap<String, ResourceEnvelope>,
-    /// How long a finished import keeps its artifacts, from the node's ROCrate limits.
-    pub artifact_retention_ms: u64,
+    /// This node's ROCrate limits, such as the artifact retention and the holder refresh.
+    pub rocrate_limits: RoCrateLimits,
 }
 
 /// Whether the timer of `key` reads the heartbeats and executor limits; they are copied only
@@ -175,7 +177,7 @@ impl TimerInput {
             group_concurrency: 1,
             heartbeats: BTreeMap::new(),
             limits: BTreeMap::new(),
-            artifact_retention_ms: 0,
+            rocrate_limits: RoCrateLimits::default(),
         }
     }
 }
@@ -238,6 +240,7 @@ pub enum TimerOperation {
     DrainWitnessQueue(WitnessDrainOperation),
     RunBackendImports(RunDueOperation),
     MaintainRanges(RangeTimerOperation),
+    RefreshBlobHolders(HoldersTimerOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -377,7 +380,8 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         }
         TaskKey::RunBackendImports => Some(match input.facts.serving {
             Some((node_id, _)) => {
-                let (retention_ms, now_ms) = (input.artifact_retention_ms, input.now_ms);
+                let retention_ms = input.rocrate_limits.artifact_retention_ms;
+                let now_ms = input.now_ms;
                 let run = RunDueOperation::new(node_id, retention_ms, now_ms, input.facts.serving);
                 TimerOperation::RunBackendImports(run)
             }
@@ -386,6 +390,17 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
             input,
         ))),
+        TaskKey::RefreshBlobHolders => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                let limits = input.rocrate_limits.clone();
+                let refresh = HoldersTimerOperation::new(realm_id, node_id, limits);
+                TimerOperation::RefreshBlobHolders(refresh)
+            }
+            None => {
+                let after = Duration::from_millis(input.rocrate_limits.holder_refresh_ms);
+                TimerOperation::Wait(WaitOperation::after(Some(after)))
+            }
+        }),
         _ => None,
     }
 }
@@ -431,6 +446,7 @@ macro_rules! each_timer {
             TimerOperation::DrainWitnessQueue($operation) => $body,
             TimerOperation::RunBackendImports($operation) => $body,
             TimerOperation::MaintainRanges($operation) => $body,
+            TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -798,6 +814,12 @@ impl TimerRun for RangeTimerOperation {
             retry_after: maintain_retry(),
             reason: error.to_string(),
         })
+    }
+}
+
+impl TimerRun for HoldersTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
     }
 }
 

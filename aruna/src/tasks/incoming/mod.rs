@@ -46,7 +46,6 @@ impl Drop for OutboxBarrier {
 
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::blob::holders::RefreshHoldersOperation;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
 use aruna_operations::device::publish_queue::DrainOutcome;
@@ -55,7 +54,6 @@ use aruna_operations::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
 };
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
@@ -338,41 +336,6 @@ impl OperationsTaskHandler {
             continuation_streak,
         };
         self
-    }
-
-    async fn refresh_blob_holders(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(task_id = ?TaskKey::RefreshBlobHolders, "Cannot refresh blob holders without net handle");
-            self.reschedule_timer(
-                TaskKey::RefreshBlobHolders,
-                Duration::from_millis(self.rocrate_limits.holder_refresh_ms),
-            )
-            .await;
-            return;
-        };
-        // A User-kind device registers no holdership: the realm refuses its DHT
-        // puts. An unreadable config is bootstrap, which registers.
-        let config = drive(
-            GetConfigOperation::new(*net_handle.realm_id()),
-            &self.context,
-        )
-        .await;
-        let origin = config.ok().and_then(|config| {
-            aruna_operations::forward::routing::is_user_origin(&config, net_handle.node_id())
-        });
-        if origin == Some(true) {
-            return;
-        }
-        let operation =
-            RefreshHoldersOperation::new(*net_handle.realm_id(), self.rocrate_limits.clone());
-        if let Err(error) = drive(operation, self.context.as_ref()).await {
-            warn!(task_id = ?TaskKey::RefreshBlobHolders, error = %error, "Failed to refresh blob holders");
-            self.reschedule_timer(
-                TaskKey::RefreshBlobHolders,
-                Duration::from_millis(self.rocrate_limits.holder_refresh_ms),
-            )
-            .await;
-        }
     }
 
     /// Handles records this node cannot publish itself: admin records are relayed under
@@ -681,7 +644,7 @@ impl OperationsTaskHandler {
             group_concurrency: materialization_group_concurrency(),
             heartbeats: (cluster.then(|| self.context.fresh_heartbeats())).unwrap_or_default(),
             limits: (cluster.then(|| self.context.compute_limits())).unwrap_or_default(),
-            artifact_retention_ms: self.rocrate_limits.artifact_retention_ms,
+            rocrate_limits: self.rocrate_limits.clone(),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -764,9 +727,7 @@ impl OperationsTaskHandler {
                 self.drain_blob_reclaim().await;
             }),
             TaskKey::MigrateCompression => Box::pin(self.run_trigger(key)),
-            TaskKey::RefreshBlobHolders => Box::pin(async move {
-                self.refresh_blob_holders().await;
-            }),
+            TaskKey::RefreshBlobHolders => Box::pin(self.run_trigger(key)),
             TaskKey::LockBucket {
                 bucket_id,
                 generation,
