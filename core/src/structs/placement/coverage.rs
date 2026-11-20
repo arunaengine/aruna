@@ -4,6 +4,7 @@
 
 use crate::errors::ConversionError;
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 
 /// This node's count of one bucket's current versions against the bucket rules. Keyed by bucket
 /// name; in a distributed bucket it counts only the ranges this node writes.
@@ -25,6 +26,8 @@ pub struct CoverageCount {
     pub started_at_ms: u64,
     /// Set once every current version was counted.
     pub finished_at_ms: Option<u64>,
+    /// The start this count belongs to; every coordinator a distributed start reached holds it.
+    pub run: Option<Ulid>,
 }
 
 impl CoverageCount {
