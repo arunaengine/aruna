@@ -85,10 +85,13 @@ pub(super) fn publish_from_outbox(
     }
 }
 
+/// The realm configuration the drain decides with: `None` on a node that has none yet, where the
+/// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
+/// rather than let an unknown membership publish.
 pub(super) async fn load_drain_config(
     context: &Arc<DriverContext>,
     realm_id: aruna_core::structs::identity::realm::RealmId,
-) -> Option<aruna_core::structs::identity::realm::RealmConfigDocument> {
+) -> Result<Option<aruna_core::structs::identity::realm::RealmConfigDocument>, String> {
     let target = DocumentTarget::RealmConfig { realm_id };
     match context
         .storage_handle
@@ -99,10 +102,15 @@ pub(super) async fn load_drain_config(
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.and_then(|bytes| {
-            aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes).ok()
-        }),
-        _ => None,
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
+            None => Ok(None),
+            Some(bytes) => {
+                let config =
+                    aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes);
+                config.map(Some).map_err(|error| error.to_string())
+            }
+        },
+        other => Err(format!("the realm configuration read answered {}", other.label())),
     }
 }
 
@@ -407,7 +415,15 @@ impl OperationsTaskHandler {
         };
 
         let realm_id = *net_handle.realm_id();
-        let realm_config = load_drain_config(&self.context, realm_id).await;
+        let realm_config = match load_drain_config(&self.context, realm_id).await {
+            Ok(config) => config,
+            Err(error) => {
+                // No row is decided while membership is unknown, so all keep their order.
+                warn!(task_id = ?retry_key, %error, "Outbox drain waits for the realm config");
+                self.reschedule_with_backoff(retry_key).await;
+                return;
+            }
+        };
 
         let rotation = self.take_rotation();
         let Some(rotation) = self.open_rotation(&retry_key, rotation).await else {

@@ -9,7 +9,7 @@ use crate::config::NetConfig;
 pub(crate) mod document_sync_support;
 
 use crate::discovery::{DHT_MAX_SKEW, select_signed_endpoint, validate_endpoint_announcement};
-use crate::eviction::flush_evicted_documents;
+use crate::eviction::{absorb_journal, flush_evicted_documents};
 use crate::test_support::make_secret;
 use aruna_clock::testing::poll_until;
 use aruna_core::events::DhtEntry;
@@ -140,6 +140,28 @@ async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
     )
     .expect("document sync service opens");
     (dir, Arc::new(service))
+}
+
+// A failed startup read of the eviction journal loads nothing, so maintenance reads it again;
+// the later read adds the old entries next to those that arrived meanwhile, once each.
+#[test]
+fn journal_read_retried() {
+    let old = PendingEviction {
+        key: ::irokle::EvictionKey::from_bytes([17; 32]),
+        documents: vec![test_evicted_document(11)],
+    };
+    let arrived = PendingEviction {
+        key: ::irokle::EvictionKey::from_bytes([18; 32]),
+        documents: vec![test_evicted_document(12)],
+    };
+    let mut pending = Vec::new();
+    let failed = Err::<Vec<PendingEviction>, _>("journal read failed");
+    assert!(!absorb_journal(failed, &mut pending));
+    assert!(pending.is_empty());
+    pending.push(arrived.clone());
+    let read = Ok::<_, &str>(vec![old.clone(), arrived.clone()]);
+    assert!(absorb_journal(read, &mut pending));
+    assert_eq!(pending, vec![arrived, old]);
 }
 
 #[tokio::test]

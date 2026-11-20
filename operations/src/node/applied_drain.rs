@@ -11,7 +11,7 @@ use aruna_core::document::{AppliedStep, AppliedSync, applied_sync_entry, order_c
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{APPLIED_ORDER_KEYSPACE, APPLIED_SYNC_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use tracing::{debug, warn};
@@ -58,6 +58,10 @@ pub struct AppliedDrainOperation {
     ordering: Option<VecDeque<Ulid>>,
     /// The current row's own order entries, deleted with it.
     entries: Vec<Key>,
+    /// Rows that waited for an earlier batch, tried again once a later row settled this run.
+    waiting: Vec<(Key, AppliedSync)>,
+    /// Whether a row settled since the waiting rows were set aside.
+    settled: bool,
 }
 
 impl Default for AppliedDrainOperation {
@@ -77,6 +81,8 @@ impl AppliedDrainOperation {
             failed: false,
             ordering: None,
             entries: Vec::new(),
+            waiting: Vec::new(),
+            settled: false,
         }
     }
 
@@ -92,10 +98,18 @@ impl AppliedDrainOperation {
 
     fn next_row(&mut self) -> Turn {
         let Some((key, applied)) = self.pending.pop_front() else {
-            return match self.after {
-                Some(_) => self.read_page(),
-                None => Ok(Next::Done(self.failed.then_some(APPLIED_RETRY_AFTER))),
-            };
+            if self.after.is_some() {
+                return self.read_page();
+            }
+            // A batch that waited for one settled since goes on now, not after the retry delay.
+            if self.settled && !self.waiting.is_empty() {
+                self.settled = false;
+                let waited = std::mem::take(&mut self.waiting).into_iter();
+                self.pending = waited.map(|(key, row)| (key, Some(row))).collect();
+                return self.next_row();
+            }
+            let left = self.failed || !self.waiting.is_empty();
+            return Ok(Next::Done(left.then_some(APPLIED_RETRY_AFTER)));
         };
         self.current = Some(key);
         self.ordering = None;
@@ -193,9 +207,9 @@ impl AppliedDrainOperation {
             return Ok(Next::Call(IoCall::Delete(vec![row])));
         }
         debug!("A queued follow-up waits for an earlier batch of its document");
-        self.failed = true;
-        self.applied = None;
-        self.current = None;
+        if let (Some(key), Some(applied)) = (self.current.take(), self.applied.take()) {
+            self.waiting.push((key, applied));
+        }
         self.next_row()
     }
 
@@ -216,6 +230,7 @@ impl AppliedDrainOperation {
     fn delete(&mut self) -> Turn {
         let key = self.current.take().ok_or(IoError::Unfinished)?;
         self.applied = None;
+        self.settled = true;
         self.step = DrainStep::Delete;
         let mut rows = vec![(APPLIED_SYNC_KEYSPACE.to_string(), key)];
         let entries = std::mem::take(&mut self.entries).into_iter();
@@ -231,6 +246,11 @@ fn error_text<T, E: std::fmt::Display>(outcome: Result<T, E>) -> Option<String> 
 impl Operation for AppliedDrainOperation {
     type Output = Option<Duration>;
     type Error = IoError;
+
+    /// Every entry point runs this operation, so one hold keeps two runs off the same rows.
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::AppliedDrain)
+    }
 
     fn first(&mut self) -> Turn {
         self.read_page()
@@ -622,5 +642,50 @@ mod tests {
         assert_eq!(drain.next(rows(&[&later])), order_read(&later));
         let projecting = drain.next(first_entry(entry(1, &later)));
         assert_eq!(projecting, after_project(&later));
+    }
+
+    // A batch held behind an earlier one goes in the same run once that one settled, not after
+    // the retry delay of a failed follow-up.
+    #[test]
+    fn settled_batch_frees() {
+        let first = batch(Ulid::from_parts(2_000, 1), Ulid::from_parts(10, 1));
+        let later = batch(Ulid::from_parts(1_000, 1), Ulid::from_parts(11, 1));
+        let (_, _, stored) = applied_sync_entry(&first).unwrap();
+        let mut drain = AppliedDrainOperation::new();
+        drain.first().unwrap();
+        assert_eq!(drain.next(rows(&[&later, &first])), order_read(&later));
+        drain.next(first_entry(entry(0, &first))).unwrap();
+        assert_eq!(
+            drain.next(IoResult::Values(vec![Some(stored)])),
+            order_read(&first)
+        );
+        drain.next(first_entry(entry(0, &first))).unwrap();
+        let settled = drain.next(child::<_, AfterSyncError>(Ok(MetadataTimings::default())));
+        assert!(matches!(settled, Ok(Next::Call(IoCall::Delete(_)))));
+        assert_eq!(drain.next(IoResult::Done), order_read(&later));
+        let projecting = drain.next(first_entry(entry(1, &later)));
+        assert_eq!(projecting, after_project(&later));
+        let done = drain.next(child::<_, AfterSyncError>(Ok(MetadataTimings::default())));
+        assert!(matches!(done, Ok(Next::Call(IoCall::Delete(_)))));
+        assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(None)));
+    }
+
+    // The timer run and the run a sync settles inline are the same operation under one hold,
+    // so two drains over the same order head never both project its batch.
+    #[test]
+    fn drains_share_hold() {
+        use aruna_core::operation::SubOperation;
+        let input = crate::triggers::TimerInput {
+            now_ms: 1,
+            local_node: Some(node()),
+        };
+        let timer = crate::triggers::timer_operation(&TaskKey::DrainAppliedSync, &input);
+        let timer = timer.expect("the applied drain runs on its timer");
+        assert_eq!(timer.hold_scope(), Some(HoldScope::AppliedDrain));
+        let mut settle = SettleAppliedOperation::new();
+        let Ok(Next::Call(IoCall::Child(inline))) = settle.first() else {
+            panic!("the settle runs the drain as its child");
+        };
+        assert_eq!(inline.hold_scope(), Some(HoldScope::AppliedDrain));
     }
 }

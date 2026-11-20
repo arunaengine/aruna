@@ -40,6 +40,9 @@ pub enum HoldScope {
     /// The passes, bindings and cleanups of the device folders in one of 64 shards, so an
     /// unbind waits for a pass in flight on its folder.
     FolderPass(u8),
+    /// The applied sync drain of this node, so the timer, inbound and outbox runs never take one
+    /// row, or the order head of one document, at once.
+    AppliedDrain,
 }
 
 /// One use case as decisions without I/O: `first` and `next` return the next call or the

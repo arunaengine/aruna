@@ -11,6 +11,7 @@ use aruna_core::structs::execution::notification_watch::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, Value};
 use aruna_core::user::id::UserId;
+use tracing::warn;
 
 use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::unexpected;
@@ -43,8 +44,9 @@ pub struct WatchPage {
     pub next: Option<Vec<u8>>,
 }
 
-/// Reads stored watch subscriptions and checks each row against its key and scope; a row of
-/// another owner or realm, or a scan beyond its cap, is an error.
+/// Reads stored watch subscriptions and checks each row against its key and scope; a scan beyond
+/// its cap is an error. A malformed row fails the owner's own listing, while a delivery scan of a
+/// realm skips it, so one broken row never costs the healthy watches on its page their events.
 #[derive(Debug, PartialEq)]
 pub struct ListWatchesOperation {
     scope: WatchScope,
@@ -82,21 +84,37 @@ impl ListWatchesOperation {
     /// Decodes rows into the page, checking that each belongs to the scope.
     fn take(&mut self, rows: Vec<(Key, Value)>) -> Result<(), WatchSubscriptionError> {
         for (key, value) in rows {
-            let subscription = decode_stored_subscription(&key, &value)?;
-            let foreign = match &self.scope {
-                WatchScope::Owner(owner) => (subscription.owner != *owner)
-                    .then_some("stored watch subscription belongs to a different owner"),
-                WatchScope::Realm(realm_id) | WatchScope::Page { realm_id, .. } => {
-                    (subscription.owner.realm_id != *realm_id)
-                        .then_some("stored watch subscription belongs to a different realm")
+            match self.checked(&key, &value) {
+                Ok(subscription) => self.page.subscriptions.push(subscription),
+                Err(WatchSubscriptionError::Malformed(reason))
+                    if !matches!(self.scope, WatchScope::Owner(_)) =>
+                {
+                    warn!(key = ?key.to_vec(), %reason, "Skipping a malformed watch subscription");
                 }
-            };
-            if let Some(reason) = foreign {
-                return Err(WatchSubscriptionError::Malformed(reason.to_string()));
+                Err(error) => return Err(error),
             }
-            self.page.subscriptions.push(subscription);
         }
         Ok(())
+    }
+
+    fn checked(
+        &self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<WatchSubscription, WatchSubscriptionError> {
+        let subscription = decode_stored_subscription(key, value)?;
+        let foreign = match &self.scope {
+            WatchScope::Owner(owner) => (subscription.owner != *owner)
+                .then_some("stored watch subscription belongs to a different owner"),
+            WatchScope::Realm(realm_id) | WatchScope::Page { realm_id, .. } => {
+                (subscription.owner.realm_id != *realm_id)
+                    .then_some("stored watch subscription belongs to a different realm")
+            }
+        };
+        match foreign {
+            Some(reason) => Err(WatchSubscriptionError::Malformed(reason.to_string())),
+            None => Ok(subscription),
+        }
     }
 
     fn page_read(
@@ -221,5 +239,41 @@ mod call_tests {
             limit: 0,
         });
         assert!(page.first().is_err());
+    }
+
+    // The realm scan this node delivers its own events with skips a malformed row and keeps the
+    // healthy watch on its page, so the event settles; the owner's own listing still reports it.
+    #[test]
+    fn realm_scan_skips() {
+        use aruna_core::structs::execution::notification_watch::{
+            WatchEventKind, WatchEventMask, watch_subscription_key,
+        };
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let owner = user(4, 3);
+        let id = ulid::Ulid::generate();
+        let mut healthy = WatchSubscription::new(id, owner, "data/".into(), mask, 1);
+        healthy.watch_id = ulid::Ulid::from_bytes([7; 16]);
+        let broken = watch_subscription_key(owner, ulid::Ulid::from_bytes([6; 16]));
+        let kept = watch_subscription_key(owner, healthy.watch_id);
+        let rows = vec![
+            (broken, Value::from(vec![0xff])),
+            (kept, Value::from(healthy.to_bytes().unwrap())),
+        ];
+        let mut realm = ListWatchesOperation::new(WatchScope::Realm(owner.realm_id));
+        realm.first().unwrap();
+        let listed = realm.next(IoResult::Page {
+            rows: rows.clone(),
+            next: None,
+        });
+        let page = WatchPage {
+            subscriptions: vec![healthy],
+            next: None,
+        };
+        assert_eq!(listed, Ok(Next::Done(page)));
+
+        let mut own = ListWatchesOperation::new(WatchScope::Owner(owner));
+        own.first().unwrap();
+        let listed = own.next(IoResult::Page { rows, next: None });
+        assert!(matches!(listed, Err(WatchSubscriptionError::Malformed(_))));
     }
 }
