@@ -102,7 +102,7 @@ fn settles_terminal_states() {
 // The settle pass reads the family as the task status does: a family this node's membership
 // view marks not run settles as unknown, and a partial read decides nothing.
 #[test]
-fn not_run_settles_unknown() {
+fn not_run_settled() {
     let projection = JobProjection {
         submission_id: family().submission_id,
         request_digest: family().request_digest,
