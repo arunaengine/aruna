@@ -152,7 +152,10 @@ mod tests {
         let origin = "https://portal.example.org";
         assert!(cors_allows([" https://portal.example.org/ "], origin));
         assert!(cors_allows(["https://other.example.org", "*"], origin));
-        assert!(cors_allows(["https://portal.example.org"], "https://portal.example.org/"));
+        assert!(cors_allows(
+            ["https://portal.example.org"],
+            "https://portal.example.org/"
+        ));
         assert!(!cors_allows(["https://other.example.org"], origin));
         assert!(!cors_allows(["https://portal.example.org:8443"], origin));
         assert!(!cors_allows([], origin));

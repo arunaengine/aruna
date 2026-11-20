@@ -8,8 +8,8 @@ use crate::tests::distributed::{
     BUCKET, CLOSED_API, LOCAL, PEER, distribute, mock_peer, node_id, node_state, publish_api,
 };
 use aruna_operations::distribution::resolve::key_holders;
-use aruna_operations::relay::tool::{Holder, pick_node};
 use aruna_operations::relay::tool::route::HolderSearchOperation;
+use aruna_operations::relay::tool::{Holder, pick_node};
 use axum::http::StatusCode;
 use serde_json::json;
 use std::time::Duration;
