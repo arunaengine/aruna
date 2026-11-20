@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::jobs::job_reads::tests::{
+use crate::jobs::job::reads::tests::{
     auth_of, child, is_child, job_id, owner, probe, record_of, stored,
 };
 

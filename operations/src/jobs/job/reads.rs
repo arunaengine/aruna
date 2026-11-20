@@ -22,10 +22,10 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::records::pages::ServingNode;
-use super::route::{JobRouteError, RoutedJobStatus};
-use super::store::mutation_error::JobMutationError;
-use super::store::row_calls::{read_crate_status, read_job_record, read_key_waits};
+use super::super::records::pages::ServingNode;
+use super::super::route::{JobRouteError, RoutedJobStatus};
+use super::super::store::mutation_error::JobMutationError;
+use super::super::store::row_calls::{read_crate_status, read_job_record, read_key_waits};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -50,24 +50,24 @@ impl From<JobMutationError> for JobReadError {
     }
 }
 
-pub(super) fn internal(error: impl std::fmt::Display) -> JobRouteError {
+pub(in crate::jobs) fn internal(error: impl std::fmt::Display) -> JobRouteError {
     JobRouteError::Internal(error.to_string())
 }
 
-pub(super) fn unavailable(reason: impl std::fmt::Display) -> JobRouteError {
+pub(in crate::jobs) fn unavailable(reason: impl std::fmt::Display) -> JobRouteError {
     JobRouteError::Unavailable(reason.to_string())
 }
 
 /// The record a job-record child answered.
-pub(super) fn job_row(result: IoResult) -> Result<Option<JobRecord>, JobReadError> {
+pub(in crate::jobs) fn job_row(result: IoResult) -> Result<Option<JobRecord>, JobReadError> {
     Ok(result.child::<Option<JobRecord>, JobMutationError>()??)
 }
 
-pub(super) fn document_read(document_id: Ulid) -> IoCall {
+pub(in crate::jobs) fn document_read(document_id: Ulid) -> IoCall {
     read_row(DOCUMENT_INDEX_KEYSPACE, metadata_document_key(document_id))
 }
 
-pub(super) fn document_row(
+pub(in crate::jobs) fn document_row(
     result: IoResult,
 ) -> Result<Option<MetadataRegistryRecord>, JobReadError> {
     Ok(decoded(result)?)
@@ -406,5 +406,5 @@ impl Operation for JobOwnerOperation {
 }
 
 #[cfg(test)]
-#[path = "job_reads_tests.rs"]
+#[path = "reads_tests.rs"]
 pub(crate) mod tests;

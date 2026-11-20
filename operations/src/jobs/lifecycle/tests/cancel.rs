@@ -372,7 +372,7 @@ async fn deletion_hides_family() {
 async fn unrecorded_deletion_kept() {
     // A node that cannot record the deletion in the run's family keeps the run, so a retried
     // delete records it again; a holder records it before the run goes.
-    use crate::jobs::job_reads::tests::delete_owned_run;
+    use crate::jobs::job::reads::tests::delete_owned_run;
     use crate::jobs::store::RunDelete;
     use crate::tests::records::secret;
     use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};

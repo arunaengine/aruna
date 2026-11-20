@@ -10,14 +10,14 @@ use aruna_core::structs::execution::job::local::{JobRecord, cleanup_job_id};
 use aruna_core::structs::identity::auth::AuthContext;
 use tracing::warn;
 
-use super::lifecycle::cancel::PublishDeletionOperation;
-use super::prune::PruneTimerOperation;
-use super::records::pages::ServingNode;
-use super::route::JobRouteError;
-use super::store::RunDelete;
-use super::store::job_calls::{CancelRequestOutcome, delete_finished_run, set_cancel_requested};
-use super::store::mutation_error::JobMutationError;
-use super::store::row_calls::read_job_record;
+use super::super::lifecycle::cancel::PublishDeletionOperation;
+use super::super::prune::PruneTimerOperation;
+use super::super::records::pages::ServingNode;
+use super::super::route::JobRouteError;
+use super::super::store::RunDelete;
+use super::super::store::job_calls::{CancelRequestOutcome, delete_finished_run, set_cancel_requested};
+use super::super::store::mutation_error::JobMutationError;
+use super::super::store::row_calls::read_job_record;
 
 #[derive(Debug, PartialEq)]
 enum DeleteStep {
@@ -160,5 +160,5 @@ impl Operation for DeleteOwnedOperation {
 }
 
 #[cfg(test)]
-#[path = "job_delete_tests.rs"]
+#[path = "delete_tests.rs"]
 mod tests;

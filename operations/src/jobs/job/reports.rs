@@ -16,15 +16,15 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::Value;
 use aruna_core::user::id::UserId;
 
-use super::job_reads::{JobReadError, OwnedJobOperation, ReadableJobOperation, internal};
-use super::job_routes::{FamilyRouteOperation, refused};
-use super::lifecycle::alias::AliasFamilyOperation;
-use super::lifecycle::family_reads::SessionJobOperation;
-use super::records::pages::ServingNode;
-use super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
-use super::store::mutation_error::JobMutationError;
-use super::store::row_calls::{EntryPage, list_job_entries};
-use super::{REPORT_MAX_ROWS, SESSION_REPORT_ROWS};
+use super::reads::{JobReadError, OwnedJobOperation, ReadableJobOperation, internal};
+use super::routes::{FamilyRouteOperation, refused};
+use super::super::lifecycle::alias::AliasFamilyOperation;
+use super::super::lifecycle::family_reads::SessionJobOperation;
+use super::super::records::pages::ServingNode;
+use super::super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
+use super::super::store::mutation_error::JobMutationError;
+use super::super::store::row_calls::{EntryPage, list_job_entries};
+use super::super::{REPORT_MAX_ROWS, SESSION_REPORT_ROWS};
 use aruna_core::job_request::session_of;
 
 /// What a report read found.
@@ -387,5 +387,5 @@ impl Operation for ReportRouteOperation {
 }
 
 #[cfg(test)]
-#[path = "job_reports_tests.rs"]
+#[path = "reports_tests.rs"]
 mod tests;

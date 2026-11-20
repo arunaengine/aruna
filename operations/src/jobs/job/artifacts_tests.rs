@@ -14,7 +14,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use futures_util::stream;
 
 use super::*;
-use crate::jobs::job_reads::tests::{
+use crate::jobs::job::reads::tests::{
     auth_of, child, is_child, job_id, node, owner, probe, realm, record_of, stranger,
 };
 

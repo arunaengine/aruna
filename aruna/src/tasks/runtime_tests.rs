@@ -674,7 +674,7 @@ async fn cancel_beats_capacity() {
         .unwrap();
     assert!(matches!(
         outcome,
-        aruna_operations::jobs::job_cancel::CancelJobOutcome::Requested(_)
+        aruna_operations::jobs::job::cancel::CancelJobOutcome::Requested(_)
     ));
 
     let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
@@ -1137,10 +1137,10 @@ async fn cancel_owned_job(
     runtime: &JobsRuntime,
     user_id: UserId,
     job_id: JobId,
-) -> Result<aruna_operations::jobs::job_cancel::CancelJobOutcome, String> {
+) -> Result<aruna_operations::jobs::job::cancel::CancelJobOutcome, String> {
     let now_ms = unix_timestamp_millis();
     let cancel =
-        aruna_operations::jobs::job_cancel::CancelOwnedOperation::new(user_id, job_id, now_ms);
+        aruna_operations::jobs::job::cancel::CancelOwnedOperation::new(user_id, job_id, now_ms);
     let report = drive(cancel, context).await.map_err(|error| error.0)?;
     for running in report.running {
         runtime.request_cancel(running);

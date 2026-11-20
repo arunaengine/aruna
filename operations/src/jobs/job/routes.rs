@@ -12,12 +12,12 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;
 
-use super::job_reads::{
+use super::reads::{
     JobReadError, LocalStatusOperation, RecordData, RecordDataOperation, internal,
 };
-use super::lifecycle::family_reads::{FamilyResponderOperation, FamilyStatusOperation};
-use super::records::pages::ServingNode;
-use super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome, RoutedJobStatus};
+use super::super::lifecycle::family_reads::{FamilyResponderOperation, FamilyStatusOperation};
+use super::super::records::pages::ServingNode;
+use super::super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome, RoutedJobStatus};
 
 /// Routes a request to the family's responder, or to the owner its id names.
 #[derive(Debug, PartialEq)]
@@ -75,7 +75,7 @@ impl Operation for FamilyRouteOperation {
 }
 
 /// The answer every routed read gives for a response that is no verdict on the job itself.
-pub(super) fn refused(response: JobResponse, what: &str) -> JobRouteError {
+pub(in crate::jobs) fn refused(response: JobResponse, what: &str) -> JobRouteError {
     match response {
         JobResponse::Unauthorized => JobRouteError::Unauthorized,
         JobResponse::Forbidden => JobRouteError::Forbidden,
@@ -183,7 +183,7 @@ impl Operation for RecordRouteOperation {
     }
 }
 
-pub(super) fn routed_job_matches(job: &JobStatusView, user_id: UserId, job_id: JobId) -> bool {
+pub(in crate::jobs) fn routed_job_matches(job: &JobStatusView, user_id: UserId, job_id: JobId) -> bool {
     job.job_id == job_id && job.created_by == user_id && !job.kind.is_internal()
 }
 
@@ -296,5 +296,5 @@ impl Operation for StatusRouteOperation {
 }
 
 #[cfg(test)]
-#[path = "job_routes_tests.rs"]
+#[path = "routes_tests.rs"]
 mod tests;

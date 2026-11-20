@@ -528,7 +528,7 @@ impl Operation for ServeLaunchOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::jobs::job_reads::tests::{child, is_child};
+    use crate::jobs::job::reads::tests::{child, is_child};
     use crate::tests::records::{Family, node};
     use aruna_core::structs::execution::job::family::JobRecordBody;
 

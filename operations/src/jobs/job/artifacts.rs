@@ -20,16 +20,16 @@ use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use ulid::Ulid;
 
-use super::job_reads::{
+use super::reads::{
     JobOwnerOperation, JobReadError, OwnedJobOperation, document_read, document_row, internal,
     unavailable,
 };
-use super::job_routes::refused;
-use super::lifecycle::family_reads::FamilyResponderOperation;
-use super::records::pages::ServingNode;
-use super::route::{JobRouteError, JobRouteOperation};
-use super::store::mutation_error::JobMutationError;
-use super::store::row_calls::read_artifact_tombstone;
+use super::routes::refused;
+use super::super::lifecycle::family_reads::FamilyResponderOperation;
+use super::super::records::pages::ServingNode;
+use super::super::route::{JobRouteError, JobRouteOperation};
+use super::super::store::mutation_error::JobMutationError;
+use super::super::store::row_calls::read_artifact_tombstone;
 
 /// An export job's artifact as its owner describes it.
 #[derive(Debug, PartialEq)]
@@ -456,5 +456,5 @@ impl Operation for ArtifactRouteOperation {
 }
 
 #[cfg(test)]
-#[path = "job_artifacts_tests.rs"]
+#[path = "artifacts_tests.rs"]
 mod tests;

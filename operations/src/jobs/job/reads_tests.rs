@@ -9,8 +9,8 @@ use aruna_core::structs::persistent_id::MintPersistentSpec;
 use aruna_core::structs::placement::record::PlacementRef;
 
 use super::*;
-use crate::jobs::job_delete::DeleteOwnedOperation;
-use crate::jobs::job_reports::{
+use crate::jobs::job::delete::DeleteOwnedOperation;
+use crate::jobs::job::reports::{
     JobReportLookup, JobReportOperation, ReportQuery, ReportRouteOperation,
 };
 use crate::jobs::store::RunDelete;

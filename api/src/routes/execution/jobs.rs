@@ -30,9 +30,9 @@ use aruna_operations::jobs::command::{
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
 use aruna_operations::jobs::export::grant::AdmitGrantOperation;
-use aruna_operations::jobs::job_artifacts::{ArtifactLookup, OwnedArtifact};
-use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
-use aruna_operations::jobs::job_reports::JobReportLookup;
+use aruna_operations::jobs::job::artifacts::{ArtifactLookup, OwnedArtifact};
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::job::reports::JobReportLookup;
 use aruna_operations::jobs::local_run::LocalExecutionError;
 use aruna_operations::jobs::store::RunDelete;
 use axum::body::Body;
@@ -1285,7 +1285,7 @@ pub async fn get_job_report(
         &state.get_ctx(),
         &auth,
         job_id,
-        aruna_operations::jobs::job_reports::ReportQuery {
+        aruna_operations::jobs::job::reports::ReportQuery {
             expected_digest,
             last_key,
             limit,

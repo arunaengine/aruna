@@ -22,7 +22,7 @@ use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
     InputMode, SessionMountSpec, SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
