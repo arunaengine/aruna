@@ -730,24 +730,6 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Takes the Git snapshots whose capture marks remain and re-arms after a failed one.
-    pub(super) async fn drain_captures(&self) {
-        use aruna_operations::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
-        let node = aruna_core::git::GitNode {
-            ids: self.context.node_and_realm(),
-            routing: node_routing(&self.context),
-        };
-        let after = match drive(CaptureDrainOperation::new(node), &self.context).await {
-            Ok(after) => after,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainCaptures, %error, "Git snapshots not taken");
-                Some(CAPTURE_RETRY_AFTER)
-            }
-        };
-        if let Some(after) = after {
-            self.reschedule_timer(TaskKey::DrainCaptures, after).await;
-        }
-    }
 }
 
 impl OperationsTaskHandler {

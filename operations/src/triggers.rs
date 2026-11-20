@@ -9,6 +9,7 @@ use std::time::Duration;
 use aruna_core::alpn::Alpn;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::git::GitNode;
 use aruna_core::id::NodeId;
 use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
@@ -26,6 +27,7 @@ use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenO
 use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
+use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
@@ -158,6 +160,7 @@ pub enum TimerOperation {
     DeliverKeyWakes(DeliverWakesOperation),
     DrainCleanupQueue(CleanupTimerOperation),
     DrainRefreshQueue(DrainRefreshOperation),
+    DrainCaptures(CaptureDrainOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -207,6 +210,12 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainRefreshQueue => Some(TimerOperation::DrainRefreshQueue(
             DrainRefreshOperation::new(),
         )),
+        TaskKey::DrainCaptures => {
+            let ids = input.facts.serving;
+            let routing = input.routing.clone();
+            let node = GitNode { ids, routing };
+            Some(TimerOperation::DrainCaptures(CaptureDrainOperation::new(node)))
+        }
         _ => None,
     }
 }
@@ -228,6 +237,7 @@ macro_rules! each_timer {
             TimerOperation::DeliverKeyWakes($operation) => $body,
             TimerOperation::DrainCleanupQueue($operation) => $body,
             TimerOperation::DrainRefreshQueue($operation) => $body,
+            TimerOperation::DrainCaptures($operation) => $body,
         }
     };
 }
@@ -440,6 +450,17 @@ impl TimerRun for DrainRefreshOperation {
             true => Some(Duration::ZERO),
             false => drained.next_due_after,
         };
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for CaptureDrainOperation {
+    /// The drain names its own next run; a failed one retries after the capture delay.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: CAPTURE_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
         Ok(TimerPlan::from(after))
     }
 }
@@ -813,6 +834,15 @@ mod tests {
         let error = ReferenceRefreshError::Refresh("boom".to_string());
         let failed = DrainRefreshOperation::rearm(Err(error));
         assert_eq!(failed.unwrap_err().retry_after, REFRESH_RETRY_AFTER);
+    }
+
+    #[test]
+    fn capture_drain_plans() {
+        // The drain's own delay is kept; a failed drain retries after the capture delay.
+        let after = Some(Duration::from_secs(5));
+        assert_eq!(CaptureDrainOperation::rearm(Ok(after)), Ok(TimerPlan::from(after)));
+        let failed = CaptureDrainOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed.unwrap_err().retry_after, CAPTURE_RETRY_AFTER);
     }
 
     #[test]
