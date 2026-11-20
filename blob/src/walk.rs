@@ -125,7 +125,8 @@ impl<T> Walk<T> {
     }
 
     /// Takes a window of the directory's first children from [`Self::resume_name`] on; with
-    /// `more`, the walk lists the directory again after the window's last name once it ran out.
+    /// `more`, the walk lists the directory again from the window's last name once it ran out,
+    /// so a window must hold at least two names to move on.
     pub(crate) fn listed_window(&mut self, mut children: Vec<Child<T>>, more: bool) {
         let Some((path, after)) = self.pending.take() else {
             return;

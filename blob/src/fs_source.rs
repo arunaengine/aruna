@@ -147,8 +147,9 @@ fn walk_entries(
                 let resolved = root.resolve(&directory)?;
                 let looped = ancestors(&directory).any(|up| listed.get(up) == Some(&resolved));
                 let from = walk.resume_name().map(ToOwned::to_owned);
-                // The names the rest of the page can take, one more to tell whether it is full.
-                let window = (limit + 1).saturating_sub(entries.len()).max(1);
+                // The names the rest of the page can take, one more to tell whether it is full,
+                // and one for the resume name, which the walk already passed on a refill.
+                let window = (limit + 2).saturating_sub(entries.len()).max(2);
                 let (children, more) = match looped {
                     true => (Vec::new(), false),
                     false => {
