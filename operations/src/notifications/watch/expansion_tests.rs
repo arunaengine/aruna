@@ -127,8 +127,8 @@ fn drained_row_deleted() {
     );
 }
 
-/// A stored retry row further along stays; a new row past the row cap is refused, while an
-/// existing row still advances.
+/// A stored retry row further along stays; a new row past the row cap is refused for now, as the
+/// queue clears, while an existing row still advances.
 #[test]
 fn retry_row_bounded() {
     let behind = watch_subscription_key(user(4, 2), Ulid::nil()).to_vec();
@@ -146,7 +146,7 @@ fn retry_row_bounded() {
     let mut refused = retrying(&behind);
     assert!(matches!(
         refused.write_retry(full.clone()),
-        Err(ExpandError::Fatal(error)) if error.contains("row cap")
+        Err(ExpandError::Unavailable(error)) if error.contains("row cap")
     ));
     let mut advancing = retrying(&ahead);
     let mut queued = full;
@@ -231,4 +231,28 @@ fn storage_faults_retry() {
     assert_eq!(ExpandError::from(full.clone()), ExpandError::Io(full));
     let missing = ExpandError::from(IoError::Storage(StorageError::KeyNotFound));
     assert!(matches!(missing, ExpandError::Fatal(_)));
+}
+
+// A watch listing or an inbox upsert that failed on storage, and a full inbox, pass on a later
+// delivery; only a record that does not decode is final.
+#[test]
+fn failed_children_retry() {
+    let mut listing = expanding(None);
+    listing.first().unwrap();
+    let failed = WatchSubscriptionError::Storage("timeout".to_string());
+    let failed = IoResult::Child(ChildOutcome::new(Err::<WatchPage, _>(failed)));
+    let unavailable = ExpandError::Unavailable("timeout".to_string());
+    assert_eq!(listing.next(failed), Err(unavailable));
+
+    let upsert = || Box::new(UpsertInboxOperation::new(Vec::new()));
+    let mut operation = expanding(None);
+    let timeout = Err(InboxError::Storage(StorageError::Timeout));
+    let retried = ExpandError::Io(IoError::Storage(StorageError::Timeout));
+    assert_eq!(operation.upserted(upsert(), timeout), Err(retried));
+    let full = Err(InboxError::TransientCap(user(4, 2)));
+    let full = operation.upserted(upsert(), full);
+    assert!(matches!(full, Err(ExpandError::Unavailable(_))));
+    let broken = Err(InboxError::Decode("bad".to_string()));
+    let broken = operation.upserted(upsert(), broken);
+    assert!(matches!(broken, Err(ExpandError::Fatal(_))));
 }
