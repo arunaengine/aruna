@@ -453,7 +453,8 @@ pub(crate) const UPLOAD_RECORDS: &str = "uploads";
 
 /// Records `upload_id` as the provider upload of copying `path` to `bucket` and `key` at
 /// `endpoint` in parts of `part_size` bytes, as an interrupted run leaves it.
-pub(crate) fn keep_upload(
+#[cfg(feature = "test-hooks")]
+pub(crate) async fn keep_upload(
     config_dir: &Path,
     (endpoint, bucket, key): (&str, &str, &str),
     (path, part_size): (&Path, u64),
@@ -462,9 +463,9 @@ pub(crate) fn keep_upload(
     let parts = split_parts(std::fs::metadata(path)?.len(), part_size);
     let (blake3, _) = digest_file(path, &parts)?;
     let records = config_dir.join(UPLOAD_RECORDS);
-    std::fs::create_dir_all(&records)?;
     let record = upload_record(&records, (endpoint, bucket, key, &blake3), &parts);
-    std::fs::write(record, upload_id)?;
+    let (mut record, _) = claim_record(record).await?;
+    keep_id(&mut record, upload_id)?;
     Ok(())
 }
 

@@ -15,6 +15,10 @@ rust-version.workspace = true
 name = "aruna-cli"
 path = "src/main.rs"
 
+[features]
+# The upload record fixture of the integration tests; only dev-dependencies enable it.
+test-hooks = []
+
 [dependencies]
 aruna-wire = { workspace = true }
 aruna-plugin-types = { workspace = true }
