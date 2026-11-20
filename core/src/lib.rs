@@ -49,6 +49,7 @@ pub mod key_seal;
 pub mod keys;
 pub mod keyspaces;
 pub mod link;
+pub mod listener;
 pub mod live_version;
 pub mod managed_copy;
 pub mod member_read;

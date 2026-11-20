@@ -36,7 +36,7 @@ enum CaptureStep {
 /// One drain run over the queued capture marks in sequence order, so Git gets a document's graphs
 /// in finish order; a failed snapshot stops its document. It reads one mark at a time, so a
 /// backlog loads one graph at most, and answers when to run again after a failed snapshot.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CaptureDrainOperation {
     node: GitNode,
     /// The last key the drain read; the next mark comes after it.

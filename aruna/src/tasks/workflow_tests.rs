@@ -1800,7 +1800,6 @@ async fn crate_write_idempotent() {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     };
     let write = run_crate::WriteCrateOperation::new(job_id, ctx.driver.node_and_realm());
     let outcome = run_crate::crate_outcome(drive(write, &ctx.driver).await);

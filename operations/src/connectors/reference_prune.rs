@@ -29,6 +29,8 @@ const PRUNE_PAGE: usize = 128;
 const PRUNE_CONNECTORS: usize = 16;
 /// Connector id bytes ahead of the version key in a reference row.
 const ROW_PREFIX: usize = 16;
+/// Delay before a failed connector reference pruning run is tried again.
+pub const PRUNE_RETRY: Duration = Duration::from_secs(5);
 
 /// Queues pruning of `connector_id`'s rows after `cursor`, the last row a check covered.
 pub(crate) fn prune_queue_write(connector_id: Ulid, cursor: Key) -> (KeySpace, Key, Value) {
@@ -110,7 +112,7 @@ impl Operation for RestorePruneOperation {
 
 /// Advances every queued connector by one page, one page operation after another. Outputs
 /// whether queued work remains; the first failed page ends the run with its error.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PruneReferencesOperation {
     rows: VecDeque<(Key, Value)>,
     remaining: bool,

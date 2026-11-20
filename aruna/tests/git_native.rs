@@ -50,7 +50,7 @@ async fn git_server(
         state,
         ServerConfig {
             http_addr: address,
-            max_body_size: aruna_api::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors: CorsConfig::new(vec![]),
         },
     );

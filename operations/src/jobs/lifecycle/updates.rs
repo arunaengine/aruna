@@ -494,7 +494,7 @@ impl Operation for PublishTerminalOperation {
 /// Retries terminal publication and capacity release for every durable local
 /// terminal execution that still has a reservation. `true` means at least one obligation
 /// stayed pending, so the caller must run it again.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SettleTerminalsOperation {
     serving: Serving,
     now_ms: u64,

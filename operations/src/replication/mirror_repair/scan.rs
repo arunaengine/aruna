@@ -16,7 +16,7 @@ const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;
 
 /// The due records of one pass, oldest first, and when the earliest later one is due.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct RepairScan {
     pub(super) records: Vec<SyncMirrorRecord>,
     pub(super) has_more_due: bool,

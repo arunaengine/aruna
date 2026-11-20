@@ -7,17 +7,38 @@ use std::fmt::Display;
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
+use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::git::GitNode;
+use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
+use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::task::TaskKey;
+use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
+use tracing::warn;
 
+use crate::blob::cleanup_timer::CleanupTimerOperation;
+use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
+use crate::blob::migration::drain::ProcessMigrationsOperation;
+use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
+use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
+use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
+use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
+use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
+use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
 use crate::node::applied_drain::AppliedDrainOperation;
+use crate::node::info_timer::InfoTimerOperation;
+use crate::node::placement_timer::PlacementTimerOperation;
+use crate::node::presence_timer::PresenceTimerOperation;
+use crate::node::usage_publish::PublishUsageOperation;
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::holder::HolderRead;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
@@ -28,13 +49,91 @@ use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEvents
 use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
+use crate::plugins::work::PruneKeepingWork;
+use crate::replication::catch_up::CatchUpCursors;
+use crate::replication::drain_timer::ReplicationTimerOperation;
+use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
+use crate::replication::mirror_repair::drain::DrainRepairsOperation;
+use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
+use crate::s3::object::metadata_drain::DrainRefreshOperation;
+use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
+
+/// What a timer keeps on this node between its runs, in memory only: its attempts since the last
+/// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
+/// every decision about it stays with the timer's operation; a restart starts it afresh.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimerMemory {
+    pub attempts: u32,
+    pub cursor: Option<Vec<u8>>,
+    /// A count the timer advances on every run, such as a heartbeat sequence.
+    pub sequence: u64,
+    /// Where the replication drain's bootstrap work goes on.
+    pub catch_up: CatchUpCursors,
+}
+
+/// Retry steps after which a timer's retry ladder stops doubling.
+const LADDER_STEPS: u32 = 7;
+
+impl TimerMemory {
+    /// The wait after a failed run: `base` for the first, then doubled per further attempt up to
+    /// `max`. The returned memory counts the attempt and keeps the cursor.
+    pub fn next_retry(&self, base: Duration, max: Duration) -> (Duration, TimerMemory) {
+        let after = capped_backoff(base, max, self.attempts.min(LADDER_STEPS), 0);
+        let memory = TimerMemory {
+            attempts: self.attempts.saturating_add(1),
+            ..self.clone()
+        };
+        (after, memory)
+    }
+}
+
+/// When a timer runs again, `None` while it waits for work, and what it keeps until then.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimerPlan {
+    pub after: Option<Duration>,
+    pub memory: TimerMemory,
+}
+
+impl From<Option<Duration>> for TimerPlan {
+    fn from(after: Option<Duration>) -> Self {
+        Self {
+            after,
+            memory: TimerMemory::default(),
+        }
+    }
+}
 
 /// What the timer shell knows when a timer fires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TimerInput {
     pub now_ms: u64,
     /// This node, `None` on a node without a net transport.
     pub local_node: Option<NodeId>,
+    /// What the timer kept from its last run.
+    pub memory: TimerMemory,
+    /// What only this node's handles and host know.
+    pub facts: NodeFacts,
+    /// This node's routing rules and backend catalog.
+    pub routing: NodeRouting,
+    /// Whether this node has blob storage.
+    pub has_blob: bool,
+    /// The jobs running on this node, for its heartbeat.
+    pub running: Option<RunningJobs>,
+}
+
+impl TimerInput {
+    /// A timer firing with nothing kept from an earlier run and no node facts.
+    pub fn new(now_ms: u64, local_node: Option<NodeId>) -> Self {
+        Self {
+            now_ms,
+            local_node,
+            memory: TimerMemory::default(),
+            facts: NodeFacts::default(),
+            routing: NodeRouting::default(),
+            has_blob: false,
+            running: None,
+        }
+    }
 }
 
 /// A timer run that failed; the shell logs it and runs the timer again after `retry_after`.
@@ -57,14 +156,15 @@ impl From<IoError> for TimerFailure {
     }
 }
 
-/// A timer operation decides when its timer runs again.
+/// A timer operation decides when its timer runs again and what it keeps until then.
 pub trait TimerRun: Operation + Sized {
-    /// The delay before the next run, or `None` when the timer stays off until work arrives.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure>;
+    /// The plan of the next run; a failure runs the timer again after its delay, keeping its
+    /// memory as it was.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure>;
 }
 
-/// The operation of one timer run. Its output is when the timer runs again; the shell persists
-/// and arms that timer.
+/// The operation of one timer run. Its output is when the timer runs again and what it keeps;
+/// the shell persists and arms that timer and stores the memory.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TimerOperation {
     DrainNotificationOutbox(DrainOutboxOperation),
@@ -72,6 +172,53 @@ pub enum TimerOperation {
     PublishWatchInterest(PublishInterestOperation),
     DrainWatchEvents(WatchDrainOperation),
     DrainAppliedSync(AppliedDrainOperation),
+    SyncPlacements(PlacementTimerOperation),
+    RealmPresence(PresenceTimerOperation),
+    MigrateCompression(ProcessMigrationsOperation),
+    SweepHiddenBlobs(ProcessHiddenOperation),
+    PruneConnectorReferences(PruneReferencesOperation),
+    DeliverKeyWakes(DeliverWakesOperation),
+    DrainCleanupQueue(CleanupTimerOperation),
+    DrainRefreshQueue(DrainRefreshOperation),
+    DrainCaptures(CaptureDrainOperation),
+    SettleJobTerminals(SettleTerminalsOperation),
+    PruneJobs(PruneKeepingWork),
+    DrainMirrorRepair(DrainRepairsOperation),
+    PublishUsageSnapshots(PublishUsageOperation),
+    PublishNodeInfo(InfoTimerOperation),
+    DrainProjectionQueue(ProjectionRunOperation),
+    DrainReplicationQueue(ReplicationTimerOperation),
+    /// A timer this node cannot run yet, which only plans its next run.
+    Wait(WaitOperation),
+}
+
+/// A timer run that only plans the next run, for a node that lacks what the timer needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaitOperation {
+    plan: TimerPlan,
+}
+
+impl WaitOperation {
+    pub fn after(after: Option<Duration>) -> Self {
+        let plan = TimerPlan::from(after);
+        Self { plan }
+    }
+}
+
+impl Operation for WaitOperation {
+    type Output = TimerPlan;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<TimerPlan>, IoError> {
+        Ok(Next::Done(self.plan.clone()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<TimerPlan>, IoError> {
+        Err(IoError::Unexpected {
+            expected: "no call",
+            got: result.label(),
+        })
+    }
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -92,6 +239,74 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainAppliedSync => Some(TimerOperation::DrainAppliedSync(
             AppliedDrainOperation::new(),
         )),
+        TaskKey::SyncPlacements { realm_id, node_id } => Some(TimerOperation::SyncPlacements(
+            PlacementTimerOperation::new(*realm_id, *node_id, input),
+        )),
+        TaskKey::RealmPresence { realm_id, node_id } => Some(TimerOperation::RealmPresence(
+            PresenceTimerOperation::new(*realm_id, *node_id),
+        )),
+        TaskKey::MigrateCompression => {
+            let after = input.memory.cursor.clone().map(Key::from);
+            let routing = input.routing.clone();
+            let run = ProcessMigrationsOperation::new(routing, input.facts.serving, after);
+            Some(TimerOperation::MigrateCompression(run))
+        }
+        TaskKey::SweepHiddenBlobs => Some(TimerOperation::SweepHiddenBlobs(
+            ProcessHiddenOperation::new(input.now_ms),
+        )),
+        TaskKey::PruneConnectorReferences => Some(TimerOperation::PruneConnectorReferences(
+            PruneReferencesOperation::new(),
+        )),
+        TaskKey::DeliverKeyWakes => {
+            let start = input.memory.cursor.clone().map(Key::from);
+            let deliver = DeliverWakesOperation::new(start, input.facts.serving);
+            Some(TimerOperation::DeliverKeyWakes(deliver))
+        }
+        TaskKey::DrainCleanupQueue => Some(TimerOperation::DrainCleanupQueue(
+            CleanupTimerOperation::new(input),
+        )),
+        TaskKey::DrainRefreshQueue => Some(TimerOperation::DrainRefreshQueue(
+            DrainRefreshOperation::new(),
+        )),
+        TaskKey::DrainCaptures => {
+            let ids = input.facts.serving;
+            let routing = input.routing.clone();
+            let node = GitNode { ids, routing };
+            Some(TimerOperation::DrainCaptures(CaptureDrainOperation::new(
+                node,
+            )))
+        }
+        TaskKey::SettleJobTerminals => Some(TimerOperation::SettleJobTerminals(
+            SettleTerminalsOperation::new(input.facts.serving, input.now_ms),
+        )),
+        TaskKey::PruneJobs => Some(TimerOperation::PruneJobs(PruneKeepingWork::new(
+            JOB_PRUNE_PAGE,
+        ))),
+        TaskKey::DrainMirrorRepair => Some(match input.local_node {
+            Some(node_id) => TimerOperation::DrainMirrorRepair(DrainRepairsOperation::new(node_id)),
+            None => TimerOperation::Wait(WaitOperation::after(Some(REPAIR_RETRY_AFTER))),
+        }),
+        TaskKey::PublishUsageSnapshots => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                let keys = (node_id, realm_id);
+                let publish = PublishUsageOperation::new(keys, Some(realm_id), false, true);
+                TimerOperation::PublishUsageSnapshots(publish)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(None)),
+        }),
+        TaskKey::PublishNodeInfo => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                let heartbeat = InfoTimerOperation::new(node_id, realm_id, input);
+                TimerOperation::PublishNodeInfo(heartbeat)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(Some(INFO_PUBLISH_INTERVAL))),
+        }),
+        TaskKey::DrainProjectionQueue => Some(TimerOperation::DrainProjectionQueue(
+            ProjectionRunOperation::new(input.local_node),
+        )),
+        TaskKey::DrainReplicationQueue => Some(TimerOperation::DrainReplicationQueue(
+            ReplicationTimerOperation::new(input),
+        )),
         _ => None,
     }
 }
@@ -105,6 +320,23 @@ macro_rules! each_timer {
             TimerOperation::PublishWatchInterest($operation) => $body,
             TimerOperation::DrainWatchEvents($operation) => $body,
             TimerOperation::DrainAppliedSync($operation) => $body,
+            TimerOperation::SyncPlacements($operation) => $body,
+            TimerOperation::RealmPresence($operation) => $body,
+            TimerOperation::MigrateCompression($operation) => $body,
+            TimerOperation::SweepHiddenBlobs($operation) => $body,
+            TimerOperation::PruneConnectorReferences($operation) => $body,
+            TimerOperation::DeliverKeyWakes($operation) => $body,
+            TimerOperation::DrainCleanupQueue($operation) => $body,
+            TimerOperation::DrainRefreshQueue($operation) => $body,
+            TimerOperation::DrainCaptures($operation) => $body,
+            TimerOperation::SettleJobTerminals($operation) => $body,
+            TimerOperation::PruneJobs($operation) => $body,
+            TimerOperation::DrainMirrorRepair($operation) => $body,
+            TimerOperation::PublishUsageSnapshots($operation) => $body,
+            TimerOperation::PublishNodeInfo($operation) => $body,
+            TimerOperation::DrainProjectionQueue($operation) => $body,
+            TimerOperation::DrainReplicationQueue($operation) => $body,
+            TimerOperation::Wait($operation) => $body,
         }
     };
 }
@@ -112,7 +344,7 @@ macro_rules! each_timer {
 /// The next call of a timer operation, or when its timer runs again.
 fn timer_turn<O: TimerRun>(
     turn: Result<Next<O::Output>, O::Error>,
-) -> Result<Next<Option<Duration>>, TimerFailure> {
+) -> Result<Next<TimerPlan>, TimerFailure> {
     match turn {
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
@@ -125,7 +357,7 @@ fn timer_turn<O: TimerRun>(
 }
 
 /// The conflict decision of a timer operation; an output it finishes with is rearmed.
-fn timer_conflict<O: TimerRun>(operation: &mut O, attempt: u32) -> AfterConflict<Option<Duration>> {
+fn timer_conflict<O: TimerRun>(operation: &mut O, attempt: u32) -> AfterConflict<TimerPlan> {
     match operation.on_conflict(attempt) {
         AfterConflict::Rerun => AfterConflict::Rerun,
         AfterConflict::Fail => AfterConflict::Fail,
@@ -137,7 +369,7 @@ fn timer_conflict<O: TimerRun>(operation: &mut O, attempt: u32) -> AfterConflict
 }
 
 impl Operation for TimerOperation {
-    type Output = Option<Duration>;
+    type Output = TimerPlan;
     type Error = TimerFailure;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
@@ -173,31 +405,32 @@ impl Operation for TimerOperation {
     }
 }
 
-fn timer_first<O: TimerRun>(operation: &mut O) -> Result<Next<Option<Duration>>, TimerFailure> {
+fn timer_first<O: TimerRun>(operation: &mut O) -> Result<Next<TimerPlan>, TimerFailure> {
     timer_turn::<O>(operation.first())
 }
 
 fn timer_next<O: TimerRun>(
     operation: &mut O,
     result: IoResult,
-) -> Result<Next<Option<Duration>>, TimerFailure> {
+) -> Result<Next<TimerPlan>, TimerFailure> {
     timer_turn::<O>(operation.next(result))
 }
 
 impl TimerRun for DrainOutboxOperation {
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
-        result.map_err(|error| TimerFailure {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
             retry_after: DELIVERY_RETRY_AFTER,
             reason: error.to_string(),
-        })
+        })?;
+        Ok(TimerPlan::from(after))
     }
 }
 
 impl TimerRun for PublishInterestOperation {
     /// A published or skipped run waits for the next change; a failed one runs again soon.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         match result {
-            Ok(_) => Ok(None),
+            Ok(_) => Ok(TimerPlan::default()),
             Err(error) => Err(TimerFailure {
                 retry_after: WATCH_PUBLISH_DEBOUNCE,
                 reason: error.to_string(),
@@ -209,23 +442,217 @@ impl TimerRun for PublishInterestOperation {
 impl TimerRun for WatchDrainOperation {
     /// A finished run waits for the next queued event; one that kept an unsettled event, or
     /// that failed itself, runs again later.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
-        result.map_err(TimerFailure::from)
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
     }
 }
 
 impl TimerRun for AppliedDrainOperation {
     /// A finished run waits for the next applied reconcile; one that kept a row after a failed
     /// follow-up, or that failed itself, runs again later.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
+    }
+}
+
+impl TimerRun for PlacementTimerOperation {
+    /// The operation plans its own next run; a failed run reads as a storage failure.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for CleanupTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for PresenceTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for ProcessMigrationsOperation {
+    /// The run plans its next start and the queue key it resumes after; a failed run keeps its
+    /// cursor and runs again after the reclaim retry.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let run = result.map_err(|error| TimerFailure {
+            retry_after: RECLAIM_SWEEP_RETRY,
+            reason: error.to_string(),
+        })?;
+        let memory = TimerMemory {
+            attempts: 0,
+            cursor: run.cursor.map(|key| key.to_vec()),
+            ..TimerMemory::default()
+        };
+        Ok(TimerPlan {
+            after: run.next,
+            memory,
+        })
+    }
+}
+
+impl TimerRun for ProcessHiddenOperation {
+    /// A sweep that left cleanup pending, or failed, runs again soon; a clean one waits.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.map_err(|error| TimerFailure {
+            retry_after: HIDDEN_SWEEP_RETRY,
+            reason: error.to_string(),
+        })?;
+        let after = match outcome.cleanup_pending {
+            true => HIDDEN_SWEEP_RETRY,
+            false => HIDDEN_SWEEP_AFTER,
+        };
+        Ok(TimerPlan::from(Some(after)))
+    }
+}
+
+impl TimerRun for PruneReferencesOperation {
+    /// Queued work runs again at once and a failed run after a short wait; an empty queue waits
+    /// for the next queued connector.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let remaining = result.map_err(|error| TimerFailure {
+            retry_after: PRUNE_RETRY,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(remaining.then_some(Duration::ZERO)))
+    }
+}
+
+impl TimerRun for DeliverWakesOperation {
+    /// Owed wakes go on at once with a further page and retry after a finished round; an
+    /// unreadable pass starts over later. The kept cursor is where the next pass starts.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let delivery = result.unwrap_or_else(|_| Delivery::unread());
+        let after = match (delivery.owed, &delivery.next) {
+            (false, _) => None,
+            (true, Some(_)) => Some(Duration::ZERO),
+            (true, None) => Some(WAKE_RETRY),
+        };
+        let memory = TimerMemory {
+            attempts: 0,
+            cursor: delivery.next.map(|key| key.to_vec()),
+            ..TimerMemory::default()
+        };
+        Ok(TimerPlan { after, memory })
+    }
+}
+
+impl TimerRun for DrainRefreshOperation {
+    /// More due refreshes run at once, the next one when it is due; a failed batch retries soon.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let drained = result.map_err(|error| TimerFailure {
+            retry_after: REFRESH_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        let after = match drained.has_more_due {
+            true => Some(Duration::ZERO),
+            false => drained.next_due_after,
+        };
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for CaptureDrainOperation {
+    /// The drain names its own next run; a failed one retries after the capture delay.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: CAPTURE_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for SettleTerminalsOperation {
+    /// A pending or failed settle retries; the reservation rows keep the obligation durable.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let pending = result.unwrap_or_else(|error| {
+            warn!(%error, "Failed to settle terminal job publications");
+            true
+        });
+        Ok(TimerPlan::from(pending.then_some(SETTLE_RETRY_AFTER)))
+    }
+}
+
+impl TimerRun for PruneKeepingWork {
+    /// More due jobs run at once; otherwise the next due job runs at its time, at most after the
+    /// poll interval. A failed run retries soon.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.map_err(|error| TimerFailure {
+            retry_after: PRUNE_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        let poll = |due: Duration| due.min(PRUNE_POLL_AFTER);
+        let after = match outcome.has_more {
+            true => Duration::ZERO,
+            false => outcome.next_due_after.map_or(PRUNE_POLL_AFTER, poll),
+        };
+        Ok(TimerPlan::from(Some(after)))
+    }
+}
+
+impl TimerRun for DrainRepairsOperation {
+    /// More due repairs run at once, the next one when it is due; a failed pass retries later.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let drained = result.map_err(|error| TimerFailure {
+            retry_after: REPAIR_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        let after = match drained.has_more_due {
+            true => Some(Duration::ZERO),
+            false => drained.next_due_after,
+        };
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for WaitOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for PublishUsageOperation {
+    /// A published run waits for the next change; a failed one runs again after the debounce.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(|error| TimerFailure {
+            retry_after: SNAPSHOT_PUBLISH_DEBOUNCE,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::default())
+    }
+}
+
+impl TimerRun for InfoTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for ProjectionRunOperation {
+    /// The run plans its own next start; a run that broke off retries after the projection delay.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: PROJECTION_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for ReplicationTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
     }
 }
 
 impl TimerRun for PruneNotificationsOperation {
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure> {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         match result {
-            Ok(outcome) => Ok(Some(outcome.rearm())),
+            Ok(outcome) => Ok(TimerPlan::from(Some(outcome.rearm()))),
             Err(error) => Err(TimerFailure {
                 retry_after: NOTIFICATION_RETRY_AFTER,
                 reason: error.to_string(),
@@ -491,21 +918,213 @@ impl Operation for PeerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::hidden::HiddenSweepOutcome;
+    use crate::blob::migration::drain::MigrationRun;
+    use crate::blob::migration::shared::MigrationError;
+    use crate::connectors::reference_prune::PruneError;
+    use crate::jobs::lifecycle::LifecycleError;
+    use crate::jobs::prune::JobPruneOutcome;
+    use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
+    use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
+    use crate::s3::object::metadata::ReferenceRefreshError;
+    use crate::s3::object::metadata_drain::ReferenceDrainResult;
 
-    const INPUT: TimerInput = TimerInput {
-        now_ms: 1_000,
-        local_node: None,
-    };
+    fn input() -> TimerInput {
+        TimerInput::new(1_000, None)
+    }
 
     #[test]
     fn unconverted_keys_absent() {
-        assert!(timer_operation(&TaskKey::DrainJobQueue, &INPUT).is_none());
-        assert!(timer_operation(&TaskKey::PruneJobs, &INPUT).is_none());
+        assert!(timer_operation(&TaskKey::DrainJobQueue, &input()).is_none());
+        assert!(timer_operation(&TaskKey::PruneJobs, &input()).is_none());
+    }
+
+    #[test]
+    fn migration_resumes_cursor() {
+        // The kept queue key is where the next run resumes; a failure keeps it unchanged.
+        let run = MigrationRun {
+            next: Some(Duration::ZERO),
+            cursor: Some(Key::from(b"bucket".to_vec())),
+        };
+        let plan = ProcessMigrationsOperation::rearm(Ok(run)).unwrap();
+        assert_eq!(plan.after, Some(Duration::ZERO));
+        assert_eq!(plan.memory.cursor.as_deref(), Some(&b"bucket"[..]));
+        let mut input = input();
+        input.memory = plan.memory;
+        let mut operation = timer_operation(&TaskKey::MigrateCompression, &input).unwrap();
+        let Ok(Next::Call(IoCall::Page { after, .. })) = operation.first() else {
+            panic!("expected the queue page read");
+        };
+        assert_eq!(after, Some(Key::from(b"bucket".to_vec())));
+        let failed = ProcessMigrationsOperation::rearm(Err(MigrationError::failed("boom")));
+        assert_eq!(failed.unwrap_err().retry_after, RECLAIM_SWEEP_RETRY);
+    }
+
+    #[test]
+    fn hidden_sweep_plans() {
+        // Pending cleanup and failures retry soon; a finished cycle waits for the interval.
+        let pending = HiddenSweepOutcome {
+            cleanup_pending: true,
+            ..HiddenSweepOutcome::default()
+        };
+        let plan = ProcessHiddenOperation::rearm(Ok(pending)).unwrap();
+        assert_eq!(plan.after, Some(HIDDEN_SWEEP_RETRY));
+        let clean = ProcessHiddenOperation::rearm(Ok(HiddenSweepOutcome::default())).unwrap();
+        assert_eq!(clean.after, Some(HIDDEN_SWEEP_AFTER));
+        let failed = ProcessHiddenOperation::rearm(Err(MigrationError::failed("boom")));
+        assert_eq!(failed.unwrap_err().retry_after, HIDDEN_SWEEP_RETRY);
+    }
+
+    #[test]
+    fn reference_prune_plans() {
+        // Queued work runs again at once; a failure retries after a short wait.
+        let more = PruneReferencesOperation::rearm(Ok(true)).unwrap();
+        assert_eq!(more.after, Some(Duration::ZERO));
+        let idle = PruneReferencesOperation::rearm(Ok(false));
+        assert_eq!(idle, Ok(TimerPlan::default()));
+        let error = PruneError::Schedule("boom".to_string());
+        let failed = PruneReferencesOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, PRUNE_RETRY);
+    }
+
+    #[test]
+    fn wake_delivery_plans() {
+        // A further page follows at once, a finished round retries later, nothing owed waits.
+        let page = Delivery {
+            owed: true,
+            next: Some(Key::from(b"wake".to_vec())),
+            ..Delivery::default()
+        };
+        let plan = DeliverWakesOperation::rearm(Ok(page)).unwrap();
+        assert_eq!(plan.after, Some(Duration::ZERO));
+        assert_eq!(plan.memory.cursor.as_deref(), Some(&b"wake"[..]));
+        let unread = DeliverWakesOperation::rearm(Err(IoError::Codec("broken".to_string())));
+        assert_eq!(unread, Ok(TimerPlan::from(Some(WAKE_RETRY))));
+        let idle = DeliverWakesOperation::rearm(Ok(Delivery::default()));
+        assert_eq!(idle, Ok(TimerPlan::default()));
+    }
+
+    #[test]
+    fn refresh_drain_plans() {
+        // More due work runs at once, the next due one at its time; a failure retries soon.
+        let result = |has_more_due, next_due_after| ReferenceDrainResult {
+            processed: 0,
+            succeeded: 0,
+            failed: 0,
+            has_more_due,
+            next_due_after,
+        };
+        let more = DrainRefreshOperation::rearm(Ok(result(true, None))).unwrap();
+        assert_eq!(more.after, Some(Duration::ZERO));
+        let due = Some(Duration::from_secs(9));
+        let later = DrainRefreshOperation::rearm(Ok(result(false, due))).unwrap();
+        assert_eq!(later.after, due);
+        let error = ReferenceRefreshError::Refresh("boom".to_string());
+        let failed = DrainRefreshOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, REFRESH_RETRY_AFTER);
+    }
+
+    #[test]
+    fn capture_drain_plans() {
+        // The drain's own delay is kept; a failed drain retries after the capture delay.
+        let after = Some(Duration::from_secs(5));
+        assert_eq!(
+            CaptureDrainOperation::rearm(Ok(after)),
+            Ok(TimerPlan::from(after))
+        );
+        let failed = CaptureDrainOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed.unwrap_err().retry_after, CAPTURE_RETRY_AFTER);
+    }
+
+    #[test]
+    fn terminal_settle_plans() {
+        // A pending or failed settle retries; a finished one waits for the next obligation.
+        let retry = Ok(TimerPlan::from(Some(SETTLE_RETRY_AFTER)));
+        assert_eq!(SettleTerminalsOperation::rearm(Ok(true)), retry);
+        let error = LifecycleError::Codec("broken".to_string());
+        assert_eq!(SettleTerminalsOperation::rearm(Err(error)), retry);
+        let settled = SettleTerminalsOperation::rearm(Ok(false));
+        assert_eq!(settled, Ok(TimerPlan::default()));
+    }
+
+    #[test]
+    fn job_prune_plans() {
+        // More due jobs run at once, a later one at its time but within the poll interval.
+        let outcome = |has_more, next_due_after| JobPruneOutcome {
+            has_more,
+            next_due_after,
+            ..JobPruneOutcome::default()
+        };
+        let more = PruneKeepingWork::rearm(Ok(outcome(true, None))).unwrap();
+        assert_eq!(more.after, Some(Duration::ZERO));
+        let idle = PruneKeepingWork::rearm(Ok(outcome(false, None))).unwrap();
+        assert_eq!(idle.after, Some(PRUNE_POLL_AFTER));
+        let far = Some(PRUNE_POLL_AFTER * 2);
+        let capped = PruneKeepingWork::rearm(Ok(outcome(false, far))).unwrap();
+        assert_eq!(capped.after, Some(PRUNE_POLL_AFTER));
+        let error = crate::jobs::prune::PruneError("boom".to_string());
+        let failed = PruneKeepingWork::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, PRUNE_RETRY_AFTER);
+    }
+
+    #[test]
+    fn mirror_repair_plans() {
+        // Without a network node the timer only waits; more due repairs run at once.
+        let mut waiting = timer_operation(&TaskKey::DrainMirrorRepair, &input()).unwrap();
+        let retry = TimerPlan::from(Some(REPAIR_RETRY_AFTER));
+        assert_eq!(waiting.first(), Ok(Next::Done(retry)));
+        let more = SyncMirrorResult {
+            has_more_due: true,
+            ..SyncMirrorResult::default()
+        };
+        let plan = DrainRepairsOperation::rearm(Ok(more)).unwrap();
+        assert_eq!(plan.after, Some(Duration::ZERO));
+        let error = SyncMirrorError::Mirror("boom".to_string());
+        let failed = DrainRepairsOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, REPAIR_RETRY_AFTER);
+    }
+
+    #[test]
+    fn usage_publish_plans() {
+        // A published run waits for the next change; a failure retries after the debounce.
+        let published = PublishUsageOperation::rearm(Ok(PublishedUsage::default()));
+        assert_eq!(published, Ok(TimerPlan::default()));
+        let error = UsagePublishError::Failed("boom".to_string());
+        let failed = PublishUsageOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, SNAPSHOT_PUBLISH_DEBOUNCE);
+        let mut idle = timer_operation(&TaskKey::PublishUsageSnapshots, &input()).unwrap();
+        assert_eq!(idle.first(), Ok(Next::Done(TimerPlan::default())));
+    }
+
+    #[test]
+    fn heartbeat_without_network() {
+        // A node without a network still keeps its heartbeat timer armed.
+        let mut idle = timer_operation(&TaskKey::PublishNodeInfo, &input()).unwrap();
+        let next = TimerPlan::from(Some(INFO_PUBLISH_INTERVAL));
+        assert_eq!(idle.first(), Ok(Next::Done(next)));
+    }
+
+    #[test]
+    fn projection_run_plans() {
+        // The run's own delay is kept; a run that broke off retries after the projection delay.
+        let more = ProjectionRunOperation::rearm(Ok(Some(Duration::ZERO)));
+        assert_eq!(more, Ok(TimerPlan::from(Some(Duration::ZERO))));
+        let failed = ProjectionRunOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed.unwrap_err().retry_after, PROJECTION_RETRY_AFTER);
+    }
+
+    #[test]
+    fn replication_key_named() {
+        let operation = timer_operation(&TaskKey::DrainReplicationQueue, &input());
+        assert!(matches!(
+            operation,
+            Some(TimerOperation::DrainReplicationQueue(_))
+        ));
     }
 
     #[test]
     fn prune_key_named() {
-        let operation = timer_operation(&TaskKey::PruneNotifications, &INPUT);
+        let operation = timer_operation(&TaskKey::PruneNotifications, &input());
         assert_eq!(
             operation,
             Some(TimerOperation::PruneNotifications(
@@ -516,7 +1135,7 @@ mod tests {
 
     #[test]
     fn timer_delegates_calls() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
+        let mut operation = timer_operation(&TaskKey::PruneNotifications, &input()).unwrap();
         let mut inner = PruneNotificationsOperation::new(1_000, PRUNE_PAGE_SIZE);
         assert_eq!(
             operation.first(),
@@ -526,17 +1145,17 @@ mod tests {
             operation.transaction(),
             aruna_core::operation::TransactionMode::None
         );
-        let drain = timer_operation(&TaskKey::DrainNotificationOutbox, &INPUT);
+        let drain = timer_operation(&TaskKey::DrainNotificationOutbox, &input());
         assert_eq!(
             drain.unwrap().first(),
-            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+            Ok(Next::Done(TimerPlan::from(Some(DELIVERY_RETRY_AFTER))))
         );
     }
 
     /// The table keeps the wrapped operation's cleanup and conflict decisions.
     #[test]
     fn hooks_are_forwarded() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
+        let mut operation = timer_operation(&TaskKey::PruneNotifications, &input()).unwrap();
         assert!(operation.abort().is_empty());
         assert_eq!(operation.on_conflict(1), AfterConflict::Rerun);
         assert_eq!(operation.on_conflict(9), AfterConflict::Fail);
@@ -551,7 +1170,7 @@ mod tests {
 
     #[test]
     fn timer_failure_rearms() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
+        let mut operation = timer_operation(&TaskKey::PruneNotifications, &input()).unwrap();
         operation.first().unwrap();
         let failure = operation.next(IoResult::Done).unwrap_err();
         assert_eq!(failure.retry_after, NOTIFICATION_RETRY_AFTER);

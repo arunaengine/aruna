@@ -28,11 +28,11 @@ use super::host::steps::AdmitCall;
 use super::rows::{Rows, StoreError, decode, delete_rows, scan_rows};
 use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
 use super::unavailable;
+use super::work::calls::JobRow;
 use super::work::{
     SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
     install_at, summary_of, update_work, work_scan, work_state,
 };
-use super::work::calls::JobRow;
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;

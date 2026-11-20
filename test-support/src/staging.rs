@@ -434,7 +434,6 @@ impl Fixture {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("items")),
             range_turns: Default::default(),
-            handlers: Default::default(),
         }
     }
 

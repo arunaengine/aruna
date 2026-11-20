@@ -411,8 +411,8 @@ async fn joiner_announces_watch() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 11).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_incoming_fixture(bootstrap_context.clone());
-    initialize_incoming_fixture(joiner_context.clone());
+    let _bootstrap_incoming = initialize_incoming_fixture(bootstrap_context.clone());
+    let _joiner_incoming = initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -498,8 +498,8 @@ async fn retries_until_seeded() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 13).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_incoming_fixture(bootstrap_context.clone());
-    initialize_incoming_fixture(joiner_context.clone());
+    let _bootstrap_incoming = initialize_incoming_fixture(bootstrap_context.clone());
+    let _joiner_incoming = initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(

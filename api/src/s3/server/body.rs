@@ -589,7 +589,7 @@ mod tests {
             connection_activity.wait_cancelled().await;
         });
         ready.notified().await;
-        tokio::time::advance(crate::s3::server::activity::CONNECTION_IDLE_TIMEOUT).await;
+        tokio::time::advance(aruna_core::listener::CONNECTION_IDLE_TIMEOUT).await;
         watcher.await.expect("response watcher joins");
         assert!(activity.is_cancelled());
         connection.await.expect("connection task joins");
@@ -603,7 +603,7 @@ mod tests {
         activity.mark_request();
         activity.begin_request();
         let deadline_activity = super::super::activity::spawn_total_deadline(
-            crate::s3::server::STREAM_LIFETIME_TIMEOUT,
+            aruna_core::listener::STREAM_LIFETIME_TIMEOUT,
         );
         let response_activity = Arc::new(ConnectionActivity::default());
         response_activity.touch();
@@ -641,7 +641,7 @@ mod tests {
         assert!(!response_activity.is_cancelled());
         assert!(!activity.is_cancelled());
         tokio::time::advance(
-            crate::s3::server::STREAM_LIFETIME_TIMEOUT - Duration::from_secs(19 * 94),
+            aruna_core::listener::STREAM_LIFETIME_TIMEOUT - Duration::from_secs(19 * 94),
         )
         .await;
         connection.await.expect("connection task joins");

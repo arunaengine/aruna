@@ -34,7 +34,6 @@ use super::super::dataset::{
     same_revision,
 };
 use super::super::grants::{install_scope, parse_grants, patterns_for, restricted_account};
-use super::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
 use super::super::install::{
     InstallError, config_answer, config_call, pick_version, read_manifest,
 };
@@ -47,6 +46,7 @@ use super::super::rows::StoreError;
 use super::super::submit::WorkRequest;
 use super::super::unavailable;
 use super::super::work::RequestContext;
+use super::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
 use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::ExportMetadataRequest;

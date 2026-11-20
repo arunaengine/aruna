@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna::inbound::{initialize_incoming_fixture, initialize_net_holder};
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture, initialize_net_holder};
 use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::testing::poll_until;
@@ -107,6 +107,8 @@ pub struct TestNode {
     pub kind: RealmNodeKind,
     /// Owner of the production net holder and task queues, when the node installed them.
     pub shutdown: Option<Shutdown>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 impl TestNode {
@@ -1048,7 +1050,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         outbound_handle: None,
     });
 
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
@@ -1064,6 +1066,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         context,
         kind,
         shutdown: None,
+        _incoming: incoming,
     })
 }
 
@@ -1592,12 +1595,13 @@ pub async fn spawn_node_with(
     });
 
     let shutdown = Shutdown::new();
-    if hold_shutdown {
+    let incoming = if hold_shutdown {
         let limits = RoCrateLimits::default();
         initialize_net_holder(context.clone(), limits, JobsRuntime::new(), &shutdown);
+        None
     } else {
-        initialize_incoming_fixture(context.clone());
-    }
+        initialize_incoming_fixture(context.clone())
+    };
     start_task_queues(context.clone(), task_handle, JobsRuntime::new(), &shutdown).await;
 
     Ok(TestNode {
@@ -1606,6 +1610,7 @@ pub async fn spawn_node_with(
         context,
         kind: RealmNodeKind::Management,
         shutdown: hold_shutdown.then_some(shutdown),
+        _incoming: incoming,
     })
 }
 
@@ -1985,12 +1990,13 @@ pub async fn spawn_replica_with(
     });
     let jobs_runtime = JobsRuntime::new();
     let shutdown = Shutdown::new();
-    if holder {
+    let incoming = if holder {
         let limits = RoCrateLimits::default();
         initialize_net_holder(context.clone(), limits, jobs_runtime.clone(), &shutdown);
+        None
     } else {
-        initialize_incoming_fixture(context.clone());
-    }
+        initialize_incoming_fixture(context.clone())
+    };
     if start_tasks {
         start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
     }
@@ -2000,6 +2006,7 @@ pub async fn spawn_replica_with(
         context,
         kind: RealmNodeKind::Management,
         shutdown: holder.then_some(shutdown),
+        _incoming: incoming,
     })
 }
 

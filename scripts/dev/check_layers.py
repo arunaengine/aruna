@@ -57,7 +57,6 @@ CRATE_TARGETS = {
     "aruna-config": (
         "aruna-core",
         "aruna-clock",
-        "aruna-api",
         "aruna-drivers",
         "aruna-graph",
         "aruna-net",

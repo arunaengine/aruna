@@ -10,7 +10,7 @@ use crate::shared;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna::tasks::runner::{ComputeReconciler, run_execution_job};
+use aruna::tasks::runner::{reconcile_lost_attempt, run_execution_job};
 use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_compute::executor::docker::DockerBackend;
@@ -26,7 +26,6 @@ use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::job_calls::{self, ClaimOutcome};
 use aruna_operations::jobs::store::{JobMutation, row_calls};
@@ -628,10 +627,7 @@ async fn execution_restart_adopts() -> TestResult<()> {
         .unwrap()
         .unwrap();
     let runtime = JobsRuntime::new();
-    let reconciler = ComputeReconciler::new(fixture.compute_ctx.clone(), Arc::downgrade(&runtime));
-    reconciler
-        .reconcile_lost_attempt(&fixture.compute_ctx, lost)
-        .await;
+    reconcile_lost_attempt(&runtime, &fixture.compute_ctx, lost).await;
 
     // Still exactly one container: no double-run.
     assert_eq!(

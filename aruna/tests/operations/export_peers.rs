@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna_core::effects::BlobEffect;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::BlobEvent;
@@ -29,15 +29,16 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use ulid::Ulid;
 
-async fn bao_node(realm_id: RealmId) -> BaoNode {
+async fn bao_node(realm_id: RealmId) -> (BaoNode, Option<IncomingFixture>) {
     node_with(realm_id, false).await
 }
 
-/// A node as `export_node`, with the peer handler that answers other nodes' reads.
-async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
+/// A node as `export_node`, with the peer handler that answers other nodes' reads; the fixture
+/// keeps that handler installed.
+async fn node_with(realm_id: RealmId, metadata: bool) -> (BaoNode, Option<IncomingFixture>) {
     let node = export_node(realm_id, metadata).await;
-    initialize_incoming_fixture(node.driver.clone());
-    node
+    let incoming = initialize_incoming_fixture(node.driver.clone());
+    (node, incoming)
 }
 
 async fn keyspace_len(driver: &DriverContext, key_space: &str) -> usize {
@@ -63,8 +64,8 @@ async fn remote_read_ephemeral() {
     let owner = UserId::local(Ulid::from_bytes([72; 16]), realm_id);
     let group_id = Ulid::from_bytes([73; 16]);
     let version_id = Ulid::from_bytes([74; 16]);
-    let client = bao_node(realm_id).await;
-    let source = bao_node(realm_id).await;
+    let (client, _client_incoming) = bao_node(realm_id).await;
+    let (source, _source_incoming) = bao_node(realm_id).await;
     client.net.add_peer_addr(source.net.endpoint_addr()).await;
     source.net.add_peer_addr(client.net.endpoint_addr()).await;
     let Event::Blob(BlobEvent::WriteFinished { location }) = source
@@ -155,8 +156,8 @@ async fn locked_remote_export() {
     let owner = UserId::local(Ulid::from_bytes([122; 16]), realm_id);
     let group_id = Ulid::from_bytes([123; 16]);
     let version_id = Ulid::from_bytes([124; 16]);
-    let client = bao_node(realm_id).await;
-    let source = bao_node(realm_id).await;
+    let (client, _client_incoming) = bao_node(realm_id).await;
+    let (source, _source_incoming) = bao_node(realm_id).await;
     client.net.add_peer_addr(source.net.endpoint_addr()).await;
     source.net.add_peer_addr(client.net.endpoint_addr()).await;
     let Event::Blob(BlobEvent::WriteFinished { location }) = source
@@ -234,8 +235,8 @@ async fn plaintext_export_parks() {
     let group_id = Ulid::from_bytes([133; 16]);
     let version_id = Ulid::from_bytes([134; 16]);
     let bucket_id = Ulid::from_bytes([135; 16]);
-    let client = bao_node(realm_id).await;
-    let source = node_with(realm_id, true).await;
+    let (client, _client_incoming) = bao_node(realm_id).await;
+    let (source, _source_incoming) = node_with(realm_id, true).await;
     client.net.add_peer_addr(source.net.endpoint_addr()).await;
     source.net.add_peer_addr(client.net.endpoint_addr()).await;
     let Event::Blob(BlobEvent::WriteFinished { location }) = source

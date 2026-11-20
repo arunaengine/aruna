@@ -1217,6 +1217,32 @@ fn skew_guard_rejects() {
     ));
 }
 
+// An empty queue falls back to replaying the event log page by page; a failed page retries soon.
+#[test]
+fn empty_queue_replays() {
+    let mut run = ProjectionRunOperation::new(None);
+    assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let empty = PendingProjectionResult {
+        markers_examined: 0,
+        projected: 0,
+        has_more: false,
+    };
+    let drained = child(Ok::<_, MetadataProjectionError>(empty));
+    assert!(matches!(
+        run.next(drained),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let page = (3usize, Some(Key::from(b"next".to_vec())));
+    let page = child(Ok::<_, MetadataProjectionError>(page));
+    assert!(matches!(run.next(page), Ok(Next::Call(IoCall::Child(_)))));
+    let error = MetadataProjectionError::Conversion("broken".to_string());
+    let failed = child(Err::<(usize, Option<Key>), _>(error));
+    assert_eq!(
+        run.next(failed),
+        Ok(Next::Done(Some(PROJECTION_RETRY_AFTER)))
+    );
+}
+
 fn child<T, E>(result: Result<T, E>) -> IoResult
 where
     T: Send + std::fmt::Debug + PartialEq + 'static,

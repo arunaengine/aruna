@@ -192,7 +192,6 @@ async fn job_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&JobProgress::new("items")),
         range_turns: Default::default(),
-        handlers: Default::default(),
     };
     (ctx, spec, test._tempdir)
 }
