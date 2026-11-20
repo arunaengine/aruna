@@ -489,7 +489,7 @@ mod tests {
     // An entry the adapter published after a retried entry of its topic stays in the oplog but
     // is not synced, so no peer receives it first.
     #[test]
-    fn retried_entry_holds_later() {
+    fn retried_holds_later() {
         let mut joined = batch(b"one");
         let later = batch(b"one");
         joined.documents.extend(later.documents);
