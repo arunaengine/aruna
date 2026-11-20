@@ -14,7 +14,7 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use bytes::Bytes;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 use tokio::io::AsyncSeekExt;
@@ -136,15 +136,21 @@ fn walk_entries(
     examined: usize,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
     let root = OfferedRoot::open(root)?;
-    // Directories already listed. A link to an ancestor inside the offered root would otherwise
-    // walk in circles forever.
-    let mut visited = HashSet::new();
+    // Where each listed directory resolves. A page lists every ancestor of a directory before
+    // it, so a link back to an ancestor is found on any page, while other aliases list as paths.
+    let mut listed = HashMap::new();
     let mut seen = 0usize;
     let mut entries = Vec::new();
     loop {
         let (path, child) = match walk.step() {
             Step::List(directory) => {
-                let children = local_children(&root, &directory, &mut visited, &mut seen)?;
+                let resolved = root.resolve(&directory)?;
+                let looped = ancestors(&directory).any(|up| listed.get(up) == Some(&resolved));
+                let children = match looped {
+                    true => Vec::new(),
+                    false => local_children(&root, (&directory, &resolved), &mut seen)?,
+                };
+                listed.insert(directory, resolved);
                 if seen > examined {
                     return Err(StagingSourceError::InvalidListing(format!(
                         "a local listing page examines at most {examined} entries; list a \
@@ -182,20 +188,21 @@ fn walk_entries(
     }
 }
 
-/// The files and directories of one local directory; a directory already listed has none.
+/// The paths that contain `path`, nearest first, down to the root of the offered folder.
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    let parents = path.rmatch_indices('/').map(|(at, _)| &path[..at]);
+    parents.chain((!path.is_empty()).then_some(""))
+}
+
+/// The files and directories of the local `directory`, which resolves to `resolved`.
 fn local_children(
     root: &OfferedRoot,
-    directory: &str,
-    visited: &mut HashSet<PathBuf>,
+    (directory, resolved): (&str, &Path),
     seen: &mut usize,
 ) -> Result<Vec<LocalChild>, StagingSourceError> {
-    let resolved = root.resolve(directory)?;
-    if !visited.insert(resolved.clone()) {
-        return Ok(Vec::new());
-    }
     let reader = root
         .directory
-        .read_dir(&resolved)
+        .read_dir(resolved)
         .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
     let mut children = Vec::new();
     for entry in reader {
@@ -472,6 +479,34 @@ pub(crate) mod tests {
             walk(3),
             Err(StagingSourceError::InvalidListing(_))
         ));
+    }
+
+    // An alias of a directory that is not its ancestor lists under its own path on every page;
+    // before, a single page hid it as already visited while a later page listed it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn alias_pages_agree() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("a")).unwrap();
+        std::fs::write(root.path().join("a/f.txt"), b"data").unwrap();
+        std::fs::write(root.path().join("m.txt"), b"data").unwrap();
+        std::os::unix::fs::symlink(root.path().join("a"), root.path().join("z")).unwrap();
+        let listed = list_local(&access(root.path(), ""), Vec::new(), 10, true, true).await;
+        let whole: Vec<String> = (listed.unwrap().0.into_iter())
+            .map(|entry| entry.path)
+            .collect();
+        let (mut after, mut paged) = (Vec::new(), Vec::new());
+        loop {
+            let page = list_local(&access(root.path(), ""), after, 1, true, true).await;
+            let (entries, truncated) = page.unwrap();
+            paged.extend(entries.into_iter().map(|entry| entry.path));
+            if !truncated {
+                break;
+            }
+            after = paged.last().unwrap().split('/').map(ToOwned::to_owned).collect();
+        }
+        assert_eq!(whole, ["a/f.txt", "m.txt", "z/f.txt"]);
+        assert_eq!(paged, whole);
     }
 
     // Each page continues after the last path of the one before, in name order, so a tree is
