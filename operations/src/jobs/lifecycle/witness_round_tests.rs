@@ -206,7 +206,7 @@ fn offer_picks_route() {
 
 // An accepted offer stores its receipt, and losing that write retries the offer's delay.
 #[test]
-fn receipt_stored_after_accept() {
+fn stores_accepted_receipt() {
     let fixture = Family::new([27u8; 32]);
     let (_, records) = foreign(&fixture);
     let receipt = JobRecordFrame::new(records[0].clone()).unwrap();

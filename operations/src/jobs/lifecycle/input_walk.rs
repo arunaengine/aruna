@@ -503,7 +503,7 @@ mod tests {
 
     // An input on another node ends the walk at once; an unreadable head ends it unchanged.
     #[test]
-    fn walk_stops_without_link() {
+    fn stops_without_link() {
         let mut remote = input("a", "a");
         remote.source_node_id = Some(node(2));
         let mut elsewhere = FollowLinkOperation::new(caller(), remote.clone());
@@ -560,7 +560,7 @@ mod tests {
     // Every listed file is read-checked before it becomes an input below the directory path;
     // folder markers are skipped and a denied file refuses the directory.
     #[test]
-    fn directory_checks_each_file() {
+    fn checks_each_file() {
         let version = Ulid::from_parts(5, 5);
         let mut walk = directory();
         walk.group_id = Some(Ulid::from_parts(2, 2));

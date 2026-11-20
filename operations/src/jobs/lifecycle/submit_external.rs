@@ -416,7 +416,7 @@ mod tests {
 
     // Only a complete read proves that no executor carries a required label.
     #[test]
-    fn label_needs_full_read() {
+    fn label_reads_fully() {
         let config = Family::new([4; 32]).config;
         let answer = |unread| {
             let mut submit = operation();

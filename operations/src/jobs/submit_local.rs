@@ -688,7 +688,7 @@ mod tests {
 
     // A submit mints first, queues second, and answers what the queue answered.
     #[test]
-    fn submit_mints_then_queues() {
+    fn mints_then_queues() {
         let mut submit = SubmitLocalOperation::new(spec(node(1)), REALM, None);
         assert!(matches!(submit.first(), Ok(Next::Call(IoCall::Child(_)))));
         let queued = submit.next(child(Ok::<_, SubmitJobError>(job())));

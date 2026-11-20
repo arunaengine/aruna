@@ -821,7 +821,7 @@ mod tests {
 
     // No family means the caller's ordinary cancellation applies.
     #[test]
-    fn no_family_answers_none() {
+    fn missing_family_none() {
         let auth = AuthContext::anonymous(REALM);
         let mut cancel = CancelFamilyOperation::new(&auth, job(), None, serving(), 5);
         cancel.first().expect("the alias is read");

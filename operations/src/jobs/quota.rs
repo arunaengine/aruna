@@ -282,7 +282,7 @@ mod pure_tests {
 
     // An uncapped group reads nothing; a capped one decides against a settled revision.
     #[test]
-    fn decides_on_settled_view() {
+    fn decides_settled_view() {
         assert_eq!(check(None).first(), Ok(Next::Done((None, None))));
         let mut capped = check(Some(4));
         assert!(matches!(capped.first(), Ok(Next::Call(IoCall::Read(_)))));

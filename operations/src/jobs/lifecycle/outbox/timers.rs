@@ -53,7 +53,7 @@ mod tests {
 
     // A stored witness deadline brings the witness drain back with the outbox drain.
     #[test]
-    fn witness_timer_needs_rows() {
+    fn witness_needs_rows() {
         let mut timers = LifecycleTimersOperation;
         assert!(matches!(
             timers.first(),

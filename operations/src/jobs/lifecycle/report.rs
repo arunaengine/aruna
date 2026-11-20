@@ -469,7 +469,7 @@ mod tests {
 
     // Other request digests count as conflicts; without a stored plan the newest launch places.
     #[test]
-    fn reads_conflicts_and_launch() {
+    fn conflicts_and_launch() {
         let fixture = Family::new([2u8; 32]);
         let family = fixture.family();
         let mut details = ReportDetailsOperation::new(family, &projection(&fixture), None);
