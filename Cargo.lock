@@ -654,6 +654,7 @@ dependencies = [
  "toml 1.1.8+spec-1.1.0",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "ulid 3.0.0",
  "unicode-normalization",
  "url",

@@ -1820,10 +1820,8 @@ async fn finish_stores_merge() {
         sync: None,
         merge: true,
         capture: Some(CaptureMark {
-            materialized_at_ms: 1,
             event_id: late_event.event_id,
             jsonld: "{}".to_string(),
-            ready: false,
         }),
     };
     finish_completed_jobs(
@@ -1841,7 +1839,7 @@ async fn finish_stores_merge() {
         "the newer status stays"
     );
     assert!(storage_key_exists(&storage, RAW_REVISION_KEYSPACE, raw_state_key.to_vec()).await);
-    // The finish made the mark ready; it stays until the Git capture drain took the snapshot.
+    // The finish queued the mark; it stays until the Git capture drain took the snapshot.
     assert!(capture_pending(&storage, document_id).await.unwrap());
 }
 

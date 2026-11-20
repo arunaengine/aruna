@@ -69,3 +69,4 @@ x25519-dalek = { workspace = true }
 [dev-dependencies]
 getrandom = { workspace = true }
 proptest = { workspace = true }
+tracing-subscriber = { workspace = true }

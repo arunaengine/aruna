@@ -248,6 +248,14 @@ pub fn document_job_key(document_id: Ulid, event_id: Ulid) -> Key {
     ByteView::from(bytes)
 }
 
+/// The key of a document's ready Git capture mark: the document, then its capture sequence.
+pub fn capture_key(document_id: Ulid, sequence: u64) -> Key {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    ByteView::from(bytes)
+}
+
 pub fn dead_letter_key(document_id: Ulid, event_id: Ulid) -> Key {
     document_job_key(document_id, event_id)
 }

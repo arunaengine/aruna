@@ -26,16 +26,18 @@ pub struct FollowUpNode {
     pub realm_id: RealmId,
 }
 
-/// The applied sync row of one apply. Its id comes from the event's sync identity, so a replay
-/// that applies the event again writes the same row instead of a second one.
+/// The applied sync row of the events one transaction applied. Its id comes from their sync
+/// identities in apply order, so a replay that applies them again writes the same row.
 pub fn followup_row(
     node: &FollowUpNode,
-    identity: &SyncQuarantineIdentity,
+    identities: &[SyncQuarantineIdentity],
     result: DocumentReconcileResult,
 ) -> Result<Row, ApplyError> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"aruna-applied-sync-v1\0");
-    hasher.update(&identity.storage_key());
+    for identity in identities {
+        hasher.update(&identity.storage_key());
+    }
     let mut id = [0u8; 16];
     id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
     let applied = AppliedSync {
@@ -65,7 +67,7 @@ impl<P> QueuedApply<P> {
     ) -> Step<Planned<T>> {
         planned
             .writes
-            .push(followup_row(&self.node, &self.identity, result)?);
+            .push(followup_row(&self.node, &[self.identity], result)?);
         Ok(planned)
     }
 

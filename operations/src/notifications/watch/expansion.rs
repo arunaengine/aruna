@@ -42,7 +42,7 @@ pub enum ExpandError {
     /// The watches or the retry row changed meanwhile; a fresh run may pass.
     #[error("watch event expansion conflicted")]
     Conflict,
-    /// An authorization check could not run now; the delivery is retried.
+    /// A check, a read or a full queue kept the run from passing now; the delivery is retried.
     #[error("{0}")]
     Unavailable(String),
     #[error("{0}")]
@@ -99,6 +99,34 @@ type Turn = Result<Next<ExpandOutcome>, ExpandError>;
 
 fn fatal(error: impl ToString) -> ExpandError {
     ExpandError::Fatal(error.to_string())
+}
+
+/// A watch listing that failed on storage or an authorization check passes on a later delivery.
+fn listing_error(error: WatchSubscriptionError) -> ExpandError {
+    match error {
+        WatchSubscriptionError::Storage(error)
+        | WatchSubscriptionError::AuthorizationUnavailable(error) => {
+            ExpandError::Unavailable(error)
+        }
+        error => fatal(error),
+    }
+}
+
+/// A full retry queue clears as its rows drain, so the delivery is retried.
+fn full_queue(reason: &str) -> ExpandError {
+    ExpandError::Unavailable(reason.to_string())
+}
+
+/// An inbox upsert that failed on storage or a full transient inbox passes on a later delivery;
+/// a record that does not encode or decode never does.
+fn upsert_error(error: InboxError) -> ExpandError {
+    match error {
+        InboxError::Conflict => ExpandError::Conflict,
+        InboxError::Storage(error) => ExpandError::from(IoError::Storage(error)),
+        InboxError::Io(error) => ExpandError::from(error),
+        InboxError::TransientCap(_) => ExpandError::Unavailable(error.to_string()),
+        InboxError::Decode(_) | InboxError::Encode(_) => fatal(error),
+    }
 }
 
 /// Expands one bounded page of the realm's watches this node holds; a later page is kept as a
@@ -348,8 +376,7 @@ impl WatchExpandOperation {
                 self.retry_change()
             }
             Ok(Next::Wait | Next::Then { .. }) => Err(fatal("the inbox upsert ended early")),
-            Err(InboxError::Conflict) => Err(ExpandError::Conflict),
-            Err(error) => Err(fatal(error)),
+            Err(error) => Err(upsert_error(error)),
         }
     }
 
@@ -380,7 +407,7 @@ impl WatchExpandOperation {
         let mut value = self.retry_value.take().ok_or(IoError::Unfinished)?;
         if rows.len() > RETRY_BATCH_CAP {
             warn!(%realm_id, "Watch retry queue row cap reached");
-            return Err(fatal("watch retry row cap reached"));
+            return Err(full_queue("watch retry row cap reached"));
         }
         let current_bytes = rows
             .iter()
@@ -393,7 +420,7 @@ impl WatchExpandOperation {
         let replaced = existing.map_or(0, |(_, row)| row.len());
         if replaced == 0 && rows.len() >= RETRY_BATCH_CAP {
             warn!(%realm_id, "Watch retry queue row cap reached");
-            return Err(fatal("watch retry row cap reached"));
+            return Err(full_queue("watch retry row cap reached"));
         }
         if let Some((_, current)) = existing
             && let Ok(current_retry) = postcard::from_bytes::<WatchEventRetry>(current.as_ref())
@@ -410,7 +437,7 @@ impl WatchExpandOperation {
             .ok_or_else(|| fatal("watch retry byte budget overflow"))?;
         if next_bytes > RETRY_BYTES_CAP {
             warn!(%realm_id, "Watch retry queue byte cap reached");
-            return Err(fatal("watch retry byte cap reached"));
+            return Err(full_queue("watch retry byte cap reached"));
         }
         self.state = ExpandState::RetryWrite;
         let row = (
@@ -497,7 +524,7 @@ impl Operation for WatchExpandOperation {
             ExpandState::List => {
                 let page = result
                     .child::<WatchPage, WatchSubscriptionError>()?
-                    .map_err(fatal)?;
+                    .map_err(listing_error)?;
                 self.listed(page)
             }
             ExpandState::Guard => self.guard_checked(result.values()?),

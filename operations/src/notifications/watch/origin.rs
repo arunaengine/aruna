@@ -53,6 +53,8 @@ pub(crate) struct EmitWatchOperation {
     holders: Vec<NodeId>,
     /// On a retry, the holders an earlier delivery left open; the others already settled.
     only: Option<Vec<NodeId>>,
+    /// On a retry, its remote holders still in the realm; `None` until the realm config is read.
+    members: Option<Vec<NodeId>>,
     config: Option<RealmConfigDocument>,
     pending: VecDeque<NodeId>,
     open: Vec<NodeId>,
@@ -69,6 +71,7 @@ impl EmitWatchOperation {
             local,
             holders,
             only: None,
+            members: None,
             config: None,
             pending: VecDeque::new(),
             open: Vec::new(),
@@ -93,6 +96,12 @@ impl EmitWatchOperation {
     fn configured(&mut self, config: Result<RealmConfigDocument, GetConfigError>) -> Turn {
         match config {
             Ok(config) => {
+                let local = self.local;
+                self.members = (self.only.as_ref()).map(|only| {
+                    (only.iter().copied())
+                        .filter(|holder| *holder != local && config.has_node(*holder))
+                        .collect()
+                });
                 self.config = Some(config);
                 self.state = EmitState::List;
                 let list = ListWatchesOperation::new(WatchScope::Realm(self.event.realm_id));
@@ -161,11 +170,25 @@ impl EmitWatchOperation {
         self.deliver()
     }
 
-    /// Orders the holders, then delivers to each once.
+    /// Orders the holders, then delivers to each once. A retry goes to its saved holders still
+    /// in the realm whatever the interest table matches now, as a failed rebuild may empty it;
+    /// without the realm config only the table vouches for one, and the others stay open.
     fn deliver(&mut self) -> Turn {
         let mut holders = std::mem::take(&mut self.holders);
         if let Some(only) = &self.only {
-            holders.retain(|holder| only.contains(holder));
+            let local = self.local;
+            match &self.members {
+                Some(members) => {
+                    holders.retain(|holder| *holder == local && only.contains(holder));
+                    holders.extend(members);
+                }
+                None => {
+                    let unvouched = (only.iter())
+                        .filter(|holder| **holder != local && !holders.contains(holder));
+                    self.open.extend(unvouched);
+                    holders.retain(|holder| only.contains(holder));
+                }
+            }
         }
         holders.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         holders.dedup();
