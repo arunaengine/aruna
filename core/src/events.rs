@@ -531,6 +531,8 @@ pub enum NetEvent {
     CursorSigned(Option<iroh::Signature>),
     /// The federation signature, or why this node cannot make it.
     FederationSigned(Result<crate::federation::FederationSignature, String>),
+    /// The opened token, why it does not open, or `None` when this node holds no credential key.
+    CredentialOpened(Option<Result<crate::compute::Secret, String>>),
     /// The sealed position, or `None` when it could not be sealed.
     PositionSealed(Option<Vec<u8>>),
     /// The opened position, or `None` when this process did not seal it.
@@ -1077,6 +1079,7 @@ impl Event {
                     HolderAvoided,
                     CursorSigned,
                     FederationSigned,
+                    CredentialOpened,
                     PositionSealed,
                     PositionOpened,
                     SecretDrawn,

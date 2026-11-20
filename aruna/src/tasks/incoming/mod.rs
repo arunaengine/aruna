@@ -724,9 +724,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::DrainWitnessQueue => Box::pin(self.run_trigger(key)),
             TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainLinkQueue => Box::pin(async move {
-                self.drain_link_queue().await;
-            }),
+            TaskKey::DrainLinkQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCaptures => Box::pin(self.run_trigger(key)),
             TaskKey::ReconcileSyncedFolders => Box::pin(async move {
                 let after = match folder_pass::reconcile_folders(&self.context).await {

@@ -26,6 +26,7 @@ use aruna_core::native_reference::{
     NativeReferenceRequest, NativeReferenceResponse,
 };
 use aruna_core::outbound::{OutboundEvent, RangeListing};
+use aruna_core::repository::credential::CredentialOpen;
 use aruna_core::structs::storage::distribution::delegation::{
     BodyTrailer, Delegation, SignedDelegation,
 };
@@ -348,6 +349,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     if let NetEffect::FederationSign(bytes) = effect {
         return Event::Net(NetEvent::FederationSigned(federation_sign(&bytes, context)));
     }
+    if let NetEffect::OpenCredential(open) = effect {
+        return Event::Net(NetEvent::CredentialOpened(open_credential(&open, context)));
+    }
     if let NetEffect::AvoidHolder { node_id, now_ms } = effect {
         context.avoid_holder(node_id, now_ms);
         return Event::Net(NetEvent::HolderAvoided);
@@ -420,6 +424,16 @@ fn federation_sign(
     let keys = (context.net_handle.as_ref()).and_then(|net| net.federation_keys());
     let keys = keys.ok_or_else(|| "this node holds no federation signing key".to_string())?;
     aruna_core::federation::sign_bytes(bytes, keys).map_err(|error| error.to_string())
+}
+
+/// Opens a sealed repository token with this node's credential key; `None` without a network.
+fn open_credential(
+    open: &CredentialOpen,
+    context: &DriverContext,
+) -> Option<Result<Secret, String>> {
+    let key = context.net_handle.as_ref()?.credential_encryption_key();
+    let opened = open.open(&key).map_err(|error| error.to_string());
+    Some(opened.map(Secret::new))
 }
 
 /// A secret of `length` letters and digits from the OS random source.

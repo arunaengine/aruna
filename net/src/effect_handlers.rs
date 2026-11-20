@@ -270,6 +270,10 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::FederationSign(_) => {
             NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
         }
+        // Credentials are opened by the drivers adapter; this handler never answers one.
+        NetEffect::OpenCredential(_) => {
+            NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
+        }
         NetEffect::CursorSign(bytes) => {
             let signer = ctx.secret_key.public();
             let signed = aruna_core::cursor::names_signer(&bytes, signer.as_bytes());
@@ -669,6 +673,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::AvoidHolder { .. } => "avoid_holder",
         NetEffect::CursorSign(_) => "cursor_sign",
         NetEffect::FederationSign(_) => "federation_sign",
+        NetEffect::OpenCredential(_) => "open_credential",
         NetEffect::SealPosition(_) => "seal_position",
         NetEffect::OpenPosition(_) => "open_position",
         NetEffect::DrawSecret(_) => "draw_secret",

@@ -56,7 +56,6 @@ pub fn credential_key() -> CredentialEncryptionKey {
 pub fn scope() -> NodeScope {
     NodeScope {
         node: Some((owner_node(), realm())),
-        credential_key: Some(credential_key()),
         has_blob: true,
         has_tasks: true,
     }
@@ -66,7 +65,6 @@ pub fn scope() -> NodeScope {
 pub fn local_scope() -> NodeScope {
     NodeScope {
         node: None,
-        credential_key: None,
         has_blob: true,
         has_tasks: false,
     }

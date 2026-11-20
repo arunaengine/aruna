@@ -22,6 +22,7 @@ use aruna_core::native_reference::{
 };
 use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
@@ -51,6 +52,7 @@ use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation
 use crate::jobs::node_inputs::witness_node;
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
+use crate::jobs::repository::link_queue::LinkRunOperation;
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::device::drain::{
     DrainPublishOperation, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, drain_publish_queue,
@@ -280,6 +282,7 @@ pub enum TimerOperation {
     RunBackendImports(RunDueOperation),
     MaintainRanges(RangeTimerOperation),
     PublishRegistration(RenewalTimerOperation),
+    DrainLinkQueue(LinkRunOperation),
     RefreshBlobHolders(HoldersTimerOperation),
     DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
@@ -437,6 +440,16 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(Some(PUBLISH_INTERVAL))),
         }),
+        // The connector opens stored tokens through the net adapter, so no key enters this scope.
+        TaskKey::DrainLinkQueue => {
+            let scope = NodeScope {
+                node: input.serving,
+                has_blob: input.has_blob,
+                has_tasks: input.has_tasks,
+            };
+            let drain = LinkRunOperation::new(scope);
+            Some(TimerOperation::DrainLinkQueue(drain))
+        }
         TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
             input,
         ))),
@@ -503,6 +516,7 @@ macro_rules! each_timer {
             TimerOperation::RunBackendImports($operation) => $body,
             TimerOperation::MaintainRanges($operation) => $body,
             TimerOperation::PublishRegistration($operation) => $body,
+            TimerOperation::DrainLinkQueue($operation) => $body,
             TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
@@ -872,6 +886,12 @@ impl TimerRun for RenewalTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         let after = result.unwrap_or(Some(PUBLISH_INTERVAL));
         Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for LinkRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
     }
 }
 

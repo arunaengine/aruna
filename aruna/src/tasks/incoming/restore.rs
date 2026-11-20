@@ -8,7 +8,6 @@ use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use aruna_drivers::driver::node_routing;
 use std::time::SystemTime;
 
-const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// The first and the longest wait before an incomplete timer restoration resumes.
 const TIMER_RESUME_FIRST: Duration = Duration::from_secs(1);
 const TIMER_RESUME_MOST: Duration = Duration::from_secs(60);
@@ -439,25 +438,6 @@ impl TaskQueues {
             handler
                 .reschedule_timer(TaskKey::RefreshBlobHolders, Duration::ZERO)
                 .await;
-        }
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
-    pub(super) async fn drain_link_queue(&self) {
-        let drain = aruna_operations::jobs::repository::link_queue::DrainLinksOperation::new(
-            self.context.node_scope(),
-        );
-        let after = match drive(drain, &self.context).await {
-            Ok(after) => after,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainLinkQueue, %error, "Failed to drain repository link queue");
-                Some(LINK_RETRY_AFTER)
-            }
-        };
-        if let Some(after) = after {
-            self.reschedule_timer(TaskKey::DrainLinkQueue, after).await;
         }
     }
 }

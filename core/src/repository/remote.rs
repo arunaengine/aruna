@@ -14,7 +14,6 @@ use ulid::Ulid;
 use url::Url;
 
 use super::ImportMode;
-use crate::credential_encryption::CredentialEncryptionKey;
 use crate::id::NodeId;
 use crate::structs::checksum::Hasher;
 use crate::structs::execution::job::input::{ArtifactRef, RoCrateLimits};
@@ -27,7 +26,6 @@ use crate::user::id::UserId;
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeScope {
     pub node: Option<(NodeId, RealmId)>,
-    pub credential_key: Option<CredentialEncryptionKey>,
     pub has_blob: bool,
     pub has_tasks: bool,
 }

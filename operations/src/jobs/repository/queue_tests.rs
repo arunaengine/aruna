@@ -555,6 +555,16 @@ fn empty_queue_idle() {
     assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Done(())));
 }
 
+// A failed drain runs again after the retry wait instead of leaving the queue unwatched.
+#[test]
+fn failed_drain_retries() {
+    let mut run = LinkRunOperation::new(scope());
+    let drain = IoCall::child(DrainLinksOperation::new(scope()));
+    assert_eq!(run.first(), Ok(Next::Call(drain)));
+    let failed = child::<Option<Duration>, _>(Err(LinkError::NotFound));
+    assert_eq!(run.next(failed), Ok(Next::Done(Some(LINK_RETRY_AFTER))));
+}
+
 // Change rows left behind, as after a failed queueing or a restart, arm the drain at once.
 #[test]
 fn changes_arm_drain() {

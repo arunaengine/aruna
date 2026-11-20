@@ -852,7 +852,6 @@ mod tests {
     fn pruned_batch(graph_iri: String) -> PruneBatchOperation {
         let mut batch = PruneBatchOperation::new(NodeScope {
             node: None,
-            credential_key: None,
             has_blob: false,
             has_tasks: true,
         });
