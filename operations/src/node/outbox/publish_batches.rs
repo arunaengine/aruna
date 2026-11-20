@@ -75,8 +75,16 @@ fn ready_entries(batch: &DrainSubBatch, published: &[usize], retried: &[usize]) 
         let origin = |index: usize| batch.origins.get(index).copied().flatten();
         topic(first) == topic(later) || origin(first).is_some_and(|o| origin(later) == Some(o))
     };
-    let waits = |later: usize| retried.iter().any(|&first| first < later && shares(first, later));
-    published.iter().copied().filter(|&index| !waits(index)).collect()
+    let waits = |later: usize| {
+        retried
+            .iter()
+            .any(|&first| first < later && shares(first, later))
+    };
+    published
+        .iter()
+        .copied()
+        .filter(|&index| !waits(index))
+        .collect()
 }
 
 type PublishTurn = Result<Next<PublishedBatches>, IoError>;
@@ -128,7 +136,10 @@ impl PublishBatchesOperation {
             };
             // A batch sharing a topic or admin origin with the one awaiting its sync waits for that
             // sync, so a failure there holds the later batch before it goes out.
-            if let Some(before) = self.awaiting.take_if(|before| shares_domain(before, &batch)) {
+            if let Some(before) = self
+                .awaiting
+                .take_if(|before| shares_domain(before, &batch))
+            {
                 self.batches.push_front(batch);
                 return self.sync_alone(before);
             }
