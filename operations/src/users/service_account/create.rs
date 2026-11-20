@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::oidc_user::initial_sync_change;

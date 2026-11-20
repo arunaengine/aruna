@@ -11,6 +11,7 @@ pub mod info;
 pub mod info_timer;
 pub mod placement_timer;
 pub mod presence_timer;
+pub mod range_timer;
 mod rebuild_counts;
 pub mod recovery_run;
 pub mod summary_refresh;

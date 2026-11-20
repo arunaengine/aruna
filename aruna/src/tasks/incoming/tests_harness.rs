@@ -1,4 +1,4 @@
-//! Shares task test helpers and tests drain delays and a paused runtime.
+//! Shares task test helpers and tests a paused runtime.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,23 +8,6 @@ use crate::tasks::runner::recover_stale_jobs;
 use aruna_test_support::jobs::{claim_job, insert_job, read_job_record};
 
 use super::support::*;
-
-#[test]
-fn blocked_batch_waits() {
-    // Nothing processed means the due head is blocked, so the next scan
-    // waits instead of respinning at the 25ms batch pace.
-    let blocked = MetadataDrainResult {
-        processed: 0,
-        has_more_due: true,
-        next_due_after: None,
-    };
-    let progressing = MetadataDrainResult {
-        processed: 4,
-        ..blocked
-    };
-    assert_eq!(drain_delay(&blocked), MATERIALIZATION_RETRY_AFTER);
-    assert_eq!(drain_delay(&progressing), NEXT_BATCH_AFTER);
-}
 
 #[tokio::test]
 async fn paused_runtime_waits() {

@@ -29,13 +29,6 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-/// The unverified data link posting the next pass continues after; a restart begins again at
-/// the start.
-static UNVERIFIED_CURSOR: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
-
-/// Where range maintenance goes on; a restart begins again at the start.
-static RANGE_CURSORS: std::sync::Mutex<Option<MaintainCursors>> = std::sync::Mutex::new(None);
-
 #[cfg(debug_assertions)]
 struct OutboxBarrier {
     marker: std::path::PathBuf,
@@ -53,38 +46,23 @@ impl Drop for OutboxBarrier {
 
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::blob::holders::RefreshHoldersOperation;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
 use aruna_operations::device::publish_queue::DrainOutcome;
-use aruna_operations::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER};
 use aruna_operations::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
 };
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
-use aruna_operations::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
-use aruna_operations::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
-use aruna_operations::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
-use aruna_operations::jobs::node_inputs::witness_node;
 use aruna_operations::jobs::prune::PruneTimerOperation;
 use aruna_operations::jobs::store::job_calls;
-use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
-use aruna_operations::metadata::device::drain::{PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use aruna_operations::metadata::materialization_queue::{
-    JobsExistOperation, MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER,
-    MaterializationBatchOperation, MetadataDrainResult, NEXT_BATCH_AFTER, NextTimerOperation,
-    RequeueParkedOperation, materialization_group_concurrency,
+    NextTimerOperation, RequeueParkedOperation, materialization_group_concurrency,
 };
 use aruna_operations::metadata::projection::ProjectionTimerOperation;
-use aruna_operations::metadata::prune_queue::{
-    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
-    PruneTimerOperation as GraphPruneTimerOperation, jobs_queued,
-};
-use aruna_operations::transfer::sharding::MaintainCursors;
+use aruna_operations::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
 
 /// Arms the graph prune drain for its next due job at start.
 async fn restore_graph_prune(
@@ -127,13 +105,15 @@ use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
-use aruna_operations::sync::outbox_defer::{
+use aruna_operations::sync::outbox::defer::{
     DrainDeferState, DrainRecord, admin_origin, classify_deferred_record, partition_drain_records,
 };
-use aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
+use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
-use aruna_operations::triggers::{TimerInput, TimerMemory, TimerPlan, timer_operation};
+use aruna_operations::triggers::{
+    TimerInput, TimerMemory, TimerPlan, needs_cluster, timer_operation,
+};
 use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_task_effect};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
@@ -354,41 +334,6 @@ impl OperationsTaskHandler {
             continuation_streak,
         };
         self
-    }
-
-    async fn refresh_blob_holders(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(task_id = ?TaskKey::RefreshBlobHolders, "Cannot refresh blob holders without net handle");
-            self.reschedule_timer(
-                TaskKey::RefreshBlobHolders,
-                Duration::from_millis(self.rocrate_limits.holder_refresh_ms),
-            )
-            .await;
-            return;
-        };
-        // A User-kind device registers no holdership: the realm refuses its DHT
-        // puts. An unreadable config is bootstrap, which registers.
-        let config = drive(
-            GetConfigOperation::new(*net_handle.realm_id()),
-            &self.context,
-        )
-        .await;
-        let origin = config.ok().and_then(|config| {
-            aruna_operations::forward::routing::is_user_origin(&config, net_handle.node_id())
-        });
-        if origin == Some(true) {
-            return;
-        }
-        let operation =
-            RefreshHoldersOperation::new(*net_handle.realm_id(), self.rocrate_limits.clone());
-        if let Err(error) = drive(operation, self.context.as_ref()).await {
-            warn!(task_id = ?TaskKey::RefreshBlobHolders, error = %error, "Failed to refresh blob holders");
-            self.reschedule_timer(
-                TaskKey::RefreshBlobHolders,
-                Duration::from_millis(self.rocrate_limits.holder_refresh_ms),
-            )
-            .await;
-        }
     }
 
     /// Handles records this node cannot publish itself: admin records are relayed under
@@ -679,11 +624,10 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// The timer map. Each arm is boxed here, outside an async body, so only
-    /// the selected timer's future stays on the stack while its work runs.
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
     async fn run_trigger(&self, key: TaskKey) {
         let memory = self.kept_memory(&key);
+        let cluster = needs_cluster(&key);
         let input = TimerInput {
             now_ms: unix_timestamp_millis(),
             local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
@@ -692,6 +636,19 @@ impl OperationsTaskHandler {
             routing: aruna_drivers::driver::node_routing(&self.context),
             has_blob: self.context.blob_handle.is_some(),
             running: Some(self.jobs_runtime.running_jobs()),
+            has_tasks: self.context.task_handle.is_some(),
+            group_concurrency: materialization_group_concurrency(),
+            heartbeats: if cluster {
+                self.context.fresh_heartbeats()
+            } else {
+                Default::default()
+            },
+            limits: if cluster {
+                self.context.compute_limits()
+            } else {
+                Default::default()
+            },
+            rocrate_limits: self.rocrate_limits.clone(),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -703,7 +660,9 @@ impl OperationsTaskHandler {
             .map(|key| key.to_vec())
             .unwrap_or_default();
         let build = || operation.clone();
-        let plan = match drive_retry(build, self.context.as_ref(), &seed).await {
+        let bulk = operation.bulk_lane().then(|| self.context.bulk());
+        let context = bulk.as_ref().unwrap_or(self.context.as_ref());
+        let plan = match drive_retry(build, context, &seed).await {
             Ok(plan) => plan,
             Err(failure) => {
                 warn!(task_id = ?key, error = %failure, "Timer run failed");
@@ -752,12 +711,8 @@ impl OperationsTaskHandler {
             TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
             TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
             TaskKey::DrainProjectionQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainMaterializationQueue => Box::pin(async move {
-                self.drain_materialization_queue().await;
-            }),
-            TaskKey::DrainPruneQueue => Box::pin(async move {
-                self.drain_graph_queue().await;
-            }),
+            TaskKey::DrainMaterializationQueue => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainPruneQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainReplicationQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainRefreshQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
@@ -776,9 +731,7 @@ impl OperationsTaskHandler {
                 self.drain_blob_reclaim().await;
             }),
             TaskKey::MigrateCompression => Box::pin(self.run_trigger(key)),
-            TaskKey::RefreshBlobHolders => Box::pin(async move {
-                self.refresh_blob_holders().await;
-            }),
+            TaskKey::RefreshBlobHolders => Box::pin(self.run_trigger(key)),
             TaskKey::LockBucket {
                 bucket_id,
                 generation,
@@ -830,85 +783,10 @@ impl OperationsTaskHandler {
                 self.publish_registration().await;
             }),
             TaskKey::PruneConnectorReferences => Box::pin(self.run_trigger(key)),
-            TaskKey::MaintainRanges => Box::pin(async move {
-                use aruna_operations::transfer::sharding::{maintain_ranges, maintain_retry};
-                let context = &self.context;
-                let kept = (RANGE_CURSORS.lock().ok()).and_then(|cursors| cursors.clone());
-                let mut after = match aruna_drivers::driver::drive(
-                    maintain_ranges(
-                        context.node_and_realm(),
-                        &context.fresh_heartbeats(),
-                        context.here().capacity,
-                        kept.unwrap_or_default(),
-                    ),
-                    context,
-                )
-                .await
-                {
-                    Ok(pass) => {
-                        let (after, imports, cursors) = pass.finish();
-                        if let Ok(mut kept) = RANGE_CURSORS.lock() {
-                            *kept = Some(cursors);
-                        }
-                        for start in imports {
-                            let started =
-                                aruna_operations::jobs::handed_imports::StartKeptOperation::new(
-                                    start,
-                                    context.node_and_realm(),
-                                    unix_timestamp_millis(),
-                                );
-                            if let Err(error) = aruna_drivers::driver::drive(started, context).await
-                            {
-                                warn!(%error, "Handed over imports could not start");
-                            }
-                        }
-                        after
-                    }
-                    Err(error) => {
-                        warn!(%error, "Range maintenance could not finish a pass");
-                        maintain_retry()
-                    }
-                };
-                // Version links metadata could not verify in a set are retried a page per pass.
-                let resume = (UNVERIFIED_CURSOR.lock().ok()).and_then(|cursor| cursor.clone());
-                let retry = RetryUnverifiedOperation::new(context.node_and_realm(), resume);
-                match aruna_drivers::driver::drive(retry, context).await {
-                    Ok(next) => {
-                        if next.is_some() {
-                            after = std::time::Duration::ZERO;
-                        }
-                        if let Ok(mut cursor) = UNVERIFIED_CURSOR.lock() {
-                            *cursor = next;
-                        }
-                    }
-                    Err(error) => warn!(%error, "Unverified data links could not be retried"),
-                }
-                self.reschedule_timer(TaskKey::MaintainRanges, after).await;
-            }),
-            TaskKey::RunBackendImports => Box::pin(async move {
-                let Some(net_handle) = self.context.net_handle.as_ref() else {
-                    warn!("Cannot start backend imports without net handle");
-                    return;
-                };
-                let retention_ms = self.rocrate_limits.artifact_retention_ms;
-                let now = unix_timestamp_millis();
-                let run = aruna_operations::jobs::backend_import::schedule::RunDueOperation::new(
-                    net_handle.node_id(),
-                    retention_ms,
-                    now,
-                    self.context.node_and_realm(),
-                );
-                if let Ok(Some(after)) = aruna_drivers::driver::drive(run, &self.context).await {
-                    self.reschedule_timer(TaskKey::RunBackendImports, after)
-                        .await;
-                }
-            }),
-            TaskKey::DrainFamilyOutbox => Box::pin(async move {
-                self.drain_family_outbox().await;
-            }),
-            TaskKey::DrainWitnessQueue => Box::pin(async move {
-                self.drain_witness_queue().await;
-            }),
+            TaskKey::MaintainRanges => Box::pin(self.run_trigger(key)),
+            TaskKey::RunBackendImports => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainWitnessQueue => Box::pin(self.run_trigger(key)),
             TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
             TaskKey::DrainLinkQueue => Box::pin(async move {
                 self.drain_link_queue().await;
@@ -927,38 +805,8 @@ impl OperationsTaskHandler {
                 self.fetch_realm_documents().await;
                 self.refresh_device_replicas().await;
             }),
-            TaskKey::DrainUploadOutbox => Box::pin(async move {
-                let drain = aruna_operations::device::sync::outbox::drain_sync_outbox(
-                    self.context.node_and_realm(),
-                );
-                let outcome = drive(drain, &self.context).await;
-                let after = match outcome.unwrap_or(DrainOutcome::Deferred) {
-                    DrainOutcome::Deferred => Some(UPLOAD_DEFER_AFTER),
-                    DrainOutcome::Recheck => Some(UPLOAD_CONTINUE_AFTER),
-                    DrainOutcome::Idle => None,
-                };
-                if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::DrainUploadOutbox, after)
-                        .await;
-                }
-            }),
-            TaskKey::DrainDeviceIntake => Box::pin(async move {
-                let drain = aruna_operations::metadata::device::drain::drain_publish_queue(
-                    self.context.node_and_realm(),
-                );
-                let after = match drive(drain, &self.context)
-                    .await
-                    .unwrap_or(DrainOutcome::Deferred)
-                {
-                    DrainOutcome::Deferred => Some(PUBLISH_DEFER_AFTER),
-                    DrainOutcome::Recheck => Some(PUBLISH_CONTINUE_AFTER),
-                    DrainOutcome::Idle => None,
-                };
-                if let Some(after) = after {
-                    self.reschedule_timer(TaskKey::DrainDeviceIntake, after)
-                        .await;
-                }
-            }),
+            TaskKey::DrainUploadOutbox => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainDeviceIntake => Box::pin(self.run_trigger(key)),
         }
     }
 }

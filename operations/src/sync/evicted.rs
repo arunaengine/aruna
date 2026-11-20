@@ -13,7 +13,7 @@ use aruna_core::operation::Operation;
 use aruna_core::task::TaskKey;
 use tracing::warn;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
 

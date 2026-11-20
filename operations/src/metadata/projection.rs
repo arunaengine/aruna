@@ -51,7 +51,7 @@ use crate::metadata::repository::{
     registry_outbox_record, schedule_materialization, schedule_projection,
 };
 use crate::realm::mutate_placement::node_kind;
-use crate::sync::outbox_record::schedule_drain_effect;
+use crate::sync::outbox::record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use aruna_core::errors::StorageReadError;
 
@@ -860,7 +860,7 @@ impl ProjectEventsOperation {
         self.has_outboxes |= outbox.is_some();
         if let Some(registry_outbox) = registry_outbox {
             self.writes.push(
-                crate::sync::outbox_record::outbox_write_entry(&registry_outbox)
+                crate::sync::outbox::record::outbox_write_entry(&registry_outbox)
                     .map_err(ConversionError::from)?,
             );
             self.has_outboxes = true;

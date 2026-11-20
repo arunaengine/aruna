@@ -23,7 +23,7 @@ use aruna_core::types::{Key, KeySpace, RoleId};
 use byteview::ByteView;
 use thiserror::Error;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 

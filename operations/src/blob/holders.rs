@@ -18,11 +18,15 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BlobLocationKey, BucketInfo, HashIndex};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
+use tracing::warn;
+
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::forward::routing::is_user_origin;
 
 const REFRESH_PAGE_SIZE: usize = 256;
 /// Owner rows of one hash read to tell whether only distributed buckets hold it.
@@ -694,5 +698,91 @@ mod pure_tests {
             error: DhtError::Other("offline".to_string()),
         })));
         assert_eq!(operation.next(failed), Err(GetHoldersError::Dht(offline)));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HoldersStage {
+    Config,
+    Refresh,
+}
+
+/// One holder refresh timer run. A User-kind device registers no holdership, since the realm
+/// refuses its DHT puts; an unreadable config is bootstrap, which registers. A failed refresh
+/// runs again after the refresh interval. Outputs when the timer runs again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HoldersTimerOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    limits: RoCrateLimits,
+    stage: HoldersStage,
+}
+
+impl HoldersTimerOperation {
+    pub fn new(realm_id: RealmId, node_id: NodeId, limits: RoCrateLimits) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            limits,
+            stage: HoldersStage::Config,
+        }
+    }
+}
+
+impl Operation for HoldersTimerOperation {
+    type Output = Option<Duration>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<Duration>>, IoError> {
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Duration>>, IoError> {
+        if self.stage == HoldersStage::Refresh {
+            if let Err(error) = result.child::<usize, RefreshHoldersError>()? {
+                warn!(%error, "Failed to refresh blob holders");
+                let after = Duration::from_millis(self.limits.holder_refresh_ms);
+                return Ok(Next::Done(Some(after)));
+            }
+            return Ok(Next::Done(None));
+        }
+        let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+        let user = config
+            .ok()
+            .and_then(|config| is_user_origin(&config, self.node_id));
+        if user == Some(true) {
+            return Ok(Next::Done(None));
+        }
+        self.stage = HoldersStage::Refresh;
+        let refresh = RefreshHoldersOperation::new(self.realm_id, self.limits.clone());
+        Ok(Next::Call(IoCall::child(refresh)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+
+    // An unreadable config still refreshes; a failed refresh runs again after the interval.
+    #[test]
+    fn holders_refresh_retries() {
+        let node_id = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let limits = RoCrateLimits::default();
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let mut run = HoldersTimerOperation::new(realm_id, node_id, limits.clone());
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let missing = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
+        let missing = IoResult::Child(ChildOutcome::new(missing));
+        assert!(matches!(
+            run.next(missing),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let failed = Err::<usize, _>(RefreshHoldersError::Schedule("boom".to_string()));
+        let failed = IoResult::Child(ChildOutcome::new(failed));
+        let after = Duration::from_millis(limits.holder_refresh_ms);
+        assert_eq!(run.next(failed), Ok(Next::Done(Some(after))));
     }
 }

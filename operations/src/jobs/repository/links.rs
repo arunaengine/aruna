@@ -27,7 +27,7 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::metadata::id_mapping::MappingRoute;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::fence;

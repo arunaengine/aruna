@@ -86,7 +86,7 @@ impl DrainQueue for UploadQueue {
 
 /// Forwards every due upload, oldest folder first. A realm that limits a device's concurrent
 /// requests gets no more uploads at once.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainOutboxOperation {
     ids: NodeRealm,
     draining: bool,

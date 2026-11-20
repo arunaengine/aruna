@@ -59,8 +59,8 @@ use aruna_operations::metadata::update_document::UpdateDocumentError;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
-use aruna_operations::sync::outbox_record::outbox_key;
-use aruna_operations::sync::outbox_record::{new_identified_record, write_outbox_effect};
+use aruna_operations::sync::outbox::record::outbox_key;
+use aruna_operations::sync::outbox::record::{new_identified_record, write_outbox_effect};
 use aruna_test_support::documents::read_outbox_record;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;

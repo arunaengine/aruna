@@ -37,7 +37,7 @@ use super::copy::rows::{StoreCopy, chunk_count, chunk_of};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::metadata::protocol::{

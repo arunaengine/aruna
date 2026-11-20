@@ -33,7 +33,7 @@ use aruna_core::types::{Key, Value};
 
 use crate::auth::permission_rules::read_rules;
 use crate::groups::backends::{backend_key, index_prefix};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::fence::WriteFence;

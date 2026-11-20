@@ -41,7 +41,7 @@ use crate::shard::pull::PullTopicsOperation;
 use crate::shard::verify::ConvergeOperation;
 use crate::shard::{AssembleManifestOperation, ManifestError, shard_answer, shard_call};
 use crate::sync::document_outbox::OutboxTimerOperation;
-use crate::sync::outbox_record::outbox_stream_prefixes;
+use crate::sync::outbox::record::outbox_stream_prefixes;
 
 /// Fence close attempts before a persistent transaction conflict is reported.
 const CLOSE_ATTEMPTS: usize = 4;
@@ -1703,7 +1703,7 @@ mod tests {
             kind: aruna_core::document::DocumentChangeKind::Delete,
             placement,
         };
-        let record = crate::sync::outbox_record::new_identified_record(
+        let record = crate::sync::outbox::record::new_identified_record(
             Ulid::from_bytes([seed; 16]),
             node(1),
             DocumentTarget::MetadataDocumentLifecycle {
@@ -1716,7 +1716,7 @@ mod tests {
         )
         .fenced_at(generation);
         let (key_space, key, value) =
-            crate::sync::outbox_record::outbox_write_entry(&record).expect("the row encodes");
+            crate::sync::outbox::record::outbox_write_entry(&record).expect("the row encodes");
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {

@@ -42,7 +42,7 @@ fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {
     })
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DrainStep {
     Scan,
     Index {
@@ -62,7 +62,7 @@ enum DrainStep {
 
 /// One bounded pass over the persisted deadlines. Answers true while rows remain, so the
 /// caller re-arms instead of spinning.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct WitnessDrainOperation {
     node: Option<WitnessNode>,
     now_ms: u64,
