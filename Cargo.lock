@@ -969,6 +969,7 @@ name = "aruna-plugin-types"
 version = "3.0.0-alpha.207"
 dependencies = [
  "hex",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
