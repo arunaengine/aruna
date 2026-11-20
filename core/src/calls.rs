@@ -642,7 +642,8 @@ impl<P: Operation> CallRun<P> {
                         &other,
                         Event::Storage(StorageEvent::Error {
                             error: StorageError::TransactionConflict
-                                | StorageError::TransactionNotFound,
+                                | StorageError::TransactionNotFound
+                                | StorageError::RolledBack(_),
                         })
                     ) {
                         self.operation.rolled_back();

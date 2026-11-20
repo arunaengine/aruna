@@ -522,6 +522,27 @@ fn abort_ends_transaction() {
     assert!(!operation.is_complete());
 }
 
+// A commit storage rolled back for another cause is told like a conflict, and fails with it.
+#[test]
+fn rollback_told_distinctly() {
+    let write = vec![("rows".to_string(), key("a"), key("1"))];
+    let mut operation = run(script(vec![IoCall::Write(write)]), true);
+    operation.start();
+    operation.step(started());
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    operation.step(Event::Storage(written));
+    let cause = Box::new(StorageError::ReadError("counter".to_string()));
+    let rolled = StorageEvent::Error {
+        error: StorageError::RolledBack(cause.clone()),
+    };
+    assert!(operation.step(Event::Storage(rolled)).is_empty());
+    assert!(operation.operation.rolled_back, "a rolled back commit is told");
+    let rolled = IoError::Storage(StorageError::RolledBack(cause));
+    assert_eq!(operation.finalize(), Err(rolled));
+}
+
 #[test]
 fn conflict_marks_retry() {
     let write = vec![("rows".to_string(), key("a"), key("1"))];

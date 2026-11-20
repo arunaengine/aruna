@@ -325,6 +325,8 @@ impl FjallStorage {
                 if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {
                     self.take_txn_deletes(txn_id, false);
                     txn.rollback();
+                    // Unlike an unknown commit, a confirmed rollback lets the caller undo work.
+                    let error = StorageError::RolledBack(Box::new(error));
                     return StorageEvent::Error { error };
                 }
                 let committed = txn.commit();
