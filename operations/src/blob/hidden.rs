@@ -61,7 +61,7 @@ impl Default for SweepCursor {
     }
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HiddenSweepOutcome {
     pub cleanup_pending: bool,
     pub uploads_deleted: usize,
@@ -139,7 +139,7 @@ impl Operation for DeleteHiddenOperation {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum SweepStep {
     Cursor,
     Page(SweepPhase),
@@ -147,7 +147,7 @@ enum SweepStep {
 }
 
 /// Runs one page of the phase the stored cursor names and stores where the next run goes on.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProcessHiddenOperation {
     /// The runner clock, read at the start for the sweep budget.
     clock_ms: u64,

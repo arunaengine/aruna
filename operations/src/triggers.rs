@@ -21,6 +21,7 @@ use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 
+use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
 use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::node::applied_drain::AppliedDrainOperation;
@@ -144,6 +145,7 @@ pub enum TimerOperation {
     SyncPlacements(PlacementTimerOperation),
     RealmPresence(PresenceTimerOperation),
     MigrateCompression(ProcessMigrationsOperation),
+    SweepHiddenBlobs(ProcessHiddenOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -176,6 +178,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             let run = ProcessMigrationsOperation::new(routing, input.facts.serving, after);
             Some(TimerOperation::MigrateCompression(run))
         }
+        TaskKey::SweepHiddenBlobs => Some(TimerOperation::SweepHiddenBlobs(
+            ProcessHiddenOperation::new(input.now_ms),
+        )),
         _ => None,
     }
 }
@@ -192,6 +197,7 @@ macro_rules! each_timer {
             TimerOperation::SyncPlacements($operation) => $body,
             TimerOperation::RealmPresence($operation) => $body,
             TimerOperation::MigrateCompression($operation) => $body,
+            TimerOperation::SweepHiddenBlobs($operation) => $body,
         }
     };
 }
@@ -339,6 +345,21 @@ impl TimerRun for ProcessMigrationsOperation {
             after: run.next,
             memory,
         })
+    }
+}
+
+impl TimerRun for ProcessHiddenOperation {
+    /// A sweep that left cleanup pending, or failed, runs again soon; a clean one waits.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.map_err(|error| TimerFailure {
+            retry_after: HIDDEN_SWEEP_RETRY,
+            reason: error.to_string(),
+        })?;
+        let after = match outcome.cleanup_pending {
+            true => HIDDEN_SWEEP_RETRY,
+            false => HIDDEN_SWEEP_AFTER,
+        };
+        Ok(TimerPlan::from(Some(after)))
     }
 }
 
@@ -611,6 +632,7 @@ impl Operation for PeerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob::hidden::HiddenSweepOutcome;
     use crate::blob::migration::drain::MigrationRun;
     use crate::blob::migration::shared::MigrationError;
 
@@ -643,6 +665,21 @@ mod tests {
         assert_eq!(after, Some(Key::from(b"bucket".to_vec())));
         let failed = ProcessMigrationsOperation::rearm(Err(MigrationError::failed("boom")));
         assert_eq!(failed.unwrap_err().retry_after, RECLAIM_SWEEP_RETRY);
+    }
+
+    #[test]
+    fn hidden_sweep_plans() {
+        // Pending cleanup and failures retry soon; a finished cycle waits for the interval.
+        let pending = HiddenSweepOutcome {
+            cleanup_pending: true,
+            ..HiddenSweepOutcome::default()
+        };
+        let plan = ProcessHiddenOperation::rearm(Ok(pending)).unwrap();
+        assert_eq!(plan.after, Some(HIDDEN_SWEEP_RETRY));
+        let clean = ProcessHiddenOperation::rearm(Ok(HiddenSweepOutcome::default())).unwrap();
+        assert_eq!(clean.after, Some(HIDDEN_SWEEP_AFTER));
+        let failed = ProcessHiddenOperation::rearm(Err(MigrationError::failed("boom")));
+        assert_eq!(failed.unwrap_err().retry_after, HIDDEN_SWEEP_RETRY);
     }
 
     #[test]

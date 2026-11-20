@@ -984,20 +984,6 @@ impl OperationsTaskHandler {
             self.reschedule_timer(key, after).await;
         }
     }
-
-    pub(super) async fn sweep_hidden_blobs(&self) {
-        let sweep = ProcessHiddenOperation::new(unix_timestamp_millis());
-        let after = match drive(sweep, &self.context).await {
-            Ok(outcome) if outcome.cleanup_pending => HIDDEN_SWEEP_RETRY,
-            Ok(_) => HIDDEN_SWEEP_AFTER,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::SweepHiddenBlobs, error = %error, "Failed to sweep hidden blobs");
-                HIDDEN_SWEEP_RETRY
-            }
-        };
-        self.reschedule_timer(TaskKey::SweepHiddenBlobs, after)
-            .await;
-    }
 }
 
 #[doc(hidden)]

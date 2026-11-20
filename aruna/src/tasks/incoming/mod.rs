@@ -57,9 +57,6 @@ use aruna_operations::blob::cleanup::{
     BLOB_CLEANUP_AFTER, BLOB_CLEANUP_RETRY, CleanupNode, ProcessCleanupOperation,
     SweepUploadsOperation,
 };
-use aruna_operations::blob::hidden::{
-    HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation,
-};
 use aruna_operations::blob::holders::RefreshHoldersOperation;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
@@ -832,9 +829,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainMirrorRepair => Box::pin(async move {
                 self.drain_mirror_repair().await;
             }),
-            TaskKey::SweepHiddenBlobs => Box::pin(async move {
-                self.sweep_hidden_blobs().await;
-            }),
+            TaskKey::SweepHiddenBlobs => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCleanupQueue => Box::pin(async move {
                 self.drain_blob_cleanup().await;
             }),
