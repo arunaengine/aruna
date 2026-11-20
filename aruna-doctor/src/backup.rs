@@ -135,7 +135,8 @@ fn publish_dir(staging: &Path, target: &Path) -> Result<(), SnapshotError> {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     let moved = {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
-        renameat_with(CWD, staging, CWD, target, RenameFlags::NOREPLACE).map_err(Into::into)
+        renameat_with(CWD, staging, CWD, target, RenameFlags::NOREPLACE)
+            .map_err(std::io::Error::from)
     };
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     let moved = std::fs::rename(staging, target);

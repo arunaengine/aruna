@@ -581,14 +581,30 @@ impl OperationsTaskHandler {
             local_node: context.net_handle.as_ref().map(|net| net.node_id()),
             serving: context.node_and_realm(),
             memory: memory.clone(),
-            facts: (needs.facts.then(|| node_facts(context))).unwrap_or_default(),
-            routing: (needs.routing.then(|| node_routing(context))).unwrap_or_default(),
+            facts: if needs.facts {
+                node_facts(context)
+            } else {
+                Default::default()
+            },
+            routing: if needs.routing {
+                node_routing(context)
+            } else {
+                Default::default()
+            },
             has_blob: context.blob_handle.is_some(),
             running: needs.running.then(|| self.jobs_runtime.running_jobs()),
             has_tasks: context.task_handle.is_some(),
             host_cores: (needs.cores.then(host_cores)).unwrap_or(UNKNOWN_CORES),
-            heartbeats: (needs.cluster.then(|| context.fresh_heartbeats())).unwrap_or_default(),
-            limits: (needs.cluster.then(|| context.compute_limits())).unwrap_or_default(),
+            heartbeats: if needs.cluster {
+                context.fresh_heartbeats()
+            } else {
+                Default::default()
+            },
+            limits: if needs.cluster {
+                context.compute_limits()
+            } else {
+                Default::default()
+            },
             rocrate_limits: self.rocrate_limits.clone(),
         };
         let Some(operation) = timer_operation(&key, &input) else {

@@ -324,7 +324,7 @@ pub(crate) mod tests {
             Next::Call(IoCall::Page { .. })
         ));
         // Source rows inside the dedup horizon stay, and a page with none older sends no delete.
-        assert!(100 <= 1 + DEDUP_RETENTION_MS);
+        const { assert!(100 <= 1 + DEDUP_RETENTION_MS) };
         let anchor = |at: u64| at.to_be_bytes().to_vec();
         let sources = vec![(b"s1".to_vec(), anchor(1)), (b"s2".to_vec(), anchor(99))];
         let next = plan.next(page_result(sources, None)).unwrap();
