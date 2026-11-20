@@ -4,10 +4,9 @@
 
 use super::{KeyAction, KeyError, KeyOperation, KeyResult};
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::GROUP_ENCRYPTED_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{GroupId, Key};
 use aruna_core::user::id::UserId;
@@ -17,9 +16,16 @@ use ulid::Ulid;
 /// Encrypted buckets of the group read per page.
 const BUCKET_PAGE: usize = 256;
 
-/// Runs one member key operation per encrypted bucket and member, best effort.
-///
-/// A group without encrypted buckets costs one index scan and nothing else.
+/// The requests a member grant opened, and each bucket and member whose request failed.
+#[derive(Debug, Default, PartialEq)]
+pub struct MemberKeys {
+    pub opened: Vec<Ulid>,
+    pub failed: Vec<(String, UserId)>,
+}
+
+/// Runs one member key operation per encrypted bucket and member, best effort: a failed one is
+/// named in the outcome, unlike a bucket that needs no request. A group without encrypted
+/// buckets costs one index scan and nothing else.
 #[derive(Debug, PartialEq)]
 pub struct MemberKeysOperation {
     auth: AuthContext,
@@ -33,7 +39,9 @@ pub struct MemberKeysOperation {
     buckets: VecDeque<String>,
     member: usize,
     next_page: Option<Key>,
-    opened: Vec<Ulid>,
+    /// The bucket and member of the key operation running now.
+    current: Option<(String, UserId)>,
+    keys: MemberKeys,
 }
 impl MemberKeysOperation {
     pub fn new(
@@ -53,11 +61,12 @@ impl MemberKeysOperation {
             buckets: VecDeque::new(),
             member: 0,
             next_page: None,
-            opened: Vec::new(),
+            current: None,
+            keys: MemberKeys::default(),
         }
     }
 
-    fn page(&mut self, after: Option<Key>) -> Next<Vec<Ulid>> {
+    fn page(&mut self, after: Option<Key>) -> Next<MemberKeys> {
         self.paging = Some(true);
         Next::Call(IoCall::Page {
             space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
@@ -69,13 +78,13 @@ impl MemberKeysOperation {
 
     /// The key operation of the next bucket and member, the next bucket page, or the opened
     /// requests; pairs are made one at a time.
-    fn request(&mut self) -> Next<Vec<Ulid>> {
+    fn request(&mut self) -> Next<MemberKeys> {
         let (bucket, member) = loop {
             let Some(bucket) = self.buckets.front() else {
                 if let Some(after) = self.next_page.take() {
                     return self.page(Some(after));
                 }
-                return Next::Done(std::mem::take(&mut self.opened));
+                return Next::Done(std::mem::take(&mut self.keys));
             };
             if let Some(member) = self.members.get(self.member) {
                 self.member += 1;
@@ -85,32 +94,36 @@ impl MemberKeysOperation {
             self.member = 0;
         };
         let action = KeyAction::Member(member);
+        self.current = Some((bucket.clone(), member));
         let operation = KeyOperation::new(bucket, self.auth.clone(), self.node, action, self.now);
-        let sub = boxed_suboperation(operation, |result| {
-            let request_ids = match result {
-                Ok(KeyResult::Opened(ids)) => ids,
-                Ok(_) | Err(KeyError::Missing) => Vec::new(),
-                Err(error) => {
-                    tracing::warn!(event = "abe.member_keys.failed", error = %error);
-                    Vec::new()
-                }
-            };
-            Event::SubOperation(SubOperationEvent::KeyRequestsOpened { request_ids })
-        });
-        Next::Call(IoCall::Child(sub))
+        Next::Call(IoCall::child(operation))
+    }
+
+    /// Keeps the outcome of one bucket and member; a missing bucket needs no request.
+    fn requested(&mut self, result: Result<KeyResult, KeyError>) -> Next<MemberKeys> {
+        let current = self.current.take();
+        match result {
+            Ok(KeyResult::Opened(ids)) => self.keys.opened.extend(ids),
+            Ok(_) | Err(KeyError::Missing) => {}
+            Err(error) => {
+                tracing::warn!(event = "abe.member_keys.failed", error = %error);
+                self.keys.failed.extend(current);
+            }
+        }
+        self.request()
     }
 }
 impl Operation for MemberKeysOperation {
-    type Output = Vec<Ulid>;
+    type Output = MemberKeys;
     type Error = KeyError;
-    fn first(&mut self) -> Result<Next<Vec<Ulid>>, KeyError> {
+    fn first(&mut self) -> Result<Next<MemberKeys>, KeyError> {
         self.members.retain(|member| !member.is_nil());
         if self.members.is_empty() {
             return Ok(self.request());
         }
         Ok(self.page(None))
     }
-    fn next(&mut self, result: IoResult) -> Result<Next<Vec<Ulid>>, KeyError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<MemberKeys>, KeyError> {
         match result {
             IoResult::Page { rows, next } if self.paging == Some(true) => {
                 self.paging = Some(false);
@@ -122,13 +135,10 @@ impl Operation for MemberKeysOperation {
                 }
                 Ok(self.request())
             }
-            IoResult::Event(event) if self.paging == Some(false) => match *event {
-                Event::SubOperation(SubOperationEvent::KeyRequestsOpened { request_ids }) => {
-                    self.opened.extend(request_ids);
-                    Ok(self.request())
-                }
-                _ => Err(KeyError::Storage),
-            },
+            IoResult::Child(_) if self.paging == Some(false) => {
+                let outcome = result.child::<KeyResult, KeyError>();
+                Ok(self.requested(outcome.map_err(|_| KeyError::Storage)?))
+            }
             _ => Err(KeyError::Storage),
         }
     }
@@ -169,12 +179,9 @@ mod tests {
             operation.next(page),
             Ok(Next::Call(IoCall::Child(_)))
         ));
-        let opened = Event::SubOperation(SubOperationEvent::KeyRequestsOpened {
-            request_ids: Vec::new(),
-        });
+        let opened = child(Ok(KeyResult::Opened(Vec::new())));
         // The next bucket page follows once the page's buckets have their requests.
-        let Ok(Next::Call(IoCall::Page { after: asked, limit, .. })) =
-            operation.next(IoResult::Event(Box::new(opened)))
+        let Ok(Next::Call(IoCall::Page { after: asked, limit, .. })) = operation.next(opened)
         else {
             panic!("expected the next bucket page");
         };
@@ -188,12 +195,16 @@ mod tests {
             operation.next(page),
             Ok(Next::Call(IoCall::Child(_)))
         ));
-        let opened = Event::SubOperation(SubOperationEvent::KeyRequestsOpened {
-            request_ids: vec![Ulid::from_bytes([5; 16])],
-        });
-        assert_eq!(
-            operation.next(IoResult::Event(Box::new(opened))),
-            Ok(Next::Done(vec![Ulid::from_bytes([5; 16])]))
-        );
+        // A failed request is named, unlike a bucket that needs none.
+        let failed = child(Err(KeyError::Storage));
+        let Ok(Next::Done(keys)) = operation.next(failed) else {
+            panic!("expected the outcome");
+        };
+        assert_eq!(keys.opened, Vec::<Ulid>::new());
+        assert_eq!(keys.failed, vec![("other".to_string(), foreign)]);
+    }
+
+    fn child(result: Result<KeyResult, KeyError>) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
     }
 }
