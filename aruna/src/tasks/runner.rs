@@ -7,7 +7,7 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use aruna_clock::unix_timestamp_millis;
@@ -32,8 +32,7 @@ use super::dispatch::dispatch_payload;
 use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::effect_adapters::job::{JobHost, with_job_host};
-use aruna_drivers::jobs::context::ExternalReconciler;
-use aruna_drivers::jobs::context::{JobContext, PayloadHandler};
+use aruna_drivers::jobs::context::JobContext;
 use aruna_drivers::jobs::executor::{RangeTurns, run_cleanup};
 use aruna_drivers::jobs::runtime::{Admission, JobShutdownReport, JobsRuntime, RecoveredAdmission};
 use aruna_operations::jobs::runtime_steps::{
@@ -90,7 +89,6 @@ pub fn spawn_job(runtime: &Arc<JobsRuntime>, context: Arc<DriverContext>, record
     let runtime = runtime.clone();
     let shutdown = runtime.shutdown_signal();
     let turns = runtime.turns();
-    let handlers = runtime.handlers();
     tokio::spawn(async move {
         // A panicking payload is turned into a failure inside `supervise`; this guard
         // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -99,7 +97,7 @@ pub fn spawn_job(runtime: &Arc<JobsRuntime>, context: Arc<DriverContext>, record
             record,
             slot.claim_token,
             (slot.cancel, slot.progress),
-            (shutdown, turns, handlers),
+            (shutdown, turns),
         ))
         .catch_unwind()
         .await;
@@ -250,10 +248,10 @@ pub async fn wait_for_terminal(
 }
 
 /// At startup every claimed/running holder is definitionally dead. Re-queue
-/// the in-process ones and route external attempts to the reconcile hook,
+/// the in-process ones and reconcile external attempts at the node boundary,
 /// since a blind requeue would double-run; a restart costs them no attempt.
 pub async fn recover_stale_jobs(
-    runtime: &JobsRuntime,
+    runtime: &Arc<JobsRuntime>,
     context: &DriverContext,
 ) -> Result<usize, String> {
     recover_until_stopped(runtime, context, &CancellationToken::new(), || false).await
@@ -263,7 +261,7 @@ pub async fn recover_stale_jobs(
 /// failure probe. Both are checked before every recovery unit, so an accepted
 /// stop or observed failure lets the current unit finish and admits no next.
 pub async fn recover_until_stopped(
-    runtime: &JobsRuntime,
+    runtime: &Arc<JobsRuntime>,
     context: &DriverContext,
     stop: &CancellationToken,
     should_stop: impl Fn() -> bool,
@@ -298,9 +296,7 @@ pub async fn recover_until_stopped(
             Recovery::Recovered => recovered += 1,
             Recovery::Untouched => {}
             Recovery::Reconcile(record) => {
-                if let Some(reconciler) = runtime.reconciler() {
-                    reconciler.reconcile_lost_attempt(context, *record).await;
-                }
+                reconcile_lost_attempt(runtime, context, *record).await;
             }
         }
     }
@@ -330,11 +326,7 @@ pub(crate) async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     (cancel, progress): (CancellationToken, Option<ProgressReporter>),
-    (shutdown, range_turns, handlers): (
-        CancellationToken,
-        RangeTurns,
-        Vec<Arc<dyn PayloadHandler>>,
-    ),
+    (shutdown, range_turns): (CancellationToken, RangeTurns),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -394,7 +386,6 @@ pub(crate) async fn run_job(
         shutdown,
         progress: progress.clone(),
         range_turns,
-        handlers,
     };
 
     let SuperviseResult::Outcome(outcome) = supervise(&context, job_id, token, &record, &ctx).await
@@ -676,70 +667,62 @@ pub(crate) async fn resume_attempt(
     finish_run(ids.0, finished);
 }
 
-/// The reconcile seam of the node: a lost external attempt is adopted by name and resolved by
-/// evidence. It never submits a new attempt name, so a container is never run twice.
-pub struct ComputeReconciler {
-    context: Arc<DriverContext>,
-    runtime: Weak<JobsRuntime>,
-}
-
-impl ComputeReconciler {
-    pub fn new(context: Arc<DriverContext>, runtime: Weak<JobsRuntime>) -> Arc<Self> {
-        Arc::new(Self { context, runtime })
+/// Reconciles a lost external attempt at the node boundary: it is adopted by name and resolved
+/// by evidence, never submitted again, so a container never runs twice. A node without an
+/// executor cannot observe the container and leaves the attempt alone.
+pub async fn reconcile_lost_attempt(
+    runtime: &Arc<JobsRuntime>,
+    context: &DriverContext,
+    record: JobRecord,
+) {
+    let job_id = record.job_id;
+    if context.compute_handle.is_none() || !matches!(record.payload, JobPayload::Execution(_)) {
+        return;
     }
-
-    /// Adopts a live container without blocking the drain, registering its supervisor with the
-    /// runtime for caps, cancellation and shutdown.
-    async fn resume(&self, scope: Arc<AttemptScope>, record: Arc<JobRecord>, phase: AttemptPhase) {
-        let (job_id, token) = (scope.job_id, scope.token);
-        let context = self.context.clone();
-        let supervised = record.clone();
-        let supervisor = move |cancel| resume_attempt(context, scope, supervised, phase, cancel);
-        let registered = self.runtime.upgrade().is_some_and(|runtime| {
-            spawn_recovered(&runtime, self.context.clone(), &record, supervisor)
-        });
-        if registered {
+    let holder = (context.net_handle.as_ref())
+        .map(|net| net.node_id())
+        .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public());
+    let adopt = AdoptAttemptOperation::new(job_id, holder, run_wiring(context));
+    let (scope, adopted) = match drive(adopt, context).await {
+        Ok(Adoption::Adopted { scope, record }) => (scope, record),
+        Ok(Adoption::Done) => return,
+        Err(error) => {
+            warn!(job_id = %job_id, %error, "Adoption failed");
             return;
         }
-        let handoff = handoff_external_attempt(job_id, token, unix_timestamp_millis());
-        if let Err(error) = drive(handoff, &self.context).await {
-            warn!(job_id = %job_id, error = %error, "Failed to hand off unregistered recovered attempt");
+    };
+    let ids = (job_id, scope.token);
+    let settle = SettleAdoptedOperation::new(scope.clone(), adopted.clone());
+    let cancel = CancellationToken::new();
+    match under_lease(context, ids, cancel, settle).await {
+        Some(Ok(AdoptedEnd::Resume(phase))) => {
+            resume_adopted(runtime, context, scope, adopted, phase).await;
         }
+        Some(Ok(AdoptedEnd::Settled)) => {}
+        Some(Err(error)) => warn!(job_id = %job_id, %error, "Adopted attempt failed"),
+        None => info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning"),
     }
 }
 
-impl ExternalReconciler for ComputeReconciler {
-    fn reconcile_lost_attempt<'a>(
-        &'a self,
-        context: &'a DriverContext,
-        record: JobRecord,
-    ) -> futures_util::future::BoxFuture<'a, ()> {
-        Box::pin(async move {
-            let job_id = record.job_id;
-            if !matches!(record.payload, JobPayload::Execution(_)) {
-                return;
-            }
-            let holder = (self.context.net_handle.as_ref())
-                .map(|net| net.node_id())
-                .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public());
-            let adopt = AdoptAttemptOperation::new(job_id, holder, run_wiring(&self.context));
-            let (scope, adopted) = match drive(adopt, context).await {
-                Ok(Adoption::Adopted { scope, record }) => (scope, record),
-                Ok(Adoption::Done) => return,
-                Err(error) => {
-                    warn!(job_id = %job_id, %error, "Adoption failed");
-                    return;
-                }
-            };
-            let ids = (job_id, scope.token);
-            let settle = SettleAdoptedOperation::new(scope.clone(), adopted.clone());
-            let cancel = CancellationToken::new();
-            match under_lease(context, ids, cancel, settle).await {
-                Some(Ok(AdoptedEnd::Resume(phase))) => self.resume(scope, adopted, phase).await,
-                Some(Ok(AdoptedEnd::Settled)) => {}
-                Some(Err(error)) => warn!(job_id = %job_id, %error, "Adopted attempt failed"),
-                None => info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning"),
-            }
-        })
+/// Adopts a live container without blocking the drain, registering its supervisor with the
+/// runtime for caps, cancellation and shutdown.
+async fn resume_adopted(
+    runtime: &Arc<JobsRuntime>,
+    context: &DriverContext,
+    scope: Arc<AttemptScope>,
+    record: Arc<JobRecord>,
+    phase: AttemptPhase,
+) {
+    let (job_id, token) = (scope.job_id, scope.token);
+    let shared = Arc::new(context.clone());
+    let owned = shared.clone();
+    let supervised = record.clone();
+    let supervisor = move |cancel| resume_attempt(owned, scope, supervised, phase, cancel);
+    if spawn_recovered(runtime, shared, &record, supervisor) {
+        return;
+    }
+    let handoff = handoff_external_attempt(job_id, token, unix_timestamp_millis());
+    if let Err(error) = drive(handoff, context).await {
+        warn!(job_id = %job_id, error = %error, "Failed to hand off unregistered recovered attempt");
     }
 }

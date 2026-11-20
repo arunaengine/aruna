@@ -674,10 +674,7 @@ mod tests {
     // so two drains over the same order head never both project its batch.
     #[test]
     fn drains_share_hold() {
-        let input = crate::triggers::TimerInput {
-            now_ms: 1,
-            local_node: Some(node()),
-        };
+        let input = crate::triggers::TimerInput::new(1, Some(node()));
         let timer = crate::triggers::timer_operation(&TaskKey::DrainAppliedSync, &input);
         let timer = timer.expect("the applied drain runs on its timer");
         assert_eq!(timer.hold_scope(), Some(HoldScope::AppliedDrain));

@@ -9,128 +9,6 @@ use aruna_clock::testing::poll_until;
 use aruna_drivers::testing::freeze_clock;
 
 #[test]
-fn admin_block_spans() {
-    let origin = node(4);
-    let blocked_topic = irokle::TopicId::hash(b"blocked-admin-page");
-    let healthy_topic = irokle::TopicId::hash(b"healthy-admin-page");
-    let mut defer = DrainDeferState::default();
-    let (_, deferred, _) = partition_drain_records(
-        vec![(b"first".to_vec(), admin_record(origin, 1), blocked_topic)],
-        &mut defer,
-        true,
-        |_| false,
-        |_| DeferOutcome::Retry,
-    );
-    assert_eq!(deferred.len(), 1);
-
-    let (published, deferred, undeliverable) = partition_drain_records(
-        vec![(b"second".to_vec(), admin_record(origin, 2), healthy_topic)],
-        &mut defer,
-        true,
-        |_| true,
-        |_| DeferOutcome::Retry,
-    );
-    assert!(published.is_empty());
-    assert_eq!(deferred.len(), 1);
-    assert!(undeliverable.is_empty());
-}
-
-// A blocked admin operation blocks its later origin sequence for the rotation across all topics.
-// Publishing a later sequence first would make the earlier record stale.
-#[test]
-fn admin_origin_blocks() {
-    let origin = node(4);
-    let blocked_topic = irokle::TopicId::hash(b"blocked-admin-topic");
-    let healthy_topic = irokle::TopicId::hash(b"healthy-admin-topic");
-    let records = vec![
-        (b"first".to_vec(), admin_record(origin, 1), blocked_topic),
-        (b"second".to_vec(), admin_record(origin, 2), healthy_topic),
-    ];
-
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
-        records,
-        &mut defer,
-        true,
-        |topic| topic != blocked_topic,
-        |_| DeferOutcome::Retry,
-    );
-
-    assert!(
-        to_publish.is_empty(),
-        "a later origin_seq must not overtake"
-    );
-    assert_eq!(deferred.len(), 2);
-    assert!(undeliverable.is_empty());
-    assert!(defer.blocked_origins.contains(&origin));
-}
-
-#[test]
-fn topic_block_spans() {
-    let topic = irokle::TopicId::hash(b"blocked-topic-pages");
-    let healthy_topic = irokle::TopicId::hash(b"healthy-topic-pages");
-    let mut defer = DrainDeferState::default();
-    let (_, deferred, _) = partition_drain_records(
-        vec![(b"first".to_vec(), shard_topic_record(1), topic)],
-        &mut defer,
-        true,
-        |_| false,
-        |_| DeferOutcome::Retry,
-    );
-    assert_eq!(deferred.len(), 1);
-
-    let (published, deferred, undeliverable) = partition_drain_records(
-        vec![
-            (b"healthy".to_vec(), shard_topic_record(3), healthy_topic),
-            (b"second".to_vec(), shard_topic_record(2), topic),
-        ],
-        &mut defer,
-        true,
-        |_| true,
-        |_| DeferOutcome::Retry,
-    );
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].0, b"healthy".to_vec());
-    assert_eq!(deferred.len(), 1);
-    assert!(undeliverable.is_empty());
-}
-
-// Evaluate topic availability once so adjacent records cannot split across defer and publish.
-// Publishing the newer record first would invert the origin sequence.
-#[test]
-fn drain_partition_flips() {
-    let topic = irokle::TopicId::hash(b"shard-genesis-race");
-    let older = shard_topic_record(1);
-    let newer = shard_topic_record(2);
-    assert!(older.target.uses_shard_topic());
-    let records = vec![
-        (b"older".to_vec(), older, topic),
-        (b"newer".to_vec(), newer, topic),
-    ];
-
-    let mut calls = 0usize;
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
-        records,
-        &mut defer,
-        true,
-        |_| {
-            calls += 1;
-            calls > 1
-        },
-        |_| DeferOutcome::Retry,
-    );
-
-    assert_eq!(calls, 1, "topic availability is evaluated once per run");
-    assert!(
-        to_publish.is_empty(),
-        "no record of a deferred topic may publish"
-    );
-    assert_eq!(deferred.len(), 2);
-    assert!(undeliverable.is_empty());
-}
-
-#[test]
 fn outbox_upsert_revision() {
     let event_id = Ulid::from_parts(10, 1);
     let target = target();
@@ -665,54 +543,6 @@ fn outbox_bound_finite() {
         OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_SIZE
     );
     assert_ne!(OUTBOX_INVOCATION_RECORDS, 0);
-}
-
-#[test]
-fn drain_partition_order() {
-    let topic = irokle::TopicId::hash(b"shard-genesis-present");
-    let records = vec![
-        (b"older".to_vec(), shard_topic_record(1), topic),
-        (b"newer".to_vec(), shard_topic_record(2), topic),
-    ];
-
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) =
-        partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
-
-    assert!(deferred.is_empty());
-    assert!(undeliverable.is_empty());
-    let keys: Vec<Vec<u8>> = to_publish.into_iter().map(|(key, _, _)| key).collect();
-    assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
-}
-
-// A non-holder can neither create nor join a bucket topic, so it cannot publish the record.
-// It is classified for reporting and retained unless a relay succeeds.
-#[test]
-fn unheld_bucket_undeliverable() {
-    let topic = irokle::TopicId::hash(b"unheld-bucket");
-    let records = vec![
-        (b"older".to_vec(), shard_topic_record(1), topic),
-        (b"newer".to_vec(), shard_topic_record(2), topic),
-    ];
-
-    let mut classified = 0usize;
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
-        records,
-        &mut defer,
-        true,
-        |_| false,
-        |_| {
-            classified += 1;
-            DeferOutcome::Undeliverable
-        },
-    );
-
-    assert_eq!(classified, 1, "holdership is decided once per topic");
-    assert!(to_publish.is_empty());
-    assert!(deferred.is_empty());
-    let keys: Vec<Vec<u8>> = undeliverable.into_iter().map(|(key, _, _)| key).collect();
-    assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1491,16 +1321,6 @@ fn admin_outbox(
     )
 }
 
-fn admin_record(origin: aruna_core::id::NodeId, origin_seq: u64) -> DocumentOutboxRecord {
-    admin_outbox(
-        RealmId([3; 32]),
-        origin,
-        origin_seq,
-        target(),
-        admin_placement(1),
-    )
-}
-
 fn shard_change(seed: u8) -> DocumentChange {
     let mut value = change();
     value.placement = aruna_core::structs::placement::record::PlacementRef {
@@ -1508,21 +1328,6 @@ fn shard_change(seed: u8) -> DocumentChange {
         shard: 1,
     };
     value
-}
-
-fn shard_topic_record(origin_seq: u64) -> DocumentOutboxRecord {
-    aruna_operations::sync::outbox_record::new_identified_record(
-        ulid::Ulid::generate(),
-        node(1),
-        target(),
-        vec![node(2)],
-        DocumentOutboxEvent::Upsert {
-            bytes: vec![origin_seq as u8],
-            change: change(),
-        },
-        aruna_core::structs::placement::record::PlacementRef::NIL,
-        false,
-    )
 }
 
 struct BoundaryHarness {

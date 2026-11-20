@@ -1,4 +1,4 @@
-//! Shares task test helpers and tests drain delays, the retry ladder and a paused runtime.
+//! Shares task test helpers and tests drain delays and a paused runtime.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -24,41 +24,6 @@ fn blocked_batch_waits() {
     };
     assert_eq!(drain_delay(&blocked), MATERIALIZATION_RETRY_AFTER);
     assert_eq!(drain_delay(&progressing), NEXT_BATCH_AFTER);
-}
-
-#[test]
-fn reclaim_retry_climbs() {
-    // A failing sweep earns the fast retry, then doubles up to the normal interval so a candidate that
-    // always fails cannot hot-loop a full rescan every minute.
-    let temp_dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let handler = OperationsTaskHandler::new(
-        Arc::new(DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        }),
-        JobsRuntime::new(),
-    );
-    let key = TaskKey::DrainReclaimQueue;
-    let ladder = |handler: &OperationsTaskHandler| {
-        handler.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER)
-    };
-
-    assert_eq!(ladder(&handler), RECLAIM_SWEEP_RETRY);
-    assert_eq!(ladder(&handler), RECLAIM_SWEEP_RETRY * 2);
-    for _ in 0..8 {
-        ladder(&handler);
-    }
-    assert_eq!(ladder(&handler), RECLAIM_SWEEP_AFTER);
-
-    handler.reset_backoff(&key);
-    assert_eq!(ladder(&handler), RECLAIM_SWEEP_RETRY);
 }
 
 #[tokio::test]

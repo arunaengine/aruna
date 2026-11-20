@@ -11,6 +11,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::id::NodeId;
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{
     BackoffChange, BackoffRequest, OutboundEffect, OutboundEvent, StoredBackoff,
@@ -84,6 +85,27 @@ pub enum DeliveryOutcome {
     Failed(JobError),
     /// Runs again after the delay without spending an attempt.
     DeferredFor(JobError, Duration),
+}
+
+impl DeliveryOutcome {
+    /// A node without a metadata transport cannot open secrets, so the job waits without
+    /// spending an attempt.
+    pub fn unavailable() -> Self {
+        Self::DeferredFor(
+            JobError::retryable("the metadata transport is unavailable"),
+            Duration::from_millis(BACKOFF_START_MS),
+        )
+    }
+}
+
+/// How the job runtime takes the end of a delivery run; a failed run may pass on a retry.
+pub fn delivery_outcome(result: Result<DeliveryOutcome, IoError>) -> JobRunOutcome {
+    match result {
+        Ok(DeliveryOutcome::Succeeded(payload)) => JobRunOutcome::Succeeded(payload),
+        Ok(DeliveryOutcome::Failed(error)) => JobRunOutcome::Failed(error),
+        Ok(DeliveryOutcome::DeferredFor(error, delay)) => JobRunOutcome::DeferredFor(error, delay),
+        Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
+    }
 }
 
 /// Where the delivery decision waits.

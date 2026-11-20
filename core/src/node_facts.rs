@@ -12,7 +12,7 @@ use crate::structs::storage::node_info::CLASS_LABEL_PREFIX;
 use crate::structs::storage::routing::BackendCatalog;
 
 /// What only this node's handles and host know, read once before a flow starts.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NodeFacts {
     /// What each enabled executor backend offers, before a placement subject is applied.
     pub offers: Vec<ExecutorOffer>,

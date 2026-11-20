@@ -27,11 +27,43 @@ use ulid::Ulid;
 use super::reclaim::{ReclaimBlobError, ReclaimBlobOperation, ReclaimVerdict};
 use crate::blob::pending_reclaim::ReclaimPendingOperation;
 use crate::groups::backends::backend_key;
+use crate::triggers::{TimerMemory, TimerPlan};
 
 pub const RECLAIM_SWEEP_AFTER: Duration = Duration::from_secs(15 * 60);
 pub const RECLAIM_SWEEP_RETRY: Duration = Duration::from_secs(60);
 
 const RECLAIM_PAGE_SIZE: usize = 128;
+
+/// When the sweep runs again after `outcome`, `None` for a failed run, with the retries and queue
+/// key it keeps, and whether it reached the end of the queue. A failing candidate climbs the
+/// retry ladder, so it cannot hold a one-minute rescan of the whole queue forever.
+pub fn reclaim_plan(
+    outcome: Option<&ReclaimOutcome>,
+    memory: &TimerMemory,
+) -> (TimerPlan, bool) {
+    let plan = |after, memory| TimerPlan {
+        after: Some(after),
+        memory,
+    };
+    let Some(outcome) = outcome else {
+        let (after, memory) = memory.next_retry(RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER);
+        return (plan(after, memory), false);
+    };
+    let cursor = outcome.next_start_after.as_ref().map(|key| key.to_vec());
+    let fresh = TimerMemory {
+        attempts: 0,
+        cursor: cursor.clone(),
+    };
+    match (outcome.capped, outcome.failed) {
+        (true, _) => (plan(RECLAIM_SWEEP_RETRY, fresh), false),
+        (false, 0) => (plan(RECLAIM_SWEEP_AFTER, fresh), true),
+        (false, _) => {
+            let (after, mut memory) = memory.next_retry(RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER);
+            memory.cursor = cursor;
+            (plan(after, memory), true)
+        }
+    }
+}
 
 /// Candidates one tick may drive. A longer queue is picked up at
 /// `RECLAIM_SWEEP_RETRY` rather than held against the task loop.
@@ -488,6 +520,41 @@ impl Operation for BackendStatusOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reclaim_retry_climbs() {
+        // A failing sweep earns the fast retry, then doubles up to the normal interval.
+        let mut memory = TimerMemory::default();
+        let mut waits = Vec::new();
+        for _ in 0..10 {
+            let (plan, drained) = reclaim_plan(None, &memory);
+            assert!(!drained);
+            waits.push(plan.after);
+            memory = plan.memory;
+        }
+        assert_eq!(waits[0], Some(RECLAIM_SWEEP_RETRY));
+        assert_eq!(waits[1], Some(RECLAIM_SWEEP_RETRY * 2));
+        assert_eq!(waits[9], Some(RECLAIM_SWEEP_AFTER));
+        let capped = ReclaimOutcome {
+            capped: true,
+            next_start_after: Some(Key::from(b"next".to_vec())),
+            ..ReclaimOutcome::default()
+        };
+        let (plan, drained) = reclaim_plan(Some(&capped), &memory);
+        assert_eq!((plan.after, drained), (Some(RECLAIM_SWEEP_RETRY), false));
+        assert_eq!(plan.memory.attempts, 0);
+        assert_eq!(plan.memory.cursor.as_deref(), Some(&b"next"[..]));
+        let failed = ReclaimOutcome {
+            failed: 1,
+            ..ReclaimOutcome::default()
+        };
+        let (plan, drained) = reclaim_plan(Some(&failed), &plan.memory);
+        assert_eq!((plan.after, drained), (Some(RECLAIM_SWEEP_RETRY), true));
+        assert_eq!(plan.memory.cursor, None);
+        let (clean, drained) = reclaim_plan(Some(&ReclaimOutcome::default()), &plan.memory);
+        assert_eq!((clean.after, drained), (Some(RECLAIM_SWEEP_AFTER), true));
+        assert_eq!(clean.memory, TimerMemory::default());
+    }
 
     fn sweep() -> ReclaimSweepOperation {
         let catalog = BackendCatalog::new("default").with_backend("default", None);

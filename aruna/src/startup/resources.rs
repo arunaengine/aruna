@@ -35,7 +35,6 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
-use crate::plugin_host::plugin_work::PluginWorkHandler;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
 use aruna_config::settings::Settings;
 use aruna_config::{Config, open_storage, resolve_config};
@@ -97,7 +96,6 @@ impl Acquired {
         task_handle: TaskHandle,
     ) -> Self {
         let jobs_runtime = JobsRuntime::new_paused();
-        jobs_runtime.register_handler(Arc::new(PluginWorkHandler));
         Self {
             storage_handle,
             task_handle,

@@ -239,109 +239,6 @@ impl OutboxBarrier {
     }
 }
 
-/// Whether a record whose shard topic is missing locally can ever publish from here.
-/// Holdership comes from the live realm config, never a local copy (rebalances leave
-/// stale copies). Without a readable config nothing is decided and the record retries.
-pub(super) fn classify_deferred_record(
-    config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-    net_handle: &aruna_net::NetHandle,
-    record: &DocumentOutboxRecord,
-) -> DeferOutcome {
-    let Some(config) = config else {
-        return DeferOutcome::Retry;
-    };
-    let node_id = net_handle.node_id();
-    // Draining former holders may publish until flushed; true non-holders remain undeliverable.
-    // The receiver history cutoff bounds a departing holder.
-    if aruna_core::placement::holds_placement(config, &record.placement, node_id)
-        || aruna_core::placement::is_draining_holder(config, &record.placement, node_id)
-        || aruna_core::placement::retained_departing_holder(config, &record.placement, node_id)
-    {
-        DeferOutcome::Retry
-    } else {
-        DeferOutcome::Undeliverable
-    }
-}
-
-/// Splits FIFO-ordered drain records into publish-now, deferred (no local shard genesis
-/// yet) and undeliverable. Holdership decides publishability, not local topic presence,
-/// and a topic never straddles the defer/publish boundary; `publishes_shared` gates devices.
-pub(super) fn partition_drain_records(
-    records: Vec<DrainRecord>,
-    defer: &mut DrainDeferState,
-    publishes_shared: bool,
-    mut topic_available: impl FnMut(irokle::TopicId) -> bool,
-    mut classify_defer: impl FnMut(&DocumentOutboxRecord) -> DeferOutcome,
-) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
-    let mut to_publish = Vec::with_capacity(records.len());
-    let mut deferred = Vec::new();
-    let mut undeliverable = Vec::new();
-    for (record_key, record, topic) in records {
-        // Origin order is the contract, whatever topic the later records ride.
-        if admin_origin(&record).is_some_and(|origin| defer.blocked_origins.contains(&origin)) {
-            deferred.push((record_key, record, topic));
-            continue;
-        }
-        if !record.target.uses_shard_topic() {
-            match publishes_shared {
-                true => to_publish.push((record_key, record, topic)),
-                false => undeliverable.push((record_key, record, topic)),
-            }
-            continue;
-        }
-        if defer.undeliverable_topics.contains(&topic) {
-            if let Some(origin) = admin_origin(&record) {
-                defer.blocked_origins.insert(origin);
-            }
-            undeliverable.push((record_key, record, topic));
-            continue;
-        }
-        let held = *defer
-            .topic_held
-            .entry(topic)
-            .or_insert_with(|| classify_defer(&record) == DeferOutcome::Retry);
-        if !held {
-            defer.undeliverable_topics.insert(topic);
-            if let Some(origin) = admin_origin(&record) {
-                defer.blocked_origins.insert(origin);
-            }
-            undeliverable.push((record_key, record, topic));
-            continue;
-        }
-        let already_deferred = defer.deferred_topics.contains(&topic);
-        let available = !already_deferred
-            && *defer
-                .topic_exists
-                .entry(topic)
-                .or_insert_with(|| topic_available(topic));
-        if available {
-            to_publish.push((record_key, record, topic));
-            continue;
-        }
-        defer.deferred_topics.insert(topic);
-        if let Some(origin) = admin_origin(&record) {
-            defer.blocked_origins.insert(origin);
-        }
-        debug!(
-            event = "pipeline.drain.deferred",
-            target = ?record.target,
-            %topic,
-            "Deferring outbox record: shard topic genesis not yet known"
-        );
-        deferred.push((record_key, record, topic));
-    }
-    (to_publish, deferred, undeliverable)
-}
-
-/// The admin origin stream a record belongs to. Origin sequence is ordered
-/// within one origin node.
-pub(super) fn admin_origin(record: &DocumentOutboxRecord) -> Option<aruna_core::id::NodeId> {
-    match &record.event {
-        DocumentOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
-        _ => None,
-    }
-}
-
 impl OperationsTaskHandler {
     async fn read_drain_page(
         &self,
@@ -609,7 +506,7 @@ impl OperationsTaskHandler {
             &mut invocation.defer,
             !self.is_device(config),
             |topic| net_handle.sync_topic_exists(topic).unwrap_or(false),
-            |record| classify_deferred_record(config, net_handle, record),
+            |record| classify_deferred_record(config, net_handle.node_id(), record),
         );
         invocation.deferred += deferred.len();
         let now_ms = unix_timestamp_millis();
