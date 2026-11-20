@@ -54,17 +54,28 @@ pub async fn persist_task_effect(
     storage: &StorageHandle,
     effect: &TaskEffect,
 ) -> Result<(), String> {
+    persist_stamped(storage, effect).await.map(|_| ())
+}
+
+/// [`persist_task_effect`], answering the due time of the row the change leaves: the stamp the
+/// scheduler carries to the firing, so that firing deletes this row and no newer one.
+pub async fn persist_stamped(
+    storage: &StorageHandle,
+    effect: &TaskEffect,
+) -> Result<Option<u64>, String> {
     if timer_is_restored(effect) || timer_is_ephemeral(effect) {
-        return Ok(());
+        return Ok(None);
     }
 
     match effect {
-        TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await,
-        TaskEffect::ShortenTimer { key, after } => shorten_timer(storage, key, *after).await,
-        TaskEffect::CancelTimer { key } => delete_timer(storage, key).await,
+        TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await.map(Some),
+        TaskEffect::ShortenTimer { key, after } => {
+            shorten_timer(storage, key, *after).await.map(Some)
+        }
+        TaskEffect::CancelTimer { key } => delete_timer(storage, key).await.map(|_| None),
         TaskEffect::ScheduleIdleTimer { .. }
         | TaskEffect::AbortRunningHandlers { .. }
-        | TaskEffect::Pull(_) => Ok(()),
+        | TaskEffect::Pull(_) => Ok(None),
     }
 }
 
@@ -111,12 +122,14 @@ fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     matches!(key, TaskKey::LockBucket { .. })
 }
 
-/// Deletes the row of a timer that fired, if that row is due: a row a later change wrote for the
-/// key stays. Best effort: a due row that survives only fires the work once more after a restart.
-pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey) {
+/// Deletes the row of a timer that fired: the row its `stamp` names, or without a stamp a row
+/// that is due. A row a later change wrote for the key stays. Best effort: a row that survives
+/// only fires the work once more after a restart.
+pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey, stamp: Option<u64>) {
     let _held = hold_timer(key).await;
+    let fired = |due: u64| stamp.map_or(due <= unix_timestamp_millis(), |stamp| due == stamp);
     let due = match read_timer(storage, key).await {
-        Ok(row) => row.is_some_and(|row| row.due_unix_millis <= unix_timestamp_millis()),
+        Ok(row) => row.is_some_and(|row| fired(row.due_unix_millis)),
         Err(error) => {
             warn!(error = %error, key = ?key, "Failed to read a fired task timer");
             return;
@@ -131,7 +144,7 @@ async fn write_timer(
     storage: &StorageHandle,
     key: &TaskKey,
     after: Duration,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let due_unix_millis = due_at_millis(after)?;
     write_record(
         storage,
@@ -140,17 +153,20 @@ async fn write_timer(
             due_unix_millis,
         },
     )
-    .await
+    .await?;
+    Ok(due_unix_millis)
 }
 
 async fn shorten_timer(
     storage: &StorageHandle,
     key: &TaskKey,
     after: Duration,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let requested_due_at = due_at_millis(after)?;
     match read_timer(storage, key).await? {
-        Some(existing) if existing.due_unix_millis <= requested_due_at => Ok(()),
+        Some(existing) if existing.due_unix_millis <= requested_due_at => {
+            Ok(existing.due_unix_millis)
+        }
         _ => {
             write_record(
                 storage,
@@ -159,7 +175,8 @@ async fn shorten_timer(
                     due_unix_millis: requested_due_at,
                 },
             )
-            .await
+            .await?;
+            Ok(requested_due_at)
         }
     }
 }

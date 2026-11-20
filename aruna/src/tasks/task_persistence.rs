@@ -102,7 +102,8 @@ async fn restore_timer(
         key: current.key,
         after,
     };
-    match task_handle.send_effect(Effect::Task(shorten)).await {
+    let stamp = Some(current.due_unix_millis);
+    match task_handle.send_stamped(shorten, stamp).await {
         Event::Task(TaskEvent::Error { message, .. }) => Err(message),
         _ => Ok(()),
     }
@@ -223,6 +224,37 @@ mod tests {
         assert!(after > Duration::from_secs(60), "armed at the new deadline: {after:?}");
     }
 
+    // A firing deletes only the row its stamp names: a replacement written while it waited to start
+    // stays, even when that replacement is already due itself.
+    #[tokio::test]
+    async fn firing_keeps_replacement() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let fired = PersistedTaskTimer {
+            key: key.clone(),
+            due_unix_millis: unix_timestamp_millis().saturating_sub(10_000),
+        };
+        let row = StorageEffect::Write {
+            key_space: TASK_TIMER_KEYSPACE.to_string(),
+            key: key.storage_key().expect("key encodes"),
+            value: ByteView::from(postcard::to_allocvec(&fired).expect("row encodes")),
+            txn_id: None,
+        };
+        storage.send_storage_effect(row).await;
+        let replacement = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::ZERO,
+        };
+        persist_task_effect(&storage, &replacement)
+            .await
+            .expect("row written");
+        let stamp = Some(fired.due_unix_millis);
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, stamp).await;
+        assert!(read_timer(&storage, &key).await.expect("reads").is_some());
+    }
+
     // A row that stopped decoding is deleted only while it still does not decode, so a timer a
     // later change wrote for its key stays.
     #[tokio::test]
@@ -314,7 +346,7 @@ mod tests {
             .await
             .expect("timer persists");
 
-        aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, None).await;
         assert!(
             read_timer(&storage, &key)
                 .await
@@ -326,7 +358,7 @@ mod tests {
         persist_task_effect(&storage, &due)
             .await
             .expect("timer persists");
-        aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, None).await;
         assert!(
             read_timer(&storage, &key)
                 .await

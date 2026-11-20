@@ -114,7 +114,7 @@ use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
     TimerInput, TimerMemory, TimerPlan, needs_cluster, timer_operation,
 };
-use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_task_effect};
+use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_stamped};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 pub(crate) mod drained;
@@ -509,15 +509,18 @@ impl OperationsTaskHandler {
             after,
         };
         let _held = hold_change(&effect).await;
-        if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
-            warn!(task_id = ?key, message = %message, "Failed to persist timer re-arm");
-            return false;
-        }
+        let stamp = match persist_stamped(&self.context.storage_handle, &effect).await {
+            Ok(stamp) => stamp,
+            Err(message) => {
+                warn!(task_id = ?key, message = %message, "Failed to persist timer re-arm");
+                return false;
+            }
+        };
         let Some(task_handle) = self.context.task_handle.as_ref() else {
             warn!(task_id = ?key, "Cannot re-arm failed timer without task handle");
             return false;
         };
-        match task_handle.send_effect(Effect::Task(effect)).await {
+        match task_handle.send_stamped(effect, stamp).await {
             Event::Task(TaskEvent::TimerScheduled { .. }) => true,
             Event::Task(TaskEvent::Error { message, .. }) => {
                 warn!(task_id = ?key, message = %message, "Failed to re-arm failed timer");
@@ -538,11 +541,15 @@ impl OperationsTaskHandler {
             after,
         };
         let _held = hold_change(&effect).await;
-        if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
-            warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
-        }
+        let stamp = match persist_stamped(&self.context.storage_handle, &effect).await {
+            Ok(stamp) => stamp,
+            Err(message) => {
+                warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
+                None
+            }
+        };
         if let Some(task_handle) = self.context.task_handle.as_ref() {
-            task_handle.send_effect(Effect::Task(effect)).await;
+            task_handle.send_stamped(effect, stamp).await;
         }
     }
 
@@ -830,9 +837,13 @@ pub struct OutboxDrainer {
 #[async_trait]
 impl InboundTaskHandler for OperationsTaskHandler {
     async fn handle_timer(&self, key: TaskKey) {
+        self.handle_firing(key, None).await;
+    }
+
+    async fn handle_firing(&self, key: TaskKey, stamp: Option<u64>) {
         // An audit record retry keeps its row until the record is stored, in one transaction.
         if !matches!(key, TaskKey::RecordAudit { .. }) {
-            delete_persisted_timer(&self.context.storage_handle, &key).await;
+            delete_persisted_timer(&self.context.storage_handle, &key, stamp).await;
         }
         self.timer_work(key).await;
     }

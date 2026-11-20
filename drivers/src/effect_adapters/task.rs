@@ -6,7 +6,7 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
-use aruna_storage::task_timers::{hold_change, persist_task_effect};
+use aruna_storage::task_timers::{hold_change, persist_stamped};
 
 use crate::driver::DriverContext;
 
@@ -15,16 +15,18 @@ pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -
     let _held = hold_change(&effect).await;
     // An audit record retry runs from memory when storage cannot persist it.
     let kept = matches!(task_effect_key(&effect), Some(TaskKey::RecordAudit { .. }));
-    if let Err(message) = persist_task_effect(&context.storage_handle, &effect).await
-        && !kept
-    {
-        return Event::Task(TaskEvent::Error {
-            key: task_effect_key(&effect),
-            message,
-        });
-    }
+    let stamp = match persist_stamped(&context.storage_handle, &effect).await {
+        Ok(stamp) => stamp,
+        Err(_) if kept => None,
+        Err(message) => {
+            return Event::Task(TaskEvent::Error {
+                key: task_effect_key(&effect),
+                message,
+            });
+        }
+    };
     if let Some(task_handle) = &context.task_handle {
-        Box::pin(task_handle.send_effect(Effect::Task(effect))).await
+        Box::pin(task_handle.send_stamped(effect, stamp)).await
     } else {
         Event::Task(TaskEvent::Error {
             key: None,
