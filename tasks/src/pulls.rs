@@ -6,9 +6,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 
 use aruna_core::structs::synced_folder::{SyncPullAck, SyncPullStatus, SyncRefusal};
 use aruna_core::task::{PullEffect, PullEvent, PullProgress};
+
+/// How long a refusal waits for its device; a later status answers none, so it claims again.
+const REFUSAL_KEPT: Duration = Duration::from_secs(3600);
 
 #[derive(Debug)]
 enum PullTask {
@@ -18,7 +22,7 @@ enum PullTask {
         total: u64,
     },
     /// Kept until the device asks once, so it learns why the pull ended.
-    Refused(SyncRefusal),
+    Refused { refusal: SyncRefusal, at: Instant },
 }
 
 #[derive(Debug, Default)]
@@ -30,19 +34,26 @@ impl PullRegistry {
     }
 
     pub(crate) fn answer(&self, effect: PullEffect) -> PullEvent {
+        let now = Instant::now();
         match effect {
-            PullEffect::Claim { key, total } => PullEvent::Claimed(self.claim(key, total)),
+            PullEffect::Claim { key, total } => PullEvent::Claimed(self.claim(key, total, now)),
             PullEffect::Finish { key, result } => {
-                self.finish(key, result);
+                self.finish(key, result, now);
                 PullEvent::Finished
             }
-            PullEffect::Status { key } => PullEvent::Status(self.status(&key)),
+            PullEffect::Status { key } => PullEvent::Status(self.status(&key, now)),
         }
     }
 
     // A new run of `key`, or the status of the live run that holds it.
-    fn claim(&self, key: Vec<u8>, total: u64) -> Result<PullProgress, SyncPullStatus> {
+    fn claim(
+        &self,
+        key: Vec<u8>,
+        total: u64,
+        now: Instant,
+    ) -> Result<PullProgress, SyncPullStatus> {
         let mut pulls = self.pulls();
+        sweep(&mut pulls, now);
         if let Some(PullTask::Running { bytes_done, total }) = pulls.get(&key)
             && let Some(bytes_done) = bytes_done.upgrade()
         {
@@ -57,16 +68,17 @@ impl PullRegistry {
     }
 
     // A commit is answered by its receipt from now on, a refusal by its entry.
-    fn finish(&self, key: Vec<u8>, result: Result<SyncPullAck, SyncRefusal>) {
+    fn finish(&self, key: Vec<u8>, result: Result<SyncPullAck, SyncRefusal>, now: Instant) {
         let mut pulls = self.pulls();
+        sweep(&mut pulls, now);
         match result {
             Ok(_) => pulls.remove(&key),
-            Err(refusal) => pulls.insert(key, PullTask::Refused(refusal)),
+            Err(refusal) => pulls.insert(key, PullTask::Refused { refusal, at: now }),
         };
     }
 
     // The run `key` names; a refusal is handed out once and a dead run is forgotten.
-    fn status(&self, key: &[u8]) -> Option<SyncPullStatus> {
+    fn status(&self, key: &[u8], now: Instant) -> Option<SyncPullStatus> {
         let mut pulls = self.pulls();
         if let Some(PullTask::Running { bytes_done, total }) = pulls.get(key)
             && let Some(bytes_done) = bytes_done.upgrade()
@@ -78,10 +90,24 @@ impl PullRegistry {
             });
         }
         match pulls.remove(key) {
-            Some(PullTask::Refused(refusal)) => Some(SyncPullStatus::Refused(refusal)),
+            Some(PullTask::Refused { refusal, at }) if kept(at, now) => {
+                Some(SyncPullStatus::Refused(refusal))
+            }
             _ => None,
         }
     }
+}
+
+/// Drops runs that ended without finishing and refusals nobody asked for in time.
+fn sweep(pulls: &mut HashMap<Vec<u8>, PullTask>, now: Instant) {
+    pulls.retain(|_, task| match task {
+        PullTask::Running { bytes_done, .. } => bytes_done.strong_count() > 0,
+        PullTask::Refused { at, .. } => kept(*at, now),
+    });
+}
+
+fn kept(at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(at) < REFUSAL_KEPT
 }
 
 #[cfg(test)]
@@ -123,6 +149,20 @@ mod tests {
         let status = PullEffect::Status { key: vec![1] };
         assert_eq!(registry.answer(status), PullEvent::Status(None));
         claimed(&registry);
+    }
+
+    #[test]
+    fn abandoned_entries_swept() {
+        let registry = PullRegistry::default();
+        let start = Instant::now();
+        drop(registry.claim(vec![1], 10, start));
+        registry.finish(vec![2], Err(SyncRefusal::Unavailable), start);
+        assert_eq!(registry.pulls().len(), 1, "the dropped run is gone");
+        let later = start + REFUSAL_KEPT;
+        let progress = registry.claim(vec![3], 10, later);
+        assert_eq!(registry.pulls().len(), 1, "the unasked refusal expired");
+        assert_eq!(registry.status(&[2], later), None);
+        drop(progress);
     }
 
     #[test]
