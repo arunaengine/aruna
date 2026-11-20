@@ -18,9 +18,15 @@ use {
     aruna_tasks::shutdown::Shutdown,
     std::io::BufWriter,
     std::os::unix::fs::{FileTypeExt, PermissionsExt},
-    tokio::net::UnixListener,
+    std::time::Duration,
+    tokio::net::{UnixListener, UnixStream},
+    tokio_util::sync::CancellationToken,
     tracing::info,
 };
+
+/// How long a backup write may make no progress before the client is dropped.
+#[cfg(unix)]
+const BACKUP_STALL: Duration = Duration::from_secs(60);
 
 /// The stores one backup covers.
 #[derive(Clone)]
@@ -128,27 +134,58 @@ pub(crate) fn serve(storage_path: &Path, ctx: &DriverContext, shutdown: &Shutdow
                     }
                 },
             };
-            let sources = sources.clone();
-            let backup = tokio::task::spawn_blocking(move || {
-                let stream = stream.into_std()?;
-                stream.set_nonblocking(false)?;
-                let now = aruna_clock::unix_timestamp_secs();
-                write_backup(BufWriter::new(stream), &sources, now)
-            });
-            tokio::select! {
-                () = token.cancelled() => break,
-                result = backup => match result {
-                    Ok(Ok(stats)) => info!(
-                        keyspaces = stats.keyspace_count,
-                        entries = stats.entry_count,
-                        "Live backup written"
-                    ),
-                    Ok(Err(error)) => warn!(error = %error, "Live backup failed"),
-                    Err(error) => warn!(error = %error, "Live backup task failed"),
-                },
+            match write_client(stream, sources.clone(), BACKUP_STALL, &token).await {
+                Ok(Ok(stats)) => info!(
+                    keyspaces = stats.keyspace_count,
+                    entries = stats.entry_count,
+                    "Live backup written"
+                ),
+                Ok(Err(error)) => warn!(error = %error, "Live backup failed"),
+                Err(error) => warn!(error = %error, "Live backup task failed"),
             }
         }
     });
+}
+
+/// Writes one backup to `stream` on a blocking thread and waits for it. A write without
+/// progress for `stall` fails, and cancellation closes the socket so the writer stops.
+#[cfg(unix)]
+async fn write_client(
+    stream: UnixStream,
+    sources: BackupSources,
+    stall: Duration,
+    token: &CancellationToken,
+) -> Result<Result<SnapshotStats, SnapshotError>, tokio::task::JoinError> {
+    let (stream, closer) = match blocking_stream(stream, stall) {
+        Ok(pair) => pair,
+        Err(error) => return Ok(Err(error.into())),
+    };
+    let mut backup = tokio::task::spawn_blocking(move || {
+        let now = aruna_clock::unix_timestamp_secs();
+        write_backup(BufWriter::new(stream), &sources, now)
+    });
+    tokio::select! {
+        () = token.cancelled() => {
+            if let Err(error) = closer.shutdown(std::net::Shutdown::Both) {
+                warn!(error = %error, "Backup socket did not close");
+            }
+            backup.await
+        }
+        result = &mut backup => result,
+    }
+}
+
+/// The stream in blocking mode with a write timeout, and a second handle that can close it.
+#[cfg(unix)]
+fn blocking_stream(
+    stream: UnixStream,
+    stall: Duration,
+) -> std::io::Result<(std::os::unix::net::UnixStream, std::os::unix::net::UnixStream)> {
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(stall))?;
+    let closer = stream.try_clone()?;
+    Ok((stream, closer))
 }
 
 /// The stores of a node with its storage, document sync and metadata databases open.
@@ -219,6 +256,45 @@ mod tests {
         entries
     }
 
+    /// Sources whose Git files exceed a socket buffer, so a write waits for its reader.
+    #[cfg(unix)]
+    fn large_sources(root: &Path) -> BackupSources {
+        std::fs::create_dir_all(root.join("git")).unwrap();
+        std::fs::write(root.join("git/large"), vec![0_u8; 8 << 20]).unwrap();
+        open_sources(root)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_joins_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, _client) = UnixStream::pair().unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let stall = Duration::from_secs(3600);
+        let writing = write_client(server, large_sources(root.path()), stall, &token);
+        let written = tokio::time::timeout(Duration::from_secs(300), writing).await;
+        assert!(
+            matches!(written, Ok(Ok(Err(_)))),
+            "shutdown did not stop and join the writer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_client_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, _client) = UnixStream::pair().unwrap();
+        let token = CancellationToken::new();
+        let stall = Duration::from_millis(100);
+        let writing = write_client(server, large_sources(root.path()), stall, &token);
+        let written = tokio::time::timeout(Duration::from_secs(300), writing).await;
+        assert!(
+            matches!(written, Ok(Ok(Err(_)))),
+            "a stalled write did not fail"
+        );
+    }
+
     #[test]
     fn backup_includes_push() {
         let root = tempfile::tempdir().unwrap();
@@ -238,7 +314,10 @@ mod tests {
         std::fs::write(repository.join("refs/heads/main"), "pushed\n").unwrap();
         drop(held);
         let entries = git_entries(&backup.join().unwrap().unwrap());
-        for (path, value) in [("objects/pushed", "object"), ("refs/heads/main", "pushed\n")] {
+        for (path, value) in [
+            ("objects/pushed", "object"),
+            ("refs/heads/main", "pushed\n"),
+        ] {
             let path = format!("{id}.git/{path}");
             assert!(
                 entries.contains(&(path.clone(), value.as_bytes().to_vec())),
