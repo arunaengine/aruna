@@ -17,7 +17,7 @@ use aruna_core::metadata::protocol::INBOUND_FRAME_BYTES;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
-use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
+use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms, record_elapsed_ms};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::InboundEventHandler;
@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use futures_util::future::BoxFuture;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
-use tracing::{Instrument, debug, error, field, info, info_span, trace, warn};
+use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
 /// Peer audit pages this node serves at once.
@@ -73,8 +73,11 @@ impl OperationsInboundHandler {
             alpn = ?alpn,
             request = field::Empty,
             response = field::Empty,
+            read_ms = field::Empty,
+            process_ms = field::Empty,
             drain_ms = field::Empty,
             write_ms = field::Empty,
+            elapsed_ms = field::Empty,
         )
     )]
     async fn serve_peer(&self, alpn: Alpn, mut stream: BiStream, peer: NodeId) {
@@ -87,6 +90,7 @@ impl OperationsInboundHandler {
             warn!(peer = %peer, "Dropping inbound metadata stream without metadata store");
             return;
         }
+        let total_started = Instant::now();
         let Some(PeerRead {
             request,
             slot: _slot,
@@ -95,6 +99,9 @@ impl OperationsInboundHandler {
         else {
             return;
         };
+        let span = Span::current();
+        record_elapsed_ms(&span, "read_ms", total_started);
+        let process_started = Instant::now();
         let input = PeerInput {
             alpn,
             peer,
@@ -129,8 +136,10 @@ impl OperationsInboundHandler {
                 self.jobs_runtime.request_cancel(*job_id);
             }
         }
+        record_elapsed_ms(&span, "process_ms", process_started);
         let audit = held.as_ref().and_then(|held| held.audit);
         write_peer(&input, stream, answer, audit).await;
+        record_elapsed_ms(&span, "elapsed_ms", total_started);
     }
 
     /// What this node offers a metadata request, read only as far as the request needs it.
