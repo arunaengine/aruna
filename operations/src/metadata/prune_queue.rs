@@ -351,10 +351,9 @@ enum TombstoneStage {
     Index,
 }
 
-/// Queues and runs the prunes for graphs a document sync deleted: each registry row leaves the
-/// cache, its prune job is queued and a kept local copy is removed; index rows go last. A failed
-/// immediate prune is logged, as its queued job retries it. A prune job that was not queued or
-/// index rows that stay fail the run once the other graphs ran, so the caller runs it again.
+/// Queues and runs the prunes for graphs a sync deleted: each row leaves the cache, its prune job
+/// is queued and a local copy removed; index rows go last. A failed prune is logged, as its job
+/// retries it; an unqueued job or kept index rows fail the run after the other graphs.
 #[derive(Debug, PartialEq)]
 pub struct TombstonesOperation {
     tombstones: VecDeque<GraphLifecycleRecord>,
