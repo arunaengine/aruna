@@ -179,16 +179,6 @@ async fn restore_notification_prune(context: &DriverContext, task_handle: &TaskH
     }
 }
 
-// A batch that processed nothing is blocked behind jobs that are not due yet, so
-// it backs off instead of rescanning the same head at batch pace.
-pub(super) fn drain_delay(result: &MetadataDrainResult) -> Duration {
-    if result.processed == 0 {
-        MATERIALIZATION_RETRY_AFTER
-    } else {
-        NEXT_BATCH_AFTER
-    }
-}
-
 // Parked materialization jobs come back on their own backoff, so a node that hit
 // the failure cap during a storm converges again without an operator or restart.
 async fn sweep_dead_letters(context: &DriverContext) {
@@ -479,93 +469,6 @@ impl OperationsTaskHandler {
         }
         self.reschedule_timer(key, aruna_core::federation::PUBLISH_INTERVAL)
             .await;
-    }
-
-    pub(super) async fn drain_materialization_queue(&self) {
-        let bulk = self.context.bulk();
-        let node = aruna_core::git::GitNode {
-            ids: bulk.node_and_realm(),
-            routing: node_routing(&bulk),
-        };
-        let concurrency = materialization_group_concurrency();
-        let batch =
-            MaterializationBatchOperation::new(node, concurrency, bulk.task_handle.is_some());
-        match drive(batch, &bulk).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainMaterializationQueue, drain_delay(&result))
-                    .await;
-            }
-            Ok(result) if result.next_due_after.is_some() => {
-                self.reschedule_timer(
-                    TaskKey::DrainMaterializationQueue,
-                    result.next_due_after.unwrap_or(MATERIALIZATION_POLL_AFTER),
-                )
-                .await;
-            }
-            Ok(_) => match drive(JobsExistOperation::new(), &bulk).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    self.reschedule_timer(
-                        TaskKey::DrainMaterializationQueue,
-                        MATERIALIZATION_POLL_AFTER,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
-                    self.reschedule_timer(
-                        TaskKey::DrainMaterializationQueue,
-                        MATERIALIZATION_RETRY_AFTER,
-                    )
-                    .await;
-                }
-            },
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
-                self.reschedule_timer(
-                    TaskKey::DrainMaterializationQueue,
-                    MATERIALIZATION_RETRY_AFTER,
-                )
-                .await;
-            }
-        }
-    }
-
-    pub(super) async fn drain_graph_queue(&self) {
-        let bulk = self.context.bulk();
-        match drive(PruneBatchOperation::new(bulk.node_scope()), &bulk).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
-                    .await;
-            }
-            Ok(result) if result.next_due_after.is_some() => {
-                self.reschedule_timer(
-                    TaskKey::DrainPruneQueue,
-                    result.next_due_after.unwrap_or(GRAPH_POLL_AFTER),
-                )
-                .await;
-            }
-            Ok(_) => match drive(jobs_queued(), &bulk)
-                .await
-                .map(|due| !due.jobs.is_empty())
-            {
-                Ok(false) => {}
-                Ok(true) => {
-                    self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
-                        .await;
-                }
-                Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to probe metadata graph prune jobs");
-                    self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_RETRY_AFTER)
-                        .await;
-                }
-            },
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to drain metadata graph prune queue");
-                self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_RETRY_AFTER)
-                    .await;
-            }
-        }
     }
 }
 

@@ -74,7 +74,7 @@ pub const MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
 // The bulk storage lane enforces fairness when immediate timer refires bypass this gap.
 pub const NEXT_BATCH_AFTER: Duration = Duration::from_millis(25);
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct MetadataDrainResult {
     pub processed: usize,
     pub has_more_due: bool,

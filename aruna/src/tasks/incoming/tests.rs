@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::outbox::publish_from_outbox;
-use super::restore::drain_delay;
 use super::*;
 use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::effects::StorageEffect;

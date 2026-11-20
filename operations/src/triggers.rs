@@ -39,7 +39,10 @@ use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperati
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use crate::metadata::materialization_queue::MATERIALIZATION_RETRY_AFTER;
 use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
+use crate::metadata::prune_queue::GRAPH_RETRY_AFTER;
+use crate::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperation};
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
@@ -128,6 +131,10 @@ pub struct TimerInput {
     pub has_blob: bool,
     /// The jobs running on this node, for its heartbeat.
     pub running: Option<RunningJobs>,
+    /// Whether this node runs a task handle.
+    pub has_tasks: bool,
+    /// Graph groups the materialization drain finishes at once on this host.
+    pub group_concurrency: usize,
 }
 
 impl TimerInput {
@@ -141,6 +148,8 @@ impl TimerInput {
             routing: NodeRouting::default(),
             has_blob: false,
             running: None,
+            has_tasks: false,
+            group_concurrency: 1,
         }
     }
 }
@@ -197,6 +206,8 @@ pub enum TimerOperation {
     PublishNodeInfo(InfoTimerOperation),
     DrainProjectionQueue(ProjectionRunOperation),
     DrainReplicationQueue(ReplicationTimerOperation),
+    DrainMaterializationQueue(MaterializationRunOperation),
+    DrainPruneQueue(PruneRunOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -316,7 +327,23 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainReplicationQueue => Some(TimerOperation::DrainReplicationQueue(
             ReplicationTimerOperation::new(input),
         )),
+        TaskKey::DrainMaterializationQueue => Some(TimerOperation::DrainMaterializationQueue(
+            MaterializationRunOperation::new(input),
+        )),
+        TaskKey::DrainPruneQueue => Some(TimerOperation::DrainPruneQueue(PruneRunOperation::new(
+            input,
+        ))),
         _ => None,
+    }
+}
+
+impl TimerOperation {
+    /// Whether the run uses the bulk storage lane, so background batches never delay requests.
+    pub fn bulk_lane(&self) -> bool {
+        matches!(
+            self,
+            TimerOperation::DrainMaterializationQueue(_) | TimerOperation::DrainPruneQueue(_)
+        )
     }
 }
 
@@ -345,6 +372,8 @@ macro_rules! each_timer {
             TimerOperation::PublishNodeInfo($operation) => $body,
             TimerOperation::DrainProjectionQueue($operation) => $body,
             TimerOperation::DrainReplicationQueue($operation) => $body,
+            TimerOperation::DrainMaterializationQueue($operation) => $body,
+            TimerOperation::DrainPruneQueue($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -655,6 +684,26 @@ impl TimerRun for ProjectionRunOperation {
 impl TimerRun for ReplicationTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for MaterializationRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: MATERIALIZATION_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for PruneRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: GRAPH_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
     }
 }
 
@@ -1238,6 +1287,17 @@ mod tests {
             operation,
             Some(TimerOperation::DrainReplicationQueue(_))
         ));
+    }
+
+    #[test]
+    fn queue_timers_bulk() {
+        // The metadata queues run on the bulk lane; other timers stay on the request lane.
+        let materialize = timer_operation(&TaskKey::DrainMaterializationQueue, &input());
+        assert!(materialize.unwrap().bulk_lane());
+        assert!(timer_operation(&TaskKey::DrainPruneQueue, &input()).unwrap().bulk_lane());
+        assert!(!timer_operation(&TaskKey::PruneJobs, &input()).unwrap().bulk_lane());
+        let failed = PruneRunOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed.unwrap_err().retry_after, GRAPH_RETRY_AFTER);
     }
 
     #[test]

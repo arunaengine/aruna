@@ -75,15 +75,10 @@ use aruna_operations::jobs::store::job_calls;
 use aruna_operations::metadata::data_links::RetryUnverifiedOperation;
 use aruna_operations::metadata::device::drain::{PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER};
 use aruna_operations::metadata::materialization_queue::{
-    JobsExistOperation, MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER,
-    MaterializationBatchOperation, MetadataDrainResult, NEXT_BATCH_AFTER, NextTimerOperation,
-    RequeueParkedOperation, materialization_group_concurrency,
+    NextTimerOperation, RequeueParkedOperation, materialization_group_concurrency,
 };
 use aruna_operations::metadata::projection::ProjectionTimerOperation;
-use aruna_operations::metadata::prune_queue::{
-    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
-    PruneTimerOperation as GraphPruneTimerOperation, jobs_queued,
-};
+use aruna_operations::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
 use aruna_operations::transfer::sharding::MaintainCursors;
 
 /// Arms the graph prune drain for its next due job at start.
@@ -692,6 +687,8 @@ impl OperationsTaskHandler {
             routing: aruna_drivers::driver::node_routing(&self.context),
             has_blob: self.context.blob_handle.is_some(),
             running: Some(self.jobs_runtime.running_jobs()),
+            has_tasks: self.context.task_handle.is_some(),
+            group_concurrency: materialization_group_concurrency(),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -703,7 +700,9 @@ impl OperationsTaskHandler {
             .map(|key| key.to_vec())
             .unwrap_or_default();
         let build = || operation.clone();
-        let plan = match drive_retry(build, self.context.as_ref(), &seed).await {
+        let bulk = operation.bulk_lane().then(|| self.context.bulk());
+        let context = bulk.as_ref().unwrap_or(self.context.as_ref());
+        let plan = match drive_retry(build, context, &seed).await {
             Ok(plan) => plan,
             Err(failure) => {
                 warn!(task_id = ?key, error = %failure, "Timer run failed");
@@ -752,12 +751,8 @@ impl OperationsTaskHandler {
             TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
             TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
             TaskKey::DrainProjectionQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainMaterializationQueue => Box::pin(async move {
-                self.drain_materialization_queue().await;
-            }),
-            TaskKey::DrainPruneQueue => Box::pin(async move {
-                self.drain_graph_queue().await;
-            }),
+            TaskKey::DrainMaterializationQueue => Box::pin(self.run_trigger(key)),
+            TaskKey::DrainPruneQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainReplicationQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainRefreshQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
