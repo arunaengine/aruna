@@ -9,6 +9,7 @@ use std::time::Duration;
 use aruna_core::alpn::Alpn;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::ShardTransportMessage;
 use aruna_core::git::GitNode;
 use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
@@ -22,7 +23,7 @@ use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::blob::cleanup_timer::CleanupTimerOperation;
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
@@ -35,6 +36,7 @@ use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
 use crate::node::applied_drain::AppliedDrainOperation;
+use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
@@ -57,6 +59,7 @@ use crate::replication::mirror_repair::drain::DrainRepairsOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
+use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
 /// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
@@ -661,16 +664,35 @@ impl TimerRun for PruneNotificationsOperation {
     }
 }
 
-/// One request frame read by the peer shell, with what the shell knows about its stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PeerInput<'a> {
+/// One request read by the peer shell, with what the shell knows about its stream.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerInput {
     pub alpn: Alpn,
     pub peer: NodeId,
     pub local_node: NodeId,
     pub local_realm: RealmId,
     pub now_ms: u64,
-    /// The frame body without its length prefix, at most the protocol's frame bound.
-    pub frame: &'a [u8],
+    pub request: PeerRequest,
+}
+
+/// A request as the peer shell read it in its protocol's framing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PeerRequest {
+    /// A frame body without its length prefix, at most the protocol's frame bound.
+    Frame(Vec<u8>),
+    /// A shard manifest request.
+    Manifest(ShardTransportMessage),
+}
+
+/// What a peer operation answers; the shell writes it in its protocol's framing.
+#[derive(Debug, PartialEq)]
+pub enum PeerAnswer {
+    /// An answer frame body.
+    Frame(Vec<u8>),
+    /// A shard manifest or why it cannot be served.
+    Manifest(ManifestAnswer),
+    /// The request was kept or dropped without an answer.
+    Kept,
 }
 
 /// A peer request that ended without an answer; the shell logs it and closes the stream.
@@ -678,9 +700,9 @@ pub struct PeerInput<'a> {
 #[error("{0}")]
 pub struct PeerFailure(pub String);
 
-/// A peer operation produces the answer frame body the shell writes back.
+/// A peer operation produces the answer the shell writes back.
 pub trait PeerRun: Operation + Sized {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure>;
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure>;
 }
 
 impl From<IoError> for PeerFailure {
@@ -700,20 +722,48 @@ pub enum PeerOperation {
     ServeInbox(ServeInboxOperation),
     /// Watch events expanded into the inboxes this node holds.
     WatchEvents(WatchEventsOperation),
+    /// A peer's heartbeat, kept when it is newer than the held one.
+    Heartbeat(ReceiveHeartbeatOperation),
+    /// A shard manifest request this node answers as a holder.
+    Manifest(ServeManifestOperation),
+}
+
+/// How long a notification request may run with its retries, so a slow store cannot hold the
+/// stream.
+pub const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
+impl PeerOperation {
+    /// How long the run may take with its conflict reruns; `None` runs it once.
+    pub fn deadline(&self) -> Option<Duration> {
+        match self {
+            PeerOperation::Heartbeat(_) | PeerOperation::Manifest(_) => None,
+            _ => Some(NOTIFICATION_AUTH_TIMEOUT),
+        }
+    }
 }
 
 /// The operation that answers `input`, or `None` while its protocol or request kind is not
 /// converted; the shell then answers the frame with its own code.
-pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
-    match input.alpn {
-        Alpn::Notification => {
+pub fn peer_operation(input: &PeerInput) -> Option<PeerOperation> {
+    match (input.alpn, &input.request) {
+        (Alpn::Heartbeat, PeerRequest::Frame(frame)) => {
+            let (peer, realm_id) = (input.peer, input.local_realm);
+            let operation = ReceiveHeartbeatOperation::new(peer, realm_id, frame.clone());
+            Some(PeerOperation::Heartbeat(operation))
+        }
+        (Alpn::Shard, PeerRequest::Manifest(message)) => {
+            let local = (input.local_node, input.local_realm);
+            let operation = ServeManifestOperation::new(local, input.peer, message.clone());
+            Some(PeerOperation::Manifest(operation))
+        }
+        (Alpn::Notification, PeerRequest::Frame(frame)) => {
             let deliver = DeliverInput {
                 peer: input.peer,
                 local: input.local_node,
                 local_realm: input.local_realm,
                 now_ms: input.now_ms,
             };
-            match postcard::from_bytes(input.frame) {
+            match postcard::from_bytes(frame) {
                 Ok(NotificationTransportMessage::DeliverBatch { records }) => {
                     let operation = DeliverBatchOperation::new(deliver, records);
                     Some(PeerOperation::DeliverNotifications(operation))
@@ -734,45 +784,57 @@ pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
                 _ => None,
             }
         }
-        Alpn::Dht
-        | Alpn::Bao
-        | Alpn::DocumentSync
-        | Alpn::Metadata
-        | Alpn::NativeReference
-        | Alpn::Shard
-        | Alpn::JobControl
-        | Alpn::Heartbeat => None,
+        _ => None,
     }
 }
 
 /// The answer frame of a notification peer request; an error closes the stream.
 fn notification_answer<E: Display>(
     result: Result<NotificationTransportMessage, E>,
-) -> Result<Vec<u8>, PeerFailure> {
+) -> Result<PeerAnswer, PeerFailure> {
     let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
-    postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+    let frame = postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))?;
+    Ok(PeerAnswer::Frame(frame))
 }
 
 impl PeerRun for DeliverBatchOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
 
 impl PeerRun for RemoveWatchOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
 
 impl PeerRun for ServeInboxOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
 
+impl PeerRun for ReceiveHeartbeatOperation {
+    /// A heartbeat gets no answer; one that is not kept is only logged.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        if let Err(error) = result {
+            debug!(%error, "Heartbeat not kept");
+        }
+        Ok(PeerAnswer::Kept)
+    }
+}
+
+impl PeerRun for ServeManifestOperation {
+    /// A failed request is answered with its refusal.
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
+        let reject = |error: IoError| ManifestAnswer::Reject(error.to_string());
+        Ok(PeerAnswer::Manifest(result.unwrap_or_else(reject)))
+    }
+}
+
 impl PeerRun for WatchEventsOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
         notification_answer(result)
     }
 }
@@ -836,14 +898,16 @@ macro_rules! each_peer {
             PeerOperation::RemoveWatch($operation) => $body,
             PeerOperation::ServeInbox($operation) => $body,
             PeerOperation::WatchEvents($operation) => $body,
+            PeerOperation::Heartbeat($operation) => $body,
+            PeerOperation::Manifest($operation) => $body,
         }
     };
 }
 
-/// The next call of a peer operation, or its answer frame body.
+/// The next call of a peer operation, or its answer.
 fn peer_turn<O: PeerRun>(
     turn: Result<Next<O::Output>, O::Error>,
-) -> Result<Next<Vec<u8>>, PeerFailure> {
+) -> Result<Next<PeerAnswer>, PeerFailure> {
     match turn {
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
@@ -856,7 +920,7 @@ fn peer_turn<O: PeerRun>(
 }
 
 /// The conflict decision of a peer operation; an output it finishes with is encoded.
-fn peer_conflict<O: PeerRun>(operation: &mut O, attempt: u32) -> AfterConflict<Vec<u8>> {
+fn peer_conflict<O: PeerRun>(operation: &mut O, attempt: u32) -> AfterConflict<PeerAnswer> {
     match operation.on_conflict(attempt) {
         AfterConflict::Rerun => AfterConflict::Rerun,
         AfterConflict::Fail => AfterConflict::Fail,
@@ -867,19 +931,19 @@ fn peer_conflict<O: PeerRun>(operation: &mut O, attempt: u32) -> AfterConflict<V
     }
 }
 
-fn peer_first<O: PeerRun>(operation: &mut O) -> Result<Next<Vec<u8>>, PeerFailure> {
+fn peer_first<O: PeerRun>(operation: &mut O) -> Result<Next<PeerAnswer>, PeerFailure> {
     peer_turn::<O>(operation.first())
 }
 
 fn peer_next<O: PeerRun>(
     operation: &mut O,
     result: IoResult,
-) -> Result<Next<Vec<u8>>, PeerFailure> {
+) -> Result<Next<PeerAnswer>, PeerFailure> {
     peer_turn::<O>(operation.next(result))
 }
 
 impl Operation for PeerOperation {
-    type Output = Vec<u8>;
+    type Output = PeerAnswer;
     type Error = PeerFailure;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
@@ -1163,7 +1227,7 @@ mod tests {
             records: Vec::new(),
         })
         .unwrap();
-        let mut peer = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
+        let mut peer = peer_operation(&peer_input(Alpn::Notification, &frame)).unwrap();
         assert_eq!(peer.on_conflict(1), AfterConflict::Rerun);
         assert_eq!(peer.hold_scope(), None);
     }
@@ -1178,7 +1242,11 @@ mod tests {
         assert_eq!(runner.retry_after, TIMER_RETRY_AFTER);
     }
 
-    fn peer_input(alpn: Alpn, frame: &[u8]) -> PeerInput<'_> {
+    fn peer_input(alpn: Alpn, frame: &[u8]) -> PeerInput {
+        peer_request(alpn, PeerRequest::Frame(frame.to_vec()))
+    }
+
+    fn peer_request(alpn: Alpn, request: PeerRequest) -> PeerInput {
         let node = crate::tests::locations::node_id(1);
         PeerInput {
             alpn,
@@ -1186,29 +1254,51 @@ mod tests {
             local_node: node,
             local_realm: RealmId::from_bytes([1; 32]),
             now_ms: 1_000,
-            frame,
+            request,
         }
+    }
+
+    // A heartbeat frame and a manifest request name their operations; a heartbeat is never
+    // answered and a failed manifest request is answered with its refusal.
+    #[test]
+    fn heartbeat_manifest_named() {
+        let heartbeat = peer_operation(&peer_input(Alpn::Heartbeat, b"beat"));
+        assert!(matches!(heartbeat, Some(PeerOperation::Heartbeat(_))));
+        assert!(peer_operation(&peer_input(Alpn::Shard, b"frame")).is_none());
+        let request = ShardTransportMessage::ManifestRequest {
+            realm_id: RealmId::from_bytes([1; 32]),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+        };
+        let manifest = peer_operation(&peer_request(Alpn::Shard, PeerRequest::Manifest(request)));
+        assert!(matches!(manifest, Some(PeerOperation::Manifest(_))));
+        let dropped = Err(crate::node::heartbeat::HeartbeatError::Io(IoError::Unfinished));
+        assert_eq!(ReceiveHeartbeatOperation::answer(dropped), Ok(PeerAnswer::Kept));
+        let Ok(PeerAnswer::Manifest(ManifestAnswer::Reject(_))) =
+            ServeManifestOperation::answer(Err(IoError::Unfinished))
+        else {
+            panic!("a failed manifest request is refused");
+        };
     }
 
     #[test]
     fn unconverted_peers_absent() {
         for alpn in Alpn::ALL {
-            if alpn != Alpn::Notification {
-                assert!(peer_operation(peer_input(alpn, &[])).is_none());
+            if !matches!(alpn, Alpn::Notification | Alpn::Heartbeat) {
+                assert!(peer_operation(&peer_input(alpn, &[])).is_none());
             }
         }
         let ack = NotificationTransportMessage::WatchEventsAck { written: 0 };
         let frame = postcard::to_allocvec(&ack).unwrap();
-        assert!(peer_operation(peer_input(Alpn::Notification, &frame)).is_none());
+        assert!(peer_operation(&peer_input(Alpn::Notification, &frame)).is_none());
         let list = NotificationTransportMessage::ListWatches {
             owner: crate::tests::notifications::user(1, 2),
         };
         let frame = postcard::to_allocvec(&list).unwrap();
         assert!(matches!(
-            peer_operation(peer_input(Alpn::Notification, &frame)),
+            peer_operation(&peer_input(Alpn::Notification, &frame)),
             Some(PeerOperation::ServeInbox(_))
         ));
-        assert!(peer_operation(peer_input(Alpn::Notification, &[0xff])).is_none());
+        assert!(peer_operation(&peer_input(Alpn::Notification, &[0xff])).is_none());
     }
 
     #[test]
@@ -1217,8 +1307,8 @@ mod tests {
             records: Vec::new(),
         };
         let frame = postcard::to_allocvec(&delivery).unwrap();
-        let mut operation = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
-        let Ok(Next::Done(answer)) = operation.first() else {
+        let mut operation = peer_operation(&peer_input(Alpn::Notification, &frame)).unwrap();
+        let Ok(Next::Done(PeerAnswer::Frame(answer))) = operation.first() else {
             panic!("an empty batch is answered");
         };
         let decoded: NotificationTransportMessage = postcard::from_bytes(&answer).unwrap();

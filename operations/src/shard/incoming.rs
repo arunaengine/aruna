@@ -25,7 +25,7 @@ fn reject(reason: String) -> Result<Next<ManifestAnswer>, IoError> {
 }
 
 /// Serves one manifest request after checking the realm, the peer and this node's holdership.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ServeManifestOperation {
     local: (NodeId, RealmId),
     peer: NodeId,
