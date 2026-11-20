@@ -101,6 +101,7 @@ pub fn new_identified_record(
         generation: 0,
         updated_at: outbox_id.timestamp_ms() / 1_000,
         allow_genesis,
+        incarnation: None,
     }
 }
 

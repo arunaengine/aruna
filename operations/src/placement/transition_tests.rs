@@ -226,6 +226,7 @@ fn outbox_row(placement: PlacementRef, generation: u64) -> Value {
         generation,
         updated_at: 1,
         allow_genesis: false,
+        incarnation: None,
     };
     postcard::to_allocvec(&record).unwrap().into()
 }

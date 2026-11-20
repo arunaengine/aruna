@@ -96,6 +96,7 @@ use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::staging::native_source::{NativeAnswer, NativeAnswerOperation};
 use crate::sync::outbox::batches::OutboxLimits;
+use crate::sync::outbox::cleanup::Publication;
 use crate::sync::outbox::rotation::OutboxRotation;
 use crate::transfer::sharding::{MaintainCursors, maintain_retry};
 
@@ -114,9 +115,9 @@ pub struct TimerMemory {
     pub ranges: MaintainCursors,
     /// The open document sync outbox rotation.
     pub rotation: OutboxRotation,
-    /// Outbox records whose op this process already created, with the lineage of the topic they
-    /// were published on, so a retry on that lineage only syncs them.
-    pub published: BTreeMap<Vec<u8>, [u8; 32]>,
+    /// Outbox records whose op this process already created, with the lineage of the topic and
+    /// the row they were published from, so a retry of that row on that lineage only syncs.
+    pub published: BTreeMap<Vec<u8>, Publication>,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.

@@ -176,7 +176,9 @@ impl FinishBatchOperation {
                 rows.push((key.clone(), None));
                 continue;
             };
-            match current.get(topic).copied().flatten() == stamp.lineage {
+            // Only a known lineage that still matches lets the record go; an unknown one waits.
+            let now = current.get(topic).copied().flatten();
+            match now.is_some() && now == stamp.lineage {
                 true => rows.push((key.clone(), stamp.digest)),
                 false => self.finished.outcome.retry_needed = true,
             }
@@ -397,6 +399,28 @@ mod tests {
         assert!(matches!(lineage, Ok(Next::Call(IoCall::Group(_)))));
         let root = Event::Net(NetEvent::Shard(Box::new(ShardNetEvent::Root(Ok([2; 32])))));
         let results = vec![GroupResult::Done(Box::new(root))];
+        let delete = run.next(IoResult::Group(GroupEvent::Finished { results }));
+        assert!(matches!(delete, Ok(Next::Call(IoCall::Child(_)))));
+        let none = child::<Vec<Vec<u8>>, ApplyError>(Ok(Vec::new()));
+        let Ok(Next::Done(finished)) = run.next(none) else {
+            panic!("the batch finishes");
+        };
+        assert!(finished.deleted.is_empty() && finished.outcome.retry_needed);
+    }
+
+    // A record whose topic lineage cannot be learned now is not deleted either, also when its
+    // publication had none: only a known matching lineage lets it go.
+    #[test]
+    fn unknown_lineage_kept() {
+        let topic = TopicId::hash(b"topic");
+        let mut run = finish(reconciled(Vec::new())).guarded(vec![(topic, RowStamp::default())]);
+        run.first().unwrap();
+        run.next(child::<(), IoError>(Ok(()))).unwrap();
+        run.next(child::<bool, IoError>(Ok(true))).unwrap();
+        let failed = Event::Net(NetEvent::Shard(Box::new(ShardNetEvent::Root(Err(
+            "no genesis".to_string(),
+        )))));
+        let results = vec![GroupResult::Done(Box::new(failed))];
         let delete = run.next(IoResult::Group(GroupEvent::Finished { results }));
         assert!(matches!(delete, Ok(Next::Call(IoCall::Child(_)))));
         let none = child::<Vec<Vec<u8>>, ApplyError>(Ok(Vec::new()));

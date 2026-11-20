@@ -275,6 +275,7 @@ pub(crate) fn registry_outbox_record(
         generation: 0,
         updated_at: event.occurred_at_ms / 1_000,
         allow_genesis,
+        incarnation: None,
     })
 }
 
@@ -309,6 +310,7 @@ pub(crate) fn create_outbox_record(
         generation: 0,
         updated_at: event.occurred_at_ms / 1_000,
         allow_genesis,
+        incarnation: None,
     }
 }
 

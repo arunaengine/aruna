@@ -20,6 +20,7 @@ use tracing::{error, warn};
 use crate::node::outbox::drain_page::{DrainPageOperation, DrainedPage, PageEnd};
 use crate::sync::document_outbox::OutboxTailsOperation;
 use crate::sync::outbox::batches::{DrainInvocation, OutboxLimits};
+use crate::sync::outbox::cleanup::Publication;
 use crate::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use crate::sync::outbox::rotation::OutboxRotation;
 use crate::sync::shard_placement::schedule_retry_after;
@@ -46,7 +47,7 @@ pub struct RotationRunOperation {
     serving: Option<(NodeId, RealmId)>,
     limits: OutboxLimits,
     rotation: OutboxRotation,
-    published: BTreeMap<Vec<u8>, [u8; 32]>,
+    published: BTreeMap<Vec<u8>, Publication>,
     config: Option<Arc<RealmConfigDocument>>,
     invocation: Option<DrainInvocation>,
     before: Option<DrainInvocation>,

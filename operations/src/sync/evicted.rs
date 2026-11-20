@@ -5,10 +5,11 @@
 use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::DocumentEvictedDocument;
+use aruna_core::document::{DocumentEvictedDocument, DocumentOutboxRecord};
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::task::TaskKey;
 use tracing::warn;
@@ -30,16 +31,17 @@ pub struct ReemitOutcome {
 /// A failed write only marks the outcome incomplete; the runner logs a failed drain schedule.
 #[derive(Debug, PartialEq)]
 pub struct ReemitEvictedOperation {
+    records: Vec<DocumentOutboxRecord>,
     writes: VecDeque<Effect>,
     outcome: ReemitOutcome,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl ReemitEvictedOperation {
     pub fn new(node_id: NodeId, documents: Vec<DocumentEvictedDocument>) -> Self {
-        let mut writes = VecDeque::with_capacity(documents.len());
-        let mut complete = true;
-        for document in documents {
-            let record = new_identified_record(
+        let record = |document: DocumentEvictedDocument| {
+            new_identified_record(
                 document.event_id,
                 node_id,
                 document.target,
@@ -47,21 +49,32 @@ impl ReemitEvictedOperation {
                 document.event,
                 document.placement,
                 document.allow_genesis,
-            );
-            match write_outbox_effect(&record) {
-                Ok(effect) => writes.push_back(effect),
-                Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
-                    complete = false;
-                }
-            }
-        }
+            )
+        };
         Self {
-            writes,
+            records: documents.into_iter().map(record).collect(),
+            writes: VecDeque::new(),
             outcome: ReemitOutcome {
                 written: 0,
-                complete,
+                complete: true,
             },
+            ids: IdMint::default(),
+            now_ms: 0,
+        }
+    }
+
+    /// Encodes each record with a fresh incarnation, so the row differs from the one an older
+    /// drain read and its finish cannot delete it.
+    fn encode(&mut self) {
+        for mut record in std::mem::take(&mut self.records) {
+            record.incarnation = Some(self.ids.mint(self.now_ms));
+            match write_outbox_effect(&record) {
+                Ok(effect) => self.writes.push_back(effect),
+                Err(error) => {
+                    warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
+                    self.outcome.complete = false;
+                }
+            }
         }
     }
 
@@ -83,7 +96,16 @@ impl Operation for ReemitEvictedOperation {
     type Output = ReemitOutcome;
     type Error = IoError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn first(&mut self) -> Result<Next<ReemitOutcome>, IoError> {
+        self.encode();
         Ok(self.advance())
     }
 
@@ -117,8 +139,8 @@ fn unexpected(got: &'static str) -> IoError {
 mod tests {
     use super::*;
     use aruna_core::document::{
-        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
-        DocumentSyncRevision, DocumentTarget,
+        DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
+        DocumentTarget,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::StorageError;
@@ -211,6 +233,30 @@ mod tests {
         let second = written_record(operation.next(written()));
         assert_eq!(second.outbox_id, evicted(2).event_id);
         assert_eq!(operation.next(written()), Ok(scheduled_after(2, true)));
+    }
+
+    // A re-emitted row keeps the key of the evicted record but never its bytes: each carries a
+    // fresh incarnation, so the finish of an older drain that read the first row keeps it.
+    #[test]
+    fn reemit_differs_from_read() {
+        let document = evicted(1);
+        let read = crate::sync::outbox::record::new_identified_record(
+            document.event_id,
+            node(),
+            document.target.clone(),
+            Vec::new(),
+            document.event.clone(),
+            document.placement,
+            document.allow_genesis,
+        );
+        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1), evicted(1)]);
+        let first = written_record(operation.first());
+        let second = written_record(operation.next(written()));
+        let key = crate::sync::outbox::record::outbox_key;
+        assert_eq!(key(&first).as_ref(), key(&read).as_ref());
+        let digest = crate::sync::outbox::cleanup::row_digest;
+        assert_ne!(digest(&first), digest(&read));
+        assert_ne!(first.incarnation, second.incarnation);
     }
 
     #[test]

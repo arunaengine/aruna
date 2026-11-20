@@ -237,6 +237,9 @@ pub struct DocumentOutboxRecord {
     /// is missing. Only the node that originated the document sets this; every
     /// other publisher waits (retryable) for the origin's genesis to replicate.
     pub allow_genesis: bool,
+    /// A fresh id eviction recovery writes into a row it re-emits, so the row never equals the
+    /// one an older drain read and finishes; `None` on a first write.
+    pub incarnation: Option<Ulid>,
 }
 
 impl DocumentOutboxRecord {

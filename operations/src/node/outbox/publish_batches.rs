@@ -21,6 +21,7 @@ use tracing::warn;
 use crate::node::outbox::finish_batch::FinishedBatch;
 use crate::node::outbox::sync_batch::SyncBatchOperation;
 use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
+use crate::sync::outbox::cleanup::Publication;
 
 /// What publishing the sub-batches left: the sync outcome, the time the publishes took, the
 /// records this run published with the lineage their topic had, and those it deleted.
@@ -28,7 +29,7 @@ use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
 pub struct PublishedBatches {
     pub outcome: DrainSyncOutcome,
     pub publish_elapsed: Duration,
-    pub published: Vec<(Vec<u8>, [u8; 32])>,
+    pub published: Vec<(Vec<u8>, Publication)>,
     pub deleted: Vec<Vec<u8>>,
 }
 
@@ -46,10 +47,15 @@ struct Syncing {
 }
 
 /// The publications of `batch` a later drain may rely on: each record with the lineage its
-/// topic had. A record without a known lineage leaves none and publishes again on a retry.
-fn evidence(batch: &DrainSubBatch) -> Vec<(Vec<u8>, [u8; 32])> {
+/// topic had and its row's digest. A record missing either publishes again on a retry.
+fn evidence(batch: &DrainSubBatch) -> Vec<(Vec<u8>, Publication)> {
+    let publication = |index: usize| {
+        let stamp = batch.stamp(index);
+        let (lineage, digest) = (stamp.lineage?, stamp.digest?);
+        Some(Publication { lineage, digest })
+    };
     (batch.record_keys.iter().enumerate())
-        .filter_map(|(index, key)| Some((key.clone(), batch.stamp(index).lineage?)))
+        .filter_map(|(index, key)| Some((key.clone(), publication(index)?)))
         .collect()
 }
 
@@ -424,13 +430,19 @@ mod tests {
             record_keys: vec![name.to_vec()],
             stamps: vec![RowStamp {
                 lineage: Some(lineage(name)),
-                digest: None,
+                digest: Some(lineage(name)),
             }],
         }
     }
 
     fn lineage(name: &[u8]) -> [u8; 32] {
         *blake3::hash(name).as_bytes()
+    }
+
+    /// What the run keeps of the publication of the record `name` from [`batch`].
+    fn kept(key: &[u8], name: &[u8]) -> (Vec<u8>, Publication) {
+        let (lineage, digest) = (lineage(name), lineage(name));
+        (key.to_vec(), Publication { lineage, digest })
     }
 
     fn net(event: DocumentNetEvent) -> IoResult {
@@ -457,7 +469,7 @@ mod tests {
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("the batches finish");
         };
-        assert_eq!(done.published, vec![(b"one".to_vec(), lineage(b"one"))]);
+        assert_eq!(done.published, vec![kept(b"one", b"one")]);
         assert_eq!(done.deleted, vec![b"one".to_vec()]);
     }
 
@@ -482,7 +494,7 @@ mod tests {
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("the later batch is held");
         };
-        assert_eq!(done.published, vec![(b"one".to_vec(), lineage(b"one"))]);
+        assert_eq!(done.published, vec![kept(b"one", b"one")]);
         assert!(done.outcome.retry_needed);
     }
 
@@ -508,7 +520,7 @@ mod tests {
         let Ok(Next::Done(done)) = run.next(partial) else {
             panic!("nothing is ready to sync");
         };
-        assert_eq!(done.published, vec![(b"later".to_vec(), lineage(b"one"))]);
+        assert_eq!(done.published, vec![kept(b"later", b"one")]);
         assert!(done.outcome.retry_needed);
     }
 
@@ -576,6 +588,6 @@ mod tests {
         };
         assert!(done.outcome.retry_needed);
         assert_eq!(done.outcome.blocked_topics, vec![TopicId::hash(b"two")]);
-        assert_eq!(done.published, vec![(b"one".to_vec(), lineage(b"one"))]);
+        assert_eq!(done.published, vec![kept(b"one", b"one")]);
     }
 }

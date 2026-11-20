@@ -37,7 +37,9 @@ use crate::sync::document_outbox::{OutboxPagePlan, OutboxReadBatch};
 use crate::sync::outbox::batches::{
     DrainInvocation, DrainSyncOutcome, RowStamp, build_drain_batches, resolve_publish_placement,
 };
-use crate::sync::outbox::cleanup::{Lineages, lineage_call, lineages, row_digest, standing};
+use crate::sync::outbox::cleanup::{
+    Lineages, Publication, lineage_call, lineages, row_digest, standing,
+};
 use crate::sync::outbox::defer::{
     DrainRecord, classify_deferred_record, hold_relays, partition_drain_records,
 };
@@ -69,7 +71,7 @@ pub enum PageEnd {
 pub struct DrainedPage {
     pub invocation: DrainInvocation,
     pub end: PageEnd,
-    pub published: Vec<(Vec<u8>, [u8; 32])>,
+    pub published: Vec<(Vec<u8>, Publication)>,
     pub deleted: Vec<Vec<u8>>,
 }
 
@@ -98,7 +100,7 @@ pub struct DrainPageOperation {
     config: Option<Arc<RealmConfigDocument>>,
     rotation: OutboxRotation,
     limit: usize,
-    published_before: BTreeMap<Vec<u8>, [u8; 32]>,
+    published_before: BTreeMap<Vec<u8>, Publication>,
     digests: BTreeMap<Vec<u8>, [u8; 32]>,
     topics: Vec<TopicId>,
     page: Option<DrainedPage>,
@@ -122,7 +124,7 @@ impl DrainPageOperation {
         rotation: OutboxRotation,
         invocation: DrainInvocation,
         limit: usize,
-        published_before: BTreeMap<Vec<u8>, [u8; 32]>,
+        published_before: BTreeMap<Vec<u8>, Publication>,
     ) -> Self {
         let page = DrainedPage {
             invocation,
@@ -395,7 +397,8 @@ impl DrainPageOperation {
     /// lineage and its row's digest, and publishes them.
     fn publish_with(&mut self, lineages: Lineages) -> PageTurn {
         let to_publish = std::mem::take(&mut self.to_publish);
-        let standing = standing(&self.published_before, &to_publish, &lineages);
+        let read = (&lineages, &self.digests);
+        let standing = standing(&self.published_before, &to_publish, read);
         let (groups, mut subbatches) = build_drain_batches(to_publish, &standing);
         for subbatch in &mut subbatches {
             let entries = subbatch.topics.iter().zip(&subbatch.record_keys);

@@ -24,18 +24,26 @@ const LINEAGE_QUERIES: usize = 16;
 /// Each topic's lineage, `None` where it could not be learned.
 pub type Lineages = BTreeMap<TopicId, Option<[u8; 32]>>;
 
-/// The records a kept publication still stands for: those this process published on the lineage
-/// their topic still has. Any other publishes again, as after a genesis tie-break.
+/// A publication the drain keeps: the lineage its topic had and the digest of the row published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Publication {
+    pub lineage: [u8; 32],
+    pub digest: [u8; 32],
+}
+
+/// The records a kept publication still stands for: those this process published from the same
+/// row on the lineage their topic still has. Any other publishes again, as after a genesis
+/// tie-break or a re-emitted row. `digests` hold the rows as this page read them.
 pub fn standing(
-    published: &BTreeMap<Vec<u8>, [u8; 32]>,
+    published: &BTreeMap<Vec<u8>, Publication>,
     records: &[DrainRecord],
-    lineages: &Lineages,
+    (lineages, digests): (&Lineages, &BTreeMap<Vec<u8>, [u8; 32]>),
 ) -> BTreeSet<Vec<u8>> {
     let holds = |(key, _, topic): &&DrainRecord| {
-        let current = lineages.get(topic).copied().flatten();
-        published
-            .get(key)
-            .is_some_and(|lineage| current == Some(*lineage))
+        let lineage = lineages.get(topic).copied().flatten();
+        let current = lineage.zip(digests.get(key).copied());
+        let current = current.map(|(lineage, digest)| Publication { lineage, digest });
+        current.is_some() && published.get(key).copied() == current
     };
     records
         .iter()
@@ -160,26 +168,38 @@ mod tests {
         (key.to_vec(), record, TopicId::hash(topic))
     }
 
-    // A kept publication stands only while its topic keeps the lineage it was published on; on
-    // another genesis, or without a known lineage, the record publishes again.
+    // A kept publication stands only while its topic keeps the lineage it was published on and
+    // the row is the one published; otherwise the record publishes again.
     #[test]
     fn moved_lineage_republishes() {
         let records = [
             record(b"kept", b"one"),
             record(b"moved", b"two"),
             record(b"unknown", b"three"),
+            record(b"rewritten", b"one"),
         ];
+        let publication = Publication {
+            lineage: [1; 32],
+            digest: [7; 32],
+        };
         let published = BTreeMap::from([
-            (b"kept".to_vec(), [1; 32]),
-            (b"moved".to_vec(), [1; 32]),
-            (b"unknown".to_vec(), [1; 32]),
+            (b"kept".to_vec(), publication),
+            (b"moved".to_vec(), publication),
+            (b"unknown".to_vec(), publication),
+            (b"rewritten".to_vec(), publication),
         ]);
         let lineages = Lineages::from([
             (TopicId::hash(b"one"), Some([1; 32])),
             (TopicId::hash(b"two"), Some([2; 32])),
             (TopicId::hash(b"three"), None),
         ]);
-        let standing = standing(&published, &records, &lineages);
+        let digests = BTreeMap::from([
+            (b"kept".to_vec(), [7; 32]),
+            (b"moved".to_vec(), [7; 32]),
+            (b"unknown".to_vec(), [7; 32]),
+            (b"rewritten".to_vec(), [8; 32]),
+        ]);
+        let standing = standing(&published, &records, (&lineages, &digests));
         assert_eq!(standing, BTreeSet::from([b"kept".to_vec()]));
     }
 
