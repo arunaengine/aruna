@@ -170,9 +170,17 @@ pub async fn get_coverage_count(
     Query(query): Query<CountQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Json<CoverageCountResponse>> {
-    count_route(&state, auth, bearer.as_ref(), &bucket, &headers, false, query.run)
-        .await
-        .map(Json)
+    count_route(
+        &state,
+        auth,
+        bearer.as_ref(),
+        &bucket,
+        &headers,
+        false,
+        query.run,
+    )
+    .await
+    .map(Json)
 }
 
 #[utoipa::path(
