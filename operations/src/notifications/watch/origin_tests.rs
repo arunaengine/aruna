@@ -113,6 +113,35 @@ fn retry_only_open() {
     assert_eq!(emit.state, EmitState::Forward(node_id(3)));
 }
 
+/// A failed interest rebuild between two attempts leaves an empty table: the retry still goes to
+/// its saved holder while it is in the realm, settles once it left, and stays open without the
+/// realm config.
+#[test]
+fn rebuild_keeps_holders() {
+    let retrying = || {
+        let emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), Vec::new());
+        let mut emit = emit.only(Some(vec![node_id(3)]));
+        emit.first().unwrap();
+        emit
+    };
+    let empty = || child::<_, WatchSubscriptionError>(Ok(WatchPage::default()));
+    let mut member = single_server();
+    member.ensure_node(node_id(3), RealmNodeKind::Server);
+    let mut emit = retrying();
+    emit.next(child::<_, GetConfigError>(Ok(member))).unwrap();
+    emit.next(empty()).unwrap();
+    assert_eq!(emit.state, EmitState::Forward(node_id(3)));
+
+    let mut left = retrying();
+    left.next(child::<_, GetConfigError>(Ok(single_server()))).unwrap();
+    assert_eq!(left.next(empty()), Ok(Next::Done(Vec::new())));
+
+    let mut unread = retrying();
+    let failed = GetConfigError::StorageError(StorageError::Timeout);
+    let failed = child::<RealmConfigDocument, _>(Err(failed));
+    assert_eq!(unread.next(failed), Ok(Next::Done(vec![node_id(3)])));
+}
+
 /// A holder that refuses the event settles it: a refusal does not pass on a later run.
 #[test]
 fn refused_forward_settles() {
