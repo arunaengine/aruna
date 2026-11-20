@@ -45,7 +45,7 @@ impl Drop for OutboxBarrier {
 }
 
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, node_routing};
-use aruna_drivers::effect_adapters::task::change_timer;
+use aruna_drivers::effect_adapters::task::{arm_unless_stored, change_timer};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;

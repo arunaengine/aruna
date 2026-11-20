@@ -642,8 +642,10 @@ async fn restore_registration_timer(
         key: TaskKey::PublishRegistration,
         after: aruna_core::federation::PUBLISH_INTERVAL,
     };
+    // A stored renewal, which may be due earlier, wins: restoration arms it, also when it
+    // resumes after this runs.
     if let Event::Task(TaskEvent::Error { message, .. }) =
-        change_timer(storage, Some(task_handle), effect, true).await
+        arm_unless_stored(storage, task_handle, effect).await
     {
         warn!(message = %message, "Failed to arm registry publication timer");
     }
@@ -732,6 +734,39 @@ mod stop_tests {
         )
         .await;
         (temp_dir, task_handle, queues, Shutdown::new())
+    }
+
+    // A stored renewal that restoration has not armed yet keeps its due time: arming the default
+    // interval at start leaves it alone, and only a node without one gets the default.
+    #[tokio::test]
+    async fn stored_renewal_wins() {
+        use aruna_core::federation::PUBLISH_INTERVAL;
+        use aruna_storage::task_timers::read_timer;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        let stored = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &stored)
+            .await
+            .expect("timer persists");
+        let before = read_timer(&storage, &key).await.expect("reads");
+
+        restore_registration_timer(&storage, &task_handle).await;
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
+
+        let fresh_dir = tempdir().expect("temp dir");
+        let fresh = FjallStorage::open(fresh_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        restore_registration_timer(&fresh, &task_handle).await;
+        let armed = read_timer(&fresh, &key).await.expect("reads").expect("row");
+        let limit = aruna_clock::unix_timestamp_millis() + PUBLISH_INTERVAL.as_millis() as u64;
+        assert!(armed.due_unix_millis <= limit);
     }
 
     // A stop accepted before restoration admits no restore unit.

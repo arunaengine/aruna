@@ -3,11 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::events::Event;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::task_timers::{
-    NO_ADMISSION, hold_change, persist_task_effect, timer_has_row, write_owned,
+    NO_ADMISSION, hold_change, persist_task_effect, read_timer, timer_has_row, write_owned,
 };
 use aruna_tasks::TaskHandle;
 use tracing::warn;
@@ -32,6 +35,42 @@ pub async fn change_timer(
 ) -> Event {
     // The row and the scheduler see changes of one key in the same order.
     let _held = hold_change(&effect).await;
+    apply_change(storage, task_handle, effect, keep_live).await
+}
+
+/// Arms a timer only while no row is stored for its key: a stored due time, which may be
+/// earlier, is left for restoration to arm, so this default never postpones it.
+pub async fn arm_unless_stored(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    effect: TaskEffect,
+) -> Event {
+    let _held = hold_change(&effect).await;
+    if let Some(key) = task_effect_key(&effect) {
+        match read_timer(storage, &key).await {
+            Ok(Some(row)) => {
+                let now_ms = unix_timestamp_millis();
+                let left = row.due_unix_millis.saturating_sub(now_ms);
+                let after = Duration::from_millis(left);
+                return Event::Task(TaskEvent::TimerScheduled { key, after });
+            }
+            Ok(None) => {}
+            Err(message) => {
+                let key = Some(key);
+                return Event::Task(TaskEvent::Error { key, message });
+            }
+        }
+    }
+    apply_change(storage, Some(task_handle), effect, true).await
+}
+
+/// [`change_timer`] once its caller holds the key's change lock.
+async fn apply_change(
+    storage: &StorageHandle,
+    task_handle: Option<&TaskHandle>,
+    effect: TaskEffect,
+    keep_live: bool,
+) -> Event {
     let admission = next_admission();
     let key = task_effect_key(&effect);
     let refused = |message| Event::Task(TaskEvent::Error { key, message });
