@@ -302,6 +302,7 @@ mod tests {
             sync: source.sync.inner().clone(),
             metadata: source.metadata.store_database(),
             git_root: root.join("git"),
+            git: None,
         };
         let mut bytes = Vec::new();
         write_backup(&mut bytes, &sources, 11).unwrap();

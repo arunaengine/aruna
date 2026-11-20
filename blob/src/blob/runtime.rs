@@ -302,6 +302,11 @@ impl BlobHandle {
         self.handler.git.get().map(Arc::as_ref)
     }
 
+    /// The installed Git store, shared with holders that outlive this handle.
+    pub fn git_store(&self) -> Option<Arc<crate::git::GitStore>> {
+        self.handler.git.get().cloned()
+    }
+
     /// Closes the blob write path before storage is closed. Mutations that
     /// arrive afterwards are rejected and counted.
     pub fn close_writes(&self) {
