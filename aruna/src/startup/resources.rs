@@ -437,6 +437,8 @@ async fn fill(
         acquired.storage_handle.clone(),
     )
     .await?;
+    // Only the net adapter signs federation payloads, so the key never enters an operation.
+    net_handle.install_federation_keys(config.node_capabilities.clone());
     if let Err(error) = net_handle.reload_realm_peers().await {
         warn!(error = %error, "Failed to refresh realm peers from persisted config during startup");
     }
@@ -567,7 +569,6 @@ async fn fill(
         acquired.task_handle.clone(),
         acquired.jobs_runtime.clone(),
         config.rocrate_limits.clone(),
-        Some(config.node_capabilities.clone()),
     )
     .await;
     acquired.task_queues = Some(task_queues);

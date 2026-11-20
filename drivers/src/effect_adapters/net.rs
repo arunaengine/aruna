@@ -345,6 +345,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
     if let NetEffect::DrawSecret(length) = effect {
         return Event::Net(NetEvent::SecretDrawn(draw_secret(length)));
     }
+    if let NetEffect::FederationSign(bytes) = effect {
+        return Event::Net(NetEvent::FederationSigned(federation_sign(&bytes, context)));
+    }
     if let NetEffect::AvoidHolder { node_id, now_ms } = effect {
         context.avoid_holder(node_id, now_ms);
         return Event::Net(NetEvent::HolderAvoided);
@@ -406,6 +409,17 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
     }
+}
+
+/// Signs federation bytes with the key installed on this node's net handle; a node without one
+/// answers why it cannot sign.
+fn federation_sign(
+    bytes: &[u8],
+    context: &DriverContext,
+) -> Result<aruna_core::federation::FederationSignature, String> {
+    let keys = (context.net_handle.as_ref()).and_then(|net| net.federation_keys());
+    let keys = keys.ok_or_else(|| "this node holds no federation signing key".to_string())?;
+    aruna_core::federation::sign_bytes(bytes, keys).map_err(|error| error.to_string())
 }
 
 /// A secret of `length` letters and digits from the OS random source.

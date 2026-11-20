@@ -146,7 +146,6 @@ async fn start_keeps_job() {
         task_handle.clone(),
         runtime.clone(),
         RoCrateLimits::default(),
-        None,
     )
     .await;
     let shutdown = Shutdown::new();

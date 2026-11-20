@@ -6,7 +6,6 @@ use super::drained::remove_drained_backends;
 use super::*;
 use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use aruna_drivers::driver::node_routing;
-use aruna_operations::federation::registration::PublishRegistrationOperation;
 use std::time::SystemTime;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -213,14 +212,12 @@ pub async fn install_task_queues(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
-    node_capabilities: Option<NodeCapabilities>,
 ) -> TaskQueues {
     install_task_handler(
         context,
         task_handle,
         jobs_runtime,
         rocrate_limits,
-        node_capabilities,
         true,
     )
     .await
@@ -241,7 +238,6 @@ pub async fn start_task_queues(
         task_handle,
         jobs_runtime,
         RoCrateLimits::default(),
-        None,
     )
     .await
     .restore_and_start(shutdown)
@@ -253,14 +249,12 @@ async fn install_task_handler(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
-    node_capabilities: Option<NodeCapabilities>,
     refresh_holders: bool,
 ) -> TaskQueues {
     let handler_context = context.clone();
     let handler = Arc::new(
         OperationsTaskHandler::new(handler_context, jobs_runtime.clone())
-            .with_rocrate_limits(rocrate_limits)
-            .with_node_capabilities(node_capabilities),
+            .with_rocrate_limits(rocrate_limits),
     );
     task_handle.set_inbound_handler(handler.clone()).await;
     // Prime the origin-side watch interest cache from any digests already in
@@ -446,28 +440,6 @@ impl TaskQueues {
                 .reschedule_timer(TaskKey::RefreshBlobHolders, Duration::ZERO)
                 .await;
         }
-    }
-}
-
-impl OperationsTaskHandler {
-    pub(super) async fn publish_registration(&self) {
-        let key = TaskKey::PublishRegistration;
-        match (self.context.net_handle.as_ref(), &self.node_capabilities) {
-            (Some(net_handle), Some(capabilities)) => {
-                let publish = PublishRegistrationOperation::new(
-                    *net_handle.realm_id(),
-                    net_handle.node_id(),
-                    capabilities.clone(),
-                );
-                if let Err(error) = drive(publish, &self.context).await {
-                    warn!(task_id = ?key, error = %error, "Failed to publish registry registration");
-                }
-            }
-            _ => warn!(task_id = ?key, "Cannot publish registration without net handle or keys"),
-        }
-        // The fired row is gone, so a refused rearm keeps a live renewal that stores it again.
-        self.keep_retrying(key, aruna_core::federation::PUBLISH_INTERVAL)
-            .await;
     }
 }
 
@@ -730,7 +702,6 @@ mod stop_tests {
             task_handle.clone(),
             JobsRuntime::new_paused(),
             RoCrateLimits::default(),
-            None,
         )
         .await;
         (temp_dir, task_handle, queues, Shutdown::new())

@@ -545,8 +545,8 @@ async fn renewal_rearm_kept() {
     use aruna_core::federation::PUBLISH_INTERVAL;
 
     let (_temp_dir, handler, task_handle) = refusing_handler();
-    handler.publish_registration().await;
     let key = TaskKey::PublishRegistration;
+    handler.run_trigger(key).await;
     let after = armed_after(&task_handle, key, PUBLISH_INTERVAL * 2).await;
     assert!(
         after <= PUBLISH_INTERVAL,

@@ -12,6 +12,7 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::document::ShardTransportMessage;
+use aruna_core::federation::PUBLISH_INTERVAL;
 use aruna_core::git::GitNode;
 use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
@@ -40,6 +41,7 @@ use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::device::publish_queue::DrainOutcome;
 use crate::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
+use crate::federation::registration::RenewalTimerOperation;
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::backend_import::schedule::RunDueOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
@@ -277,6 +279,7 @@ pub enum TimerOperation {
     DrainWitnessQueue(WitnessDrainOperation),
     RunBackendImports(RunDueOperation),
     MaintainRanges(RangeTimerOperation),
+    PublishRegistration(RenewalTimerOperation),
     RefreshBlobHolders(HoldersTimerOperation),
     DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
@@ -426,6 +429,14 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
         }),
+        // The net adapter signs with the node's key, so no key enters this input.
+        TaskKey::PublishRegistration => Some(match input.serving {
+            Some((node_id, realm_id)) => {
+                let renewal = RenewalTimerOperation::new(realm_id, node_id);
+                TimerOperation::PublishRegistration(renewal)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(Some(PUBLISH_INTERVAL))),
+        }),
         TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
             input,
         ))),
@@ -491,6 +502,7 @@ macro_rules! each_timer {
             TimerOperation::DrainWitnessQueue($operation) => $body,
             TimerOperation::RunBackendImports($operation) => $body,
             TimerOperation::MaintainRanges($operation) => $body,
+            TimerOperation::PublishRegistration($operation) => $body,
             TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
@@ -852,6 +864,14 @@ impl TimerRun for RunDueOperation {
     /// The run names when a schedule is due next; a failed run waits for the next rule change.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         Ok(TimerPlan::from(result.unwrap_or(None)))
+    }
+}
+
+impl TimerRun for RenewalTimerOperation {
+    /// A renewal runs again after the publication interval, also after a failed run.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.unwrap_or(Some(PUBLISH_INTERVAL));
+        Ok(TimerPlan::from(after))
     }
 }
 
@@ -1578,6 +1598,15 @@ mod tests {
         assert!(materialize.routing && materialize.cores && !materialize.facts);
         assert_eq!(group_concurrency(7), 4);
         assert_eq!(group_concurrency(0), 1);
+    }
+
+    #[test]
+    fn renewal_without_network() {
+        // A node without a network keeps its renewal armed; a broken run also renews later.
+        let mut idle = timer_operation(&TaskKey::PublishRegistration, &input()).unwrap();
+        let next = TimerPlan::from(Some(PUBLISH_INTERVAL));
+        assert_eq!(idle.first(), Ok(Next::Done(next.clone())));
+        assert_eq!(RenewalTimerOperation::rearm(Err(IoError::Unfinished)), Ok(next));
     }
 
     #[test]

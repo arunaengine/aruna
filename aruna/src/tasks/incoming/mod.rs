@@ -18,7 +18,6 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::identity::JobExecutionClass;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
-use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -201,7 +200,6 @@ pub(crate) struct OperationsTaskHandler {
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
     // Signs registry publications; `None` where no node identity was supplied.
-    node_capabilities: Option<NodeCapabilities>,
 }
 
 struct DrainSubBatch {
@@ -276,13 +274,7 @@ impl OperationsTaskHandler {
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
-            node_capabilities: None,
         }
-    }
-
-    fn with_node_capabilities(mut self, capabilities: Option<NodeCapabilities>) -> Self {
-        self.node_capabilities = capabilities;
-        self
     }
 
     fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
@@ -725,9 +717,7 @@ impl OperationsTaskHandler {
                 }
             }),
             TaskKey::DeliverKeyWakes => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishRegistration => Box::pin(async move {
-                self.publish_registration().await;
-            }),
+            TaskKey::PublishRegistration => Box::pin(self.run_trigger(key)),
             TaskKey::PruneConnectorReferences => Box::pin(self.run_trigger(key)),
             TaskKey::MaintainRanges => Box::pin(self.run_trigger(key)),
             TaskKey::RunBackendImports => Box::pin(self.run_trigger(key)),

@@ -529,6 +529,8 @@ pub enum NetEvent {
     HolderAvoided,
     /// The cursor signature, or `None` when this node cannot sign the cursor.
     CursorSigned(Option<iroh::Signature>),
+    /// The federation signature, or why this node cannot make it.
+    FederationSigned(Result<crate::federation::FederationSignature, String>),
     /// The sealed position, or `None` when it could not be sealed.
     PositionSealed(Option<Vec<u8>>),
     /// The opened position, or `None` when this process did not seal it.
@@ -1074,6 +1076,7 @@ impl Event {
                     DelegationSign,
                     HolderAvoided,
                     CursorSigned,
+                    FederationSigned,
                     PositionSealed,
                     PositionOpened,
                     SecretDrawn,
