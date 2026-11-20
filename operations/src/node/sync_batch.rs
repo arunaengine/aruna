@@ -81,7 +81,8 @@ impl Operation for SyncBatchOperation {
             return Err(IoError::Unfinished);
         };
         let synced = result.child::<DocumentReconcileResult, ApplyError>()?;
-        let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(synced)));
+        let synced = DocumentNetEvent::reconciled(synced);
+        let event = Event::Net(NetEvent::DocumentSync(synced));
         let elapsed = self.now_ms.saturating_sub(self.started_ms);
         let outcome = DrainSyncOutcome {
             sync_elapsed: Duration::from_millis(elapsed),

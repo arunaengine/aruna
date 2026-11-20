@@ -208,6 +208,7 @@ pub type StuckRecord = (u64, DocumentTarget, TopicId, PlacementRef);
 
 /// One bounded invocation of an open rotation: where it reads, what it blocks and what it
 /// counted.
+#[derive(Debug, PartialEq)]
 pub struct DrainInvocation {
     pub outcome: DrainSyncOutcome,
     pub defer: DrainDeferState,

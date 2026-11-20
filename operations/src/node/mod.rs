@@ -7,6 +7,7 @@ pub mod applied_drain;
 pub mod catch_up;
 pub mod contacts;
 pub mod counter_check;
+pub mod drain_page;
 pub mod finish_batch;
 pub mod heartbeat;
 pub mod info;
