@@ -406,7 +406,7 @@ mod tests {
         let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
         let context = aruna_drivers::testing::test_context(storage.clone());
-        let node_id = NodeId::from_bytes(&[2u8; 32]).expect("node id");
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let (id, result) = (ulid::Ulid::from_parts(5, 1), empty());
         let queue = DeferSyncOperation::new(id, node_id, None, result.clone());
 
