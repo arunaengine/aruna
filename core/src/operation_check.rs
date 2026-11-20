@@ -13,7 +13,10 @@ pub fn sample_events() -> Vec<Event> {
     let key = || Vec::<u8>::new().into();
     vec![
         Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-        Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
+        Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+            sequence: 1,
+        }),
         Event::Storage(StorageEvent::TransactionAborted { txn_id }),
         Event::Storage(StorageEvent::ReadResult {
             key: key(),

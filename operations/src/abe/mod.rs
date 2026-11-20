@@ -503,7 +503,7 @@ impl Operation for KeyOperation {
             }
             State::Reuse => self.reuse_read(result.page()?.0),
             State::Count => self.count_read(result.page()?.0),
-            State::Holders => self.notify_holders(result.page()?.0),
+            State::Holders => self.holders_read(result.page()?),
             State::Issue => self.issue_read(result.event()?),
             State::Cleanup | State::Write => {
                 result.done()?;

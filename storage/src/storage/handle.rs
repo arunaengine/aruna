@@ -50,7 +50,8 @@ pub(super) enum CleanupKind {
     Aborted,
     CommitQueued,
     CommitUnknown,
-    Committed,
+    /// Holds the commit's sequence, so a repeated commit answers it again.
+    Committed(u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -326,7 +327,7 @@ impl StorageHandle {
             .lock()
             .expect("transaction cleanup mutex poisoned");
         if pending.get(&txn_id).is_some_and(|entry| {
-            matches!(entry.kind, CleanupKind::Committed | CleanupKind::Aborted)
+            matches!(entry.kind, CleanupKind::Committed(_) | CleanupKind::Aborted)
         }) {
             pending.remove(&txn_id);
             return true;
@@ -375,7 +376,7 @@ impl StorageHandle {
                     entry.kind,
                     CleanupKind::CommitQueued
                         | CleanupKind::CommitUnknown
-                        | CleanupKind::Committed
+                        | CleanupKind::Committed(_)
                         | CleanupKind::Aborted
                 )
             })
@@ -466,15 +467,18 @@ impl StorageHandle {
         let cleanup = cleanup_effect(&effect);
         let cleanup_write = is_cleanup_write(&effect);
         if let StorageEffect::CommitTransaction { txn_id } = &effect
-            && self
+            && let Some(CleanupKind::Committed(sequence)) = self
                 .transaction_cleanup
                 .lock()
                 .expect("transaction cleanup mutex poisoned")
                 .get(txn_id)
-                .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed))
+                .map(|entry| entry.kind)
         {
-            return self
-                .observe_storage_event(StorageEvent::TransactionCommitted { txn_id: *txn_id });
+            let committed = StorageEvent::TransactionCommitted {
+                txn_id: *txn_id,
+                sequence,
+            };
+            return self.observe_storage_event(committed);
         }
         let mut deferred = None;
         let send_result: Result<(), StorageError> = {
@@ -861,7 +865,9 @@ pub(super) fn reserve_cleanup(
     match (kind, previous) {
         (
             CleanupKind::Abort,
-            Some(CleanupKind::CommitQueued | CleanupKind::CommitUnknown | CleanupKind::Committed),
+            Some(
+                CleanupKind::CommitQueued | CleanupKind::CommitUnknown | CleanupKind::Committed(_),
+            ),
         )
         | (CleanupKind::CommitQueued, Some(CleanupKind::Abort | CleanupKind::Aborted))
         | (CleanupKind::CommitUnknown, Some(CleanupKind::Abort | CleanupKind::Aborted)) => {
@@ -943,7 +949,7 @@ pub(super) fn observe_cleanup(
     }
     if pending
         .get(&txn_id)
-        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed | CleanupKind::Aborted))
+        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed(_) | CleanupKind::Aborted))
     {
         return true;
     }
@@ -961,8 +967,11 @@ pub(super) fn observe_cleanup(
         ) => Some(CleanupKind::Aborted),
         (
             CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
-            StorageEvent::TransactionCommitted { txn_id: committed },
-        ) if txn_id == *committed => Some(CleanupKind::Committed),
+            StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                sequence,
+            },
+        ) if txn_id == *committed => Some(CleanupKind::Committed(*sequence)),
         (
             CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
             StorageEvent::Error {
@@ -1094,8 +1103,10 @@ impl ResponseToken {
             ResponseCleanup::Commit(txn_id) => {
                 if matches!(
                     event,
-                    StorageEvent::TransactionCommitted { txn_id: committed }
-                        if txn_id == *committed
+                    StorageEvent::TransactionCommitted {
+                        txn_id: committed,
+                        ..
+                    } if txn_id == *committed
                 ) || matches!(
                     event,
                     StorageEvent::Error {

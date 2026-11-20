@@ -25,9 +25,9 @@ use crate::bootstrap::{
     ensure_onboarding_secret, fetch_core_documents, prepare_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use crate::config::{Config, StartupMode};
-use crate::identity::{mark_onboarding_phase, mark_state_complete};
 use crate::startup::federation::register_default;
+use aruna_config::identity::{mark_onboarding_phase, mark_state_complete};
+use aruna_config::{Config, StartupMode};
 
 pub(crate) struct CoreAnnouncement {
     pub(crate) documents: Vec<DocumentTarget>,
@@ -397,8 +397,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (config, storage) = crate::config::resolve_settings(
-            crate::settings::read_settings_from(&map).expect("settings parse"),
+        let (config, storage) = aruna_config::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await
         .expect("settings resolve");

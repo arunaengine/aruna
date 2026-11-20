@@ -81,6 +81,8 @@ pub struct JoinDecisionResponse {
     pub request: JoinResponse,
     /// Open scoped key request ids created for an approved member on this node.
     pub key_requests: Vec<String>,
+    /// False when a key request could not be opened; the decision holds anyway.
+    pub key_requests_complete: bool,
 }
 
 fn timestamp(value: u64) -> ServerResult<String> {
@@ -395,13 +397,14 @@ Realm and group request policies may deny.
 
 **Behavior**
 - Approval atomically records the decision and assigns the requested roles.
-- `key_requests` lists open scoped key requests for an approved member in encrypted buckets.
+- `key_requests` lists open scoped key requests for an approved member in encrypted buckets;
+  `key_requests_complete` is false when a request could not be opened, and the decision holds.
 - Omitted roles default to the group's single user role; denial grants no roles.
 - Repeating a decision returns its saved result; changing a terminal decision returns 409.
 - Concurrent decisions retain approval if either node accepted an approval granting membership."#,
     params(("id" = Ulid, Path, description = "Group id"), ("request_id" = Ulid, Path, description = "Membership request id")),
     request_body(content = DecideJoinRequest, example = json!({"approve":true,"role_ids":[]})),
-    responses((status = 200, body = JoinDecisionResponse, description = "Saved decision", example = json!({"request":{"request_id":"01JABCDEF0123456789ABCDEFG","group_id":"01JABCDEF0123456789ABCDEFG","user_id":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","message":null,"status":"approved","decided_by":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","decision_reason":null,"created_at":"2026-09-08T00:00:00+00:00","decided_at":"2026-09-08T01:00:00+00:00"},"key_requests":[]})),
+    responses((status = 200, body = JoinDecisionResponse, description = "Saved decision", example = json!({"request":{"request_id":"01JABCDEF0123456789ABCDEFG","group_id":"01JABCDEF0123456789ABCDEFG","user_id":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","message":null,"status":"approved","decided_by":"01JABCDEF0123456789ABCDEFG@YXJ1bmEtZXhhbXBsZS1yZWFsbS0wMDAwMDAwMDAwMDA","decision_reason":null,"created_at":"2026-09-08T00:00:00+00:00","decided_at":"2026-09-08T01:00:00+00:00"},"key_requests":[],"key_requests_complete":true})),
         (status = 400, body = ErrorResponse, description = "Invalid roles or reason"), (status = 401, body = ErrorResponse, description = "Authentication required"), (status = 403, body = ErrorResponse, description = "Membership administration required"), (status = 404, body = ErrorResponse, description = "Request not found"), (status = 409, body = ErrorResponse, description = "Different terminal decision, concurrent change, or device node")), security(("bearer_auth" = [])))]
 async fn decide_join(
     State(state): State<Arc<ServerState>>,
@@ -429,16 +432,18 @@ async fn decide_join(
         },
     )
     .await?;
-    let key_requests = match aruna_core::user::id::UserId::from_string(&request.user_id) {
-        Ok(member) if request.status == "approved" => {
-            let members = vec![member];
-            crate::routes::storage::abe::records::member_requests(&state, &actor, group_id, members)
-                .await
-        }
-        _ => Vec::new(),
-    };
+    let (key_requests, key_requests_complete) =
+        match aruna_core::user::id::UserId::from_string(&request.user_id) {
+            Ok(member) if request.status == "approved" => {
+                let members = vec![member];
+                let requests = crate::routes::storage::abe::records::member_requests;
+                requests(&state, &actor, group_id, members).await
+            }
+            _ => (Vec::new(), true),
+        };
     Ok(Json(JoinDecisionResponse {
         request,
         key_requests,
+        key_requests_complete,
     }))
 }

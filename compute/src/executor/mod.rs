@@ -5,8 +5,8 @@
 use aruna_core::compute::offer::{BackendCaps, WorkerSite};
 use aruna_core::compute::{
     AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, GrantedResources,
-    LogLimits, LogTails, ReconcileEvidence, ResourceEnvelope, TaskOutput, TaskSpec,
-    TombstoneEvidence, TombstoneSpec, UserSpec,
+    LogLimits, LogTails, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, TombstoneSpec,
+    UserSpec,
 };
 use async_trait::async_trait;
 use std::pin::Pin;
@@ -59,7 +59,7 @@ pub fn enforced_limit(
 
 /// What a backend offers whose attempts run on the controller host with an open channel.
 #[cfg(any(all(feature = "apptainer", unix), feature = "docker"))]
-pub(crate) fn host_capabilities(limits: ResourceEnvelope) -> BackendCaps {
+pub(crate) fn host_capabilities(limits: aruna_core::compute::ResourceEnvelope) -> BackendCaps {
     BackendCaps {
         file_staging: true,
         direct_s3: true,

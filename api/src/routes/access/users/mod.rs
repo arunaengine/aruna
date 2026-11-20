@@ -37,7 +37,7 @@ use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
 use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
-use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
+use aruna_operations::onboarding::list_secrets::{ListSecretsOperation, OnboardingSecretEntry};
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
@@ -1631,9 +1631,7 @@ async fn owned_devices(
         })
         .collect::<Vec<_>>();
 
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))?;
+    let secrets = secrets_where(state, |entry| entry.record.mode.owner() == Some(owner)).await?;
     let now = aruna_clock::unix_timestamp_secs();
     for entry in secrets {
         if entry.record.mode.owner() != Some(owner) {
@@ -1851,13 +1849,28 @@ async fn evict_node(
 
 /// Enrollment whose secret this node claimed, so an eviction can retire it.
 async fn claimed_enrollment(state: &Arc<ServerState>, node_id: &str) -> ServerResult<Option<Ulid>> {
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))?;
-    Ok(secrets
-        .into_iter()
-        .find(|entry| entry.state.claimed_node_id() == Some(node_id))
-        .map(|entry| entry.record.enrollment_id))
+    let claimed = secrets_where(state, |entry| {
+        entry.state.claimed_node_id() == Some(node_id)
+    });
+    Ok((claimed.await?.into_iter().next()).map(|entry| entry.record.enrollment_id))
+}
+
+/// The onboarding secrets `keep` selects, read a page at a time.
+async fn secrets_where(
+    state: &Arc<ServerState>,
+    keep: impl Fn(&OnboardingSecretEntry) -> bool,
+) -> ServerResult<Vec<OnboardingSecretEntry>> {
+    let (mut kept, mut after) = (Vec::new(), None);
+    loop {
+        let page = drive(ListSecretsOperation::new(after), &state.get_ctx())
+            .await
+            .map_err(|err| ServerError::InternalError(err.into()))?;
+        kept.extend(page.entries.into_iter().filter(&keep));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(kept),
+        }
+    }
 }
 
 async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> ServerResult<()> {

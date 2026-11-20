@@ -340,7 +340,10 @@ fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
         (transaction, event),
         (
             Some(TransactionEffect::Commit(txn_id)),
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                ..
+            })
         ) if txn_id == *committed
     )
 }
@@ -397,7 +400,9 @@ impl TransactionTracker {
             }
             (
                 Some(TransactionEffect::Commit(txn_id)),
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }),
+                Event::Storage(StorageEvent::TransactionCommitted {
+                    txn_id: committed, ..
+                }),
             ) if txn_id == *committed => {
                 self.states.remove(&txn_id);
             }
@@ -3567,7 +3572,7 @@ mod test {
     }
 
     /// Mints one id from the runner's stamp and entropy and ends with it.
-    #[derive(Debug, Default)]
+    #[derive(Debug, Default, PartialEq)]
     struct Minter {
         now_ms: u64,
         ids: aruna_core::id_mint::IdMint,

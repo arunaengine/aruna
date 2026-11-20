@@ -9,7 +9,7 @@ use super::settings::{
     compute_s3_endpoint, kubernetes_s3_access, kubernetes_workspace, session_s3_port,
 };
 use super::{ComputeBuildError, ComputeSettings, KubernetesSettings};
-use crate::config::Config;
+use aruna_config::Config;
 
 pub(super) async fn build(
     settings: &ComputeSettings,

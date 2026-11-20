@@ -617,7 +617,7 @@ impl<P: Operation> CallRun<P> {
             },
             State::Waiting(wait) => self.deliver(wait, event),
             State::Committing(output, calls) => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id })
+                Event::Storage(StorageEvent::TransactionCommitted { txn_id, .. })
                     if Some(txn_id) == self.txn_id =>
                 {
                     self.txn_id = None;

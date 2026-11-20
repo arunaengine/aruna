@@ -23,7 +23,10 @@ const TXN: Ulid = Ulid::from_bytes([7; 16]);
 type Stepper = crate::stepper::Stepper<Promotion, PromoteError>;
 
 fn committed() -> Event {
-    Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: TXN,
+        sequence: 1,
+    })
 }
 
 fn written() -> Event {

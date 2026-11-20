@@ -17,7 +17,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::settings::HttpsSettings;
+use aruna_config::settings::HttpsSettings;
 
 /// How often the certificate files are checked for a renewal; `SIGHUP` checks at once.
 const RELOAD_INTERVAL: Duration = Duration::from_secs(60 * 60);

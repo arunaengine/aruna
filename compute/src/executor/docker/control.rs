@@ -122,12 +122,13 @@ impl ControlGuard {
     /// on an absent container is lost evidence, never a licence to create one.
     /// The durable write runs on the blocking pool while this guard keeps the lock.
     pub async fn mark_start(&mut self) -> Result<(), BackendError> {
+        let path = self.0.path().to_path_buf();
         let record = self.0.record_mut().ok_or_else(missing_record)?;
         if record.started {
             return Ok(());
         }
         record.started = true;
-        let (path, record) = (self.0.path().to_path_buf(), record.clone());
+        let record = record.clone();
         tokio::task::spawn_blocking(move || control_store::write_json(&path, &record))
             .await
             .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?

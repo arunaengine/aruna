@@ -10,10 +10,7 @@ use aruna::bootstrap::{
     fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use aruna::config::{Config, resolve_settings};
-use aruna::identity::{mark_onboarding_phase, mark_state_complete};
 use aruna::inbound::initialize_incoming_fixture;
-use aruna::settings::read_settings_from;
 use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
@@ -30,6 +27,9 @@ use aruna_blob::blob::BlobHandler;
 use aruna_blob::blob::registry::BackendRegistry;
 use aruna_clock::testing::poll_until;
 use aruna_compute::registry::ExecutorRegistry;
+use aruna_config::identity::{mark_onboarding_phase, mark_state_complete};
+use aruna_config::settings::read_settings_from;
+use aruna_config::{Config, resolve_settings};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metrics::NodeMetrics;
@@ -720,7 +720,7 @@ pub(crate) async fn spawn_keyed_joiner(
 /// Stores a pending server identity with a chosen node key and a delegation the seed's realm key
 /// signs. Startup then refreshes the enrollment with it, as after a restart during onboarding.
 async fn store_pending_joiner(dir: &TempDir, seed: &SeedNode, net_key: [u8; 32]) -> TestResult<()> {
-    use aruna::identity::IdentityStore;
+    use aruna_config::identity::IdentityStore;
     use aruna_core::structs::identity::node_state::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };

@@ -26,6 +26,7 @@ aruna-wire = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-clock = { workspace = true }
+aruna-config = { workspace = true }
 aruna-core = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
@@ -74,9 +75,6 @@ tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 byteview = { workspace = true }
 rand = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
 
 [dev-dependencies]
 aruna-clock = { workspace = true, features = ["test-hooks"] }

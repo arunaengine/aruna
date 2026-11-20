@@ -140,21 +140,25 @@ async fn execute(
         .await
         .map_err(key_error)
 }
-/// Opens key requests for members in the group's encrypted buckets and returns open ids.
+/// Opens key requests for members in the group's encrypted buckets and returns the open ids,
+/// and `false` when a request could not be opened; the membership change holds either way.
 pub(crate) async fn member_requests(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
     members: Vec<aruna_core::user::id::UserId>,
-) -> Vec<String> {
+) -> (Vec<String>, bool) {
     let now = aruna_clock::unix_timestamp_millis();
     let node = state.get_node_id();
     let operation = MemberKeysOperation::new(auth.clone(), node, group_id, members, now);
     match drive(operation, &state.get_ctx()).await {
-        Ok(ids) => ids.iter().map(Ulid::to_string).collect(),
+        Ok(keys) => {
+            let opened = keys.opened.iter().map(Ulid::to_string).collect();
+            (opened, keys.failed.is_empty())
+        }
         Err(error) => {
             tracing::warn!(event = "abe.member_requests.failed", error = %error);
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }

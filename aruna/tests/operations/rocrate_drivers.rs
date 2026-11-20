@@ -1494,7 +1494,7 @@ fn storage_proxy(
                 let committed = gated_commit
                     && matches!(
                         &event,
-                        StorageEvent::TransactionCommitted { txn_id }
+                        StorageEvent::TransactionCommitted { txn_id, .. }
                             if Some(*txn_id) == version_transaction
                     );
                 if committed {

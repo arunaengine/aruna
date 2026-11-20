@@ -287,15 +287,15 @@ pub struct DocumentSyncService {
     // Realm-config kind table shared with the accept loop, so the dial side
     // applies the same node-kind boundary. Empty until the embedder attaches it.
     peer_kinds: PeerKinds,
-    // The temporary folder of a database opened without a configured path. Declared last, so it
-    // is removed only after the database handles above are closed.
-    fallback_dir: Option<tempfile::TempDir>,
+    // The temporary folder of a database opened without a configured path. Declared last and shared
+    // by clones, so the last clone removes it after its database handles above are closed.
+    fallback_dir: Option<Arc<tempfile::TempDir>>,
 }
 
 impl DocumentSyncService {
     /// Keeps the temporary folder the database was opened in until the service is dropped.
     pub(crate) fn keep_fallback(&mut self, dir: Option<tempfile::TempDir>) {
-        self.fallback_dir = dir;
+        self.fallback_dir = dir.map(Arc::new);
     }
 }
 

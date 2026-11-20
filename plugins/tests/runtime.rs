@@ -346,8 +346,10 @@ fn runtime() -> Runtime {
 #[tokio::test]
 async fn refuses_large_first() {
     // An artifact over the limit is refused at once, before it is hashed or waits for a slot.
-    let mut config = RuntimeConfig::default();
-    config.max_artifact = 4;
+    let config = RuntimeConfig {
+        max_artifact: 4,
+        ..RuntimeConfig::default()
+    };
     let runtime = Runtime::new(config).unwrap();
     let mut prepared = std::pin::pin!(runtime.prepare(vec![0; 5]));
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());

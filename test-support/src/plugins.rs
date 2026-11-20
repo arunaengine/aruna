@@ -557,7 +557,6 @@ pub fn job_context(ctx: &DriverContext, fixture: &Fixture) -> JobContext {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&JobProgress::new("bytes")),
         range_turns: Default::default(),
-        handlers: Default::default(),
     }
 }
 
