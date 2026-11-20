@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::structs::execution::job::input::StagingJobSpec;
 use aruna_core::structs::storage::blob::BucketIdentity;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
@@ -14,9 +14,9 @@ use super::JOB_RETENTION_MS;
 use super::records::pages::ServingNode;
 use super::store::mutation_error::JobMutationError;
 use super::store::store_call::RowBatch;
-use super::submit::{SubmitJobError, SubmitJobResult};
-use super::submit_local::HandedJobOperation;
+use super::submit::local::HandedJobOperation;
 use crate::distribution::imports::{Kept, KeptStart};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 /// Handed over imports could not start, or their row could not follow.
 #[derive(Debug, Error, PartialEq)]
@@ -139,13 +139,14 @@ impl Operation for StartKeptOperation {
 mod tests {
     use std::time::SystemTime;
 
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::id::NodeId;
-    use aruna_core::structs::execution::job::{JobId, StagingJobCheckpoint};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::StagingJobCheckpoint;
     use aruna_core::structs::execution::staging::StagingStrategy;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::*;

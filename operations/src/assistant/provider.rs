@@ -2,18 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{ASSISTANT_PROVIDER_KEYSPACE, PROVIDER_OWNER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderSecret, AssistantSecretError,
 };
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::BTreeSet;
 use thiserror::Error;
@@ -163,7 +162,7 @@ impl Operation for CreateProviderOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<AssistantProvider>, ProviderStoreError> {
         match std::mem::replace(&mut self.stage, CreateStage::Written) {
             CreateStage::Index => {
-                let mut index = decode_index(rows::value(result)?.as_ref())?;
+                let mut index = decode_index(result.value()?.as_ref())?;
                 if !index.insert(self.provider.provider_id.clone()) {
                     return Err(ProviderStoreError::IdCollision);
                 }
@@ -172,13 +171,13 @@ impl Operation for CreateProviderOperation {
                 Ok(Next::Call(IoCall::Read(vec![read])))
             }
             CreateStage::Provider(index) => {
-                if rows::value(result)?.is_some() {
+                if result.value()?.is_some() {
                     return Err(ProviderStoreError::IdCollision);
                 }
                 Ok(Next::Call(self.write(&index)?))
             }
             CreateStage::Written => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.provider.clone()))
             }
         }
@@ -217,7 +216,7 @@ impl Operation for GetProviderOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProviderStoreError> {
-        let provider = (rows::value(result)?)
+        let provider = (result.value()?)
             .map(|value| AssistantProvider::from_bytes(value.as_ref()))
             .transpose()?;
         let owned = provider.filter(|provider| provider.user_id == self.user_id);
@@ -273,11 +272,9 @@ impl Operation for ListProviderOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProviderStoreError> {
         if let Some(provider_ids) = self.provider_ids.take() {
-            return Ok(Next::Done(
-                self.collect(&provider_ids, rows::all_values(result)?)?,
-            ));
+            return Ok(Next::Done(self.collect(&provider_ids, result.values()?)?));
         }
-        let index = decode_index(rows::value(result)?.as_ref())?;
+        let index = decode_index(result.value()?.as_ref())?;
         if index.is_empty() {
             return Ok(Next::Done(Vec::new()));
         }
@@ -341,10 +338,10 @@ impl Operation for UpdateProviderOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<AssistantProvider>, ProviderStoreError> {
         if self.written {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(self.provider.clone()));
         }
-        self.check(rows::value(result)?)?;
+        self.check(result.value()?)?;
         let (space, key) = provider_row(&self.provider.provider_id);
         self.written = true;
         Ok(Next::Call(IoCall::Write(vec![(
@@ -363,8 +360,8 @@ impl Operation for UpdateProviderOperation {
 mod pure_tests {
     use super::*;
     use aruna_core::credential_encryption::EncryptedS3Secret;
+    use aruna_core::structs::assistant_provider::{AssistantProviderKind, AssistantProviderStatus};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{AssistantProviderKind, AssistantProviderStatus};
 
     #[test]
     fn rejects_stale_update() {
@@ -441,7 +438,7 @@ impl Operation for DeleteProviderOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ProviderStoreError> {
         match std::mem::replace(&mut self.stage, DeleteStage::Written) {
             DeleteStage::Provider => {
-                let value = rows::value(result)?.ok_or(ProviderStoreError::NotFound)?;
+                let value = result.value()?.ok_or(ProviderStoreError::NotFound)?;
                 if AssistantProvider::from_bytes(value.as_ref())?.user_id != self.user_id {
                     return Err(ProviderStoreError::NotFound);
                 }
@@ -449,7 +446,7 @@ impl Operation for DeleteProviderOperation {
                 Ok(Next::Call(IoCall::Read(vec![owner_row(self.user_id)])))
             }
             DeleteStage::Index => {
-                let mut index = decode_index(rows::value(result)?.as_ref())?;
+                let mut index = decode_index(result.value()?.as_ref())?;
                 if !index.remove(&self.provider_id) {
                     return Err(ProviderStoreError::IndexInconsistent);
                 }
@@ -459,12 +456,12 @@ impl Operation for DeleteProviderOperation {
                 )])))
             }
             DeleteStage::Deleted(index) => {
-                rows::done(result)?;
+                result.done()?;
                 let (space, key) = owner_row(self.user_id);
                 Ok(Next::Call(IoCall::Write(vec![(space, key, index)])))
             }
             DeleteStage::Written => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }

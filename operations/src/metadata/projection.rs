@@ -6,11 +6,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     COMMIT_MESSAGE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE, NODE_STATE_KEYSPACE,
@@ -25,7 +25,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
     event_log_key, graph_lifecycle_key, materialization_job_entry, materialization_status_key,
@@ -42,16 +42,16 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::call_results::{effect_event, page_rows};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
+use crate::metadata::owned_events::{Owned, OwnedEventsOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{
     create_materialization_entries, create_outbox_entries, create_outbox_record,
     registry_outbox_record, schedule_materialization, schedule_projection,
 };
 use crate::realm::mutate_placement::node_kind;
-use crate::sync::outbox_record::schedule_drain_effect;
+use crate::sync::outbox::record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use aruna_core::errors::StorageReadError;
 
@@ -90,7 +90,7 @@ impl Operation for StoreSkewOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -565,7 +565,8 @@ impl ProjectEventsOperation {
                         return Ok(Flow::Call(read_row(MATERIALIZATION_STATUS_KEYSPACE, key)));
                     }
                     (None, Some(result)) => {
-                        let status = value(result)?
+                        let status = result
+                            .value()?
                             .map(|bytes| decode::<MaterializationStatusRecord>(&bytes))
                             .transpose()?;
                         self.status_cache.insert(document_id, status.clone());
@@ -631,7 +632,7 @@ impl ProjectEventsOperation {
         answer: Option<IoResult>,
     ) -> Result<Flow, MetadataProjectionError> {
         let journaled = match answer {
-            Some(result) => value(result)?.is_some(),
+            Some(result) => result.value()?.is_some(),
             None => true,
         };
         if !journaled && let Some(source) = current.source.as_ref() {
@@ -664,7 +665,7 @@ impl ProjectEventsOperation {
                     counter: batch.counter,
                 })));
             };
-            if !dot_answer(effect_event(result)?)? {
+            if !dot_answer(result.event()?)? {
                 let job = MetadataMaterializationRecord::new(&current.event, self.now_ms);
                 self.writes.push(materialization_job_entry(&job)?);
                 self.writes.push(document_job_entry(&job)?);
@@ -703,7 +704,7 @@ impl ProjectEventsOperation {
                 );
                 return Ok(Flow::Call(read_row(PENDING_PROJECTION_KEYSPACE, key)));
             };
-            current.mint_pending = value(result)?.is_some();
+            current.mint_pending = result.value()?.is_some();
         }
         if !current.needs_projection && !current.mint_pending {
             return Ok(Flow::EventDone);
@@ -772,7 +773,8 @@ impl ProjectEventsOperation {
         answer: Option<IoResult>,
     ) -> Result<Flow, MetadataProjectionError> {
         let lifecycle = match answer {
-            Some(result) => value(result)?
+            Some(result) => result
+                .value()?
                 .and_then(|bytes| postcard::from_bytes::<MetadataLifecycleRecord>(&bytes).ok()),
             None => None,
         };
@@ -858,7 +860,7 @@ impl ProjectEventsOperation {
         self.has_outboxes |= outbox.is_some();
         if let Some(registry_outbox) = registry_outbox {
             self.writes.push(
-                crate::sync::outbox_record::outbox_write_entry(&registry_outbox)
+                crate::sync::outbox::record::outbox_write_entry(&registry_outbox)
                     .map_err(ConversionError::from)?,
             );
             self.has_outboxes = true;
@@ -981,15 +983,15 @@ impl ProjectEventsOperation {
             ));
         };
         match expected {
-            Answer::Done => Ok(done(result)?),
+            Answer::Done => Ok(result.done()?),
             Answer::Child => Ok(result.child::<(), MetadataProjectionError>()??),
             Answer::Ignored => {
-                let _ = effect_event(result);
+                let _ = result.event();
                 Ok(())
             }
             Answer::Wake => {
                 if let Ok(Event::Task(aruna_core::task::TaskEvent::Error { message, .. })) =
-                    effect_event(result)
+                    result.event()
                 {
                     warn!(%message, "Failed to wake a metadata drain after projection");
                 }
@@ -1020,7 +1022,8 @@ fn author_message_read(event: &MetadataEventRecord) -> IoCall {
 }
 
 fn message_value(result: IoResult) -> Result<Option<String>, MetadataProjectionError> {
-    value(result)?
+    result
+        .value()?
         .map(|bytes| decode::<String>(&bytes))
         .transpose()
 }
@@ -1049,14 +1052,16 @@ impl Operation for ProjectEventsOperation {
     fn next(&mut self, result: IoResult) -> ProjectTurn {
         if self.max_skew_ms.is_none() {
             // A node that never stored the setting keeps the default.
-            let stored = value(result)?.and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
+            let stored = result
+                .value()?
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
             self.max_skew_ms = Some(stored.map_or(DEFAULT_SKEW_MS, u64::from_be_bytes));
             return Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)));
         }
         if !self.generation_read {
             // The answer to the cache generation read; a node without the cache has none.
             if let Ok(Event::Metadata(MetadataEvent::CacheGeneration { generation })) =
-                effect_event(result)
+                result.event()
             {
                 self.cache_generation = Some(generation);
             }
@@ -1105,10 +1110,10 @@ impl Operation for ProjectionCommitOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataProjectionError> {
         if self.writes.is_empty() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
-        let read: Vec<Option<Value>> = aruna_core::rows::all_values(result)?;
+        let read: Vec<Option<Value>> = result.values()?;
         let lifecycle_reads = self.graph_iris.len();
         if read.len() != lifecycle_reads + self.fence.reads().len() {
             return Err(MetadataProjectionError::UnexpectedEvent(
@@ -1182,7 +1187,7 @@ impl ProjectLoggedOperation {
     }
 
     fn events_read(&mut self, result: IoResult) -> LoggedTurn {
-        let read = aruna_core::rows::all_values(result)?;
+        let read = result.values()?;
         let mut events = Vec::new();
         let mut orphans = Vec::new();
         for ((document_id, event_id), value) in self.targets.iter().copied().zip(read) {
@@ -1244,7 +1249,7 @@ impl Operation for ProjectLoggedOperation {
         match self.stage {
             LoggedStage::Events => self.events_read(result),
             LoggedStage::Orphans => {
-                done(result)?;
+                result.done()?;
                 let project = self.project.take().ok_or_else(|| {
                     MetadataProjectionError::UnexpectedEvent("the projection is missing".into())
                 })?;
@@ -1263,18 +1268,23 @@ impl Operation for ProjectLoggedOperation {
 }
 
 /// One drain pass of the pending projection queue: projects the events of the first page of
-/// markers and deletes malformed and orphan markers.
+/// markers and deletes malformed and orphan markers. Events a queued applied batch owns stay for
+/// the applied drain, which projects them in acceptance order; a page of only those reads on.
 #[derive(Debug, PartialEq)]
 pub struct DrainProjectionOperation {
     local_node: Option<NodeId>,
     stage: DrainStage,
     has_more: bool,
+    after: Option<Key>,
+    /// Markers left for the applied drain; they count as examined.
+    deferred: usize,
 }
 
 #[derive(Debug, PartialEq)]
 enum DrainStage {
     Page,
     Malformed(Vec<(Ulid, Ulid)>),
+    Owned(Vec<(Ulid, Ulid)>),
     Project,
 }
 
@@ -1294,7 +1304,28 @@ impl DrainProjectionOperation {
             local_node,
             stage: DrainStage::Page,
             has_more: false,
+            after: None,
+            deferred: 0,
         }
+    }
+
+    fn page(&mut self) -> DrainTurn {
+        self.stage = DrainStage::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.clone(),
+            limit: PROJECTION_PAGE_SIZE,
+        }))
+    }
+
+    fn check_owned(&mut self, targets: Vec<(Ulid, Ulid)>) -> DrainTurn {
+        if targets.is_empty() {
+            return self.project(targets);
+        }
+        let owned = OwnedEventsOperation::new(targets.iter().map(|(document_id, _)| *document_id));
+        self.stage = DrainStage::Owned(targets);
+        Ok(Next::Call(IoCall::child(owned)))
     }
 
     fn project(&mut self, targets: Vec<(Ulid, Ulid)>) -> DrainTurn {
@@ -1309,19 +1340,15 @@ impl Operation for DrainProjectionOperation {
     type Error = MetadataProjectionError;
 
     fn first(&mut self) -> DrainTurn {
-        Ok(Next::Call(IoCall::Page {
-            space: PENDING_PROJECTION_KEYSPACE.to_string(),
-            prefix: Key::from(Vec::new()),
-            after: None,
-            limit: PROJECTION_PAGE_SIZE,
-        }))
+        self.page()
     }
 
     fn next(&mut self, result: IoResult) -> DrainTurn {
         match std::mem::replace(&mut self.stage, DrainStage::Project) {
             DrainStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.has_more = next.is_some();
+                self.after = next;
                 let mut targets = Vec::with_capacity(rows.len());
                 let mut malformed = Vec::new();
                 for (key, _) in rows {
@@ -1334,19 +1361,29 @@ impl Operation for DrainProjectionOperation {
                     }
                 }
                 if malformed.is_empty() {
-                    return self.project(targets);
+                    return self.check_owned(targets);
                 }
                 self.stage = DrainStage::Malformed(targets);
                 Ok(Next::Call(IoCall::Delete(malformed)))
             }
             DrainStage::Malformed(targets) => {
-                done(result)?;
+                result.done()?;
+                self.check_owned(targets)
+            }
+            DrainStage::Owned(mut targets) => {
+                let owned = result.child::<Owned, IoError>()??;
+                let examined = targets.len();
+                targets.retain(|target| !owned.contains(target));
+                self.deferred = self.deferred.saturating_add(examined - targets.len());
+                if targets.is_empty() && self.has_more {
+                    return self.page();
+                }
                 self.project(targets)
             }
             DrainStage::Project => {
                 let logged = result.child::<LoggedProjection, MetadataProjectionError>()??;
                 Ok(Next::Done(PendingProjectionResult {
-                    markers_examined: logged.existing,
+                    markers_examined: logged.existing.saturating_add(self.deferred),
                     projected: logged.projected,
                     has_more: self.has_more,
                 }))
@@ -1356,12 +1393,15 @@ impl Operation for DrainProjectionOperation {
 }
 
 /// Replays one page of the event log into the projection; answers what it projected and where
-/// the next page starts, so a shell can stop at a page boundary.
+/// the next page starts, so a shell can stop at a page boundary. Events a queued applied batch
+/// owns are left to the applied drain, which projects them in acceptance order.
 #[derive(Debug, PartialEq)]
 pub struct ReplayPageOperation {
     after: Option<Key>,
     local_node: Option<NodeId>,
     next: Option<Key>,
+    /// The page's events while the owned ones are looked up.
+    events: Option<Vec<MetadataEventRecord>>,
     projecting: bool,
 }
 
@@ -1371,6 +1411,7 @@ impl ReplayPageOperation {
             after,
             local_node,
             next: None,
+            events: None,
             projecting: false,
         }
     }
@@ -1394,14 +1435,22 @@ impl Operation for ReplayPageOperation {
             let projected = result.child::<usize, MetadataProjectionError>()??;
             return Ok(Next::Done((projected, self.next.take())));
         }
-        let (rows, next) = page_rows(result)?;
+        if let Some(mut events) = self.events.take() {
+            let owned = result.child::<Owned, IoError>()??;
+            events.retain(|event| !owned.contains(&(event.record.document_id, event.event_id)));
+            self.projecting = true;
+            let project = ProjectEventsOperation::new(events, self.local_node);
+            return Ok(Next::Call(IoCall::child(project)));
+        }
+        let (rows, next) = result.page()?;
         self.next = next;
         let events = (rows.iter())
             .map(|(_, value)| decode::<MetadataEventRecord>(value))
             .collect::<Result<Vec<_>, _>>()?;
-        self.projecting = true;
-        let project = ProjectEventsOperation::new(events, self.local_node);
-        Ok(Next::Call(IoCall::child(project)))
+        let documents = events.iter().map(|event| event.record.document_id);
+        let owned = OwnedEventsOperation::new(documents);
+        self.events = Some(events);
+        Ok(Next::Call(IoCall::child(owned)))
     }
 }
 
@@ -1437,7 +1486,7 @@ impl Operation for DotAppliedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, MetadataProjectionError> {
-        Ok(Next::Done(dot_answer(effect_event(result)?)?))
+        Ok(Next::Done(dot_answer(result.event()?)?))
     }
 }
 
@@ -1462,7 +1511,7 @@ impl Operation for ProjectionWakeOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataProjectionError> {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
                 Err(MetadataProjectionError::UnexpectedEvent(message))
             }
@@ -1505,18 +1554,75 @@ impl Operation for ProjectionTimerOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataProjectionError> {
         if self.waking {
             if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
-                effect_event(result)?
+                result.event()?
             {
                 warn!(message = %message, "Failed to restore metadata projection timer");
             }
             return Ok(Next::Done(()));
         }
-        let (rows, _) = page_rows(result)?;
+        let (rows, _) = result.page()?;
         if rows.is_empty() {
             return Ok(Next::Done(()));
         }
         self.waking = true;
         Ok(Next::Call(effect_call(schedule_projection(Duration::ZERO))))
+    }
+}
+
+/// One projection timer run: drains a page of pending markers and, when the queue held none,
+/// replays the whole event log page by page as the fallback. Outputs when the timer runs again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectionRunOperation {
+    local_node: Option<NodeId>,
+    replaying: bool,
+}
+
+type RunTurn = Result<Next<Option<Duration>>, IoError>;
+
+impl ProjectionRunOperation {
+    pub fn new(local_node: Option<NodeId>) -> Self {
+        Self {
+            local_node,
+            replaying: false,
+        }
+    }
+
+    fn replay_page(&mut self, after: Option<Key>) -> RunTurn {
+        self.replaying = true;
+        let page = ReplayPageOperation::new(after, self.local_node);
+        Ok(Next::Call(IoCall::child(page)))
+    }
+}
+
+impl Operation for ProjectionRunOperation {
+    type Output = Option<Duration>;
+    type Error = IoError;
+
+    fn first(&mut self) -> RunTurn {
+        let drain = DrainProjectionOperation::new(self.local_node);
+        Ok(Next::Call(IoCall::child(drain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> RunTurn {
+        if self.replaying {
+            return match result.child::<(usize, Option<Key>), MetadataProjectionError>()? {
+                Ok((_, Some(next))) => self.replay_page(Some(next)),
+                Ok((_, None)) => Ok(Next::Done(None)),
+                Err(error) => {
+                    warn!(%error, "Failed to replay metadata event log fallback");
+                    Ok(Next::Done(Some(PROJECTION_RETRY_AFTER)))
+                }
+            };
+        }
+        match result.child::<PendingProjectionResult, MetadataProjectionError>()? {
+            Ok(drained) if drained.has_more => Ok(Next::Done(Some(Duration::ZERO))),
+            Ok(drained) if drained.markers_examined == 0 => self.replay_page(None),
+            Ok(_) => Ok(Next::Done(None)),
+            Err(error) => {
+                warn!(%error, "Failed to drain metadata projection queue");
+                Ok(Next::Done(Some(PROJECTION_RETRY_AFTER)))
+            }
+        }
     }
 }
 

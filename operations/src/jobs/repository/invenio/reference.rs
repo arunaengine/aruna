@@ -13,7 +13,7 @@ use aruna_core::repository::invenio::{
 };
 use aruna_core::repository::remote::{NodeScope, RemoteCall};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ImportRoCrateSource, ImportRoCrateSpec};
+use aruna_core::structs::execution::job::input::{ImportRoCrateSource, ImportRoCrateSpec};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::StagingStrategy;
@@ -27,7 +27,7 @@ use crate::connectors::descriptor::build_source_binding;
 use crate::jobs::repository::connector::{ConnectOperation, ConnectRequest};
 use crate::jobs::repository::link_store::time_of;
 use crate::jobs::repository::{JobScope, TransferError, not_supported, remote_call};
-use crate::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+use crate::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
 
 #[derive(Debug, PartialEq)]
 enum ReferenceStep {

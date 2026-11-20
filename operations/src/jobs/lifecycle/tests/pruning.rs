@@ -5,11 +5,11 @@
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE};
-use aruna_core::structs::execution::job::record_keys::family_prefix;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     ExecutionStop, JobFamilyRecord, JobRecordBody, PhysicalExecutionState, StopEvidence,
-    job_record_key,
 };
+use aruna_core::structs::execution::job::local::job_record_key;
+use aruna_core::structs::execution::job::record_keys::family_prefix;
 use aruna_core::types::Key;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;

@@ -5,7 +5,6 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
@@ -19,10 +18,11 @@ use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, SessionKind};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::document_repository::GetConfigError;
-use crate::session::{
+use crate::session::create::{
     CreateSessionConfig, CreateSessionError, CreateSessionOperation, CreatedSession,
 };
 use crate::users::read_document::ReadUserError;
@@ -330,11 +330,11 @@ impl Operation for FederatedLoginOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::auth::{Actor, SessionRef};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::user::User;
+    use aruna_core::user::id::UserId;
     use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;

@@ -21,12 +21,13 @@ use serde_json::Value as JsonValue;
 use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
-use crate::replication::protocol::LocationSummaryRequest;
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::local::{LocalSummary, LocationSummaryOperation};
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::replication_protocol::LocationSummaryRequest;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 const FILE_TYPES: [&str; 4] = [
     "File",
@@ -561,7 +562,6 @@ mod tests {
         };
         assert_eq!(done, Ok(Next::Done(expected)));
     }
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -576,6 +576,7 @@ mod tests {
     use aruna_core::structs::storage::blob::{BucketInfo, HashIndex};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX;
+    use aruna_core::user::id::UserId;
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
@@ -594,7 +595,7 @@ mod tests {
     }
 
     async fn fixture(anonymous_read: bool) -> Fixture {
-        let staging = crate::tests::staging::setup_driver_context().await;
+        let staging = aruna_test_support::staging::setup_driver_context().await;
         let context = staging.driver_context;
         let realm_id = RealmId::from_bytes([61; 32]);
         let owner = UserId::local(Ulid::from_bytes([62; 16]), realm_id);

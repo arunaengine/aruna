@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::keyspaces::{
@@ -17,6 +16,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 
 use super::list::{admin_check, authorized};
 use super::{Cutoffs, GroupToken, GroupTokensError, TokenKind, TokenStatus};
@@ -24,7 +24,8 @@ use super::{config_read, parse_config};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::{RevokeTokenError, RevokeTokenOperation, owner_cutoff};
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
-use crate::s3::session::{RevokeS3Config, RevokeS3Operation, S3SessionError};
+use crate::s3::session::S3SessionError;
+use crate::s3::session::revoke::{RevokeS3Config, RevokeS3Operation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RevokeTarget {

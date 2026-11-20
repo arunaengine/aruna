@@ -5,10 +5,8 @@
 pub mod change;
 pub mod create;
 pub mod cron;
-pub mod discovery;
 pub mod folders;
 pub mod remove;
-pub mod schedule;
 pub mod shared;
 
 use crate::groups::backends::RecordReadError;
@@ -19,7 +17,8 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row, values};
-use aruna_core::structs::execution::job::{JobError, JobId, JobRecord, JobState, job_record_key};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::{JobError, JobRecord, job_record_key};
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, import_key, object_prefix, read_patterns,
@@ -29,8 +28,6 @@ use aruna_core::types::{GroupId, Key, Value};
 use std::path::Path;
 use thiserror::Error;
 use ulid::Ulid;
-
-pub use folders::folders_overlap;
 
 const RULE_PAGE: usize = 256;
 
@@ -55,7 +52,7 @@ pub enum ImportRuleError {
     #[error("storage read failed: {0}")]
     Read(String),
     #[error(transparent)]
-    Submit(#[from] crate::jobs::submit::SubmitJobError),
+    Submit(#[from] aruna_core::job_request::SubmitJobError),
     #[error("unexpected event in state {0}")]
     Unexpected(&'static str),
     #[error("import rule storage failed: {0}")]
@@ -337,6 +334,7 @@ impl Operation for ReadEarlierOperation {
 
 #[cfg(test)]
 mod tests {
+    use super::folders::folders_overlap;
     use super::*;
 
     fn import_rule() -> BackendImport {

@@ -5,22 +5,18 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{
     Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
 };
-use aruna_core::metadata::MetadataError;
-use aruna_core::operation::{EffectOperation, Operation};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::id::NodeId;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_answer, encode_message, metadata_request, peer_call,
+};
+use aruna_core::operation::Operation;
 use thiserror::Error;
 use tracing::{debug, warn};
-
-use crate::metadata::protocol::{
-    MetadataTransportMessage, decode_answer, encode_message, metadata_request,
-};
 
 /// What one holder's answer means to the fetch.
 #[derive(Debug, PartialEq)]
@@ -73,13 +69,15 @@ pub enum FetchError {
 #[derive(Debug, PartialEq)]
 pub struct HolderFetchOperation<T> {
     holders: Vec<NodeId>,
-    frame: PeerFrame,
+    frame: Result<PeerFrame, String>,
     remaining: Duration,
     budget: Budget,
     asked: Option<usize>,
     answered: bool,
-    output: Option<Result<Fetched<T>, FetchError>>,
+    marker: std::marker::PhantomData<T>,
 }
+
+type FetchTurn<T> = Result<Next<Fetched<T>>, FetchError>;
 
 impl<T: HolderRecord> HolderFetchOperation<T> {
     pub fn new(
@@ -88,55 +86,50 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
         deadline: Duration,
         budget: Budget,
     ) -> Self {
-        let (frame, output) = match PeerFrame::encode(request) {
-            Ok(frame) => (frame, None),
-            Err(error) => (PeerFrame::default(), Some(Ok(Fetched::Unavailable(error)))),
-        };
         Self {
             holders: holders.to_vec(),
-            frame,
+            frame: PeerFrame::encode(request),
             remaining: deadline,
             budget,
             asked: None,
             answered: false,
-            output,
+            marker: std::marker::PhantomData,
         }
     }
 
-    fn ask(&mut self, index: usize) -> Effects {
+    fn ask(&mut self, index: usize) -> FetchTurn<T> {
         let Some(peer) = self.holders.get(index).copied() else {
-            return self.finish();
+            return Ok(self.finish());
         };
         if self.remaining.is_zero() {
-            return self.finish();
+            return Ok(self.finish());
         }
         let timeout = match self.budget {
             Budget::Shared => self.remaining,
             Budget::Split => self.remaining / (self.holders.len() - index) as u32,
         };
+        let frame = match &self.frame {
+            Ok(frame) => frame.bytes(),
+            Err(error) => return Ok(Next::Done(Fetched::Unavailable(error.clone()))),
+        };
         self.asked = Some(index);
-        smallvec![Effect::Net(NetEffect::MetadataRequest(Box::new(
-            metadata_request(peer, self.frame.bytes(), timeout)
-        )))]
+        Ok(Next::Call(peer_call(peer, frame, timeout)))
     }
 
-    fn finish(&mut self) -> Effects {
-        self.asked = None;
-        let outcome = match self.answered {
+    fn finish(&self) -> Next<Fetched<T>> {
+        Next::Done(match self.answered {
             true => Fetched::NotFound,
             false => Fetched::Unavailable(format!("no {} holder answered", T::LABEL)),
-        };
-        self.output = Some(Ok(outcome));
-        smallvec![]
+        })
     }
 
-    fn answer(&mut self, index: usize, answer: MetadataAnswer) -> Effects {
+    fn answer(&mut self, index: usize, answer: MetadataAnswer) -> FetchTurn<T> {
         self.remaining = self.remaining.saturating_sub(answer.elapsed);
         let holder = answer.peer;
         let bytes = match answer.result {
             Ok(bytes) => bytes,
             Err(PeerRequestError::TimedOut) if self.budget == Budget::Shared => {
-                return self.finish();
+                return Ok(self.finish());
             }
             Err(error) => {
                 warn!(peer = %holder, error = ?error, fetch = T::LABEL, "Holder fetch failed");
@@ -151,16 +144,8 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
             }
         };
         match T::read(message) {
-            Answer::Found(value) => {
-                self.asked = None;
-                self.output = Some(Ok(Fetched::Found { holder, value }));
-                smallvec![]
-            }
-            Answer::Denied => {
-                self.asked = None;
-                self.output = Some(Ok(Fetched::Denied));
-                smallvec![]
-            }
+            Answer::Found(value) => Ok(Next::Done(Fetched::Found { holder, value })),
+            Answer::Denied => Ok(Next::Done(Fetched::Denied)),
             Answer::Missing => {
                 self.answered = true;
                 self.ask(index + 1)
@@ -173,44 +158,31 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
     }
 }
 
-impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> EffectOperation
-    for HolderFetchOperation<T>
-{
+impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> Operation for HolderFetchOperation<T> {
     type Output = Fetched<T>;
     type Error = FetchError;
 
-    fn start(&mut self) -> Effects {
-        if self.output.is_some() {
-            return smallvec![];
+    fn first(&mut self) -> FetchTurn<T> {
+        match &self.frame {
+            Ok(_) => self.ask(0),
+            Err(error) => Ok(Next::Done(Fetched::Unavailable(error.clone()))),
         }
-        self.ask(0)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    /// Only an answer from the holder that was asked moves the fetch on.
+    fn next(&mut self, result: IoResult) -> FetchTurn<T> {
         let index = self.asked.take();
-        match (index, event) {
-            (Some(index), Event::Net(NetEvent::MetadataAnswer(answer)))
-                if Some(answer.peer) == self.holders.get(index).copied() =>
-            {
-                self.answer(index, *answer)
-            }
-            _ => {
-                self.output = Some(Err(FetchError::Unexpected));
-                smallvec![]
-            }
+        match (index, result) {
+            (Some(index), IoResult::Event(event)) => match *event {
+                Event::Net(NetEvent::MetadataAnswer(answer))
+                    if Some(answer.peer) == self.holders.get(index).copied() =>
+                {
+                    self.answer(index, *answer)
+                }
+                _ => Err(FetchError::Unexpected),
+            },
+            _ => Err(FetchError::Unexpected),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Fetched<T>, FetchError> {
-        self.output.unwrap_or(Err(FetchError::Unfinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -234,36 +206,6 @@ impl std::fmt::Debug for PeerFrame {
             .field("frame_bytes", &self.0.len())
             .finish()
     }
-}
-
-/// The call that sends one encoded request to `peer`; [`peer_reply`] reads its answer.
-pub(crate) fn peer_call(peer: NodeId, frame: Vec<u8>, timeout: Duration) -> IoCall {
-    let request = metadata_request(peer, frame, timeout);
-    IoCall::Effect(Box::new(Effect::Net(NetEffect::MetadataRequest(Box::new(
-        request,
-    )))))
-}
-
-/// The decoded answer of `peer` to a [`peer_call`], or why there is none.
-pub(crate) fn peer_reply(
-    peer: NodeId,
-    result: IoResult,
-) -> Result<Result<MetadataTransportMessage, PeerRequestError>, IoError> {
-    let Event::Net(NetEvent::MetadataAnswer(answer)) = aruna_core::rows::event(result)? else {
-        return Err(IoError::Unexpected {
-            expected: "a peer answer",
-            got: "another event",
-        });
-    };
-    if answer.peer != peer {
-        return Ok(Err(PeerRequestError::Failed(MetadataError::Backend(
-            "the answer came from another peer".to_string(),
-        ))));
-    }
-    Ok(answer.result.and_then(|bytes| {
-        decode_answer(&bytes)
-            .map_err(|error| PeerRequestError::Failed(MetadataError::Backend(error)))
-    }))
 }
 
 /// One peer's answer, or why there is none.

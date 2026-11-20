@@ -5,8 +5,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -16,9 +16,7 @@ use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 use super::super::access::{child_results, children};
 use super::super::head_versions::{HeadVersions, HeadVersionsError, HeadVersionsOperation};
 use super::super::prefix_scan::{PrefixScanError, PrefixScanOperation, ScannedRows};
-use super::super::preflight_types::{
-    MetadataResolvedTarget, MetadataStorageOperation, ReferenceTarget,
-};
+use super::super::preflight_types::{MetadataStorageOperation, ReferenceTarget};
 use super::super::readable::PathPermissionOperation;
 use super::super::{
     ARUNA_DATA_PREFIX, BLOB_VERSIONS_KEYSPACE, BlobHeadKey, BlobVersion, Key, MetadataApiError,
@@ -27,7 +25,8 @@ use super::super::{
 use super::{
     LONG_KEY_ROWS, MAX_TARGET_VERSIONS, ResolvedPreflightTargets, decode_version, version_targets,
 };
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::metadata::api::MetadataResolvedTarget;
 
 type Versions = Vec<(VersionKey, BlobVersion)>;
 

@@ -12,9 +12,11 @@ use aruna_core::effects::Effect;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSelection, InputSource, JobError, JobId, JobRecord,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputSelection, InputSource,
 };
+use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::HashIndex;
@@ -23,7 +25,6 @@ use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
-use futures_util::StreamExt;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -31,19 +32,19 @@ use super::credential::RunIdentity;
 use super::workspace::{
     SourceObject, StagedSource, device_read_error, local_copies, source_input_error, source_object,
 };
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::connectors::root_record::{parse_root, read_root};
 use crate::jobs::lifecycle::stage::{StageError, StageInputOperation, StagedInput};
-use crate::jobs::read_access::{SourceReadError, SourceReadOperation};
 use crate::jobs::store::JobMutation;
 use crate::jobs::store::job_calls::change_job;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::store_call::StoreCall;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::{LocalUserOperation, ManagedReadOperation};
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
+use crate::s3::object::read_access::{SourceReadError, SourceReadOperation};
 use crate::staging::granted_read::GrantedReadOperation;
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
 
 /// The creator as admitted: submissions refuse path restricted credentials.
 fn creator_auth(run: &RunIdentity) -> AuthContext {
@@ -57,7 +58,7 @@ fn creator_auth(run: &RunIdentity) -> AuthContext {
 
 #[derive(Debug, PartialEq)]
 enum SourceStep {
-    Role(aruna_core::NodeId),
+    Role(aruna_core::id::NodeId),
     Authorize,
     Read,
     Copies,
@@ -183,7 +184,7 @@ impl InputSourceOperation {
     /// One exact realm version a device fetches for itself. It plans nothing, so the request's
     /// own version is the only authority, and the bytes land in the run's workspace as a local
     /// copy, never as a reference. A device is never a managed-copy destination.
-    fn device(&mut self, holder: aruna_core::NodeId) -> SourceNext {
+    fn device(&mut self, holder: aruna_core::id::NodeId) -> SourceNext {
         let InputSource::S3 {
             bucket,
             key,
@@ -582,15 +583,8 @@ impl LoadInputsOperation {
         if let Some(pin) = pin {
             self.served.insert(file.dest_key, pin);
         }
-        let stream = file
-            .source
-            .blob
-            .map(|chunk| chunk.map_err(std::io::Error::other));
-        self.files.push(TaskInput::from_stream(
-            file.path,
-            file.size,
-            Box::pin(stream),
-        ));
+        let input = TaskInput::from_blob(file.path, file.size, file.source.blob);
+        self.files.push(input);
         self.next_input()
     }
 

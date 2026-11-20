@@ -6,13 +6,12 @@ use super::*;
 use crate::auth::RealmAuth;
 use crate::auth::extract;
 use crate::error::ServerError;
-use crate::metadata::{
+use crate::metadata::model::{
     CreateMetadataRequest, CreateScaffoldRequest, MetadataQueryMode, ReplaceRoCrateRequest,
 };
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::rocrate::replace_metadata_rocrate;
 use crate::tests::metadata_fixtures::drain_metadata_background;
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -28,6 +27,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -180,7 +180,8 @@ async fn seed_user(state: &ServerState, actor: &Actor, user_id: UserId, name: &s
 async fn setup() -> Fixture {
     let storage_dir = tempfile::tempdir().unwrap();
     let metadata_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
     let realm = realm_id(5);
     let user_id = UserId::local(Ulid::from_bytes([200u8; 16]), realm);
@@ -910,7 +911,7 @@ fn search_maps_partiality() {
     let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
     let result = ObjectExecution {
-        hits: vec![aruna_operations::s3::object::search::ObjectInventoryHit {
+        hits: vec![aruna_core::search::ObjectInventoryHit {
             node_id: healthy,
             group_id: Ulid::from_bytes([23u8; 16]),
             bucket: "data".to_string(),

@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use aruna_core::listener::HostRoutes;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -11,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use super::{HostRoutes, request_host};
+use super::request_host;
 
 /// Answers every request with `308` to its route's origin, or `400` for an unknown host.
 pub fn router(routes: Arc<HostRoutes>) -> Router {

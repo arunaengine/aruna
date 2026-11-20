@@ -5,23 +5,25 @@
 use std::fmt::Debug;
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoResult};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
+use aruna_core::repository::link::{LinkDirection, LinkRemote, LinkStatus, RepositoryLink};
 #[cfg(test)]
 use aruna_core::repository::remote::InvenioAccess;
 use aruna_core::repository::remote::{JobStop, NodeScope, RemoteAnswer, RemoteFailure};
-use aruna_core::repository::{LinkDirection, LinkRemote, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ArtifactRef, JobId, JobProgress, RoCrateLimits};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ArtifactRef, RoCrateLimits};
+use aruna_core::structs::execution::job::local::JobProgress;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, PlacementRef};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use serde_json::Value as Json;
 use tokio_util::sync::CancellationToken;
@@ -128,8 +130,8 @@ pub fn link() -> RepositoryLink {
 }
 
 /// The target of `link` before anything is published.
-pub fn target() -> aruna_core::repository::LinkTarget {
-    aruna_core::repository::LinkTarget {
+pub fn target() -> aruna_core::repository::link::LinkTarget {
+    aruna_core::repository::link::LinkTarget {
         link_id: link().link_id,
         published_id: None,
         parent_id: None,

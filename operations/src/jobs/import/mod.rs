@@ -4,17 +4,15 @@
 
 mod acquire;
 #[cfg(test)]
-mod consortium;
+mod consortium_tests;
 mod finish;
-mod job;
+pub mod job;
 mod plan;
 mod reports;
 pub(crate) mod rewrite;
 pub mod upload;
 pub mod upload_store;
 mod write;
-
-pub use job::ImportJobOperation;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,11 +26,12 @@ use aruna_core::jobs::{JobEffect, JobEvent, JobStops};
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::repository::RepositoryPull;
 use aruna_core::rocrate_archive::{ArchiveCompression, ArchiveInspection};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::identity::{JobId, SYSTEM_ENTRY_PREFIX};
+use aruna_core::structs::execution::job::input::{
     ImportReportDetail, ImportReportRow, ImportRoCrateResult, ImportRoCrateSource,
-    ImportRoCrateSpec, JobError, JobId, JobResultPayload, ReasonCode, RoCrateCheckpointRefs,
-    SYSTEM_ENTRY_PREFIX,
+    ImportRoCrateSpec, ReasonCode, RoCrateCheckpointRefs,
 };
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::blob::{BackendLocation, BucketInfo, HiddenBlobKey};
@@ -47,12 +46,12 @@ use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document};
 use super::metadata_class::MetadataFailure;
 use super::repository::JobScope;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::forward::transport::MetadataWriteError;
-use crate::placement::policy::GateContextError;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::metadata::forward::write::MetadataWriteError;
+use crate::placement::policy::gate::GateContextError;
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::put::PutObjectError;
 use crate::staging::read_source::ReadSourceError;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::repository::remote::NodeScope;
 
@@ -685,12 +684,12 @@ pub(crate) mod tests {
     use crate::jobs::repository::test_support::{
         artifact, job_id, job_scope, local_scope, owner_node, realm,
     };
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::input::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateTarget, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::blob::HIDDEN_BLOB_PREFIX;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
 
     pub(super) fn spec() -> ImportRoCrateSpec {

@@ -4,7 +4,6 @@
 use super::*;
 use crate::s3::bucket::checked_rename::AuthorizedRenameOperation;
 use crate::tests::records::node;
-use crate::tests::s3::test_storage;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -15,6 +14,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
+use aruna_test_support::s3::test_storage;
 use std::time::SystemTime;
 
 pub(crate) const BUCKET: &str = "bucket";
@@ -514,7 +514,7 @@ pub(crate) async fn access(context: &DriverContext) -> AuthContext {
         BUCKET,
         "secret/**",
     );
-    crate::testing_access::seed_access(context, (realm(), group(), node(4)), &secret).await
+    aruna_drivers::testing::seed_access(context, (realm(), group(), node(4)), &secret).await
 }
 
 #[tokio::test]

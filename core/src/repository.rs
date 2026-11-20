@@ -10,16 +10,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-mod credential;
-pub use credential::RepositoryCredential;
+pub mod credential;
+use credential::RepositoryCredential;
 pub mod fields;
 pub mod invenio;
-mod kind;
+pub mod kind;
 pub mod remote;
-pub use kind::{KindDescriptor, RequirementProfile, builtin_profile, descriptor, kinds};
-mod link;
+use kind::descriptor;
+pub mod link;
+use link::LinkTarget;
 pub mod rules;
-pub use link::*;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RepositoryQuery {

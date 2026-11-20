@@ -6,15 +6,16 @@ use std::collections::BTreeSet;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
+use aruna_core::job_request;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{ExecutionSpec, OutputDestination, WorkspaceMode};
+use aruna_core::structs::execution::job::input::{ExecutionSpec, OutputDestination};
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::GroupId;
 
-use super::ids;
-use crate::jobs::submit::SubmitJobError;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::job_request::SubmitJobError;
 
 /// The placement refs of every bucket the run writes into; all live on the ingress node and in
 /// the execution's group.
@@ -44,7 +45,7 @@ impl OutputPoliciesOperation {
                 bucket.clone()
             })
             .collect();
-        let (mode, workspace) = ids::workspace_of(spec);
+        let (mode, workspace) = job_request::workspace_of(spec);
         if mode == WorkspaceMode::Existing
             && let Some(bucket) = workspace
         {
@@ -115,7 +116,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{node, payload};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::OutputSelection;
+    use aruna_core::structs::execution::job::input::OutputSelection;
     use aruna_core::structs::storage::format::Compression;
     use ulid::Ulid;
 

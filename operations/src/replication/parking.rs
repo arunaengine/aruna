@@ -5,7 +5,8 @@
 
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 
-use super::queue::{BlobQueueError, schedule_blob_drain};
+use super::queue::BlobQueueError;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -709,10 +710,10 @@ impl Operation for AwaitingJobsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::key_locks::KeyUnlockedOperation;
+    use crate::blob::unlocked::KeyUnlockedOperation;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::test_context;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
 
     async fn next_blob_timer(storage: &StorageHandle) -> Result<Option<Duration>, BlobQueueError> {
         let context = test_context(storage.clone());
@@ -750,7 +751,6 @@ mod tests {
         }
     }
     use crate::replication::drain::NextTimerOperation;
-    use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::{BlobEffect, StorageEffect};
     use aruna_core::errors::StorageError;
@@ -766,6 +766,7 @@ mod tests {
         ReplicateScopeInput, ReplicateScopeTarget,
     };
     use aruna_core::types::TxnId;
+    use aruna_core::user::id::UserId;
     use aruna_storage::scan::iter_prefix_page;
     use std::time::SystemTime;
     use tempfile::TempDir;
@@ -777,7 +778,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
         let blob_root = format!("{root}/blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
-        let storage = aruna_storage::FjallStorage::open(root).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(root).unwrap();
         let net = aruna_net::NetHandle::new(aruna_drivers::testing::local_net(), storage.clone())
             .await
             .unwrap();
@@ -1011,7 +1012,7 @@ mod tests {
 
     #[tokio::test]
     async fn parking_fences_rotation() {
-        let (_dir, storage) = crate::tests::s3::test_storage();
+        let (_dir, storage) = aruna_test_support::s3::test_storage();
         let context = test_context(storage.clone());
         let old = BucketKeyRef::new(Ulid::from_parts(11, 11), 1);
         source(&context, old).await;
@@ -1071,7 +1072,9 @@ mod tests {
     async fn parked_job_wakes() {
         // A locked source parks the job without an attempt; the unlock makes it due again.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = test_context(storage.clone());
         let relationship = Ulid::from_parts(5, 5);
         let mut record = job(relationship);
@@ -1131,7 +1134,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_archive_waits() {
-        let (_dir, storage) = crate::tests::s3::test_storage();
+        let (_dir, storage) = aruna_test_support::s3::test_storage();
         let context = test_context(storage.clone());
         let key = BucketKeyRef::new(Ulid::from_parts(13, 13), 1);
         let mut location = source(&context, key).await;
@@ -1506,7 +1509,8 @@ mod tests {
         for (failed_page, job_count) in [(1, WAIT_PAGE + 1), (2, WAIT_PAGE + 1), (2, WAIT_PAGE)] {
             let dir = tempfile::tempdir().unwrap();
             let mut context = test_context(
-                aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+                aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                    .unwrap(),
             );
             let tasks = aruna_tasks::TaskHandle::new();
             let (scheduled, mut drains) = tokio::sync::mpsc::unbounded_channel();

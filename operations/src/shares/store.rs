@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{
@@ -12,6 +11,7 @@ use aruna_core::operation::{AfterConflict, Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::structs::storage::share::{ShareEvent, ShareLink, ShareUses, event_key, owner_key};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -85,7 +85,7 @@ impl Operation for GetShareOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
-        let link = rows::value(result)?.map(|bytes| ShareLink::from_bytes(&bytes));
+        let link = result.value()?.map(|bytes| ShareLink::from_bytes(&bytes));
         let link = link.transpose()?;
         if link.as_ref().is_some_and(|link| link.id != self.id) {
             return Err(ShareStoreError::UnexpectedEvent);
@@ -151,12 +151,12 @@ impl Operation for ListSharesOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
         if !self.reading {
-            let (values, next) = rows::page(result)?;
+            let (values, next) = result.page()?;
             self.next = next;
             return Ok(Next::Call(self.index_page(values)?));
         }
         // An index row whose record is gone is skipped.
-        for value in rows::all_values(result)?.into_iter().flatten() {
+        for value in result.values()?.into_iter().flatten() {
             let link = ShareLink::from_bytes(&value)?;
             if link.created_by != self.owner {
                 return Err(ShareStoreError::UnexpectedEvent);
@@ -229,10 +229,10 @@ impl Operation for LogShareOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareStoreError> {
         if self.written {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
-        let uses = rows::value(result)?;
+        let uses = result.value()?;
         self.written = true;
         Ok(Next::Call(IoCall::Write(self.writes(uses.as_deref())?)))
     }
@@ -271,7 +271,7 @@ impl Operation for ReadUsesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
-        let values = rows::all_values(result)?;
+        let values = result.values()?;
         if values.len() != self.ids.len() {
             return Err(ShareStoreError::UnexpectedEvent);
         }
@@ -333,7 +333,7 @@ impl Operation for ShareEventsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ShareStoreError> {
-        let (values, next) = rows::page(result)?;
+        let (values, next) = result.page()?;
         Ok(Next::Done(self.page(values, next.is_some())?))
     }
 }

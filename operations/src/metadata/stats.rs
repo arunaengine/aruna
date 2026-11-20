@@ -12,7 +12,6 @@ use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, REGISTRY_CANDIDATE_LIMIT,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
@@ -139,7 +138,7 @@ impl Operation for GroupPurposeOperation {
                 if let Event::Metadata(MetadataEvent::Error {
                     error: MetadataError::HandleMissing,
                     ..
-                }) = event(result)?
+                }) = result.event()?
                 {
                     return Ok(Next::Done(None));
                 }
@@ -200,7 +199,7 @@ pub(crate) fn classify_root_summary(
 
 #[cfg(test)]
 mod tests {
-    use crate::testing::write_entries;
+    use aruna_drivers::testing::write_entries;
     use std::sync::Arc;
 
     use aruna_core::events::Event;
@@ -215,7 +214,8 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::types::GroupId;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use byteview::ByteView;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -390,7 +390,7 @@ mod tests {
                 root
             ]
         });
-        match crate::testing::send_metadata_effect(
+        match aruna_drivers::testing::send_metadata_effect(
             &fixture.context,
             MetadataEffect::ApplyRoCrate {
                 request: ApplyRoCrateRequest {
@@ -497,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn counts_realm_groups() {
         let fixture = setup_fixture();
-        let owner = aruna_core::UserId::nil(fixture.realm_id);
+        let owner = aruna_core::user::id::UserId::nil(fixture.realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             user_id: owner,
@@ -516,7 +516,7 @@ mod tests {
             group_id: Ulid::generate(),
             realm_id: foreign_realm,
             roles: Default::default(),
-            owner: aruna_core::UserId::nil(foreign_realm),
+            owner: aruna_core::user::id::UserId::nil(foreign_realm),
         };
         write_entries(
             &fixture.storage,

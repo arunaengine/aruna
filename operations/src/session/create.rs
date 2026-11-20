@@ -4,7 +4,6 @@
 
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
 use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_login_token};
-use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::Secret;
@@ -12,7 +11,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionKind, SessionRef,
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{GroupId, Value};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
@@ -362,11 +362,11 @@ impl Operation for CreateSessionOperation {
                 self.handle_sessions(values)
             }
             Stage::DeleteStale => {
-                done(result)?;
+                result.done()?;
                 self.write_session()
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 let session = self
                     .session
                     .clone()

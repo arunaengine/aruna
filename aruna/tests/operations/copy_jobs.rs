@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna::tasks::job_host::run_copy_job;
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::jobs::ProgressReporter;
-use aruna_core::structs::execution::job::{CopyJobSpec, JobResultPayload};
-use aruna_core::structs::execution::job::{JobErrorKind, JobId, JobProgress};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::CopyJobSpec;
+use aruna_core::structs::execution::job::local::{JobErrorKind, JobProgress, JobResultPayload};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{
@@ -20,11 +20,12 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
+use aruna_drivers::testing::seed_bucket;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
-use aruna_operations::testing_objects::seed_bucket;
-use aruna_operations::tests::s3::{full_context, spawn_reference_server, write_version};
+use aruna_test_support::s3::{full_context, spawn_reference_server, write_version};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -118,7 +119,6 @@ fn job_context(context: DriverContext, node_id: NodeId) -> JobContext {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&JobProgress::new("bytes")),
         range_turns: Default::default(),
-        handlers: Default::default(),
     }
 }
 

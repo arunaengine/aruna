@@ -1,18 +1,18 @@
 //! Prepares and sends a plugin task's submission from its install's receiver: keyed, without a
-//! workspace bucket and admissible only until a deadline. The plugin host checks and records
-//! each send itself, so preparing commits nothing and a send goes to exactly its targets.
+//! workspace bucket and admissible only until a deadline; preparing commits nothing.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{ExecutionSpec, WorkspaceMode};
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::LabelMatch;
+use aruna_core::user::id::UserId;
 
 use super::admit_here::placement_failure;
 use super::advertised::{Advertised, AdvertisementsOperation};
@@ -23,8 +23,8 @@ use super::resolve_inputs::{ResolveInputsOperation, ResolvedInputs};
 use super::submission_rules::{family_view, is_device, pin_outputs};
 use super::submit_external::IngressNode;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::submit::SubmitJobError;
-use crate::jobs::submit_execution::validate_execution;
+use crate::jobs::submit::execution::validate_execution;
+use aruna_core::job_request::SubmitJobError;
 
 /// A plugin task's request, resolved at the receiver and not yet paged, with its identity and
 /// the nodes it goes to: this node when it holds the family, else the holders.
@@ -53,8 +53,7 @@ pub fn task_targets(
 
 /// The call that sends a prepared task to exactly `targets`, in their order: admitted here when
 /// this node is the one target and holds the family, else forwarded with the install account
-/// vouched for by this node; `ids` mints the alias of an admission here. Answers an
-/// `AcceptedSubmission`.
+/// vouched for by this node. `ids` mints the alias of an admission here.
 pub fn send_task_job(
     submission: &TaskSubmission,
     (config, node): (&RealmConfigDocument, &IngressNode),

@@ -19,7 +19,6 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{
@@ -28,6 +27,7 @@ use crate::placement::policy::resolve_set::{
 use crate::s3::policy::successor::{
     MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
+use aruna_core::blob_records::HeadAliasContext;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolicyMutationConfig {
@@ -238,7 +238,6 @@ impl Operation for PolicyMutationOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
     use aruna_core::events::Event;
@@ -249,6 +248,7 @@ mod pure_tests {
         PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
     };
     use aruna_core::structs::storage::blob::CurrentVersionPointer;
+    use aruna_core::user::id::UserId;
     use std::time::UNIX_EPOCH;
 
     /// The successor id a test mutation is pinned to.

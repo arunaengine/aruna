@@ -5,22 +5,23 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_PRUNE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobFamilyId;
+use aruna_core::structs::execution::job::family::JobFamilyId;
 use aruna_core::structs::execution::job::record_keys::{PRUNE_DUE_PREFIX, parse_prune_due};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 
+use super::commit::PruneCommitOperation;
 use super::family::PruneFamilyOperation;
-use super::{FAMILY_PRUNE_PAGE, FamilyPruneOutcome, PruneCommitOperation, PruneError, PruneStep};
+use super::{FAMILY_PRUNE_PAGE, FamilyPruneOutcome, PruneError, PruneStep};
 
 /// Works through the due rows of the family prune index at the run's time.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PruneFamiliesOperation {
     serving: Option<(NodeId, RealmId)>,
     now_ms: u64,
@@ -112,17 +113,17 @@ impl Operation for PruneFamiliesOperation {
 /// Moves the family prune timer up to the earliest due row of the index. An unreadable index
 /// leaves the timer as it is.
 #[derive(Debug, Default, PartialEq)]
-pub struct FamilyTimerOperation {
+pub struct ArmFamiliesOperation {
     now_ms: u64,
 }
 
-impl FamilyTimerOperation {
+impl ArmFamiliesOperation {
     pub fn new() -> Self {
         Self::default()
     }
 }
 
-impl Operation for FamilyTimerOperation {
+impl Operation for ArmFamiliesOperation {
     type Output = ();
     type Error = IoError;
 

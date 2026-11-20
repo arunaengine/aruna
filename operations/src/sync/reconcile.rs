@@ -2,15 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentReconcileResult};
+use aruna_core::document::{
+    AppliedStep, DocumentEffect, DocumentNetEvent, DocumentReconcileResult,
+};
 use aruna_core::document_apply::ApplyError;
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::RealmId;
 
 /// Pulls `topics` from `peers` through net, then runs one reconcile pass over them.
@@ -19,6 +20,8 @@ pub struct SyncTopicsOperation {
     realm_id: RealmId,
     effect: Option<DocumentEffect>,
     fetched: Option<DocumentNetEvent>,
+    /// The node whose drain runs the follow-ups of what is applied, and its first follow-up.
+    followups: Option<(NodeId, AppliedStep)>,
     reconciling: bool,
 }
 
@@ -33,14 +36,27 @@ impl SyncTopicsOperation {
         Self::with(realm_id, DocumentEffect::SyncDocument { topic, peers })
     }
 
-    /// Reconciles after a fetch that already ended with `fetched`.
-    pub(crate) fn after_fetch(realm_id: RealmId, fetched: DocumentNetEvent) -> Self {
+    /// Reconciles after a fetch that already ended with `fetched` and stores the follow-ups of
+    /// what it applies for `node_id`'s drain.
+    pub(crate) fn after_fetch(
+        realm_id: RealmId,
+        fetched: DocumentNetEvent,
+        node_id: NodeId,
+    ) -> Self {
         Self {
             realm_id,
             effect: None,
             fetched: Some(fetched),
+            followups: Some((node_id, AppliedStep::Usage)),
             reconciling: false,
         }
+    }
+
+    /// Also stores the metadata follow-up of each apply for `node_id`'s drain in the apply's own
+    /// transaction; the caller runs the other follow-ups itself.
+    pub fn queuing_metadata(mut self, node_id: NodeId) -> Self {
+        self.followups = Some((node_id, AppliedStep::Metadata));
+        self
     }
 
     fn with(realm_id: RealmId, effect: DocumentEffect) -> Self {
@@ -48,6 +64,7 @@ impl SyncTopicsOperation {
             realm_id,
             effect: Some(effect),
             fetched: None,
+            followups: None,
             reconciling: false,
         }
     }
@@ -59,7 +76,10 @@ impl SyncTopicsOperation {
         match fetched {
             DocumentNetEvent::DocumentsSynced { topics } => {
                 self.reconciling = true;
-                let reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
+                let mut reconcile = ReconcileTopicsOperation::new(self.realm_id, topics);
+                if let Some((node_id, from)) = self.followups {
+                    reconcile = reconcile.queuing_followups(node_id, from);
+                }
                 Ok(Next::Call(IoCall::child(reconcile)))
             }
             DocumentNetEvent::Error { error, .. } => Err(ApplyError::Failed(error)),
@@ -90,7 +110,7 @@ impl Operation for SyncTopicsOperation {
             let reconciled = result.child::<DocumentReconcileResult, ApplyError>()??;
             return Ok(Next::Done(reconciled));
         }
-        match event(result)? {
+        match result.event()? {
             Event::Net(NetEvent::DocumentSync(fetched)) => self.reconcile(fetched),
             Event::Net(NetEvent::Error(error)) => Err(ApplyError::Failed(format!("{error:?}"))),
             other => Err(IoError::Unexpected {
@@ -109,6 +129,10 @@ mod tests {
 
     fn realm() -> RealmId {
         RealmId::from_bytes([1; 32])
+    }
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
     }
 
     fn topic() -> irokle::TopicId {
@@ -147,8 +171,9 @@ mod tests {
         let fetched = DocumentNetEvent::DocumentsSynced {
             topics: vec![topic()],
         };
-        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched);
+        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched, node());
         let reconcile = ReconcileTopicsOperation::new(realm(), vec![topic()]);
+        let reconcile = reconcile.queuing_followups(node(), AppliedStep::Usage);
         let expected = Next::Call(IoCall::child(reconcile));
         assert_eq!(operation.first(), Ok(expected));
     }
@@ -159,7 +184,7 @@ mod tests {
             target: None,
             error: "no peer".to_string(),
         };
-        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched);
+        let mut operation = SyncTopicsOperation::after_fetch(realm(), fetched, node());
         let expected = ApplyError::Failed("no peer".to_string());
         assert_eq!(operation.first(), Err(expected));
     }

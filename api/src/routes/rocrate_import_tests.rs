@@ -7,13 +7,12 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
 use crate::server::state::ROCRATE_UPLOAD_SLOTS;
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{RoCrateLimits, RoCrateUploadRecord};
+use aruna_core::structs::execution::job::input::{RoCrateLimits, RoCrateUploadRecord};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -24,10 +23,12 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_storage::FjallStorage;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, Request};
@@ -206,13 +207,13 @@ fn invenio_openapi_contract() {
     }
     let request =
         serde_json::json!({"group_id": "group", "connector_id": "connector", "metadata": {}});
-    let default: crate::metadata::RepositoryExportRequest =
+    let default: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(request.clone()).unwrap();
     assert!(!default.publish);
     assert!(!default.public_files);
     let mut configured = request;
     configured["publish"] = serde_json::json!(true);
-    let configured: crate::metadata::RepositoryExportRequest =
+    let configured: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(configured).unwrap();
     assert!(configured.publish);
 }
@@ -241,7 +242,7 @@ fn invenio_mode_contract() {
 
 #[test]
 fn invenio_login_private() {
-    let request: crate::metadata::RepositoryExportRequest =
+    let request: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(serde_json::json!({
             "group_id": "group", "connector_id": "connector", "access_token": "author-private-token"
         }))

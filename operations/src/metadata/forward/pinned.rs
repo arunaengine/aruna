@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
@@ -19,12 +19,12 @@ use ulid::Ulid;
 use super::authorized_create::CreateAuthorizedError;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::is_user_origin;
-use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::{
-    CreateDocumentError, CreateDocumentPayload, mint_forward_document, mint_local_document,
-    resolve_metadata_id,
+    CreateDocumentError, mint_forward_document, mint_local_document, resolve_metadata_id,
 };
+use crate::metadata::forward::write::MetadataWriteError;
+use aruna_core::metadata::api::CreateDocumentPayload;
 
 /// A create of a given document on one pinned node, kept so that a retry sends the very same
 /// arguments to the very same node.
@@ -151,7 +151,7 @@ mod call_tests {
         let realm_id = RealmId::from_bytes([1; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }

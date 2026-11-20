@@ -10,11 +10,11 @@ use ulid::Ulid;
 
 use super::membership::changeable;
 use super::snapshot::{Deletion, DistributionSnapshot, OpenTransfer, Tombstone};
-use super::{
-    DataStrategy, DistributionError, DistributionMember, KeyRange, MemberState, MetadataCoverage,
-    SetPhase, SignedStatement, Statement, StatementKind, TransferRole,
-};
+use super::{DataStrategy, DistributionMember, KeyRange, MemberState, MetadataCoverage, SetPhase};
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::distribution::request::TransferRole;
+use crate::structs::storage::distribution::statement::{SignedStatement, Statement, StatementKind};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 const DELETION_DOMAIN: &[u8] = b"aruna-distribution-deletion-v1";
 const LIFECYCLE_DOMAIN: &[u8] = b"aruna-distribution-lifecycle-v1";

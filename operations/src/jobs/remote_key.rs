@@ -5,18 +5,19 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::rows::{read_row, value};
-use aruna_core::structs::execution::job::{JobId, JobRecord, JobState, KeyWait};
+use aruna_core::rows::read_row;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, HashIndex, VersionKey, object_permission_path,
@@ -24,13 +25,15 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::blob::unlocked::KeyUnlockedOperation;
 use crate::jobs::key_locks::{
-    AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, KeyUnlockedOperation,
-    MAX_AWAITED, VersionWaitOperation,
+    AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, MAX_AWAITED,
+    VersionWaitOperation,
 };
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
@@ -145,7 +148,7 @@ impl TargetLocksOperation {
     }
 
     fn bucket_read(&mut self, result: IoResult) -> TargetNext {
-        let Some(info) = value(result)? else {
+        let Some(info) = result.value()? else {
             return Ok(Next::Done(Vec::new()));
         };
         let group_id = BucketInfo::from_bytes(&info)
@@ -536,7 +539,7 @@ impl Delivery {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DeliverStep {
     Owed,
     Sent(Box<OwedWake>),
@@ -544,7 +547,7 @@ enum DeliverStep {
 }
 
 /// Key node: sends one page of owed wakes after `start_after` and drops each acknowledged one.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeliverWakesOperation {
     start_after: Option<Key>,
     serving: ServingNode,
@@ -663,18 +666,17 @@ impl Operation for DeliverWakesOperation {
 mod tests {
     use super::*;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::park_job;
-    use crate::jobs::store::test_calls::{claim_job, read_job_record};
-    use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::structs::execution::job::JobPayload;
-    use aruna_core::structs::execution::job::JobRecord;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::HashIndex;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::scan::iter_prefix_page;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use std::future::Future;
     use ulid::Ulid;
 
@@ -742,8 +744,10 @@ mod tests {
     async fn wake_requires_parked() {
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -764,9 +768,12 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, local, 1_000, 1_000, None);
         insert_job(&context, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, local, 2_000).await.unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, local, 2_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let auth = owner_auth(&claimed, RealmId([1; 32]));
@@ -785,9 +792,12 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        park_job(&context, job_id, token, 3_000, vec![wait])
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]),
+            &context,
+        )
+        .await
+        .unwrap();
         // Only the node holding the key wakes the job; another node's wake is acknowledged only.
         assert_eq!(
             accept_wake(&context, local, &auth, job_id, key).await,
@@ -831,8 +841,10 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -1030,8 +1042,10 @@ mod tests {
 
     fn empty_context(dir: &tempfile::TempDir) -> DriverContext {
         DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -1058,10 +1072,12 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, waiter, 1_000, 1_000, None);
         insert_job(&waiter_node, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(&waiter_node, job_id, waiter, 2_000)
-            .await
-            .unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, waiter, 2_000),
+            &waiter_node,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let auth = owner_auth(&claimed, RealmId([1; 32]));
@@ -1073,9 +1089,12 @@ mod tests {
             key,
         };
         let token = claimed.claim.unwrap().claim_token;
-        park_job(&waiter_node, job_id, token, 3_000, vec![wait])
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::park_job(job_id, token, 3_000, vec![wait]),
+            &waiter_node,
+        )
+        .await
+        .unwrap();
         let register = WaitRowOperation::register(key, waiter, job_id, &auth);
         drive(register, &key_node).await.unwrap();
         drive(QueueWakesOperation::new(key), &key_node)

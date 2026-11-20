@@ -14,15 +14,15 @@ use crate::routes::access::sessions::{
 };
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, SessionKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::group_permission_path;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation,
 };
-use aruna_operations::session::{
+use aruna_operations::session::create::{
     CreateSessionConfig, CreateSessionOperation, MAX_SESSION_TTL, bound_session_expiry,
 };
 use aruna_operations::users::service_account::check::{

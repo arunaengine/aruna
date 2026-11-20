@@ -7,25 +7,25 @@ use std::time::Duration;
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::structured_id::StructuredId;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::types::GroupId;
-use aruna_core::{MetaResourceId, NodeId};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::create_document::{
-    CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload, CreateDocumentResult,
-    mint_document_for,
+    CreateDocumentError, CreateDocumentOperation, CreateDocumentResult, mint_document_for,
 };
 use crate::metadata::profile::rules::not_profiled_status;
 use crate::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, submission_verdict,
 };
 use crate::metadata::repository::{schedule_materialization, schedule_projection};
+use aruna_core::metadata::api::CreateDocumentPayload;
 
 /// Mints a metadata document id from the realm config: from a local held bucket and a
 /// pre-provisioned binding, or with the blind placement a job-produced or forwarded document
@@ -258,7 +258,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([3; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }

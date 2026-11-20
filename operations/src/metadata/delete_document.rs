@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::{
@@ -19,11 +19,13 @@ use aruna_core::storage_entries::{
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::persistent_id::{
+    PersistentIdMapping, persistent_id_key, secondary_index_deletes,
+};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
 };
-use aruna_core::structs::{PersistentIdMapping, persistent_id_key, secondary_index_deletes};
 use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use thiserror::Error;
@@ -32,7 +34,7 @@ use ulid::Ulid;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::id_mapping::{MappingRoute, mapping_route_for, tombstone_transition};
 use crate::metadata::repository::{audit_entry, lifecycle_revision_entries, schedule_prune_drain};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::fence::WriteFence;
@@ -279,6 +281,7 @@ impl DeleteDocumentOperation {
         }
         self.deletes = registry_delete_entries(&record);
         // Commit the PID tombstone with the registry row so a crash never leaves it active.
+        let ids = (self.ids.mint(self.now_ms), self.ids.mint(self.now_ms));
         let transition = match self.mapping.as_ref() {
             None => Ok(None),
             Some(mapping) => tombstone_transition(
@@ -286,6 +289,7 @@ impl DeleteDocumentOperation {
                 &self.mapping_route,
                 self.document_id,
                 self.now_ms,
+                ids,
             ),
         };
         match transition {
@@ -473,9 +477,9 @@ mod call_tests {
         DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_AUDIT_KEYSPACE,
         PRUNE_JOB_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
     };
-    use aruna_core::structs::PersistentIdStatus;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::structs::persistent_id::PersistentIdStatus;
     use aruna_core::structs::placement::record::PlacementStrategy;
 
     use aruna_core::types::Value;
@@ -486,7 +490,7 @@ mod call_tests {
         let realm_id = RealmId::from_bytes([7u8; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }
@@ -799,7 +803,7 @@ mod call_tests {
         ));
         assert!(rows_in(&unminted, ID_MAPPING_KEYSPACE).is_empty());
 
-        let revision = aruna_core::structs::PersistentIdRevision {
+        let revision = aruna_core::structs::persistent_id::PersistentIdRevision {
             event_id: Ulid::from_parts(17, 17),
             actor: actor.node_id,
             occurred_at_ms: 1,

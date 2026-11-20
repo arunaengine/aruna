@@ -3,28 +3,24 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod access;
-mod check;
+pub mod check;
 mod commit;
 pub mod coordinator;
 mod onboarding;
-mod peer;
+pub(crate) mod peer;
 mod prepare;
 mod resources;
 
-pub use check::{CheckGroupOperation, GroupBlockers};
-pub use coordinator::{DeleteGroupOperation, InstallOnboardingOperation};
-
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
-pub(crate) use peer::ApplyRequestOperation;
 
 #[cfg(test)]
 mod barrier_tests;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod check_tests;
+#[cfg(test)]
+mod check_tests;
 #[cfg(test)]
 mod recovery_tests;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod tests;
+#[cfg(test)]
+mod tests;
 
 /// The reads of the permission rules on `path`.
 fn auth_call(path: &str) -> Result<aruna_core::calls::IoCall, GroupDeletionError> {

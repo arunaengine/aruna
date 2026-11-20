@@ -13,13 +13,12 @@ use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
-use crate::job_calls::read_artifact_range;
-use crate::job_calls::{claim_job, release_job, transition_to_running};
-use crate::job_calls::{insert_job, list_job_entries};
+use crate::job_calls::{
+    claim_job, insert_job, read_artifact_range, release_job, transition_to_running,
+};
 use aruna::tasks::rocrate_jobs::{run_export_job, run_rocrate_import};
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::StorageError;
@@ -30,11 +29,13 @@ use aruna_core::keyspaces::{
     ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
     ExportRoCrateSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JobErrorKind, JobId, JobPayload, JobRecord,
-    JobResultPayload, ReasonCode, RoCrateLimits, RoCrateMediaType, RoCrateUploadRecord,
+    ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, ReasonCode, RoCrateLimits,
+    RoCrateMediaType, RoCrateUploadRecord,
 };
+use aruna_core::structs::execution::job::local::{JobErrorKind, JobRecord, JobResultPayload};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -46,23 +47,27 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
 use aruna_operations::testing::fresh_job_id;
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_operations::transfer::origin::ReadOriginOperation;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::jobs::list_job_entries;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::replay_event_log;
 use async_zip::{Compression, StringEncoding, ZipEntryBuilder, ZipString};
 use axum::Router;
 use axum::http::header;
@@ -78,8 +83,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::blob_node::{seed_config, write_value};
-use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_core::{MetaResourceId, StructuredId};
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 
 /// A fixed structured id (handle 1, bucket 0). The single-node import fixture
 /// holds every bucket, so bucket 0 is always held and the create resolves.
@@ -1368,7 +1372,7 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
     } else {
         (direct, None)
     };
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId::from_bytes([41; 32]);
     let net = NetHandle::new(
         NetConfig {
@@ -1490,7 +1494,7 @@ fn storage_proxy(
                 let committed = gated_commit
                     && matches!(
                         &event,
-                        StorageEvent::TransactionCommitted { txn_id }
+                        StorageEvent::TransactionCommitted { txn_id, .. }
                             if Some(*txn_id) == version_transaction
                     );
                 if committed {
@@ -1866,7 +1870,6 @@ async fn claim_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     })
 }
 
@@ -2237,7 +2240,7 @@ async fn triple_archive() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 
 async fn artifact_bytes(
     fixture: &Fixture,
-    artifact: &aruna_core::structs::execution::job::ArtifactRef,
+    artifact: &aruna_core::structs::execution::job::input::ArtifactRef,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut read =
         read_artifact_range(fixture.context.as_ref(), artifact, 0..artifact.size).await?;

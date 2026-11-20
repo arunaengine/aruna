@@ -21,17 +21,17 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 
 const OLDER: Ulid = Ulid::from_parts(1, 10);
 
 async fn read_current(
     context: &DriverContext,
     document: &MetadataRegistryRecord,
-    revision: Option<&MetadataRawRevision>,
+    graph: Source,
     materializing: bool,
 ) -> Result<Source, GitError> {
-    drive(super::current(document, revision, materializing), context).await
+    drive(super::current(document, graph, materializing), context).await
 }
 
 /// The stored crate event "older" and the registry row of the newer event `last`.
@@ -67,7 +67,7 @@ fn events(last: Ulid) -> (MetadataEventRecord, MetadataRegistryRecord) {
     let event = MetadataEventRecord {
         event_id: OLDER,
         record: record.clone(),
-        user_id: aruna_core::UserId::local(Ulid::from_parts(1, 3), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 3), realm_id),
         node_id,
         payload: MetadataEventPayload::RoCrate {
             jsonld: jsonld.to_string(),
@@ -162,20 +162,14 @@ async fn waits_for_materialization() {
     assert_eq!(refreshed, None, "a refresh snapshots the older graph");
     let stored = read_current(&context, &document, None, true).await.unwrap();
     assert_eq!(stored.map(|(id, _)| id), Some(OLDER));
-    let supplied = MetadataRawRevision {
-        jsonld: "{\"name\":\"newer\"}".to_string(),
-        winning_event_id: pending,
-        context_digest: [0; 32],
-        dataset_digest: None,
-        merged: None,
-    };
-    let captured = read_current(&context, &document, Some(&supplied), true).await;
+    let supplied = (pending, "{\"name\":\"newer\"}".to_string());
+    let captured = read_current(&context, &document, Some(supplied.clone()), true).await;
     assert_eq!(
         captured.unwrap(),
-        Some((pending, supplied.jsonld.clone())),
+        Some(supplied.clone()),
         "a capture snapshots the graph its job made"
     );
-    let refreshed = read_current(&context, &document, Some(&supplied), false).await;
+    let refreshed = read_current(&context, &document, Some(supplied), false).await;
     assert_eq!(
         refreshed.unwrap(),
         None,
@@ -547,7 +541,7 @@ fn held_capture_outcomes() {
         let mut run = HeldCaptureOperation {
             node: git_node(),
             record: document.clone(),
-            revision: None,
+            graph: None,
             forgotten: false,
         };
         let scope = HoldScope::GitRepository(document.document_id);

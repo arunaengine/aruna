@@ -22,7 +22,8 @@ use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 
 use super::rebuild::shadow_row;
 
-use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
+use super::handle::{CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP};
+use super::worker::{FjallStorage, Txn};
 
 /// A transaction's pending counter changes, keyed by key space and key in sorted order.
 pub(super) type PendingChanges = BTreeMap<(String, ByteView), CounterChange>;
@@ -242,7 +243,7 @@ impl FjallStorage {
                     entry.kind,
                     CleanupKind::CommitQueued
                         | CleanupKind::CommitUnknown
-                        | CleanupKind::Committed
+                        | CleanupKind::Committed(_)
                         | CleanupKind::Aborted
                 )
             })
@@ -296,8 +297,8 @@ impl FjallStorage {
                     entry.kind = CleanupKind::CommitQueued;
                 }
             }
-            Some(CleanupKind::Committed) => {
-                return StorageEvent::TransactionCommitted { txn_id };
+            Some(CleanupKind::Committed(sequence)) => {
+                return StorageEvent::TransactionCommitted { txn_id, sequence };
             }
             None => {}
         }
@@ -306,7 +307,10 @@ impl FjallStorage {
         self.usage_views.remove(&txn_id);
         let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
-            Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
+            Some(Txn::Read(_)) => StorageEvent::TransactionCommitted {
+                txn_id,
+                sequence: self.commits,
+            },
             Some(Txn::Write(txn)) => {
                 // A commit never waits for a read still running in the transaction.
                 let Ok(mut txn) = Arc::try_unwrap(txn) else {
@@ -321,6 +325,8 @@ impl FjallStorage {
                 if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {
                     self.take_txn_deletes(txn_id, false);
                     txn.rollback();
+                    // Unlike an unknown commit, a confirmed rollback lets the caller undo work.
+                    let error = StorageError::RolledBack(Box::new(error));
                     return StorageEvent::Error { error };
                 }
                 let committed = txn.commit();
@@ -330,7 +336,13 @@ impl FjallStorage {
                     self.note_config_change();
                 }
                 match committed {
-                    Ok(Ok(())) => StorageEvent::TransactionCommitted { txn_id },
+                    Ok(Ok(())) => {
+                        self.commits += 1;
+                        StorageEvent::TransactionCommitted {
+                            txn_id,
+                            sequence: self.commits,
+                        }
+                    }
                     Ok(Err(_)) => StorageEvent::Error {
                         error: StorageError::TransactionConflict,
                     },

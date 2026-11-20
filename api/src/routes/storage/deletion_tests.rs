@@ -10,19 +10,19 @@ use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{
+use aruna_core::structs::sync_relationship::{
     SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key,
 };
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use std::time::SystemTime;
 
 #[tokio::test]
 async fn preflight_discloses_cleanup() {
     let storage_dir = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()
@@ -56,7 +56,7 @@ async fn preflight_discloses_cleanup() {
         reference_handling: Default::default(),
         reference_serving: false,
         replicate_deletes: true,
-        created_by: aruna_core::UserId::nil(realm_id),
+        created_by: aruna_core::user::id::UserId::nil(realm_id),
         created_at: SystemTime::UNIX_EPOCH,
         state: SyncState::Enabled,
         status: SyncStatusSnapshot::default(),

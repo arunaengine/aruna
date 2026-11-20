@@ -8,7 +8,9 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::LaunchDecline;
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordEnvelope, LaunchIntent};
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, LaunchIntent,
+};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
@@ -140,7 +142,7 @@ fn verdicts_end_commit() {
 
 // A refusal needs no read, and an admitted launch of a cancelled family names its run.
 #[test]
-fn settle_names_cancelled_run() {
+fn settle_names_cancelled() {
     let mut refused = SettleLaunchOperation::new(Err(LaunchDecline::Capacity));
     assert_eq!(
         refused.first(),
@@ -166,7 +168,7 @@ fn settle_names_cancelled_run() {
 
 // An incomplete family read leaves an admitted offer undecided.
 #[test]
-fn settle_needs_full_read() {
+fn settle_reads_fully() {
     let (_, _, config) = commit();
     let mut settle = SettleLaunchOperation::new(Ok(receipt_of(&config)));
     calls_child(settle.first());

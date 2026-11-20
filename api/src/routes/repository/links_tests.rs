@@ -5,7 +5,7 @@
 use super::*;
 use crate::auth::extract;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
-use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
+use crate::metadata::model::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::link_routes::*;
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::repositories::delete_repository;
@@ -124,7 +124,7 @@ async fn create(
 
 fn stranger(linked: &Linked) -> AuthContext {
     AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), linked.test.auth.realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), linked.test.auth.realm_id),
         ..linked.test.auth.clone()
     }
 }
@@ -182,7 +182,7 @@ async fn link_routes_authorize() {
     for (key_space, key) in [
         (
             REPOSITORY_LINK_KEYSPACE,
-            aruna_core::repository::link_key(document_id, link_id),
+            aruna_core::repository::link::link_key(document_id, link_id),
         ),
         (LINK_SECRET_KEYSPACE, link_id.to_bytes().to_vec()),
     ] {
@@ -369,12 +369,12 @@ async fn holder_copy_refuses() {
         last_push: None,
         active_job: None,
         sequence: 0,
-        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        limits: aruna_core::structs::execution::job::input::RoCrateLimits::default(),
         created_at: now,
         updated_at: now,
         generation: 1,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     };
     let written = linked
@@ -652,7 +652,7 @@ async fn admin_rights_limited() {
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: REPOSITORY_LINK_KEYSPACE.into(),
-            key: aruna_core::repository::link_key(document_id, link_id).into(),
+            key: aruna_core::repository::link::link_key(document_id, link_id).into(),
             value: stored.to_bytes().unwrap().into(),
             txn_id: None,
         })
@@ -694,7 +694,8 @@ async fn admin_rights_limited() {
 
 /// Stores a pull link on the dataset the way a keep_updated import creates it.
 async fn pull_link_for(linked: &Linked) -> RepositoryLink {
-    use aruna_core::repository::{LinkDirection, LinkPull, RepositoryRecord};
+    use aruna_core::repository::RepositoryRecord;
+    use aruna_core::repository::link::{LinkDirection, LinkPull};
     let now = std::time::SystemTime::now();
     let mut link = RepositoryLink {
         link_id: Ulid::generate(),
@@ -713,7 +714,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         last_push: None,
         active_job: None,
         sequence: 0,
-        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        limits: aruna_core::structs::execution::job::input::RoCrateLimits::default(),
         created_at: now,
         updated_at: now,
         generation: 0,
@@ -722,7 +723,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         direction: LinkDirection::Pull(Box::new(LinkPull {
             auto_update: false,
             options: Default::default(),
-            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+            target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
                 bucket: "research".into(),
                 prefix: "zenodo".into(),
             },
@@ -911,7 +912,7 @@ async fn viewer(linked: &Linked) -> AuthContext {
 
 #[tokio::test]
 async fn readers_cannot_push() {
-    use crate::metadata::RepositoryExportRequest;
+    use crate::metadata::model::RepositoryExportRequest;
     use crate::routes::repository::{SubmitRepositoryExport, export_record};
     let linked = setup().await;
     let reader = viewer(&linked).await;

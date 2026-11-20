@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -19,13 +18,14 @@ use aruna_core::storage_entries::{
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 use aruna_core::types::RoleId;
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::write_stage::{WriteStage, WriteStep};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
@@ -399,7 +399,6 @@ pub mod test {
     };
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget,
     };
@@ -414,14 +413,16 @@ pub mod test {
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::types::RoleId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -756,7 +757,7 @@ pub mod test {
     pub async fn test_add_user() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

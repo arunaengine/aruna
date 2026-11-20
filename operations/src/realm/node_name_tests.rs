@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::*;
@@ -126,7 +126,7 @@ fn finish(mut write: NameWrite) -> Result<NodeDisplay, NodeNameError> {
 }
 
 fn refusal(turn: NameTurn) -> NodeNameError {
-    turn.err().expect("the write is refused")
+    turn.expect_err("the write is refused")
 }
 
 #[test]

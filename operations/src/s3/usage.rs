@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -28,9 +28,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::distribution::inventory::{
-    InventoryChange, InventoryError, InventoryUpdate, StagedCall,
-};
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
+use aruna_core::rows::StagedCall;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
@@ -883,24 +882,23 @@ impl Operation for MarkDirtyOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::realm_usage::{
-        RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
-    };
     use crate::node::summary_refresh::RefreshUsageOperation;
     use crate::node::usage_publish::{
         ClearMarkersOperation, PublishUsageOperation, PublishedUsage,
     };
     use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::s3::bucket::create::CreateBucketOperation;
-    use crate::testing::path_context;
+    use crate::s3::realm_usage::{
+        RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
+    };
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
         UPLOAD_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::operation_check::{rejects_events, sample_events};
+    use aruna_core::operation_check::sample_events;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -921,8 +919,8 @@ mod tests {
         SUMMARY_GLOBAL_KEY, global_shard_keys, usage_global_key, usage_snapshot_key,
         usage_summary_key,
     };
-    use aruna_core::types::TxnId;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -1778,7 +1776,7 @@ mod tests {
     }
 
     async fn write_stat(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     fn logical(logical_bytes: u64) -> UsageCounters {
@@ -2774,29 +2772,31 @@ mod tests {
         );
     }
 
-    // A state that expects no event must reject one instead of ignoring it.
+    // The swap after the walk takes only its write answer; any other event is refused.
     #[test]
     fn terminal_rejects_event() {
-        let rebuild = || {
+        let finishing = || {
             let mut rebuild = RebuildStatsOperation::new();
-            rebuild.start();
-            rebuild.step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: TxnId::generate(),
-            }));
+            rebuild.first().unwrap();
+            let walked = Ok::<_, RebuildStatsError>(UsageCounters::default());
+            let swap = rebuild.next(IoResult::Child(ChildOutcome::new(walked)));
+            assert!(matches!(swap, Ok(Next::Call(IoCall::Effect(_)))));
             rebuild
         };
-        for (_, effects, error) in rejects_events(rebuild, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(
-                    error,
-                    RebuildStatsError::InvalidStateEvent {
-                        state: RebuildStatsState::Error,
-                        ..
-                    } | RebuildStatsError::StorageError(_)
-                ),
-                "{error:?}"
+        for event in sample_events() {
+            if matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
+                continue;
+            }
+            let label = event.label();
+            let refused = finishing().next(IoResult::Event(Box::new(event)));
+            let finish = matches!(
+                refused,
+                Err(RebuildStatsError::InvalidStateEvent {
+                    state: RebuildStatsState::Finish,
+                    ..
+                })
             );
+            assert!(finish, "{label}: {refused:?}");
         }
     }
 }

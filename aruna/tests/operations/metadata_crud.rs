@@ -5,8 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna::tasks::incoming::start_task_queues;
-use aruna_core::StructuredId;
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -15,11 +14,13 @@ use aruna_core::keyspaces::{
     METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataEffect, MetadataEventPayload, MetadataEventRecord,
 };
-use aruna_core::placement::{
-    PlacementResolutionContext, choose_origin_bucket, strategy_for_target, subject_bytes,
+use aruna_core::placement::choose_origin_bucket;
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, strategy_for_target, subject_bytes,
 };
 use aruna_core::storage_entries::{
     create_event_entry, create_projection_entries, event_log_prefix, graph_lifecycle_entry,
@@ -29,26 +30,24 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::registry_cache::RegistryReadOperation;
-use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
-};
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{
-    drain_projection_queue, project_create_events, project_logged_event, replay_event_log,
-    schedule_projection_drain,
-};
-use aruna_storage::FjallStorage;
+use aruna_operations::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::{drain_projection_queue, project_create_events};
+use aruna_test_support::projection::{
+    project_logged_event, replay_event_log, schedule_projection_drain,
+};
 use byteview::ByteView;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -1011,7 +1010,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     storage_handle.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
         realm_id: RealmId([5u8; 32]),
     };
     let config = seed_realm_config(&storage_handle, &actor).await?;
@@ -1050,7 +1049,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
     storage_handle.install_metadata_indexes(metadata_dir.path());
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
     };
     let config = seed_realm_config(&storage_handle, &actor).await?;
@@ -1073,7 +1072,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
 }
 
 async fn seed_realm_config(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     actor: &Actor,
 ) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);

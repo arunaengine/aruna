@@ -9,13 +9,15 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::{ExecutorCapability, NetworkAccess};
 use aruna_core::events::LaunchDecline;
 use aruna_core::id::NodeId;
-use aruna_core::node_state::{
+use aruna_core::job_request;
+use aruna_core::node::state::{
     DrainState, DrainStateError, DrainStateOperation, NodeInfoError, ReadInfoOperation,
 };
 use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputSource, LaunchIntent, LogicalJobSpec, object_count, tagged,
+use aruna_core::structs::execution::job::family::{JobFamilyId, LaunchIntent, LogicalJobSpec};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputSource, object_count, tagged,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -27,18 +29,16 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::types::Value;
 use ulid::Ulid;
 
-use super::ids;
 use super::plan::{REALM_STAGING, network_access};
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicySets, compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::placement::policy::{
-    GateContext, GateContextError, GateOperation, PolicySetError, PolicySetResolver, Resolutions,
-    ResolveMode,
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::resolve_set::{
+    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
 };
 use crate::plugins::screen::{AdmitTask, ScreenError, ScreenTask};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::structs::execution::job::JobFamilyId;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// What a check answers: the capability that runs the launch, or why this target refuses it.
 pub(crate) type Verdict = Result<ExecutorCapability, LaunchDecline>;
@@ -65,10 +65,9 @@ enum CapabilityStep {
     Drain,
 }
 
-/// The executor capability of this node that runs `intent`. The node must be a sync-eligible
-/// realm member that is not leaving or draining, and its executor must fit the spec. The
-/// durable operator flag is read directly: a stale heartbeat document must never re-enable
-/// offers this node was drained out of.
+/// The executor capability of this node for `intent`: a sync-eligible member, not leaving or
+/// draining, whose executor fits the spec. The durable operator flag is read directly, so a stale
+/// heartbeat never re-enables offers this node was drained out of.
 #[derive(Debug, PartialEq)]
 pub(crate) struct LocalCapabilityOperation {
     config: RealmConfigDocument,
@@ -158,7 +157,7 @@ impl LocalCapabilityOperation {
             return Err(LaunchDecline::Unauthorized);
         }
         let labels =
-            ids::required_labels(&spec.payload).map_err(|_| LaunchDecline::Unauthorized)?;
+            job_request::required_labels(&spec.payload).map_err(|_| LaunchDecline::Unauthorized)?;
         let carried = |key: &str| capability.subject.labels.get(key).map(|value| value.trim());
         if !labels
             .iter()
@@ -241,11 +240,9 @@ enum CheckStep {
     Policies,
 }
 
-/// Checks one offered launch in order: this node's capability, the governed-data gate (a
-/// node that stopped admitting governed data declines every new execution target), the
-/// stored submitter's WRITE grant on the group here, and the placement policies this target
-/// can resolve against its own subject. No bearer token replicates, so the grant is read from
-/// this node's replicated permissions. An error leaves the offer undecided.
+/// Checks one launch offer in order: capability, the governed-data gate, the stored submitter's
+/// WRITE grant here (from replicated permissions, as no token replicates) and the placement
+/// policies this target resolves for its subject. An error leaves the offer undecided.
 #[derive(Debug, PartialEq)]
 pub(crate) struct LaunchChecksOperation {
     check: LaunchCheck,

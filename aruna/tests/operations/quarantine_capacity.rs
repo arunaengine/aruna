@@ -13,19 +13,22 @@ use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
-use aruna_core::structs::{
+use aruna_core::structs::sync_quarantine::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
     SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::sync::sync_quarantine::{
-    AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
-    QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,
-};
-use aruna_operations::testing::{reconcile_topics, write_entries};
-use aruna_storage::StorageHandle;
+use aruna_drivers::testing::write_entries;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_operations::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::list::ListQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::prune::PruneQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::read::ReadQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::{QuarantinePage, QuarantinePageRequest};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_test_support::documents::reconcile_topics;
 use byteview::ByteView;
 use ulid::Ulid;
 
@@ -92,7 +95,7 @@ async fn fill_store(storage: &StorageHandle) -> SyncQuarantineUsage {
     usage
 }
 
-fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
+fn node_info_bytes(node_id: aruna_core::id::NodeId) -> Vec<u8> {
     NodeInfoDocument {
         node_id,
         executors: Vec::new(),
@@ -133,8 +136,10 @@ async fn list(ctx: &DriverContext, request: QuarantinePageRequest) -> Quarantine
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_blocks_releases() {
     let storage_dir = tempfile::tempdir().expect("storage dir");
-    let storage = aruna_storage::FjallStorage::open(storage_dir.path().to_str().expect("path"))
-        .expect("storage opens");
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
+        storage_dir.path().to_str().expect("path"),
+    )
+    .expect("storage opens");
     let realm_id = RealmId::from_bytes([31; 32]);
     let net = NetHandle::new(
         NetConfig {

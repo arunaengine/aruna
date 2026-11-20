@@ -26,7 +26,7 @@ use ulid::Ulid;
 
 use super::{Applied, ChangeError, Managers, SecretChange, apply_change, drains, widening_notices};
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox::record::{new_identified_record, outbox_write_entry};
 use aruna_core::placement::target_placement_ref;
 
 /// One realm secret change, with the time and write id it uses.
@@ -300,11 +300,11 @@ impl Operation for RealmSecretOperation {
                 self.write(document, reducer, auth)
             }
             Stage::Write(deletes) => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Then {
                     output: self.result.take().flatten(),
                     calls: drains(self.notices),

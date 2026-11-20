@@ -3,10 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MaterializationState, MetadataEffect, MetadataEvent};
 use aruna_core::operation::Operation;
 use aruna_core::placement::read_holder_sets;
@@ -16,23 +16,21 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use super::super::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT, device_raw_revision};
 use crate::device::replica::{ReplicaRecord, read_answer, replica_read};
-use crate::device::selection::keep_read;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::ExportOperation;
 use crate::metadata::api::export_types::{
-    ENTRY_ROOM, ExportMetadataRequest, ExportMetadataResult, PAGE_DEFAULT, PAGE_MAX,
-    RoCrateExportView,
+    ENTRY_ROOM, ExportMetadataRequest, PAGE_DEFAULT, PAGE_MAX,
 };
 use crate::metadata::api::readable::RecordReadableOperation;
-use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::deletion_guard::metadata_call;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::metadata::revision_read::MetadataRawView;
+use crate::metadata::device::selection::keep_read;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataApiError>;
 
@@ -202,7 +200,7 @@ impl Operation for DeviceExportOperation {
             return self.graph_view();
         }
         let record = self.record()?;
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => {
                 Ok(Next::Done(self.raw(record, Some(jsonld))))
             }
@@ -316,7 +314,7 @@ impl RoutedExportOperation {
 
     /// Like a read, an unselected replica answers only while the realm is out of reach.
     fn replica_read(&mut self, result: IoResult) -> ExportTurn {
-        let replica = read_answer(&effect_event(result)?).filter(ReplicaRecord::serves_reads);
+        let replica = read_answer(&result.event()?).filter(ReplicaRecord::serves_reads);
         let pinned = replica
             .as_ref()
             .is_some_and(|replica| replica.selected || replica.pending_edits > 0);
@@ -473,7 +471,7 @@ impl Operation for RoutedExportOperation {
             RoutedStage::Holder => {
                 let local = result
                     .child::<ExportMetadataResult, MetadataApiError>()?
-                    .map_err(crate::forward::transport::read_error);
+                    .map_err(crate::metadata::forward::write::read_error);
                 if let Some(node) = self.local_node {
                     self.answers.push((node, local));
                 }

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{ConnectionMonitorState, OpenConnection};
+use aruna_core::structs::info::{ConnectionMonitorState, OpenConnection};
 use iroh::endpoint::{
     AfterHandshakeOutcome, BeforeConnectOutcome, Connection, EndpointHooks, Side,
     WeakConnectionHandle,

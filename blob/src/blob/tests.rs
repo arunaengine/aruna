@@ -5,8 +5,9 @@
 use super::backend::{build_backend_path, build_part_path, rebuild_backend_path};
 use super::group::GROUP_WRITE_CHUNK;
 use super::io::compose_chunk;
+use super::registry::{BackendRegistry, NodeBackend};
 use super::{
-    BackendRegistry, BlobHandle, BlobHandler, ControlPlaneKind, NodeBackend,
+    BlobHandle, BlobHandler, ControlPlaneKind,
     control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
@@ -17,17 +18,18 @@ use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BUCKET_FREE_INDEX, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
     PATHS_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::Status;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::info::Status;
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, BlobCleanupWork, BlobTimeoutConfig,
     HiddenBlobKey, ResolvedBackend, WriteOwner,
@@ -37,9 +39,10 @@ use aruna_core::structs::storage::group_backend::{
     GroupBackendKind, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_net::streams::BiStream;
-use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
+use aruna_net::{InboundEventHandler, NetHandle};
 use aruna_storage::storage;
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -400,7 +403,7 @@ fn local_net() -> NetConfig {
 
 async fn loopback_net_handle() -> (NetHandle, tempfile::TempDir) {
     let dir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let net_handle = NetHandle::new(local_net(), storage_handle).await.unwrap();
     (net_handle, dir)
 }
@@ -416,7 +419,7 @@ async fn connected_stream_pair() -> (NetHandle, tempfile::TempDir, NetHandle, te
 struct TestContext {
     _temp_dir: tempfile::TempDir,
     blob_handle: BlobHandle,
-    storage_handle: aruna_storage::storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
 }
 
 enum TestContextSetup<'a> {
@@ -431,8 +434,8 @@ enum TestContextSetup<'a> {
 async fn setup_context(setup: TestContextSetup<'_>) -> TestContext {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -538,7 +541,7 @@ fn stream_from_bytes(
 }
 
 async fn bucket_load(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     backend: &BackendRef,
     bucket: &str,
 ) -> u64 {
@@ -561,7 +564,7 @@ async fn bucket_load(
         .unwrap_or(0)
 }
 
-async fn keyspace_count(storage_handle: &storage::StorageHandle, key_space: &str) -> usize {
+async fn keyspace_count(storage_handle: &storage::handle::StorageHandle, key_space: &str) -> usize {
     let Event::Storage(StorageEvent::IterResult { values, .. }) = storage_handle
         .send_storage_effect(StorageEffect::Iter {
             key_space: key_space.to_string(),
@@ -578,7 +581,7 @@ async fn keyspace_count(storage_handle: &storage::StorageHandle, key_space: &str
 }
 
 /// Cleanup rows that leave a target to the upload record `record_id`.
-async fn upload_rows(storage_handle: &storage::StorageHandle, record_id: Ulid) -> usize {
+async fn upload_rows(storage_handle: &storage::handle::StorageHandle, record_id: Ulid) -> usize {
     let Event::Storage(StorageEvent::IterResult { values, .. }) = storage_handle
         .send_storage_effect(StorageEffect::Iter {
             key_space: aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE.to_string(),
@@ -1706,7 +1709,7 @@ async fn local_spool_budget() {
 async fn local_spool_unconfigured() {
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
     let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1735,8 +1738,8 @@ async fn sweeps_demoted_backend() {
     // A changed default must not hide the old backend's crash leftovers.
     let temp_dir = tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(local_net(), storage_handle.clone())
         .await
         .unwrap();

@@ -49,7 +49,7 @@ pub async fn advertise(
     }
     refuse_scoped_push(&auth, query.service == "git-receive-pack")?;
     drive(
-        git::repository(
+        git::access::repository(
             state.get_ctx().node_id(),
             &auth,
             repository_id(&repository)?,
@@ -98,7 +98,7 @@ pub async fn rpc(
     }
     refuse_scoped_push(&auth, service == "git-receive-pack")?;
     drive(
-        git::repository(
+        git::access::repository(
             state.get_ctx().node_id(),
             &auth,
             repository_id(&repository)?,
@@ -149,7 +149,7 @@ async fn serve(
     };
     refuse_scoped_push(&auth, permission == Permission::WRITE)?;
     let (_, repository) = drive(
-        git::repository(state.get_ctx().node_id(), &auth, id, permission),
+        git::access::repository(state.get_ctx().node_id(), &auth, id, permission),
         &state.get_ctx(),
     )
     .await
@@ -180,7 +180,7 @@ async fn serve(
         metadata_url: format!("{}/metadata/{id}", api_url(&state).await?),
         push_key: String::new(),
     };
-    let serve = git::transport(&git_node(&state), &auth, request);
+    let serve = git::transport::transport(&git_node(&state), &auth, request);
     let result = drive(serve, &state.get_ctx()).await.map_err(map_error)?;
     let GitEvent::Response {
         status,

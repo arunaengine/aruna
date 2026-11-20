@@ -11,8 +11,9 @@ use aruna_core::events::{Event, StorageEvent};
 use tempfile::tempdir;
 use ulid::Ulid;
 
-use super::worker::PoolItem;
-use super::{FjallPersistPolicy, FjallStorage, StorageHandle, Store, Txn};
+use super::handle::StorageHandle;
+use super::persistence::FjallPersistPolicy;
+use super::worker::{FjallStorage, PoolItem, Store, Txn};
 
 const SPACE: &str = "pooled_reads";
 

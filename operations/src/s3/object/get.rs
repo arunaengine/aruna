@@ -3,12 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::distribution::held::{
     HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
 };
-use crate::distribution::inventory::{StagedCall, outside_answer};
-use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, check_copy_values, copy_check_call, location_from_value,
     summary_call, summary_from_value,
@@ -18,9 +16,10 @@ use crate::s3::object::put::abe::keyed;
 use crate::s3::object::source::choice::{Candidate, choose_source};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::id_mint::IdMint;
-use futures_util::StreamExt;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_core::rows::{StagedCall, outside_answer};
+use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
 use std::collections::{HashMap, VecDeque};
-use std::ops::Range;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -29,6 +28,7 @@ use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
@@ -50,18 +50,22 @@ use aruna_core::structs::storage::abe::{AbeEffect, AbeError};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey,
+    strong_validator,
 };
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::storage::object_read::{
+    InvalidRange, ObjectInfo, ObjectRangeRequest, ResolvedObjectRange,
+};
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::live_obligation_entry;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -73,10 +77,6 @@ const MAX_DRIFT_ATTEMPTS: u8 = 3;
 /// Minimum age of the current reference version before a read may mint another
 /// successor. Rate-limits a READ-only caller pointing at a source they control.
 pub const MIN_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Hard bound on automatic successors per explicit binding: the interval only
-/// slows growth, this stops it. Only a WRITE or rebind starts a fresh count.
-pub const MAX_AUTO_ADVANCES: u16 = 100;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GetObjectState {
@@ -213,55 +213,6 @@ pub enum GetObjectError {
     Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ObjectRangeRequest {
-    StartEnd { start: u64, end: u64 },
-    Start { start: u64 },
-    Suffix { length: u64 },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedObjectRange {
-    pub range: Range<u64>,
-    pub content_length: i64,
-    pub content_range: String,
-}
-
-impl ObjectRangeRequest {
-    pub fn resolve(&self, full_length: u64) -> Result<ResolvedObjectRange, GetObjectError> {
-        if full_length == 0 {
-            return Err(GetObjectError::InvalidRange);
-        }
-
-        let range = match self {
-            ObjectRangeRequest::StartEnd { start, end } => {
-                if start > end || *start >= full_length {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                *start..((*end).min(full_length - 1) + 1)
-            }
-            ObjectRangeRequest::Start { start } => {
-                if *start >= full_length {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                *start..full_length
-            }
-            ObjectRangeRequest::Suffix { length } => {
-                if *length == 0 {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                full_length.saturating_sub(*length)..full_length
-            }
-        };
-
-        Ok(ResolvedObjectRange {
-            content_range: format!("bytes {}-{}/{}", range.start, range.end - 1, full_length),
-            content_length: (range.end - range.start) as i64,
-            range,
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetObjectInput {
     pub bucket: String,
@@ -274,20 +225,6 @@ pub struct GetObjectInput {
     pub realm_id: RealmId,
     /// Local node recorded on the replication obligation of a drift successor.
     pub node_id: NodeId,
-}
-
-/// Authoritative whole-object facts of one read, carried independently of any
-/// physical location. `size` is the whole-object size; a ranged read reports its
-/// response length in `GetObjectResult::resolved_range` instead.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ObjectInfo {
-    pub size: u64,
-    pub version_created_at: Option<SystemTime>,
-    pub etag: Option<String>,
-    pub checksum_type: MultipartChecksumType,
-    pub hashes: HashMap<String, Vec<u8>>,
-    pub composite_hashes: HashMap<String, Vec<u8>>,
-    pub part_count: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -312,6 +249,12 @@ pub struct GetObjectResult {
 impl From<IoError> for GetObjectError {
     fn from(error: IoError) -> Self {
         Self::StorageError(error.into())
+    }
+}
+
+impl From<InvalidRange> for GetObjectError {
+    fn from(_: InvalidRange) -> Self {
+        Self::InvalidRange
     }
 }
 
@@ -1452,7 +1395,7 @@ impl GetObjectOperation {
             return Err(self.unexpected("Event::Blob(BlobEvent::ReadFinished)", event));
         };
         if let Some(lease) = self.reference_lease.take() {
-            blob = leased(blob, lease);
+            blob = blob.keep(lease);
         }
         let location = self.location.clone();
         let location = location.ok_or(GetObjectError::GetObjectFailed)?;
@@ -1616,7 +1559,7 @@ impl GetObjectOperation {
         mut blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> Turn {
         if let Some(lease) = self.reference_lease.take() {
-            blob = leased(blob, lease);
+            blob = blob.keep(lease);
         }
         let source_metadata = self.source_metadata.clone();
         let mut source_metadata = source_metadata.ok_or(GetObjectError::GetObjectFailed)?;
@@ -1959,32 +1902,15 @@ impl Operation for AdvanceReference {
     }
 }
 
-/// Keeps `lease` with the stream until the stream ends.
-pub(crate) fn leased(
-    blob: BackendStream<Result<Bytes, StreamError>>,
-    lease: ReadLease,
-) -> BackendStream<Result<Bytes, StreamError>> {
-    BackendStream(Box::pin(blob.0.map(move |chunk| {
-        let _lease = &lease;
-        chunk
-    })))
-}
-
 /// A reference version has no archive, so its lease names the bucket id, which no archive uses.
 pub(crate) fn reference_archive(key: BucketKeyRef) -> ArchiveKey {
     ArchiveKey::new(key.bucket_id, BackendRef::node_default())
 }
 
-pub(super) fn locked(error: BucketKeyError) -> GetObjectError {
+pub(crate) fn locked(error: BucketKeyError) -> GetObjectError {
     GetObjectError::ConversionError(ConversionError::BucketKey(error))
 }
 
 #[cfg(test)]
 #[path = "get_tests.rs"]
 mod test;
-
-/// Whether an ETag can bind a read through `If-Match`: present and not weak.
-pub(crate) fn strong_validator(etag: Option<&str>) -> bool {
-    etag.map(str::trim)
-        .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
-}

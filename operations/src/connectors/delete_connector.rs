@@ -16,10 +16,11 @@ use ulid::Ulid;
 use crate::connectors::reference_prune::schedule_prune;
 use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
-    StorageReadError, connector_id_key, delete_secret_effect, parse_secret_read,
-    read_secret_effect, source_connector_key,
+    connector_id_key, delete_secret_effect, parse_secret_read, read_secret_effect,
+    source_connector_key,
 };
-use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteSourceInput {
@@ -130,14 +131,14 @@ impl Operation for DeleteSourceOperation {
         let connector_id = self.input.connector_id;
         match &mut self.stage {
             Stage::Connector => {
-                decode_row(rows::value(result)?, SourceConnector::from_bytes)?
+                decode_row(result.value()?, SourceConnector::from_bytes)?
                     .ok_or(DeleteSourceError::NotFound)?;
                 self.stage = Stage::Secret;
                 let read = read_secret_effect(connector_id, None);
                 Ok(Next::Call(read.into()))
             }
             Stage::Secret => {
-                if parse_secret_read(rows::event(result)?, connector_id)?.is_none() {
+                if parse_secret_read(result.event()?, connector_id)?.is_none() {
                     return Ok(self.delete_records());
                 }
                 let mut scan = ReferenceScan::new(connector_id);
@@ -150,11 +151,11 @@ impl Operation for DeleteSourceOperation {
                 self.scanned(step)
             }
             Stage::Records => {
-                rows::done(result)?;
+                result.done()?;
                 self.stage = Stage::SecretDeleted;
                 Ok(Next::Call(delete_secret_effect(connector_id, None).into()))
             }
-            Stage::SecretDeleted => match rows::event(result)? {
+            Stage::SecretDeleted => match result.event()? {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {
                     Ok(Next::Done(Some(DeleteSourceResult)))
                 }
@@ -184,9 +185,9 @@ mod tests {
         create_connector, defers_pending, reference_rows, source_metadata, vault_context,
         write_reference,
     };
+    use aruna_core::calls::CallRun;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::handle::Handle;
-    use aruna_core::operation::{EffectOperation, Runnable};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::{
         SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -447,7 +448,7 @@ mod tests {
             connector_id: connector.connector_id,
         };
         // Runs the delete by hand: its transaction start, connector read and secret read.
-        let mut operation = DeleteSourceOperation::new(input.clone()).into_machine();
+        let mut operation = CallRun::new(DeleteSourceOperation::new(input.clone()));
         let mut effects = operation.start();
         for _ in 0..3 {
             assert_eq!(effects.len(), 1);

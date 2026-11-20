@@ -27,7 +27,7 @@ fn outcome<E: std::fmt::Display>(result: Result<(), E>) -> ShardNetEvent {
 async fn pull_topics(
     net: &NetHandle,
     topics: Vec<irokle::TopicId>,
-    peers: Vec<aruna_core::NodeId>,
+    peers: Vec<aruna_core::id::NodeId>,
 ) -> DocumentNetEvent {
     let sync = DocumentEffect::SyncDocuments { topics, peers };
     let effect = Effect::Net(NetEffect::DocumentSync(sync));

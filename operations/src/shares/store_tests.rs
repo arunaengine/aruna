@@ -10,7 +10,7 @@ use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget, S
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 
 fn context(dir: &tempfile::TempDir) -> DriverContext {
-    crate::testing::path_context(dir.path().to_str().unwrap())
+    aruna_drivers::testing::path_context(dir.path().to_str().unwrap())
 }
 
 async fn save(context: &DriverContext, link: ShareLink) {

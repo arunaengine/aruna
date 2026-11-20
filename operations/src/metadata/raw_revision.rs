@@ -472,7 +472,7 @@ pub(crate) mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
 
     pub(crate) fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataEventRecord {
@@ -502,7 +502,7 @@ pub(crate) mod tests {
                 establishing_event_id: event_id,
                 last_event_id: event_id,
             },
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 3), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 3), realm_id),
             node_id,
             payload: MetadataEventPayload::Scaffold {
                 name: "raw".to_string(),

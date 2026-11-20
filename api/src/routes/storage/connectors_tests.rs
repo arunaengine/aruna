@@ -8,8 +8,8 @@ use crate::openapi::ApiDoc;
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage,
 };
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::user::id::UserId;
 use aruna_drivers::testing::test_context;
 use serde_json::json;
 use tempfile::TempDir;
@@ -314,8 +314,8 @@ fn entries_normalize_prefix() {
 fn cursor_round_trips() {
     for cursor in [
         ListCursor::After("datasets/run 1/ä.txt".to_string()),
-        ListCursor::Offset(500),
         ListCursor::At("datasets/run 0".to_string()),
+        ListCursor::Walk("datasets/run 2/b.txt".to_string()),
     ] {
         assert_eq!(decode_cursor(&encode_cursor(&cursor)).unwrap(), cursor);
     }

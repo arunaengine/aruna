@@ -135,7 +135,7 @@ async fn stored(members: &Members, key: &str) {
     let mut extensions = http::Extensions::new();
     extensions.insert(members.user_on(1));
     extensions.insert(node.bucket().await);
-    extensions.insert(aruna_operations::auth::request_policy::PolicyRequestExtras::rest());
+    extensions.insert(aruna_core::request_policy::PolicyRequestExtras::rest());
     let request = s3s::S3Request {
         input,
         method: Method::PUT,
@@ -438,7 +438,7 @@ async fn trailer_checksum_checked() {
     let mut extensions = http::Extensions::new();
     extensions.insert(members.user_on(1));
     extensions.insert(node.bucket().await);
-    extensions.insert(aruna_operations::auth::request_policy::PolicyRequestExtras::rest());
+    extensions.insert(aruna_core::request_policy::PolicyRequestExtras::rest());
     let create = s3s::S3Request {
         input,
         method: Method::POST,

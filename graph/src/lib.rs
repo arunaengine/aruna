@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{MetadataError, MetadataGraphPolicy};
 use aruna_core::profile_shapes::ProfileShaclError;
 use craqle::{
@@ -25,14 +25,13 @@ mod convert;
 pub mod merge;
 mod persist;
 mod profiles;
-mod read;
+pub mod read;
 mod run;
 mod scope_reads;
-mod shacl;
+pub mod shacl;
 mod summaries;
 
-pub use crate::read::{Properties, ReadScope};
-pub use crate::shacl::ProfileShaclEngine;
+use crate::shacl::ProfileShaclEngine;
 
 /// Store calls at or above this duration are logged as slow.
 const SLOW_CALL: Duration = Duration::from_millis(100);

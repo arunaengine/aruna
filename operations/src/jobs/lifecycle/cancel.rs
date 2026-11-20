@@ -10,16 +10,18 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     CancelAuthority, ExecutionClaim, ExpiryReason, JobCancelRecord, JobFamilyId, JobFamilyRecord,
-    JobId, JobProjection, JobRecordEnvelope, JobRecordKind, LogicalJobSpec, tagged,
+    JobProjection, JobRecordEnvelope, JobRecordKind, LogicalJobSpec,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::tagged;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use super::admit_forwarded::GroupWriteOperation;
+use super::admit::forwarded::GroupWriteOperation;
 use super::alias::AliasFamilyOperation;
 use super::family_reads::{FamilyProjectionOperation, FamilyView};
 use super::routing::decidable;
@@ -61,14 +63,14 @@ enum FlagStep {
 /// it. A settled or pruned row is a no-op, and a repeated request leaves the row untouched. A
 /// terminal publication that stays pending is retried by the settle timer.
 #[derive(Debug, PartialEq)]
-pub struct FlagLocalRunOperation {
+pub struct FlagRunOperation {
     physical: JobId,
     serving: ServingNode,
     now_ms: u64,
     step: FlagStep,
 }
 
-impl FlagLocalRunOperation {
+impl FlagRunOperation {
     pub fn new(physical: JobId, serving: ServingNode, now_ms: u64) -> Self {
         Self {
             physical,
@@ -79,7 +81,7 @@ impl FlagLocalRunOperation {
     }
 }
 
-impl Operation for FlagLocalRunOperation {
+impl Operation for FlagRunOperation {
     type Output = bool;
     type Error = IoError;
 
@@ -145,7 +147,7 @@ fn local_physical_jobs(receipts: &[JobRecordEnvelope], local: NodeId) -> Vec<Job
 /// Stops every physical execution of one family this node runs. The replicated record reaches
 /// no local attempt by itself, so each local row is flagged here and the drain is woken once.
 #[derive(Debug, PartialEq)]
-pub struct CancelLocalRunsOperation {
+pub struct CancelRunsOperation {
     family: JobFamilyId,
     serving: ServingNode,
     now_ms: u64,
@@ -156,7 +158,7 @@ pub struct CancelLocalRunsOperation {
 
 type LocalRunsNext = Result<Next<()>, IoError>;
 
-impl CancelLocalRunsOperation {
+impl CancelRunsOperation {
     pub fn new(family: JobFamilyId, serving: ServingNode, now_ms: u64) -> Self {
         Self {
             family,
@@ -170,7 +172,7 @@ impl CancelLocalRunsOperation {
     fn flag_next(&mut self) -> LocalRunsNext {
         match self.pending.as_mut().and_then(Vec::pop) {
             Some(physical) => {
-                let flag = FlagLocalRunOperation::new(physical, self.serving, self.now_ms);
+                let flag = FlagRunOperation::new(physical, self.serving, self.now_ms);
                 Ok(Next::Call(IoCall::child(flag)))
             }
             None if self.flagged => Ok(Next::Then {
@@ -182,7 +184,7 @@ impl CancelLocalRunsOperation {
     }
 }
 
-impl Operation for CancelLocalRunsOperation {
+impl Operation for CancelRunsOperation {
     type Output = ();
     type Error = IoError;
 
@@ -662,7 +664,7 @@ impl Operation for CancelFamilyOperation {
             },
             CancelStep::Publish(target) => {
                 result.child::<(), JobRouteError>()??;
-                let local = CancelLocalRunsOperation::new(target.family, self.serving, self.now_ms);
+                let local = CancelRunsOperation::new(target.family, self.serving, self.now_ms);
                 self.step = CancelStep::Local(Box::new(target.projection));
                 Ok(Next::Call(IoCall::child(local)))
             }
@@ -692,7 +694,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{Family, REALM, node};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::JobRecord;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use ulid::Ulid;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
@@ -711,15 +713,15 @@ mod tests {
         Some((node(1), REALM))
     }
 
-    fn flag() -> FlagLocalRunOperation {
-        FlagLocalRunOperation::new(job(), serving(), 5)
+    fn flag() -> FlagRunOperation {
+        FlagRunOperation::new(job(), serving(), 5)
     }
 
     fn record(family: &Family) -> JobRecord {
         let spec = family.spec();
         JobRecord::new(
             job(),
-            aruna_core::structs::execution::job::JobPayload::Execution(spec.payload),
+            aruna_core::structs::execution::job::input::JobPayload::Execution(spec.payload),
             spec.created_by,
             node(1),
             1,
@@ -774,7 +776,7 @@ mod tests {
     #[test]
     fn drain_woken_once() {
         let family = Family::new([1; 32]).family();
-        let mut runs = CancelLocalRunsOperation::new(family, serving(), 5);
+        let mut runs = CancelRunsOperation::new(family, serving(), 5);
         runs.pending = Some(vec![job()]);
         let next = runs.next(child(Ok::<_, IoError>(true)));
         assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
@@ -792,7 +794,7 @@ mod tests {
     #[test]
     fn offline_stops_nothing() {
         let family = Family::new([1; 32]).family();
-        let mut runs = CancelLocalRunsOperation::new(family, None, 5);
+        let mut runs = CancelRunsOperation::new(family, None, 5);
         assert_eq!(runs.first(), Ok(Next::Done(())));
     }
 
@@ -883,7 +885,7 @@ mod tests {
 
     // No family means the caller's ordinary cancellation applies.
     #[test]
-    fn no_family_answers_none() {
+    fn missing_family_none() {
         let auth = AuthContext::anonymous(REALM);
         let mut cancel = CancelFamilyOperation::new(&auth, job(), None, serving(), 5);
         cancel.first().expect("the alias is read");

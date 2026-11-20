@@ -74,86 +74,43 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
 mod tests {
     use super::dispatch_storage;
     use crate::driver::{DriverContext, managed_effect};
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-    use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::tempdir;
 
+    /// Writes one row in its own write transaction; the runner commits it when it is done.
     #[derive(Debug, PartialEq)]
-    struct CommitOutcome {
-        state: u8,
-        failed: bool,
-        txn_id: Option<TxnId>,
-    }
+    struct CommitOutcome;
 
-    impl EffectOperation for CommitOutcome {
+    impl Operation for CommitOutcome {
         type Output = ();
-        type Error = ();
+        type Error = IoError;
 
-        fn start(&mut self) -> aruna_core::types::Effects {
-            if let Some(txn_id) = self.txn_id {
-                self.state = 3;
-                return smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                    txn_id
-                },)];
-            }
-            self.state = 1;
-            smallvec::smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
         }
 
-        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
-            match (event, self.state) {
-                (Event::Storage(StorageEvent::TransactionStarted { txn_id }), 1) => {
-                    self.txn_id = Some(txn_id);
-                    self.state = 2;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: "default".to_string(),
-                        key: ByteView::from(*b"commit-outcome"),
-                        value: ByteView::from(*b"committed"),
-                        txn_id: Some(txn_id),
-                    })]
-                }
-                (Event::Storage(StorageEvent::WriteResult { .. }), 2) => {
-                    self.state = 3;
-                    smallvec::smallvec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id: self.txn_id.expect("transaction id recorded"),
-                    })]
-                }
-                (Event::Storage(StorageEvent::TransactionCommitted { .. }), 3) => {
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                (Event::Storage(StorageEvent::Error { .. }), 3) => {
-                    self.failed = true;
-                    self.state = 4;
-                    smallvec::smallvec![]
-                }
-                _ => smallvec::smallvec![],
-            }
+        fn first(&mut self) -> Result<Next<()>, IoError> {
+            let row = (
+                "default".to_string(),
+                ByteView::from(*b"commit-outcome"),
+                ByteView::from(*b"committed"),
+            );
+            Ok(Next::Call(IoCall::Write(vec![row])))
         }
 
-        fn is_complete(&self) -> bool {
-            self.state == 4
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            if self.failed { Err(()) } else { Ok(()) }
-        }
-
-        fn abort(&mut self) -> aruna_core::types::Effects {
-            self.failed = true;
-            self.state = 4;
-            smallvec::smallvec![]
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+            result.done()?;
+            Ok(Next::Done(()))
         }
     }
 
@@ -173,8 +130,9 @@ mod tests {
             txn_id: None,
         })));
         let directory = tempdir().unwrap();
-        let direct = storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
-        let (storage_handle, receivers) = storage::StorageHandle::new();
+        let direct =
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+        let (storage_handle, receivers) = storage::handle::StorageHandle::new();
         let receiver = receivers.foreground;
         drop(receivers.bulk);
         let committed = Arc::new(AtomicBool::new(false));
@@ -222,10 +180,10 @@ mod tests {
             let _ = actor_done_tx.send(());
         });
         let net_handle = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
-                ..aruna_net::NetConfig::default()
+            aruna_net::config::NetConfig {
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
+                ..aruna_net::config::NetConfig::default()
             },
             storage_handle.clone(),
         )
@@ -240,33 +198,11 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
-        let txn_id = match storage_handle
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            other => panic!("unexpected transaction start: {other:?}"),
-        };
-        match storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: "default".to_string(),
-                key: ByteView::from(*b"commit-outcome"),
-                value: ByteView::from(*b"committed"),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected transaction write: {other:?}"),
-        }
+        // The operation's own commit is the managed effect whose refresh the actor holds.
         let task_context = context.clone();
         let mut task = tokio::spawn(async move {
             crate::driver::drive_until(
-                CommitOutcome {
-                    state: 0,
-                    failed: false,
-                    txn_id: Some(txn_id),
-                },
+                CommitOutcome,
                 &task_context,
                 tokio::time::Instant::now() + std::time::Duration::from_millis(100),
             )
@@ -336,13 +272,13 @@ mod tests {
     async fn config_commit_reloads() {
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let net_handle = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
+            aruna_net::config::NetConfig {
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
                 sync_storage_path: Some(directory.path().join("sync")),
-                ..aruna_net::NetConfig::default()
+                ..aruna_net::config::NetConfig::default()
             },
             storage_handle.clone(),
         )
@@ -360,7 +296,7 @@ mod tests {
         let realm_id = *net_handle.realm_id();
         let actor = Actor {
             node_id: net_handle.node_id(),
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             realm_id,
         };
         let config = |seed: u8| {
@@ -401,7 +337,7 @@ mod tests {
         // dropped effect; the peer link is only a post-write side channel.
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

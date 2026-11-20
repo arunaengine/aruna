@@ -3,19 +3,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect};
 use aruna_core::id::NodeId;
-use aruna_core::node_state::{DrainState, DrainStateError, DrainStateOperation};
+use aruna_core::node::state::{DrainState, DrainStateError, DrainStateOperation};
 use aruna_core::operation::Operation;
-use aruna_core::scheduling::RejectionVerdict;
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, InputMode, InputSource, JobPayload, JobRecord, JobState, LocalAdmission,
-    WorkspaceMode,
+use aruna_core::scheduling::eligibility::RejectionVerdict;
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, InputMode, InputSource, JobPayload,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, LocalAdmission, WorkspaceMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -23,13 +24,13 @@ use ulid::Ulid;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::device_admission::{BackendAdmission, select_offer};
 use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
-use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+use crate::jobs::submit::execution::{ExecutionSubmission, SubmitExecutionOperation};
 use crate::jobs::workflow::compute::{compute_answer, compute_call};
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.
@@ -449,7 +450,6 @@ fn missing_input(bucket: &str, key: &str) -> LocalExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::submit::SubmitJobError;
     use crate::jobs::workflow::fixtures::compute;
     use crate::tests::records::payload;
     use aruna_core::calls::ChildOutcome;
@@ -461,14 +461,15 @@ mod tests {
     use aruna_core::events::LaunchDecline;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
+    use aruna_core::job_request::SubmitJobError;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
         FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::InputSelection;
-    use aruna_core::structs::execution::job::{
-        InputSource, JobPayload, OutputDestination, OutputSelection, WorkspaceMode,
+    use aruna_core::structs::execution::job::input::{
+        InputSelection, InputSource, JobPayload, OutputDestination, OutputSelection,
     };
+    use aruna_core::structs::execution::job::local::WorkspaceMode;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::storage::blob::{
@@ -679,7 +680,7 @@ mod tests {
         };
         assert_eq!(version_id.as_deref(), Some(version.to_string().as_str()));
         let job = SubmitJobResult {
-            job_id: aruna_core::structs::execution::job::JobId::from_bytes([1; 16]),
+            job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([1; 16]),
             created: true,
         };
         let answer = run.next(outcome::<_, SubmitJobError>(Ok(job.clone())));
@@ -778,7 +779,7 @@ mod tests {
     }
 
     fn test_ctx(root: &str) -> DriverContext {
-        crate::testing::path_context(root)
+        aruna_drivers::testing::path_context(root)
     }
 
     async fn write_config(ctx: &DriverContext, config: &RealmConfigDocument, local: NodeId) {
@@ -863,7 +864,7 @@ mod tests {
     struct StubBackend;
 
     #[async_trait::async_trait]
-    impl aruna_compute::ExecutorBackend for StubBackend {
+    impl aruna_compute::executor::ExecutorBackend for StubBackend {
         fn kind(&self) -> ExecutorKind {
             ExecutorKind::Docker
         }
@@ -939,7 +940,7 @@ mod tests {
     fn device_ctx(root: &str) -> DriverContext {
         DriverContext {
             compute_handle: Some(std::sync::Arc::new(
-                aruna_compute::ExecutorRegistry::new()
+                aruna_compute::registry::ExecutorRegistry::new()
                     .with_backend("docker", std::sync::Arc::new(StubBackend)),
             )),
             ..test_ctx(root)

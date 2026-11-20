@@ -12,7 +12,7 @@ use aruna_core::effects::{CatchUpEffect, Effect, NetEffect};
 use aruna_core::events::{CatchUpEvent, Event, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
-use aruna_core::node_state::{DISCARD_KEY, LAST_CONTACT_KEY};
+use aruna_core::node::state::{DISCARD_KEY, LAST_CONTACT_KEY};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -38,7 +38,7 @@ pub struct CatchUpOutcome {
     pub unanswered: Vec<NodeId>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum CatchUpStep {
     /// The marker of an unfinished discard, then the reservations it still holds.
     Marker,
@@ -57,7 +57,7 @@ type CatchUpNext = Result<Next<CatchUpOutcome>, IoError>;
 
 /// Counts a sync round without `WouldBlock` with every management node that answers, at least one
 /// if any exists, then waits until the applied cursor covers each round's target.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CatchUpOperation {
     local: NodeId,
     realm_id: RealmId,

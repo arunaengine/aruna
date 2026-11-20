@@ -11,11 +11,12 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{ARTIFACT_TOMBSTONE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
-use aruna_core::structs::execution::job::{
-    JobDeletes, JobId, JobPayload, JobRecord, JobResultPayload, PRUNE_INDEX_PREFIX, cleanup_job_id,
-    parse_schedule_key, prune_delete_entries,
+use aruna_core::structs::execution::job::identity::{JobId, PRUNE_INDEX_PREFIX};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    JobRecord, JobResultPayload, cleanup_job_id, parse_schedule_key,
 };
+use aruna_core::structs::execution::job::rows::{JobDeletes, prune_delete_entries};
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -36,6 +37,8 @@ pub struct JobPruneOutcome {
     pub pruned: usize,
     pub has_more: bool,
     pub next_due_after: Option<Duration>,
+    /// Rows the pass deleted, also those of a job whose record stays for a later pass.
+    pub deleted_rows: usize,
 }
 
 /// A prune step failed; the rows stay for the next pass.
@@ -55,6 +58,13 @@ impl From<JobMutationError> for PruneError {
     }
 }
 
+/// The due jobs of one window, and the index row to continue after when the window was full.
+#[derive(Debug, Default, PartialEq)]
+pub struct DueJobs {
+    pub jobs: Vec<(JobId, JobPayload)>,
+    pub after: Option<Key>,
+}
+
 /// The due jobs of the next prune pass, for the payload handlers that may keep one for now.
 #[derive(Debug, PartialEq)]
 pub struct PruneDueOperation {
@@ -64,12 +74,14 @@ pub struct PruneDueOperation {
     next_page: Option<Key>,
     due: Vec<(JobId, JobPayload)>,
     reading: Option<JobId>,
+    last: Option<Key>,
 }
 
-type DueNext = Result<Next<Vec<(JobId, JobPayload)>>, PruneError>;
+type DueNext = Result<Next<DueJobs>, PruneError>;
 
 impl PruneDueOperation {
-    pub fn new(now_ms: u64, page_size: usize) -> Self {
+    /// Starts after the index row `after`, or at the first row.
+    pub fn new(now_ms: u64, page_size: usize, after: Option<Key>) -> Self {
         Self {
             now_ms,
             page_size,
@@ -77,7 +89,18 @@ impl PruneDueOperation {
             next_page: None,
             due: Vec::new(),
             reading: None,
+            last: after,
         }
+    }
+
+    fn done(&mut self, full: bool) -> DueNext {
+        let jobs = std::mem::take(&mut self.due);
+        let after = if full && !jobs.is_empty() {
+            self.last.clone()
+        } else {
+            None
+        };
+        Ok(Next::Done(DueJobs { jobs, after }))
     }
 
     fn page(&self, after: Option<Key>) -> IoCall {
@@ -89,25 +112,29 @@ impl PruneDueOperation {
             let Ok((expiry_ms, job_id)) = parse_schedule_key(key.as_ref()) else {
                 continue;
             };
-            if expiry_ms > self.now_ms || self.due.len() >= self.page_size.saturating_mul(4) {
-                return Ok(Next::Done(std::mem::take(&mut self.due)));
+            if expiry_ms > self.now_ms {
+                return self.done(false);
             }
+            if self.due.len() >= self.page_size.saturating_mul(4) {
+                return self.done(true);
+            }
+            self.last = Some(key);
             self.reading = Some(job_id);
             return Ok(Next::Call(IoCall::child(read_job_record(job_id))));
         }
         match self.next_page.take() {
             Some(next) => Ok(Next::Call(self.page(Some(next)))),
-            None => Ok(Next::Done(std::mem::take(&mut self.due))),
+            None => self.done(false),
         }
     }
 }
 
 impl Operation for PruneDueOperation {
-    type Output = Vec<(JobId, JobPayload)>;
+    type Output = DueJobs;
     type Error = PruneError;
 
     fn first(&mut self) -> DueNext {
-        Ok(Next::Call(self.page(None)))
+        Ok(Next::Call(self.page(self.last.clone())))
     }
 
     fn next(&mut self, result: IoResult) -> DueNext {
@@ -148,6 +175,7 @@ pub struct PruneJobsOperation {
     page_size: usize,
     deletion_cap: usize,
     kept: BTreeSet<JobId>,
+    checked: Option<BTreeSet<JobId>>,
     deletes: Vec<(KeySpace, Key)>,
     outcome: JobPruneOutcome,
     processed: usize,
@@ -178,6 +206,7 @@ impl PruneJobsOperation {
             page_size,
             deletion_cap: page_size.saturating_mul(4),
             kept,
+            checked: None,
             deletes: Vec::new(),
             outcome: JobPruneOutcome::default(),
             processed: 0,
@@ -185,6 +214,14 @@ impl PruneJobsOperation {
             next_page: None,
             step: PruneStep::Held,
         }
+    }
+
+    /// Limits the pass to the jobs a due window checked, read after the index row `after`; the
+    /// first other job ends the pass.
+    pub fn within(mut self, checked: BTreeSet<JobId>, after: Option<Key>) -> Self {
+        self.checked = Some(checked);
+        self.next_page = after;
+        self
     }
 
     fn call(&mut self, step: PruneStep, call: IoCall) -> PruneNext {
@@ -203,6 +240,7 @@ impl PruneJobsOperation {
 
     fn finish(&mut self) -> PruneNext {
         let deletes = std::mem::take(&mut self.deletes);
+        self.outcome.deleted_rows = deletes.len();
         self.call(PruneStep::Deletes, IoCall::child(RowBatch::delete(deletes)))
     }
 
@@ -261,6 +299,11 @@ impl PruneJobsOperation {
             ));
             return self.counted();
         };
+        if let Some(checked) = &self.checked
+            && !checked.contains(&record.job_id)
+        {
+            return self.more_left();
+        }
         if !matches!(&record.payload, JobPayload::Execution(_)) {
             return self.cleanup_clear(Box::new(record));
         }
@@ -340,7 +383,8 @@ impl Operation for PruneJobsOperation {
                 let held = held.map_err(|error| PruneError(error.to_string()))?;
                 self.kept
                     .extend(held.iter().map(|reservation| reservation.job_id));
-                self.page(None)
+                let after = self.next_page.take();
+                self.page(after)
             }
             PruneStep::Page => {
                 let (mut rows, next) = result.child::<SchedulePage, JobMutationError>()??;
@@ -375,7 +419,7 @@ impl Operation for PruneJobsOperation {
                 result.child::<(), JobMutationError>()??;
                 self.delete_artifact(record)
             }
-            PruneStep::Artifact(record) => match event(result)? {
+            PruneStep::Artifact(record) => match result.event()? {
                 Event::Blob(BlobEvent::HiddenDeleted) => self.record_gone(record),
                 Event::Blob(BlobEvent::Error(error)) => Err(PruneError(error.to_string())),
                 other => Err(PruneError(format!(
@@ -439,11 +483,6 @@ pub(crate) mod tests {
     use crate::jobs::JOB_PRUNE_PAGE;
     use crate::jobs::JOB_RETENTION_MS;
     use crate::jobs::store::job_calls::ClaimOutcome;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::put_job_entry;
-    use crate::jobs::store::test_calls::read_job_record;
-    use crate::jobs::store::test_calls::{claim_job, complete_job, transition_to_running};
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::handle::Handle;
     use aruna_core::id::NodeId;
@@ -451,44 +490,30 @@ pub(crate) mod tests {
         ARTIFACT_TOMBSTONE_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
         STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateResult,
-        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId, JobPayload,
-        JobProgress, JobRecord, JobResultPayload, JobState, RoCrateLimits,
+        ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, RoCrateLimits,
     };
+    use aruna_core::structs::execution::job::local::{JobProgress, JobRecord, JobResultPayload};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_drivers::jobs::context::PayloadHandler;
     use aruna_drivers::testing::test_context;
-    use aruna_storage::FjallStorage;
     use aruna_storage::scan::iter_prefix_page;
+    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use byteview::ByteView;
-    use std::sync::Arc;
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    /// One prune pass with the keep decisions of `handlers`, as the prune task runs it.
-    pub(crate) async fn prune_job_batch(
-        context: &DriverContext,
-        handlers: &[Arc<dyn PayloadHandler>],
-    ) -> Result<JobPruneOutcome, String> {
-        let now_ms = unix_timestamp_millis();
-        let mut kept = BTreeSet::new();
-        if !handlers.is_empty() {
-            let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
-                .await
-                .map_err(|error| error.0)?;
-            for (job_id, payload) in due {
-                for handler in handlers {
-                    if handler.keeps_job(context, &payload).await? {
-                        kept.insert(job_id);
-                    }
-                }
-            }
-        }
+    /// One prune pass with nothing kept back.
+    async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome, String> {
+        let (now_ms, kept) = (unix_timestamp_millis(), BTreeSet::new());
         let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
         drive(prune, context).await.map_err(|error| error.0)
     }
@@ -510,10 +535,10 @@ pub(crate) mod tests {
     }
 
     fn prune_key(expiry_ms: u64, job_id: JobId) -> Key {
-        aruna_core::structs::execution::job::job_prune_key(expiry_ms, job_id)
+        aruna_core::structs::execution::job::local::job_prune_key(expiry_ms, job_id)
     }
 
-    fn is_child(next: &PruneNext) -> bool {
+    fn is_child<T>(next: &Result<Next<T>, PruneError>) -> bool {
         matches!(next, Ok(Next::Call(IoCall::Child(_))))
     }
 
@@ -563,7 +588,7 @@ pub(crate) mod tests {
     // A finished job whose reservation is not released yet stays like a kept one.
     #[test]
     fn reserved_job_kept() {
-        use aruna_core::structs::execution::job::EffectiveResources;
+        use aruna_core::structs::execution::job::family::EffectiveResources;
         let job_id = JobId::from_bytes([4u8; 16]);
         let reservation = JobReservationRecord {
             execution_id: Ulid::from_bytes([5u8; 16]),
@@ -609,12 +634,50 @@ pub(crate) mod tests {
     #[test]
     fn due_list_stops() {
         let (due, later) = (JobId::from_bytes([6u8; 16]), JobId::from_bytes([7u8; 16]));
-        let mut list = PruneDueOperation::new(10, 4);
+        let mut list = PruneDueOperation::new(10, 4, None);
         assert!(matches!(list.first(), Ok(Next::Call(IoCall::Child(_)))));
         let page = page_of(vec![prune_key(5, due), prune_key(20, later)]);
         assert!(matches!(list.next(page), Ok(Next::Call(IoCall::Child(_)))));
         let missing = child(Ok::<Option<JobRecord>, JobMutationError>(None));
-        assert!(matches!(list.next(missing), Ok(Next::Done(found)) if found.is_empty()));
+        let found = list.next(missing);
+        assert!(matches!(found, Ok(Next::Done(found)) if found == DueJobs::default()));
+    }
+
+    // A full window names the last row it read, so the next window starts after it.
+    #[test]
+    fn full_window_continues() {
+        let mut list = PruneDueOperation::new(10, 1, None);
+        list.first().unwrap();
+        let keys = (1..=5u8).map(|seed| prune_key(5, JobId::from_bytes([seed; 16])));
+        assert!(is_child(&list.next(page_of(keys.collect()))));
+        for seed in 1..=4u8 {
+            let record = terminal_record(JobId::from_bytes([seed; 16]), 1);
+            let read = list.next(child(Ok::<_, JobMutationError>(Some(record))));
+            if seed < 4 {
+                assert!(is_child(&read));
+                continue;
+            }
+            let Ok(Next::Done(window)) = read else {
+                panic!("a full window ends");
+            };
+            assert_eq!(window.jobs.len(), 4);
+            let last = prune_key(5, JobId::from_bytes([4u8; 16]));
+            assert_eq!(window.after, Some(last));
+        }
+    }
+
+    // A due job outside the checked window waits for the next pass and is not deleted.
+    #[test]
+    fn unchecked_job_waits() {
+        let (checked, later) = (JobId::from_bytes([8u8; 16]), JobId::from_bytes([9u8; 16]));
+        let only = BTreeSet::from([checked]);
+        let mut prune = PruneJobsOperation::new(10, 4, BTreeSet::new()).within(only, None);
+        let read = prune.record_read(prune_key(5, later), Some(terminal_record(later, 1)));
+        assert!(is_child(&read));
+        assert_eq!(prune.step, PruneStep::Deletes);
+        assert!(prune.deletes.is_empty());
+        assert!(prune.outcome.has_more);
+        assert_eq!(prune.outcome.pruned, 0);
     }
 
     fn node_id(seed: u8) -> NodeId {
@@ -750,7 +813,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 1);
@@ -788,7 +851,7 @@ pub(crate) mod tests {
             })
             .await;
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 
@@ -810,7 +873,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 0);
@@ -832,7 +895,7 @@ pub(crate) mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 
@@ -885,43 +948,54 @@ pub(crate) mod tests {
         );
         record.retention_ms = retention_ms;
         insert_job(&context, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, node_id(7), 2).await.unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node_id(7), 2),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let token = claimed.claim.unwrap().claim_token;
-        put_job_entry(&context, job_id, token, b"entry", &"row")
-            .await
-            .unwrap();
-        transition_to_running(&context, job_id, token, 3)
-            .await
-            .unwrap();
-        complete_job(
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::put_job_entry(job_id, token, b"entry", &"row"),
             &context,
-            job_id,
-            token,
-            JobResultPayload::ImportRoCrate(ImportRoCrateResult {
-                document_id: None,
-                entries_total: 1,
-                imported: 1,
-                unlisted: 0,
-                failed: 0,
-                report_digest: [0u8; 32],
-            }),
-            JobProgress {
-                current: 1,
-                total: Some(1),
-                unit: "entries".to_string(),
-                paused_until: None,
-            },
-            unix_timestamp_millis().saturating_sub(2),
+        )
+        .await
+        .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::transition_to_running(job_id, token, 3),
+            &context,
+        )
+        .await
+        .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::complete_job(
+                job_id,
+                token,
+                JobResultPayload::ImportRoCrate(ImportRoCrateResult {
+                    document_id: None,
+                    entries_total: 1,
+                    imported: 1,
+                    unlisted: 0,
+                    failed: 0,
+                    report_digest: [0u8; 32],
+                }),
+                JobProgress {
+                    current: 1,
+                    total: Some(1),
+                    unit: "entries".to_string(),
+                    paused_until: None,
+                },
+                unix_timestamp_millis().saturating_sub(2),
+            ),
+            &context,
         )
         .await
         .unwrap();
         assert_eq!(count(&context, JOB_ENTRY_KEYSPACE).await, 1);
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 1);
@@ -943,7 +1017,7 @@ pub(crate) mod tests {
             .unwrap();
         insert_job(&context, &cleanup_record(job_id)).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 
@@ -956,6 +1030,80 @@ pub(crate) mod tests {
                 .is_some(),
             "the cleanup still needs its parent"
         );
+    }
+
+    #[tokio::test]
+    async fn held_window_moves() {
+        // A full window of jobs held by their cleanups does not stop a later due job.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
+        let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 10);
+        for seed in 1..=4u8 {
+            let job_id = JobId::from_bytes([seed; 16]);
+            insert_job(&context, &execution_record(job_id, finished))
+                .await
+                .unwrap();
+            insert_job(&context, &cleanup_record(job_id)).await.unwrap();
+        }
+        let eligible = JobId::from_bytes([9u8; 16]);
+        insert_job(&context, &terminal_record(eligible, finished + 5))
+            .await
+            .unwrap();
+
+        let prune = crate::plugins::work::PruneKeepingWork::new(1);
+        let outcome = drive(prune, &context).await.unwrap();
+
+        assert_eq!(outcome.pruned, 1, "the job after the held window is pruned");
+        let gone = read_job_record(&context, eligible, None).await.unwrap();
+        assert!(gone.is_none());
+        let held = read_job_record(&context, JobId::from_bytes([1u8; 16]), None);
+        assert!(held.await.unwrap().is_some(), "held jobs stay");
+    }
+
+    #[tokio::test]
+    async fn partial_prune_continues() {
+        // A job whose staging rows fill the pass keeps the run going, also when held jobs follow.
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
+        let finished = unix_timestamp_millis().saturating_sub(JOB_RETENTION_MS + 20);
+        let large = JobId::from_bytes([9u8; 16]);
+        insert_job(&context, &terminal_record(large, finished))
+            .await
+            .unwrap();
+        let writes = (1..=6u8)
+            .map(|seed| {
+                let mut row = large.to_bytes().to_vec();
+                row.push(seed);
+                let row = ByteView::from(row);
+                (
+                    STAGING_QUEUE_KEYSPACE.to_string(),
+                    row,
+                    ByteView::from(Vec::new()),
+                )
+            })
+            .collect();
+        storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        for seed in 1..=4u8 {
+            let job_id = JobId::from_bytes([seed; 16]);
+            insert_job(&context, &execution_record(job_id, finished + 10))
+                .await
+                .unwrap();
+            insert_job(&context, &cleanup_record(job_id)).await.unwrap();
+        }
+
+        let prune = crate::plugins::work::PruneKeepingWork::new(1);
+        let outcome = drive(prune, &context).await.unwrap();
+
+        assert_eq!((outcome.pruned, outcome.deleted_rows), (0, 4));
+        assert!(outcome.has_more, "the rest of the large job is next");
+        assert_eq!(count(&context, STAGING_QUEUE_KEYSPACE).await, 2);
     }
 
     #[tokio::test]
@@ -973,7 +1121,7 @@ pub(crate) mod tests {
         cleanup.finished_at_ms = Some(finished);
         insert_job(&context, &cleanup).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
+        let outcome = prune_job_batch(&test_context(storage.clone()))
             .await
             .unwrap();
 

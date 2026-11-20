@@ -5,7 +5,7 @@
 
 use super::*;
 use aruna_blob::blob::BlobHandler;
-use aruna_blob::blob::{BackendRegistry, NodeBackend};
+use aruna_blob::blob::registry::{BackendRegistry, NodeBackend};
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::StorageEffect;
 use aruna_core::egress::EgressPolicy;
@@ -31,7 +31,7 @@ fn count_files(path: &Path) -> usize {
 }
 
 async fn read_value(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
-    crate::testing::read_value(&context.storage_handle, key_space, key).await
+    aruna_drivers::testing::read_value(&context.storage_handle, key_space, key).await
 }
 
 fn test_location(created_by: UserId) -> BackendLocation {
@@ -126,7 +126,7 @@ pub(super) fn asked(turn: &Turn) -> &Effect {
 
 /// The cleanup rows among `calls`, in order.
 pub(super) fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
-    crate::tests::s3::cleanup_works(calls)
+    aruna_test_support::s3::cleanup_works(calls)
 }
 
 /// `calls` delete the written blob through a rollback child, and nothing else.
@@ -492,7 +492,7 @@ pub async fn test_put_object() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -517,7 +517,7 @@ pub async fn test_put_object() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let group_id = Ulid::generate();
     let node_id = net_handle.node_id();
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let preassigned_version_id = Ulid::generate();
     let put_config = PutObjectConfig {
         user_id,
@@ -776,7 +776,7 @@ pub async fn deduplicates_blob() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -813,7 +813,7 @@ pub async fn deduplicates_blob() {
 
     let first = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -840,7 +840,7 @@ pub async fn deduplicates_blob() {
 
     let second = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -943,7 +943,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
     let cold_root = format!("{temp_root}/cold");
     std::fs::create_dir_all(&hot_root).unwrap();
     std::fs::create_dir_all(&cold_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1015,7 +1015,7 @@ async fn put_routed(
 ) -> super::PutObjectResult {
     drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -1107,7 +1107,7 @@ async fn release_row_committed() {
     ]);
     let put = |key: &str, metadata: HashMap<String, String>| {
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -1207,7 +1207,7 @@ async fn delete_keeps_copy() {
                 group_id,
                 realm_id,
                 node_id: context.net_handle.as_ref().unwrap().node_id(),
-                deleted_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+                deleted_by: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             },
         ),
         &context,
@@ -1241,7 +1241,7 @@ pub async fn overwrite_retains_index() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1277,7 +1277,7 @@ pub async fn overwrite_retains_index() {
 
     let first = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -1304,7 +1304,7 @@ pub async fn overwrite_retains_index() {
 
     let second = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             group_id,
             realm_id,
             node_id,
@@ -1426,7 +1426,7 @@ async fn mismatch_cleans_blob() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1459,7 +1459,10 @@ async fn mismatch_cleans_blob() {
     let data = b"hello, world!";
     let err = drive(
         PutObjectOperation::new(PutObjectConfig {
-            user_id: aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            user_id: aruna_core::user::id::UserId::local(
+                Ulid::generate(),
+                RealmId::from_bytes([1u8; 32]),
+            ),
             group_id: Ulid::generate(),
             realm_id: RealmId::from_bytes([1u8; 32]),
             node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -1737,7 +1740,7 @@ async fn plain_owns_copy() {
     use aruna_core::structs::storage::format::StoredLayout;
     use aruna_core::structs::storage::routing::PlainTarget;
     let temp = tempdir().unwrap();
-    let storage = storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+    let storage = storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
     let backend = BackendRef::Group(Ulid::from_parts(2, 2));
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::generate().public();
@@ -2378,7 +2381,7 @@ mod routing {
 /// the shared placement gate, which runs as a child.
 mod decisions {
     use super::*;
-    use crate::placement::policy::PolicyCacheStats;
+    use crate::placement::policy::cache::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
         PlacementDecision, PlacementSubject, VerifiedPolicy,
     };

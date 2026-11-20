@@ -7,22 +7,23 @@ use aruna_drivers::driver::drive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aruna_core::structs::execution::job::UploadForm;
-use aruna_core::structs::execution::job::{JobErrorKind, PluginWorkAction};
+use aruna_core::structs::execution::job::input::{PluginWorkAction, UploadForm};
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::json;
 
 use super::*;
 use crate::plugin_host::plugin_work::run_plugin_work;
 use aruna_drivers::driver::DriverContext;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::edit_work;
-use aruna_operations::plugins::test_support::job_context;
+use aruna_drivers::testing::{seed_bucket, with_blob};
 use aruna_operations::plugins::work::{
-    Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve,
+    Identity, RequestContext, SendBoundary, WorkChange, WorkKind, begin_send, read_work, reserve,
+    update_work,
 };
 use aruna_operations::s3::object::put::PutObjectOperation;
-use aruna_operations::testing_objects::{put_config, seed_bucket, with_blob};
+use aruna_operations::testing_objects::put_config;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::job_context;
 
 const CONTENT: &[u8] = b"ACGTACGT";
 
@@ -70,11 +71,9 @@ async fn uploader(fixture: &Fixture) -> PluginInstall {
         "connections": { "catalog": { "url": "{catalog_url}/api/", "methods": ["PUT", "POST"] } }
     });
     let digest = fixture.publish("0.2.0", "cd", upload).await;
-    let mut request = fixture.request(None);
-    request.version = Some(digest);
     let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
-    request.grants = std::collections::BTreeMap::from([("read".into(), vec![data])]);
-    fixture.install(&request).await.unwrap()
+    let grants = std::collections::BTreeMap::from([("read".into(), vec![data])]);
+    fixture.install_with(Some(digest), grants).await
 }
 
 /// A blob context with the object `in/a.txt` of the install's group.
@@ -187,10 +186,8 @@ async fn open_post_undecided() {
     let (_root, blob) = ready(&fixture, &install).await;
     let (base, seen) = server(201).await;
     let (row, spec) = recorded(&fixture, &install, (&base, "POST")).await;
-    let begun = |row: &mut WorkRow| row.boundary = Some(SendBoundary::Sending { attempt: 1 });
-    edit_work(&fixture.ctx, (install.install_id, row.work_id), begun)
-        .await
-        .unwrap();
+    let begun = begin_send((install.install_id, row.work_id), false);
+    drive(begun, &fixture.ctx).await.unwrap();
     let ctx = job_context(&blob, &fixture);
     assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "undecided");
     assert_eq!(seen.hits.load(Ordering::SeqCst), 0);
@@ -374,19 +371,18 @@ async fn recovers_without_source() {
         *version = Some(Ulid::from_parts(5, 1));
     }
     let ids = (install.install_id, row.work_id);
-    let begun = |row: &mut WorkRow| row.boundary = Some(SendBoundary::Sending { attempt: 1 });
-    edit_work(&fixture.ctx, ids, begun).await.unwrap();
+    drive(begin_send(ids, false), &fixture.ctx).await.unwrap();
     let ctx = job_context(&blob, &fixture);
     assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "undecided");
-    let answered = |row: &mut WorkRow| {
-        row.boundary = Some(SendBoundary::Sent {
-            status: 201,
-            reply: None,
-            bytes: 8,
-            version: Ulid::from_parts(5, 2),
-        })
+    let answered = WorkChange::Sent {
+        status: 201,
+        reply: None,
+        bytes: 8,
+        version: Ulid::from_parts(5, 2),
     };
-    edit_work(&fixture.ctx, ids, answered).await.unwrap();
+    drive(update_work(ids, answered), &fixture.ctx)
+        .await
+        .unwrap();
     let outcome = run_plugin_work(&ctx, &spec).await;
     let JobRunOutcome::Succeeded(JobResultPayload::PluginWork { bytes, version_id }) = outcome
     else {

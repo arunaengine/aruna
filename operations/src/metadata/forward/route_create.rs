@@ -8,29 +8,28 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structured_id::StructuredId;
-use aruna_core::{MetaResourceId, NodeId};
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::replay::create_record_matches;
-use crate::forward::routing::{create_forward_holders, distinct_holders};
-use crate::forward::transport::{MetadataWriteError, unexpected_response};
-use crate::metadata::call_results::effect_event;
+use crate::forward::routing::distinct_holders;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
     mint_forward_document,
 };
 use crate::metadata::create_entry::CreateEntryOperation;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{
-    MetadataTransportMessage, WriteAuthError, decode_message, encode_message,
+use crate::metadata::forward::holders::create_forward_holders;
+use crate::metadata::forward::replay::create_record_matches;
+use crate::metadata::forward::write::{MetadataWriteError, unexpected_response};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, WriteAuthError, decode_message, encode_message, metadata_request,
 };
 
 /// How long one holder may take to answer a forwarded create, which validates and commits it.
@@ -190,7 +189,7 @@ impl RouteCreateOperation {
                 "no holder was asked".into(),
             ));
         };
-        let Event::Net(NetEvent::MetadataAnswer(answer)) = effect_event(result)? else {
+        let Event::Net(NetEvent::MetadataAnswer(answer)) = result.event()? else {
             return Err(MetadataWriteError::Undeliverable(
                 "unexpected answer to a forwarded create".into(),
             ));

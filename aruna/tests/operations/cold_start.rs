@@ -21,7 +21,7 @@ use aruna_drivers::driver::{DriverContext, drive};
 use aruna_graph::{GraphHandle, GraphOptions, MetadataSearchStorage};
 use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_operations::metadata::registry_cache::{RegistryReadOperation, WarmCachesOperation};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -37,7 +37,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 fn open_handle(
     metadata_dir: &std::path::Path,
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
 ) -> Result<DriverContext, BoxError> {
     let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
     let graph = GraphHandle::open(
@@ -83,7 +83,7 @@ fn registry_record(group_id: GroupId, index: usize) -> MetadataRegistryRecord {
 }
 
 async fn write_registry_records(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     records: &[MetadataRegistryRecord],
 ) -> Result<(), BoxError> {
     for chunk in records.chunks(512) {
@@ -112,7 +112,7 @@ async fn write_registry_records(
 }
 
 async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), BoxError> {
-    let event = aruna_operations::testing::send_metadata_effect(
+    let event = aruna_drivers::testing::send_metadata_effect(
         handle,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {

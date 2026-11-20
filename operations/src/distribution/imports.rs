@@ -5,18 +5,22 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, JOB_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, read_row, value};
-use aruna_core::structs::execution::job::{
-    JobId, JobPayload, JobRecord, RECORD_KEY_PREFIX, StagingJobCheckpoint, StagingJobSpec,
+use aruna_core::rows::{PrefixPages, read_row};
+use aruna_core::structs::execution::job::identity::{JobId, RECORD_KEY_PREFIX};
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobCheckpoint, StagingJobSpec,
 };
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::source_root::SourceRoot;
-use aruna_core::structs::storage::distribution::{DistributionSnapshot, DistributionView};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView,
+};
+use aruna_core::structs::storage::distribution::source_root::{HandedImport, SourceRoot};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,9 +37,9 @@ use crate::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation, ListSourceResult,
 };
 use crate::forward::transport::{peer_answer, peer_call};
-use crate::jobs::staging::{ReadCheckpointOperation, StagingStoreError, handed_checkpoint};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_core::staging_checkpoint::{ReadCheckpointOperation, handed_checkpoint};
 
 /// Job rows one scan page reads.
 const JOB_PAGE: usize = 256;
@@ -56,18 +60,6 @@ impl From<IoError> for ImportError {
 
 fn failed(error: impl std::fmt::Display) -> ImportError {
     ImportError(error.to_string())
-}
-
-/// A staging job a range's former coordinator hands over: its spec, the source root its
-/// connector reads, and where the job stood before the range was fenced.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HandedImport {
-    pub spec: StagingJobSpec,
-    pub root: SourceRoot,
-    pub resume: Option<StagingJobCheckpoint>,
-    /// The connector's record when it holds no credentials, so the new coordinator can register
-    /// it under the same id, as the import's fan-out does.
-    pub shared: Option<SourceConnector>,
 }
 
 /// A fenced job as its former coordinator keeps it until the transfer is no longer open: its
@@ -91,12 +83,12 @@ fn resume_key(transfer_id: Ulid, job_id: JobId) -> Vec<u8> {
     [RESUME_PREFIX, &transfer_id.to_bytes(), &job_id.to_bytes()].concat()
 }
 
-pub(super) fn jobs_key(transfer_id: Ulid) -> Vec<u8> {
+pub(crate) fn jobs_key(transfer_id: Ulid) -> Vec<u8> {
     [JOBS_PREFIX, &transfer_id.to_bytes()].concat()
 }
 
 /// The prefix of the rows that resume the imports of a transfer.
-pub(super) fn resume_prefix(transfer_id: Ulid) -> Vec<u8> {
+pub(crate) fn resume_prefix(transfer_id: Ulid) -> Vec<u8> {
     [RESUME_PREFIX, &transfer_id.to_bytes()].concat()
 }
 
@@ -189,7 +181,7 @@ enum KeepStep {
 /// Keeps the open imports of `bucket` and where each stands, before the range of `transfer_id`
 /// is fenced: pages committed after it only repeat work the new coordinator does again.
 #[derive(Debug, PartialEq)]
-pub(super) struct KeepResumeOperation {
+pub(crate) struct KeepResumeOperation {
     bucket: String,
     transfer_id: Ulid,
     step: KeepStep,
@@ -199,7 +191,7 @@ pub(super) struct KeepResumeOperation {
 }
 
 impl KeepResumeOperation {
-    pub(super) fn new(bucket: &str, transfer_id: Ulid) -> Self {
+    pub(crate) fn new(bucket: &str, transfer_id: Ulid) -> Self {
         Self {
             bucket: bucket.to_string(),
             transfer_id,
@@ -241,7 +233,7 @@ impl Operation for KeepResumeOperation {
                 self.next_job()
             }
             KeepStep::Checkpoint => {
-                let read = result.child::<Option<StagingJobCheckpoint>, StagingStoreError>()?;
+                let read = result.child::<Option<StagingJobCheckpoint>, IoError>()?;
                 let at = read.map_err(failed)?;
                 let (job_id, spec) = self.current.take().ok_or(IoError::Unfinished)?;
                 self.jobs.push(job_id);
@@ -272,7 +264,7 @@ enum FencedStep {
 /// The imports of `bucket` to hand over: those open now and those kept before the fence of
 /// `transfer_id`, finished ones too, since a job may end while it skips the fenced range's keys.
 #[derive(Debug, PartialEq)]
-pub(super) struct FencedImportsOperation {
+pub(crate) struct FencedImportsOperation {
     bucket: String,
     transfer_id: Ulid,
     step: FencedStep,
@@ -281,7 +273,7 @@ pub(super) struct FencedImportsOperation {
 }
 
 impl FencedImportsOperation {
-    pub(super) fn new(bucket: &str, transfer_id: Ulid) -> Self {
+    pub(crate) fn new(bucket: &str, transfer_id: Ulid) -> Self {
         Self {
             bucket: bucket.to_string(),
             transfer_id,
@@ -317,7 +309,7 @@ impl Operation for FencedImportsOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<JobId>>, ImportError> {
         match self.step {
             FencedStep::Kept => {
-                let kept = value(result)?;
+                let kept = result.value()?;
                 let kept = kept.as_deref().map(postcard::from_bytes).transpose();
                 self.jobs = kept.map_err(failed)?.unwrap_or_default();
                 self.step = FencedStep::Open;
@@ -403,7 +395,7 @@ impl Operation for StagingSpecOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<HandedImport>, MetadataReadError> {
         match self.step {
             SpecStep::Resume => {
-                let stored = value(result)?.ok_or(MetadataReadError::NotFound)?;
+                let stored = result.value()?.ok_or(MetadataReadError::NotFound)?;
                 let job: FencedJob =
                     postcard::from_bytes(&stored).map_err(|_| MetadataReadError::Unavailable)?;
                 let bucket = GetBucketOperation::new(job.spec.bucket.clone());
@@ -419,7 +411,7 @@ impl Operation for StagingSpecOperation {
                 Ok(Next::Call(record_read(binding.set_id)))
             }
             SpecStep::Record => {
-                let record = value(result)?.ok_or(MetadataReadError::Forbidden)?;
+                let record = result.value()?.ok_or(MetadataReadError::Forbidden)?;
                 let view = DistributionView::from_bytes(&record)
                     .map_err(|_| MetadataReadError::Unavailable)?;
                 let members = &view.snapshot().config.members;
@@ -458,7 +450,7 @@ enum FetchStep {
 /// source root, and keeps them until this node coordinates the range. `true` once all are
 /// fetched; an unanswered request or a root no connector here reads waits for the next pass.
 #[derive(Debug, PartialEq)]
-pub(super) struct FetchImportsOperation {
+pub(crate) struct FetchImportsOperation {
     set_id: Ulid,
     range_id: Ulid,
     transfer_id: Ulid,
@@ -473,7 +465,7 @@ pub(super) struct FetchImportsOperation {
 type Fetching = Result<Next<bool>, ImportError>;
 
 impl FetchImportsOperation {
-    pub(super) fn new(
+    pub(crate) fn new(
         (set_id, range_id, transfer_id): (Ulid, Ulid, Ulid),
         local: NodeId,
         from: NodeId,
@@ -620,7 +612,7 @@ impl Operation for FetchImportsOperation {
     fn next(&mut self, result: IoResult) -> Fetching {
         match self.step {
             FetchStep::Kept => {
-                self.kept = Some(match value(result)? {
+                self.kept = Some(match result.value()? {
                     Some(stored) => postcard::from_bytes(&stored).map_err(failed)?,
                     None => Kept {
                         from: self.from,
@@ -667,7 +659,7 @@ impl Operation for FetchImportsOperation {
 }
 
 /// Kept imports of a range this node now coordinates, ready to run as its own jobs.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KeptStart {
     pub(crate) key: Vec<u8>,
     pub(crate) kept: Kept,
@@ -686,7 +678,7 @@ enum ContinueStep {
 /// Finds the kept imports of every range this node now coordinates; a transfer that ended
 /// without this node drops them, one still on its way leaves them waiting.
 #[derive(Debug, PartialEq)]
-pub(super) struct ContinueImportsOperation {
+pub(crate) struct ContinueImportsOperation {
     local: NodeId,
     step: ContinueStep,
     rows: VecDeque<(Key, Value)>,
@@ -699,7 +691,7 @@ pub(super) struct ContinueImportsOperation {
 type Continuing = Result<Next<Vec<KeptStart>>, ImportError>;
 
 impl ContinueImportsOperation {
-    pub(super) fn new(local: NodeId) -> Self {
+    pub(crate) fn new(local: NodeId) -> Self {
         Self {
             local,
             step: ContinueStep::Page,
@@ -774,7 +766,7 @@ impl Operation for ContinueImportsOperation {
                 self.next_row()
             }
             ContinueStep::Record => {
-                let Some(record) = value(result)? else {
+                let Some(record) = result.value()? else {
                     return self.drop_row();
                 };
                 let view = DistributionView::from_bytes(&record).map_err(failed)?;

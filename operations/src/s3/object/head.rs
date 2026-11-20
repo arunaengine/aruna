@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::s3::object::lookup::{FoundVersion, VersionLookup, VersionLookupError};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
@@ -369,7 +369,7 @@ mod tests {
     async fn current_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(temp_root).unwrap();
         let net_handle =
             NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
                 .await
@@ -485,7 +485,7 @@ mod tests {
     async fn specific_version_read() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(temp_root).unwrap();
         let net_handle =
             NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
                 .await
@@ -667,7 +667,7 @@ mod tests {
     async fn cached_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
-        let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(temp_root).unwrap();
         let net_handle =
             NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
                 .await

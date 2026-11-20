@@ -233,11 +233,11 @@ pub fn reduce(records: &[GitRecord], ancestry: &Ancestry) -> (GitState, Vec<(Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::git::GitPack;
     use aruna_core::git::RefUpdate;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::user::id::UserId;
 
     fn oid(seed: char) -> String {
         seed.to_string().repeat(40)

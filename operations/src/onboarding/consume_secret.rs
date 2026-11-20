@@ -7,13 +7,13 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::types::Value;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::create_secret::secret_record_key;
+use crate::onboarding::create_secret::{expiry_entry, secret_record_key};
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +142,7 @@ impl ConsumeSecretOperation {
                 node_id: node.clone(),
             },
         )?;
+        let expiry = expiry_entry(&record);
         self.claimed = Some(record);
         Ok(Next::Call(IoCall::Write(vec![
             (
@@ -150,6 +151,7 @@ impl ConsumeSecretOperation {
                 ByteView::from(value),
             ),
             state_entry,
+            expiry,
         ])))
     }
 }
@@ -173,7 +175,7 @@ impl Operation for ConsumeSecretOperation {
             let [record, state] = values::<2>(result)?;
             return self.claim(record, state);
         };
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(ConsumeSecretOutput {
             record,
             consumed_now: true,
@@ -194,7 +196,8 @@ mod tests {
     #[tokio::test]
     async fn claims_same_node() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

@@ -10,8 +10,8 @@ pub mod resolver;
 pub mod selector;
 pub mod transition;
 
-use crate::NodeId;
 use crate::document::DocumentTarget;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmConfigDocument;
 use crate::structs::placement::record::{
     DocumentClass, PlacementOverride, PlacementRef, PlacementStrategy, shard_for_subject,
@@ -22,9 +22,9 @@ use ulid::Ulid;
 
 use crate::placement::selector::{ROLE_SHARD, rank_weighted};
 
-pub use resolver::{
-    PlacementResolutionContext, PlacementView, ResolvedNode, build_view, document_class,
-    meta_bucket_subject, resolve_holders, strategy_for_target, subject_bytes, view_from_map,
+use resolver::{
+    PlacementResolutionContext, PlacementView, build_view, resolve_holders, strategy_for_target,
+    subject_bytes, view_from_map,
 };
 
 /// Canonical rendezvous subject for a shard's holder resolution:
@@ -711,7 +711,8 @@ pub fn choose_origin_bucket(
 mod pure_tests {
     use super::*;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-    use crate::reducer::{AdminDocumentState, overlay_placement};
+    use crate::reducer::AdminDocumentState;
+    use crate::reducer::placement::overlay_placement;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::{RealmId, RealmNodeKind};
     use crate::structs::placement::record::{
@@ -928,7 +929,7 @@ mod pure_tests {
     #[test]
     fn user_origin_empty() {
         let (mut config, _) = config_and_placement();
-        let owner = crate::UserId::nil(config.realm_id);
+        let owner = crate::user::id::UserId::nil(config.realm_id);
         config.ensure_node(node(5), RealmNodeKind::User { owner });
         let strategy = strategy_of(&config);
         assert!(held_buckets(&config, strategy, node(5)).is_empty());
@@ -1588,7 +1589,7 @@ mod pure_tests {
         let mut state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
         let actor = |seed: u8| Actor {
             node_id: node(seed),
-            user_id: crate::UserId::nil(realm_id),
+            user_id: crate::user::id::UserId::nil(realm_id),
             realm_id,
         };
         let map = |epoch: u64, seeds: [u8; 2]| CandidatePlacementMap {

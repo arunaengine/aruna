@@ -5,11 +5,16 @@
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, LogicalJobState, OutputObject, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    ExecutionReceipt, JobFamilyRecord, LogicalJobState, PhysicalExecutionState,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobClaim, JobRecord, JobResultPayload, OutputObject,
+};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -21,8 +26,6 @@ use crate::jobs::output_record::StoreOutputsOperation;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::store::test_calls::record_attempt_intent;
-use crate::jobs::store::test_calls::reserve_output_commits;
 use crate::tests::records::{Family, REALM, context};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
@@ -167,22 +170,32 @@ async fn publishes_terminal_success() {
         config_generation: 0,
         home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
-    let commit = record_attempt_intent(
+    let commit = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            physical(),
+            TOKEN,
+            intent,
+            Some(receipt.execution_id),
+            None,
+            4_100,
+        ),
         &ctx,
-        physical(),
-        TOKEN,
-        intent,
-        Some(receipt.execution_id),
-        None,
-        4_100,
     )
     .await
     .expect("attempt intent commits");
     let executor = family.target.public();
-    let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
-    let control = reserve_output_commits(&ctx, physical(), &destinations, &Default::default())
-        .await
-        .expect("output commits reserved");
+    let destinations = [(executor, "ws".to_string(), "out.txt".to_string())];
+    let control = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::reserve_output_commits(
+            physical(),
+            destinations.to_vec(),
+            Default::default(),
+            aruna_core::time::unix_timestamp_millis(),
+        ),
+        &ctx,
+    )
+    .await
+    .expect("output commits reserved");
     let outputs = vec![OutputObject {
         node_id: executor,
         bucket: "ws".to_string(),
@@ -283,7 +296,7 @@ async fn bumps_dashboard_once() {
 
 async fn publish_terminal(
     ctx: &aruna_drivers::driver::DriverContext,
-    record: &aruna_core::structs::execution::job::JobRecord,
+    record: &aruna_core::structs::execution::job::local::JobRecord,
 ) -> bool {
     let publish = PublishTerminalOperation::new(
         record.clone(),

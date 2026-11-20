@@ -41,10 +41,11 @@ tracing-opentelemetry = { workspace = true }
 smallvec = { workspace = true }
 crossfire = { workspace = true }
 ulid = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-core = { workspace = true, features = ["test-hooks"] }
-tempfile = { workspace = true }
 
 [[test]]
 name = "integration"

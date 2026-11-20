@@ -4,16 +4,15 @@
 
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::decode_reducer_state;
-use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
@@ -70,7 +69,7 @@ impl Operation for PrepareOperation {
             result.child::<(), GroupDeletionError>()??;
             return Ok(Next::Call(IoCall::Sync));
         }
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -312,7 +311,7 @@ impl Operation for PrepareWrite {
                 None => self.write(),
             },
             (Stage::Write, result) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
             _ => Err(GroupDeletionError::Unavailable(

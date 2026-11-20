@@ -13,16 +13,19 @@ use crate::routes::access::sessions::unix_rfc3339;
 use crate::routes::info::is_realm_admin;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_core::UserId;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
-    AssistantProviderStatus, AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, SESSION_HEADER,
-    USER_HEADER, secs_to_midnight, utc_day,
+    AssistantProviderStatus,
 };
+use aruna_core::structs::central_assistant::{
+    AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, SESSION_HEADER, USER_HEADER,
+    secs_to_midnight, utc_day,
+};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::assistant::central::{
     CentralRead, CentralStoreError, ChargeUsageOperation, GetCentralOperation, SetCentralOperation,

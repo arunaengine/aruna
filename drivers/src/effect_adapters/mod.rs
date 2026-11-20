@@ -12,7 +12,7 @@ pub mod queue_lag;
 mod session;
 pub(crate) mod shard;
 mod storage;
-mod task;
+pub mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
@@ -293,10 +293,30 @@ fn plugin_state(effect: PluginEffect) -> PluginEvent {
             unnamed,
             now_ms,
         } => {
-            let keys = |users: Vec<aruna_core::UserId>| -> Vec<String> {
+            let keys = |users: Vec<aruna_core::user::id::UserId>| -> Vec<String> {
                 users.iter().map(ToString::to_string).collect()
             };
             PluginEvent::Seen(host_state::first_seen(&keys(named), &keys(unnamed), now_ms))
+        }
+        PluginEffect::HeldValue {
+            run_id,
+            holder,
+            slot,
+        } => {
+            let held = host_state::held_value((run_id.into(), holder.into()), &slot);
+            PluginEvent::Held(held.map(ulid::Ulid::from))
+        }
+        PluginEffect::HoldValue {
+            run_id,
+            holder,
+            slot,
+            value_id,
+            fields,
+        } => {
+            let fields = fields.map(|fields| fields.expose().to_vec());
+            let holder = (run_id.into(), holder.into());
+            let held = host_state::hold_value(holder, &slot, value_id.into(), fields);
+            PluginEvent::Fields(held.map(aruna_core::compute::SecretBytes::new))
         }
     }
 }
@@ -312,10 +332,10 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
         OutboundEffect::RefreshMail(_) => OutboundEvent::MailRefreshed,
         // Both checks need no backend, so they answer as on a node with one.
         OutboundEffect::CheckSmtp(settings) => OutboundEvent::SmtpChecked {
-            result: aruna_outbound::check_smtp(settings),
+            result: aruna_outbound::mail::check_smtp(settings),
         },
         OutboundEffect::CheckAddress(address) => OutboundEvent::AddressChecked {
-            valid: aruna_outbound::valid_address(address),
+            valid: aruna_outbound::mail::valid_address(address),
         },
         OutboundEffect::ListRange(_) => OutboundEvent::RangeListed(Box::new(RangeAnswer::Silent)),
         OutboundEffect::MemberFetch(_) => {

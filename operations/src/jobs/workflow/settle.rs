@@ -8,9 +8,10 @@ use aruna_core::compute::LogTails;
 use aruna_core::effects::Effect;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobError, JobErrorKind, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState,
-    OutputObject,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    JobError, JobErrorKind, JobProgress, JobRecord, JobResultPayload, OutputObject,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::{info, warn};

@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ACCESS_OWNER_KEYSPACE, USER_ACCESS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, read_row, value};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::Key;
 use std::time::{Duration, SystemTime};
@@ -172,19 +172,19 @@ impl Operation for RevokeUserOperation {
 
     fn next(&mut self, result: IoResult) -> RevokeTurn {
         match self.stage {
-            Stage::Access => self.access_read(value(result)?),
-            Stage::Owner => self.index_read(value(result)?),
+            Stage::Access => self.access_read(result.value()?),
+            Stage::Owner => self.index_read(result.value()?),
             Stage::Index => {
-                done(result)?;
+                result.done()?;
                 Ok(self.delete_access())
             }
             Stage::Credential => {
-                done(result)?;
+                result.done()?;
                 Ok(self.scan_tokens())
             }
             Stage::Tokens => self.tokens_read(result),
             Stage::TokensDeleted => {
-                done(result)?;
+                result.done()?;
                 if self.tokens.done() {
                     return self.mark_due();
                 }
@@ -198,7 +198,6 @@ impl Operation for RevokeUserOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -207,6 +206,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::abe_access::token_prefix;
     use aruna_core::structs::storage::blob::UserAccess;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::BTreeSet;
@@ -371,7 +371,7 @@ mod tests {
     async fn revokes_user_access() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -450,7 +450,7 @@ mod tests {
     async fn revoke_deletes_tokens() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

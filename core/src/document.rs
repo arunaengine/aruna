@@ -3,35 +3,39 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cmp::Ordering;
+use std::time::Duration;
 
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
+use crate::effects::Effect;
+use crate::errors::ConversionError;
+use crate::id::{NodeId, TopicId};
 use crate::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE,
-    ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE,
-    OWNER_SECRETS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    APPLIED_SYNC_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
+    NODE_STATS_KEYSPACE, OWNER_SECRETS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
     REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE, USER_KEYSPACE, VAULT_REVISION_KEYSPACE,
     WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE, WEBHOOK_SETTINGS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
-use crate::repository::link_key;
+use crate::repository::link::link_key;
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 use crate::structs::execution::setting::setting_key;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::user_record_key;
-use crate::structs::persistent_id_key;
+use crate::structs::persistent_id::persistent_id_key;
 use crate::structs::placement::policy::document::placement_policy_key;
 use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::node_info::node_info_key;
 use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
-use crate::types::{GroupId, Key};
-use crate::{NodeId, TopicId};
+use crate::task::{TaskEffect, TaskKey};
+use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DocumentTarget {
@@ -364,7 +368,7 @@ pub struct ReconcileBatch {
     pub cursor_key: ByteView,
     pub cursor_value: ByteView,
     /// Ops whose payload never decoded into an event.
-    pub rejections: Vec<crate::structs::SyncRejection>,
+    pub rejections: Vec<crate::structs::sync_quarantine::SyncRejection>,
     pub events: Vec<BatchEvent>,
 }
 
@@ -394,7 +398,7 @@ pub struct BatchEvent {
     pub publisher_allowed: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentReconcileResult {
     pub targets: Vec<DocumentTarget>,
     pub metadata_create_events: Vec<MetadataEventRecord>,
@@ -405,6 +409,80 @@ impl DocumentReconcileResult {
     pub fn applied(&self) -> usize {
         self.targets.len()
     }
+}
+
+/// The follow-up of an [`AppliedSync`] the node drain runs next, in this order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppliedStep {
+    #[default]
+    Usage,
+    Interest,
+    Mail,
+    Metadata,
+}
+
+impl AppliedStep {
+    /// The follow-up after this one, `None` after the last.
+    pub fn after(self) -> Option<Self> {
+        match self {
+            Self::Usage => Some(Self::Interest),
+            Self::Interest => Some(Self::Mail),
+            Self::Mail => Some(Self::Metadata),
+            Self::Metadata => None,
+        }
+    }
+}
+
+/// A reconcile a shard pull applied, kept until the node drain ran its usage, watch, mail and
+/// metadata follow-ups. The id orders the rows and is the generation of the usage refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedSync {
+    pub id: Ulid,
+    pub node_id: NodeId,
+    /// The realm this node serves, when it runs a net transport.
+    pub realm_id: Option<RealmId>,
+    pub result: DocumentReconcileResult,
+    /// The drain stores each finished follow-up here, so a rerun after a restart goes on.
+    pub next: AppliedStep,
+}
+
+impl AppliedSync {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// The row that queues `applied` for the node drain.
+pub fn applied_sync_entry(
+    applied: &AppliedSync,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    let key = Key::from(applied.id.to_bytes().to_vec());
+    let value = Value::from(applied.to_bytes()?);
+    Ok((APPLIED_SYNC_KEYSPACE.to_string(), key, value))
+}
+
+/// The counter row of the order `document_id`'s queued follow-ups were accepted in.
+pub fn order_counter_key(document_id: Ulid) -> Key {
+    Key::from(document_id.to_bytes().to_vec())
+}
+
+/// The entry of the follow-up batch queued `sequence`-th for `document_id`; it holds the id.
+pub fn order_entry_key(document_id: Ulid, sequence: u64) -> Key {
+    let mut key = document_id.to_bytes().to_vec();
+    key.extend_from_slice(&sequence.to_be_bytes());
+    Key::from(key)
+}
+
+/// Arms the node drain of applied reconciles to run now.
+pub fn schedule_applied_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::ZERO,
+    })
 }
 
 impl DocumentSyncPublish {

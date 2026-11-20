@@ -15,11 +15,8 @@ use crate::jobs::export::sources::{AliasState, ResolveEntriesOperation, alias_al
 use crate::replication::bao_read::BaoReadOutput;
 use crate::replication::plaintext::HolderCheckOperation;
 use crate::tests::export::{
-    BaoNode, FIXTURE_BYTES, byte_stream, crate_document, encrypting_bucket, export_node,
-    job_context, open_candidate, probe_sources, recognized_entities, remote_spec, scope_of,
-    seed_bao,
+    crate_document, job_context, open_candidate, probe_sources, recognized_entities, scope_of,
 };
-use aruna_core::UserId;
 use aruna_core::effects::BlobEffect;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::BlobEvent;
@@ -31,8 +28,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::structs::execution::job::ExportReportSource;
-use aruna_core::structs::execution::job::ExportRoCrateSpec;
+use aruna_core::structs::execution::job::input::{ExportReportSource, ExportRoCrateSpec};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
@@ -45,8 +41,12 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
+use aruna_test_support::export::{
+    BaoNode, FIXTURE_BYTES, byte_stream, encrypting_bucket, export_node, remote_spec, seed_bao,
+};
 use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -269,11 +269,13 @@ async fn selection_reads_locally() {
         expected_blake3: Some(hash),
     };
     let mut spec = remote_spec(realm_id, UserId::nil(realm_id));
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
-        files: vec!["data.csv".to_string()],
-        audience: RealmId::from_bytes([67; 32]),
-        intent_digest: String::new(),
-    });
+    spec.selection = Some(
+        aruna_core::structs::execution::job::input::ExportSelection {
+            files: vec!["data.csv".to_string()],
+            audience: RealmId::from_bytes([67; 32]),
+            intent_digest: String::new(),
+        },
+    );
     let opened = open_candidate(node.driver.as_ref(), &spec, &candidate, true).await;
     assert!(matches!(
         opened.unwrap(),
@@ -420,11 +422,13 @@ async fn sealed_local_export() {
     };
     driver.storage_handle.send_storage_effect(write).await;
     let mut spec = remote_spec(realm_id, reader);
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
-        files: Vec::new(),
-        audience: RealmId::from_bytes([117; 32]),
-        intent_digest: String::new(),
-    });
+    spec.selection = Some(
+        aruna_core::structs::execution::job::input::ExportSelection {
+            files: Vec::new(),
+            audience: RealmId::from_bytes([117; 32]),
+            intent_digest: String::new(),
+        },
+    );
     assert!(matches!(
         open_candidate(driver, &spec, &candidate, true).await,
         Ok(CandidateOpen::Status(OpenStatus::NotHolder))
@@ -671,11 +675,13 @@ async fn unheld_copy_skipped() {
     let (node, _, viewer, candidates) = two_copies().await;
     let ctx = job_context(node.driver.clone(), node.net.node_id());
     let mut spec = remote_spec(viewer.realm_id, viewer);
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
-        files: vec!["data/payload".to_string()],
-        audience: RealmId::from_bytes([138; 32]),
-        intent_digest: String::new(),
-    });
+    spec.selection = Some(
+        aruna_core::structs::execution::job::input::ExportSelection {
+            files: vec!["data/payload".to_string()],
+            audience: RealmId::from_bytes([138; 32]),
+            intent_digest: String::new(),
+        },
+    );
     let entity = |candidates: &[ExportCandidate]| ExportEntity {
         entity_id: "data/payload".to_string(),
         local_path: None,
@@ -725,11 +731,13 @@ async fn consent_resolves_hashes() {
     let jsonld = jsonld.to_string();
     let spec = |user_id| {
         let mut spec = remote_spec(viewer.realm_id, user_id);
-        spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
-            files: vec![file.clone()],
-            audience: RealmId::from_bytes([138; 32]),
-            intent_digest: String::new(),
-        });
+        spec.selection = Some(
+            aruna_core::structs::execution::job::input::ExportSelection {
+                files: vec![file.clone()],
+                audience: RealmId::from_bytes([138; 32]),
+                intent_digest: String::new(),
+            },
+        );
         spec
     };
     let (viewing, owning) = (spec(viewer), spec(owner));

@@ -13,19 +13,17 @@ use serde_json::json;
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::secret_use::slot_kind;
-#[allow(unused_imports)]
-pub(crate) use crate::plugins::test_support::{
-    ORIGIN, TOKEN, bound, edit_config, hold_keys, rule_for, secret, secret_with,
-};
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::{Refusal, ReleaseError};
 use aruna_core::secrets::UseRule;
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+#[allow(unused_imports)]
+use aruna_test_support::plugins::{TOKEN, bound, hold_keys, rule_for, secret};
 use ulid::Ulid;
 
 #[tokio::test]
@@ -81,7 +79,7 @@ async fn node_binding_checks() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let name = SecretName::try_from("api-key".to_string()).unwrap();
     let bearer = SecretKind::parse("bearer").unwrap();
     let local = fixture.actor.node_id;
@@ -167,7 +165,7 @@ async fn slots_bind() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let input = crate::secrets::node::NodeChange {
         realm_id: fixture.actor.realm_id,
         node_id: fixture.actor.node_id,
@@ -287,12 +285,12 @@ mod operations {
 
     use super::*;
     use crate::document_repository::GetConfigError;
-    use crate::metadata::protocol::MetadataTransportMessage;
     use crate::plugins::entry::EntryError;
     use crate::plugins::fixtures::{
         self, config_result, is_child, is_effect, node, peer_says, peer_silent,
     };
     use crate::plugins::rows::tests::{child_result, values_result};
+    use aruna_core::metadata::protocol::MetadataTransportMessage;
 
     fn key() -> (SecretName, SecretKind) {
         let name = SecretName::try_from("key".to_string()).unwrap();

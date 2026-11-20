@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -15,7 +14,6 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -25,17 +23,18 @@ use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{GroupId, Key, KeySpace, RoleId};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
-use crate::notifications::emit::emit_notifications_effect;
-use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::sync::outbox_record::{
+use crate::sync::notification_outbox::emit_notifications_effect;
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::notification_routing::{RoutingContext, route_resource_event};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 
@@ -489,14 +488,14 @@ impl Operation for MemberAddition {
                 self.emit_auth_write(auth_doc, reducer, realm_config)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.after_writes()
             }
             Stage::Fence => {
@@ -567,12 +566,14 @@ fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> bool {
 pub mod test {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
+    use aruna_core::keyspaces::{
+        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    };
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
@@ -584,10 +585,9 @@ pub mod test {
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::RoleId;
-    use aruna_core::{
-        AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
-    };
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_core::user::id::UserId;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::{TempDir, tempdir};
@@ -600,7 +600,7 @@ pub mod test {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_drivers::driver::{DriverContext, drive};
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -1039,7 +1039,7 @@ pub mod test {
     pub async fn test_add_user() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1138,7 +1138,7 @@ pub mod test {
     async fn add_context() -> (DriverContext, NetHandle, TempDir) {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

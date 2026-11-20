@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
+use aruna_core::user::id::UserId;
 
 fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])
@@ -118,7 +118,10 @@ fn routed_create_emits() {
         panic!("expected the record with its watch event");
     };
     assert_eq!(output, record(document_id));
-    assert!(matches!(calls.as_slice(), [IoCall::Child(_)]));
+    assert!(matches!(
+        calls.as_slice(),
+        [IoCall::Write(_), IoCall::Effect(_)]
+    ));
 }
 
 #[test]

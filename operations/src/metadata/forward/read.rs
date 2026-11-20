@@ -1,18 +1,25 @@
-//! Shared parts of routed metadata reads: status choice, summary export and Profile peer check.
+//! Shared parts of routed metadata reads: status choice, summary exports, the dataset summary of
+//! a bucket and the Profile peer check.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::ExportMetadataRequest;
-use crate::metadata::api::export_types::ExportMetadataResult;
-use crate::metadata::api::export_types::RoCrateExportView;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
-use aruna_core::NodeId;
-use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
+use aruna_core::metadata::{AuthToken, ProfileValidationStatus};
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::dataset_description::{DatasetSummaryRequest, DescriptionError};
+use aruna_core::structs::storage::dataset_description::{
+    DatasetDescription, DatasetSummaryRequest, DescriptionError, describe,
+};
 use std::time::Duration;
 use ulid::Ulid;
 
@@ -75,4 +82,113 @@ pub(crate) fn summary_answer(
 /// of this realm are admitted.
 pub fn admits_profile_peer(config: &RealmConfigDocument, peer: NodeId, realm_id: RealmId) -> bool {
     ensure_peer_trust(config, peer, realm_id, PeerTrust::Vouched(None)).is_ok()
+}
+
+/// What the dataset says about a bucket, read from its holders with the caller's own access,
+/// so a reader never sees a description it may not read.
+#[derive(Debug, PartialEq)]
+pub struct DatasetSummaryOperation {
+    request: Option<DatasetSummaryRequest>,
+}
+
+impl DatasetSummaryOperation {
+    pub fn new(
+        realm_id: RealmId,
+        dataset: Ulid,
+        (auth, token): (Option<&AuthContext>, Option<AuthToken>),
+    ) -> Self {
+        let auth = auth.cloned();
+        let request = DatasetSummaryRequest {
+            realm_id,
+            dataset,
+            auth,
+            token,
+        };
+        Self {
+            request: Some(request),
+        }
+    }
+}
+
+impl Operation for DatasetSummaryOperation {
+    type Output = DatasetDescription;
+    type Error = DescriptionError;
+
+    fn first(&mut self) -> Result<Next<DatasetDescription>, DescriptionError> {
+        let local = Effect::Net(NetEffect::LocalNode);
+        Ok(Next::Call(IoCall::Effect(Box::new(local))))
+    }
+
+    // The summary is read from the dataset's holders with the caller's own access.
+    fn next(&mut self, result: IoResult) -> Result<Next<DatasetDescription>, DescriptionError> {
+        if let Some(request) = self.request.take() {
+            let Ok(Event::Net(NetEvent::LocalNode(local_node))) = result.event() else {
+                return Err(DescriptionError::Unavailable);
+            };
+            let export = summary_export(local_node, request);
+            return Ok(Next::Call(IoCall::child(export)));
+        }
+        let export = (result.child::<ExportMetadataResult, MetadataApiError>())
+            .map_err(|_| DescriptionError::Unavailable)?;
+        let summary = summary_answer(export)?;
+        let described = describe(&summary).map_err(DescriptionError::Invalid)?;
+        Ok(Next::Done(described))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary() -> DatasetSummaryOperation {
+        DatasetSummaryOperation::new(
+            RealmId::from_bytes([1; 32]),
+            Ulid::from_parts(1, 1),
+            (None, None),
+        )
+    }
+
+    // A summary walked past its local node lookup to the export it reads.
+    fn exporting() -> DatasetSummaryOperation {
+        let mut operation = summary();
+        let local = Effect::Net(NetEffect::LocalNode);
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(local))))
+        );
+        let node = IoResult::Event(Box::new(Event::Net(NetEvent::LocalNode(None))));
+        assert!(matches!(
+            operation.next(node),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        operation
+    }
+
+    fn exported(export: Result<ExportMetadataResult, MetadataApiError>) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(export))
+    }
+
+    // The summary is read once with the caller's access, and its root must be a Dataset.
+    #[test]
+    fn summary_needs_dataset() {
+        let summary = ExportMetadataResult::Summary {
+            record: crate::metadata::visible_scope::call_tests::record(1),
+            jsonld: "{}".to_string(),
+        };
+        let refused = exporting().next(exported(Ok(summary)));
+        assert!(matches!(refused, Err(DescriptionError::Invalid(_))));
+    }
+
+    // A refused export leaves the dataset unreadable; any other failure leaves it unavailable.
+    #[test]
+    fn summary_keeps_refusal() {
+        let refused = exporting().next(exported(Err(MetadataApiError::Forbidden)));
+        assert_eq!(refused, Err(DescriptionError::Unreadable));
+        let failed = exporting().next(exported(Err(MetadataApiError::ServiceUnavailable)));
+        assert_eq!(failed, Err(DescriptionError::Unavailable));
+        assert_eq!(
+            exporting().next(IoResult::Done),
+            Err(DescriptionError::Unavailable)
+        );
+    }
 }

@@ -10,9 +10,9 @@ use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_POLICIES_PATH};
+use aruna_core::reducer::paths::GROUP_POLICIES_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -27,7 +27,7 @@ use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::fence::WriteFence;
@@ -383,14 +383,14 @@ impl Operation for GroupPoliciesWrite {
                 self.emit_write_state(document, reducer, realm_config)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(self.after_writes())
             }
             Stage::Fence => {
@@ -431,7 +431,6 @@ mod tests {
     use super::{GroupPoliciesWrite, SetGroupConfig, SetGroupError, SetGroupOperation};
     use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{AuthorizationError, StorageError};
@@ -442,8 +441,9 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;

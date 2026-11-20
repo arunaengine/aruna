@@ -7,10 +7,10 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{HoldScope, Operation, TransactionMode};
-use aruna_core::rows::{done, outside_answer, outside_call, read_row, value};
+use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     FolderState, RemoteBinding, SyncPageLimit, SyncRefusal, SyncVersionPage, SyncedFolder,
 };
 use aruna_core::task::TaskKey;
@@ -21,18 +21,19 @@ use ulid::Ulid;
 use crate::device::sync_status::ArmTimerOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::transport::{no_peer_transport, peer_answer, peer_call};
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::transport_message_kind;
-use crate::staging::offered_directory::{OfferedDirectoryError, check_root};
+use crate::staging::offer::run::check_root;
+use crate::staging::offered_directory::OfferedDirectoryError;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, transport_message_kind};
 
 use super::super::ReconcileFolderError;
-use super::super::repository::{MAX_SYNCED_FOLDERS, folder_bucket, folder_entry, folder_key};
+use super::super::repository::{MAX_SYNCED_FOLDERS, folder_entry, folder_key};
 use super::reads::read_bound;
 use super::{BindFolderInput, FolderChange, FolderError, RealmBucketInput, UpdateFolderOperation};
+use aruna_core::structs::synced_folder::folder_bucket;
 
 type RemoteError = ReconcileFolderError;
 
-fn owner_auth(user_id: aruna_core::UserId, realm_id: RealmId) -> AuthContext {
+fn owner_auth(user_id: aruna_core::user::id::UserId, realm_id: RealmId) -> AuthContext {
     AuthContext::new(user_id, realm_id)
 }
 
@@ -234,7 +235,7 @@ impl Operation for ReserveBindingOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, FolderError> {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let (rows, next) = result.page()?;
@@ -291,14 +292,14 @@ pub(in crate::device::sync) struct RequestVersionsOperation {
     auth: AuthContext,
     bucket: String,
     prefix: String,
-    cursor: Option<aruna_core::structs::SyncListCursor>,
+    cursor: Option<aruna_core::structs::synced_folder::SyncListCursor>,
     limit: SyncPageLimit,
 }
 
 impl RequestVersionsOperation {
     pub(in crate::device::sync) fn new(
         (remote, auth): (&RemoteBinding, AuthContext),
-        cursor: Option<aruna_core::structs::SyncListCursor>,
+        cursor: Option<aruna_core::structs::synced_folder::SyncListCursor>,
         limit: SyncPageLimit,
     ) -> Self {
         Self {
@@ -613,7 +614,7 @@ impl Operation for FinishBindingOperation {
                     false => self.check_bucket(),
                 }
             }
-            FinishStep::Sync => match outside_answer(result).and_then(done) {
+            FinishStep::Sync => match outside_answer(result).and_then(IoResult::done) {
                 Ok(()) => self.create_bucket(),
                 Err(_) => self.settled(Err(FolderError::Unavailable)),
             },
@@ -685,10 +686,12 @@ impl Operation for DropBindingOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.deleting {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
-        let folder = value(result)?.and_then(|row| SyncedFolder::from_bytes(&row).ok());
+        let folder = result
+            .value()?
+            .and_then(|row| SyncedFolder::from_bytes(&row).ok());
         if !folder.is_some_and(|folder| matches!(folder.state, FolderState::Binding { .. })) {
             return Ok(Next::Done(()));
         }

@@ -4,13 +4,13 @@
 
 use aruna_core::events::{MetadataAnswer, PeerRequestError};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::distribution::Statement;
+use aruna_core::structs::storage::distribution::statement::Statement;
 use aruna_core::types::Value;
 use std::time::Duration;
 
 use super::*;
 use crate::distribution::test_record::{member, realm, record, secret};
-use crate::metadata::protocol::encode_message;
+use aruna_core::metadata::protocol::encode_message;
 
 fn node(seed: u8) -> NodeId {
     secret(seed).public()
@@ -67,7 +67,7 @@ fn accepted(result: Revision) -> IoResult {
 
 fn auth() -> AuthContext {
     AuthContext {
-        user_id: aruna_core::UserId::nil(realm()),
+        user_id: aruna_core::user::id::UserId::nil(realm()),
         realm_id: realm(),
         path_restrictions: None,
         session: None,

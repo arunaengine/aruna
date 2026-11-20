@@ -12,7 +12,7 @@ use aruna_core::errors::StorageReadError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use std::time::{Duration, SystemTime};
@@ -263,7 +263,7 @@ impl Operation for ReplaceWrite {
                 Ok(Next::Call(IoCall::Write(record_writes(&self.record)?)))
             }
             WriteStage::Records => {
-                done(result)?;
+                result.done()?;
                 let Some(secret) = self.secret.take() else {
                     return Ok(Next::Done(self.record.clone()));
                 };
@@ -303,7 +303,7 @@ mod pure_tests {
     fn input(group_id: Ulid) -> CreateBackendInput {
         CreateBackendInput {
             group_id,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             name: "updated".to_string(),
             kind: GroupBackendKind::S3,
             public_config: HashMap::from([
@@ -331,7 +331,7 @@ mod pure_tests {
             ]),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: false,
             cleanup: CleanupStrategy::Retain,
         }

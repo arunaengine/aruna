@@ -6,7 +6,6 @@ use super::*;
 use crate::migrate::families::tests::key;
 use crate::migrate::migrate_output;
 use crate::migrate::tests::{read, strip, write};
-use aruna_core::UserId;
 use aruna_core::compute::{ExecutionTargetId, ExecutorCapability};
 use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
@@ -14,14 +13,15 @@ use aruna_core::keyspaces::{
     NODE_INFO_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::scheduling::{ExecutionPlan, RejectedTarget};
-use aruna_core::structs::execution::job::job_insert_entries;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobRetryPolicy,
+use aruna_core::structs::execution::job::family::{
+    EffectiveResources, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+    JobRecordKind, JobRetryPolicy,
 };
-use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKind,
-};
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{AttemptIntent, JobRecord};
+use aruna_core::structs::execution::job::rows::job_insert_entries;
 use aruna_core::structs::storage::node_info::node_info_key;
+use aruna_core::user::id::UserId;
 use aruna_operations::sync::outbox_record::new_outbox_record;
 use std::path::Path;
 use tempfile::tempdir;

@@ -9,11 +9,13 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, INPUT_PAGE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
+use aruna_core::structs::execution::job::family::{
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+};
+use aruna_core::structs::execution::job::pages::PageManifest;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
-use aruna_core::structs::execution::job::{
-    JobDeletes, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, PageManifest,
-};
+use aruna_core::structs::execution::job::rows::JobDeletes;
 use aruna_core::types::Key;
 
 use super::{FAMILY_PRUNE_PAGE, PruneError};
@@ -151,7 +153,8 @@ impl Operation for PrunePagesOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::execution::job::{InputPage, PageEntries, SubmissionId};
+    use aruna_core::structs::execution::job::family::SubmissionId;
+    use aruna_core::structs::execution::job::pages::{InputPage, PageEntries};
     use aruna_core::types::Value;
 
     use super::*;

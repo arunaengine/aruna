@@ -8,9 +8,9 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::cursor;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{RangeEntry, RangePage, RangeRefusal};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -19,8 +19,9 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionMember, DistributionView, KeyRange,
+    DistributionBinding, DistributionMember, KeyRange,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

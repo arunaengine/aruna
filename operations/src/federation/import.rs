@@ -10,17 +10,21 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::federation::Signed;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{HttpMethod, HttpRequest, OutboundEffect, OutboundEvent};
 use aruna_core::rows::{decode, decoded, read_row, values};
-use aruna_core::structs::execution::job::{
-    ImportRoCrateSource, ImportRoCrateSpec, JobRecord, RoCrateUploadRecord, dedup_index_key,
-    job_record_key, parse_dedup_value, upload_key as stored_upload_key, upload_stale,
-    user_dedup_key,
+use aruna_core::structs::execution::job::input::{
+    ImportRoCrateSource, ImportRoCrateSpec, RoCrateUploadRecord, upload_key as stored_upload_key,
+    upload_stale,
 };
+use aruna_core::structs::execution::job::local::{
+    JobRecord, job_record_key, parse_dedup_value, user_dedup_key,
+};
+use aruna_core::structs::execution::job::rows::dedup_index_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
@@ -28,19 +32,19 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::transfer::{
     ExportGrant, ImportDestination, ImportIntent, TransferError, check_grant, check_intent,
 };
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use serde::Serialize;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::federation::access::{AccessCheckOperation, access_granted};
 use crate::federation::records::{
     ImportRecord, RecordChange, RecordError, RecordOutcome, StaleUpload, change_call,
 };
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 const IMPORT_OPERATION: &str = "federation.import";
 
@@ -61,7 +65,7 @@ pub enum ImportError {
     #[error("the source realm could not be reached: {0}")]
     Unreachable(String),
     #[error("the source realm answered {0}")]
-    Refused(reqwest::StatusCode),
+    Refused(http::StatusCode),
 }
 
 /// Header carrying a signed export grant as unpadded base64url JSON.
@@ -98,8 +102,8 @@ fn binding_key(principal: UserId, import_key: &str) -> Vec<u8> {
 }
 
 /// A failed or busy source stays temporary; only other answers refuse the grant.
-pub fn answer_error(status: reqwest::StatusCode) -> ImportError {
-    use reqwest::StatusCode;
+pub fn answer_error(status: http::StatusCode) -> ImportError {
+    use http::StatusCode;
     if status.is_server_error()
         || status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::REQUEST_TIMEOUT
@@ -260,7 +264,7 @@ impl Operation for ConfirmSourceOperation {
                     return Err(IoError::Unexpected { expected, got }.into());
                 };
                 let status = result.map_err(|error| ImportError::Unreachable(error.to_string()))?;
-                let status = reqwest::StatusCode::from_u16(status)
+                let status = http::StatusCode::from_u16(status)
                     .map_err(|error| ImportError::Unreachable(error.to_string()))?;
                 if !status.is_success() {
                     return Err(answer_error(status));
@@ -799,7 +803,7 @@ pub(crate) mod tests {
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::RealmDescriptor;
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::input::{
         ImportMetadataTarget, ImportRoCrateTarget, RoCrateLimits,
     };
     use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -923,7 +927,7 @@ pub(crate) mod tests {
             operation.next(consumed(false)).unwrap();
             operation.next(answered(result))
         };
-        let refused = reqwest::StatusCode::FORBIDDEN;
+        let refused = http::StatusCode::FORBIDDEN;
         assert_eq!(answer(Ok(403)), Err(ImportError::Refused(refused)));
         assert!(matches!(answer(Ok(503)), Err(ImportError::Unreachable(_))));
         let down = aruna_core::outbound::OutboundError::Retryable("down".to_string());
@@ -1150,7 +1154,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn context() -> (TempDir, DriverContext) {
-        crate::testing::temp_context()
+        aruna_drivers::testing::temp_context()
     }
 
     pub(crate) fn realm(seed: u8) -> RealmId {
@@ -1440,11 +1444,11 @@ pub(crate) mod tests {
     fn busy_source_waits() {
         // Source infrastructure and throttling defer the import; refusals of the grant end it.
         for code in [500, 502, 503, 504, 429, 408] {
-            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let status = http::StatusCode::from_u16(code).unwrap();
             assert!(matches!(answer_error(status), ImportError::Unreachable(_)));
         }
         for code in [400, 401, 403, 404, 410] {
-            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let status = http::StatusCode::from_u16(code).unwrap();
             assert_eq!(answer_error(status), ImportError::Refused(status));
         }
     }
@@ -1471,7 +1475,7 @@ pub(crate) mod tests {
             },
             blake3: [0; 32],
             size: record().grant.payload.artifact_size,
-            media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
+            media_type: aruna_core::structs::execution::job::input::RoCrateMediaType::Zip,
             expires_at_ms,
             claimed_by: None,
         }

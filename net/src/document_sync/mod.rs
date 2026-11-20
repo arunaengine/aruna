@@ -23,16 +23,16 @@ use aruna_core::document::{
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::id::short_display_id;
+use aruna_core::id::{DhtKeyId, NodeId, short_display_id};
 use aruna_core::keyspaces::APPLIED_OPS_KEYSPACE;
-use aruna_core::reducer::reduced_admin_target;
+use aruna_core::reducer::overlay::reduced_admin_target;
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{SyncQuarantineIdentity, SyncRejection};
+use aruna_core::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Value;
-use aruna_core::{DhtKeyId, NodeId};
-use aruna_storage::{FjallPersistPolicy, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -287,6 +287,16 @@ pub struct DocumentSyncService {
     // Realm-config kind table shared with the accept loop, so the dial side
     // applies the same node-kind boundary. Empty until the embedder attaches it.
     peer_kinds: PeerKinds,
+    // The temporary folder of a database opened without a configured path. Declared last and shared
+    // by clones, so the last clone removes it after its database handles above are closed.
+    fallback_dir: Option<Arc<tempfile::TempDir>>,
+}
+
+impl DocumentSyncService {
+    /// Keeps the temporary folder the database was opened in until the service is dropped.
+    pub(crate) fn keep_fallback(&mut self, dir: Option<tempfile::TempDir>) {
+        self.fallback_dir = dir.map(Arc::new);
+    }
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -389,6 +399,7 @@ impl DocumentSyncService {
             configured_peers: default_peers,
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
             peer_kinds: PeerKinds::default(),
+            fallback_dir: None,
         })
     }
 

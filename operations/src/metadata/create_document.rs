@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
+use aruna_core::metadata::api::CreateDocumentPayload;
 
-use aruna_core::MetaResourceId;
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_INDEX_KEYSPACE};
 use aruna_core::metadata::{
     MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
@@ -22,36 +22,35 @@ use aruna_core::storage_entries::{
     commit_message_entry, create_acceptance_entry, create_acceptance_key, metadata_document_key,
     profile_validation_entry, raw_budget_entry,
 };
-use aruna_core::structs::execution::job::{
-    JobPayload, JobRecord, RETENTION_MS, WorkspaceMode, pid_dedup_key,
-};
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode, pid_dedup_key};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::persistent_id::{MintPersistentSpec, PersistentIdMapping};
 use aruna_core::structs::placement::binding_directory::BindingError;
 use aruna_core::structs::placement::record::{
     DocumentClass, PlacementRef, PlacementScope, PlacementStrategy, shard_for_subject,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
-use aruna_core::structured_id::{BucketId, ClockHealthError, PlacementHandle, StructuredId};
+use aruna_core::structured_id::clock_health::ClockHealthError;
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::types::{GroupId, Key, Value};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{effect_event, read_value, read_values};
 use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, stamp_unprofiled,
     submission_profile_tag,
 };
-use crate::metadata::repository::create_projection_entries;
 use crate::sync::shard_placement::sort_node_ids;
-use aruna_core::placement::{
-    PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
-    resolve_shard_holders, strategy_for_target,
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, meta_bucket_subject, strategy_for_target,
 };
+use aruna_core::placement::{choose_origin_bucket, holds_placement, resolve_shard_holders};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::storage_entries::create_projection_entries;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateDocumentConfig {
@@ -61,19 +60,6 @@ pub struct CreateDocumentConfig {
     pub document_path: String,
     pub public: bool,
     pub payload: CreateDocumentPayload,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum CreateDocumentPayload {
-    Scaffold {
-        name: String,
-        description: String,
-        date_published: String,
-        license: Option<String>,
-    },
-    RoCrate {
-        jsonld: String,
-    },
 }
 
 /// Result returned after a metadata create is durably accepted.
@@ -139,7 +125,7 @@ pub enum CreateDocumentError {
     PlacementBinding(#[from] BindingError),
     /// The structured-id generator refused to mint under a clock-health fault.
     #[error(transparent)]
-    ClockHealth(#[from] aruna_core::structured_id::ClockHealthError),
+    ClockHealth(#[from] aruna_core::structured_id::clock_health::ClockHealthError),
     #[error("metadata raw update budget exceeded")]
     RawLimit,
     #[error("topic announcement failed: {0}")]
@@ -288,7 +274,7 @@ impl CreateDocumentOperation {
     }
 
     fn validated(&mut self, result: IoResult) -> CreateTurn {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::ValidationResult { .. }) if self.skip_existing_check => {
                 self.commit()
             }
@@ -306,7 +292,7 @@ impl CreateDocumentOperation {
     }
 
     fn existing_read(&mut self, result: IoResult) -> CreateTurn {
-        match read_value(result)? {
+        match result.value()? {
             Some(bytes) => {
                 postcard::from_bytes::<MetadataRegistryRecord>(&bytes)
                     .map_err(aruna_core::errors::ConversionError::from)?;
@@ -519,7 +505,7 @@ impl CreateCommitOperation {
     }
 
     fn fence_read(&mut self, result: IoResult) -> CommitTurn {
-        let values = read_values(result)?;
+        let values = result.values()?;
         let [acceptance, realm_config, group_fence] =
             <[_; 3]>::try_from(values).map_err(|_| IoError::Unexpected {
                 expected: "three create fence values",
@@ -576,7 +562,7 @@ impl CreateCommitOperation {
     }
 
     fn pid_fence_read(&mut self, result: IoResult) -> CommitTurn {
-        let value = read_value(result)?;
+        let value = result.value()?;
         let Some((config, placement, holders)) = self.pending.take() else {
             return Err(CreateDocumentError::PlacementFenced);
         };
@@ -667,7 +653,7 @@ impl CreateCommitOperation {
             }
         };
         let dedup_key = pid_dedup_key(create_event.record.document_id);
-        let job_id = crate::jobs::submit::mint_configured_job(
+        let job_id = aruna_core::job_request::mint_configured_job(
             realm_config,
             create_event.node_id,
             &dedup_key,
@@ -689,13 +675,14 @@ impl CreateCommitOperation {
         );
         job.workspace_mode = WorkspaceMode::None;
         job.retention_ms = RETENTION_MS;
-        let mut writes = aruna_core::structs::execution::job::job_insert_entries(&job)?;
+        let mut writes = aruna_core::structs::execution::job::rows::job_insert_entries(&job)?;
         let route = mapping_route_for(
             realm_config,
             create_event.record.realm_id,
             create_event.record.document_id,
             create_event.node_id,
         );
+        let revision_id = self.ids.mint(self.now_ms);
         let mapping = PersistentIdMapping::requested(
             create_event.record.document_id,
             profile,
@@ -703,11 +690,14 @@ impl CreateCommitOperation {
             job_id,
             create_event.record.public,
             create_event.record.permission_path.clone(),
-            mapping_revision(&route, create_event.occurred_at_ms),
+            mapping_revision(&route, revision_id, create_event.occurred_at_ms),
         );
-        writes.extend(transition_entries(&route, &mapping).map_err(|error| {
-            aruna_core::errors::ConversionError::FromStrError(error.to_string())
-        })?);
+        let outbox_id = self.ids.mint(self.now_ms);
+        writes.extend(
+            transition_entries(&route, &mapping, outbox_id).map_err(|error| {
+                aruna_core::errors::ConversionError::FromStrError(error.to_string())
+            })?,
+        );
         Ok(writes)
     }
 }
@@ -956,7 +946,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    use aruna_core::StructuredId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -968,13 +957,14 @@ mod tests {
     use aruna_core::metadata::RawOriginBudget;
     use aruna_core::placement::resolve_shard_holders;
     use aruna_core::storage_entries::{event_log_prefix, pending_projection_key};
-    use aruna_core::structs::PersistentIdStatus;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::structs::persistent_id::PersistentIdStatus;
     use aruna_core::structs::placement::record::{
         FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange, PlacementBinding,
     };
-    use aruna_storage::storage::EffectReceiver;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_core::structured_id::StructuredId;
+    use aruna_storage::storage::handle::{EffectReceiver, StorageHandle};
+    use aruna_storage::storage::worker::FjallStorage;
 
     use aruna_drivers::driver::{DriverContext, drive};
 
@@ -983,7 +973,7 @@ mod tests {
     fn actor(realm_id: RealmId, key_byte: u8) -> Actor {
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[key_byte; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
         }
     }
@@ -1613,7 +1603,10 @@ mod tests {
                                 error: StorageError::TransactionConflict,
                             }
                         } else {
-                            StorageEvent::TransactionCommitted { txn_id }
+                            StorageEvent::TransactionCommitted {
+                                txn_id,
+                                sequence: 1,
+                            }
                         }
                     }
                     StorageEffect::AbortTransaction { txn_id } => {

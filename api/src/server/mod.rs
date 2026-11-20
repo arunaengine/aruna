@@ -8,9 +8,10 @@ use crate::error::ServerSetupError;
 use crate::routes::rest_router;
 pub mod state;
 use crate::forwarded::DirectOrigin;
+use crate::https::check_host;
 use crate::https::listener::CombinedListener;
-use crate::https::{HostRoute, check_host};
-pub(crate) use crate::server::state::{ServerState, swagger_ui};
+use crate::server::state::{ServerState, swagger_ui};
+use aruna_core::listener::HostRoute;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{Next, from_fn, from_fn_with_state};
@@ -22,8 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-
-pub const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 // Backstop for handler response creation; interactive operations use tighter deadlines.
 // Streaming bodies are unbounded, and handler-owned request bodies use exempt routes.
@@ -197,7 +196,8 @@ async fn redirect_swagger(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BODY_SIZE, Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt};
+    use super::{Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt};
+    use aruna_core::listener::MAX_BODY_SIZE;
     use axum::Router;
     use axum::body::Body;
     use axum::extract::MatchedPath;
@@ -217,7 +217,9 @@ mod tests {
         use aruna_core::structs::identity::realm::RealmId;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let realm_id = RealmId::from_bytes(
             ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
                 .verifying_key()
@@ -280,7 +282,9 @@ mod tests {
         use aruna_core::structs::identity::realm::RealmId;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let realm_id = RealmId::from_bytes(
             ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
                 .verifying_key()

@@ -6,10 +6,11 @@
 use ulid::Ulid;
 
 use super::{
-    DataStrategy, DistributionError, DistributionMember, FIRST_EPOCH, KeyRange, MemberState,
-    MetadataCoverage, validate::validate_ranges,
+    DataStrategy, DistributionMember, FIRST_EPOCH, KeyRange, MemberState, MetadataCoverage,
+    validate::validate_ranges,
 };
-use crate::NodeId;
+use crate::id::NodeId;
+use crate::structs::storage::distribution::validate::DistributionError;
 
 const RANGE_ID_DOMAIN: &[u8] = b"aruna-distribution-range-v1";
 const RANDOM_MASK: u128 = (1 << 80) - 1;

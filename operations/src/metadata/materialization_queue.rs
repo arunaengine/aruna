@@ -5,14 +5,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
+    CAPTURE_SEQUENCE_KEYSPACE, DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
     MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
     MATERIALIZATION_STATUS_KEYSPACE,
 };
@@ -22,11 +22,12 @@ use aruna_core::metadata::{
     MetadataEventRecord, MetadataGraphPolicy, MetadataMaterializationRecord, MetadataRawRevision,
     MetadataRequestDurability, ProfileValidationStatus, deterministic_materialization_actor,
 };
-use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
-use aruna_core::rows::{all_values, event, values};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry, boxed_suboperation};
+use aruna_core::repository::link::{link_change_entry, schedule_drain};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
-    dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,
-    event_log_key, materialization_job_entry, materialization_job_key,
+    capture_key, dead_letter_entry, dead_letter_key, document_job_entry, document_job_key,
+    document_job_prefix, event_log_key, materialization_job_entry, materialization_job_key,
     materialization_status_entry, materialization_status_key, profile_validation_entry,
 };
 use aruna_core::task::TaskEvent;
@@ -37,16 +38,12 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::git::snapshot::capture;
-use crate::git::{GitError, GitNode};
-use crate::jobs::repository::link_queue::{LinkTimerOperation, QueueRowsOperation};
-use crate::jobs::repository::links::LinkError;
-use crate::metadata::call_results::page_rows;
 use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::topic_sync::GraphSyncOperation;
 use crate::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
+use aruna_core::git::{CaptureMark, GitNode, schedule_capture_drain};
 
 use super::data_links::{DataLinkError, LinkRows};
 use super::iri_index::{MetadataIriError, ProjectRowsOperation};
@@ -77,14 +74,14 @@ pub const MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
 // The bulk storage lane enforces fairness when immediate timer refires bypass this gap.
 pub const NEXT_BATCH_AFTER: Duration = Duration::from_millis(25);
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct MetadataDrainResult {
     pub processed: usize,
     pub has_more_due: bool,
     pub next_due_after: Option<Duration>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct CompletedMaterializationJob {
     job_key: Vec<u8>,
     document_job_key: Option<Vec<u8>>,
@@ -97,6 +94,8 @@ struct CompletedMaterializationJob {
     sync: Option<CompletedMaterializationSync>,
     /// A merge renders the whole merged graph, so its raw state stays valid under a newer status.
     merge: bool,
+    /// The capture mark the job wrote; the finish that stores the graph marks it ready.
+    capture: Option<CaptureMark>,
 }
 
 impl CompletedMaterializationJob {
@@ -112,6 +111,7 @@ impl CompletedMaterializationJob {
             validation_write: None,
             sync: None,
             merge: false,
+            capture: None,
         }
     }
 }
@@ -126,7 +126,7 @@ struct CompletedMaterializationSync {
 
 /// The outcome of one job attempt, resolved together in the per-batch finish
 /// transaction so a batch of failures costs one transaction, not one each.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum FinishedMaterializationJob {
     Completed(CompletedMaterializationJob),
     Rescheduled {
@@ -263,25 +263,25 @@ impl Operation for NextTimerOperation {
     }
 }
 
-// Half-core concurrency reserves capacity for foreground create and validation traffic.
-pub fn materialization_group_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|cores| cores.get())
-        .unwrap_or(4)
-        .div_ceil(2)
-        .max(1)
+/// The graph groups one drain finishes at once on a host with `cores` logical cores: half of
+/// them, so capacity stays for foreground create and validation traffic.
+pub fn group_concurrency(cores: usize) -> usize {
+    cores.div_ceil(2).max(1)
 }
+
+/// The cores a caller assumes when the host cannot tell how many logical cores it offers.
+pub const UNKNOWN_CORES: usize = 4;
 
 #[derive(Debug, PartialEq)]
 enum BatchStage {
     Scan,
     Groups,
-    Plan,
     Commit,
     Sync(CompletedMaterializationSync),
     /// A sync that found no free background slot and runs in this pass instead.
     SyncInline(String),
     Timer,
+    Captures,
 }
 
 /// One drain pass: materializes the due jobs one document group at a time, `concurrency`
@@ -307,7 +307,8 @@ pub struct MaterializationBatchOperation {
 }
 
 impl MaterializationBatchOperation {
-    /// `link_timer` arms the repository link drain after finished jobs, on a node with tasks.
+    /// `link_timer` arms the repository link and Git capture drains after finished jobs, on a
+    /// node with tasks.
     pub fn new(node: GitNode, concurrency: usize, link_timer: bool) -> Self {
         Self {
             node,
@@ -415,8 +416,12 @@ impl MaterializationBatchOperation {
             self.timings.finish_elapsed = elapsed(self.finish_started_ms, self.now_ms);
             return self.sync();
         };
-        self.stage = BatchStage::Plan;
-        Ok(Next::Call(IoCall::child(PlanFinishOperation::new(chunk))))
+        self.stage = BatchStage::Commit;
+        let build = move || CommitFinishOperation::new(chunk.clone());
+        let commit = boxed_retry(build, b"materialization-finish", |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Ok(Next::Call(IoCall::Child(commit)))
     }
 
     fn finish_failed(
@@ -438,14 +443,15 @@ impl MaterializationBatchOperation {
         Ok(Next::Call(IoCall::background(graph_sync)))
     }
 
-    // Finished jobs may queue link pushes, and the link drain stops once its queue is empty.
+    // Finished jobs may queue link pushes and Git snapshots, and both drains stop once their
+    // rows are gone.
     fn timer(&mut self) -> MaterializationTurn<MetadataDrainResult> {
         if let Some(error) = self.first_error.take() {
             return Err(error);
         }
         if self.timings.processed > 0 && self.link_timer {
             self.stage = BatchStage::Timer;
-            return Ok(Next::Call(IoCall::child(LinkTimerOperation::new())));
+            return Ok(Next::Call(IoCall::from(schedule_drain(Duration::ZERO))));
         }
         self.summary()
     }
@@ -514,22 +520,13 @@ impl Operation for MaterializationBatchOperation {
                 }
                 self.finish()
             }
-            BatchStage::Plan => match result.child::<FinishPlan, MetadataMaterializationError>() {
-                Ok(Ok(plan)) if plan.writes.is_empty() && plan.deletes.is_empty() => self.finish(),
-                Ok(Ok(plan)) => {
-                    self.stage = BatchStage::Commit;
-                    Ok(Next::Call(IoCall::child(CommitFinishOperation::new(plan))))
-                }
-                Ok(Err(error)) => self.finish_failed(error),
-                Err(error) => self.finish_failed(error.into()),
-            },
             BatchStage::Commit => match result.child::<(), MetadataMaterializationError>() {
                 Ok(Ok(())) => self.finish(),
                 Ok(Err(error)) => self.finish_failed(error),
                 Err(error) => self.finish_failed(error.into()),
             },
             // A sync without a free background slot runs inline, so no materialization skips it.
-            BatchStage::Sync(sync) => match event(result) {
+            BatchStage::Sync(sync) => match result.event() {
                 Ok(Event::Task(TaskEvent::BackgroundStarted { started: true })) => self.sync(),
                 Ok(Event::Task(TaskEvent::BackgroundStarted { started: false })) => {
                     warn!(graph_iri = %sync.graph_iri, "No background slot for the metadata graph sync after materialization; waiting for it");
@@ -549,10 +546,25 @@ impl Operation for MaterializationBatchOperation {
                 self.sync()
             }
             BatchStage::Timer => {
-                match result.child::<(), LinkError>() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => warn!(%error, "Failed to arm the repository link queue"),
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the repository link queue")
+                    }
+                    Ok(_) => {}
                     Err(error) => warn!(%error, "Failed to arm the repository link queue"),
+                }
+                self.stage = BatchStage::Captures;
+                Ok(Next::Call(IoCall::from(schedule_capture_drain())))
+            }
+            // The capture marks stay until the drain took the snapshots, so a missed arming
+            // only waits for the next one or the restart.
+            BatchStage::Captures => {
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the Git capture drain")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Failed to arm the Git capture drain"),
                 }
                 self.summary()
             }
@@ -580,113 +592,11 @@ fn dedupe_graph_syncs(
     by_graph.into_values().collect()
 }
 
-/// Row changes for one finish chunk, resolved before the transaction opens.
+/// Row changes for one finish chunk, resolved in the transaction that writes them.
 #[derive(Debug, Default, PartialEq)]
 struct FinishPlan {
     writes: Vec<(String, ByteView, ByteView)>,
     deletes: Vec<(String, ByteView)>,
-}
-
-#[derive(Debug, PartialEq)]
-enum PlanStage {
-    Read,
-    Queue(FinishPlan),
-}
-
-// Guard reads precede the transaction so concurrent changes enter its read set.
-#[derive(Debug, PartialEq)]
-struct PlanFinishOperation {
-    finished: Vec<FinishedMaterializationJob>,
-    documents: BTreeSet<Ulid>,
-    parked: BTreeSet<(Ulid, Ulid)>,
-    now_ms: u64,
-    stage: PlanStage,
-}
-
-impl PlanFinishOperation {
-    fn new(finished: Vec<FinishedMaterializationJob>) -> Self {
-        let documents = finished.iter().map(finished_document_id).collect();
-        let parked = (finished.iter())
-            .filter_map(|finished| match finished {
-                FinishedMaterializationJob::Parked { job, .. } => {
-                    Some((job.document_id, job.event_id))
-                }
-                _ => None,
-            })
-            .collect();
-        Self {
-            finished,
-            documents,
-            parked,
-            now_ms: 0,
-            stage: PlanStage::Read,
-        }
-    }
-
-    fn plan(&mut self, values: Vec<Option<Value>>) -> MaterializationTurn<FinishPlan> {
-        let mut values = values.into_iter();
-        let mut snapshot = HashMap::new();
-        for (document_id, value) in self.documents.iter().zip(values.by_ref()) {
-            if let Some(status) = decode_status(value)? {
-                snapshot.insert(*document_id, status);
-            }
-        }
-        let mut parked = HashMap::new();
-        for (target, value) in self.parked.iter().zip(values) {
-            if let Some(record) = value.and_then(|value| postcard::from_bytes(&value).ok()) {
-                parked.insert(*target, record);
-            }
-        }
-        let finished = std::mem::take(&mut self.finished);
-        let (plan, superseding) = plan_rows(finished, &snapshot, &parked, self.now_ms)?;
-        self.stage = PlanStage::Queue(plan);
-        // Linked repositories learn of the change in the same commit as the new status.
-        let queue_rows = QueueRowsOperation::new(superseding);
-        Ok(Next::Call(IoCall::child(queue_rows)))
-    }
-}
-
-impl Operation for PlanFinishOperation {
-    type Output = FinishPlan;
-    type Error = MetadataMaterializationError;
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
-    fn first(&mut self) -> MaterializationTurn<FinishPlan> {
-        let statuses = self
-            .documents
-            .iter()
-            .map(|document_id| status_read(*document_id));
-        let dead_letters = (self.parked.iter()).map(|(document_id, event_id)| {
-            let key = dead_letter_key(*document_id, *event_id);
-            (DEAD_LETTER_KEYSPACE.to_string(), key)
-        });
-        let reads: Vec<_> = statuses.chain(dead_letters).collect();
-        if reads.is_empty() {
-            return self.plan(Vec::new());
-        }
-        Ok(Next::Call(IoCall::Read(reads)))
-    }
-
-    fn next(&mut self, result: IoResult) -> MaterializationTurn<FinishPlan> {
-        match std::mem::replace(&mut self.stage, PlanStage::Read) {
-            PlanStage::Read => self.plan(all_values(result)?),
-            PlanStage::Queue(mut plan) => {
-                match result.child::<Vec<(String, Key, Value)>, LinkError>() {
-                    Ok(Ok(rows)) => plan.writes.extend(rows),
-                    Ok(Err(error)) => {
-                        warn!(%error, "Failed to queue repository link pushes after materialization")
-                    }
-                    Err(error) => {
-                        warn!(%error, "Failed to queue repository link pushes after materialization")
-                    }
-                }
-                Ok(Next::Done(plan))
-            }
-        }
-    }
 }
 
 /// The rows a finish chunk writes and deletes, judged against the statuses read before it,
@@ -695,7 +605,7 @@ fn plan_rows(
     finished: Vec<FinishedMaterializationJob>,
     snapshot: &HashMap<Ulid, Status>,
     parked: &HashMap<(Ulid, Ulid), DeadLetterRecord>,
-    now_ms: u64,
+    (now_ms, mut sequences): (u64, HashMap<Ulid, u64>),
 ) -> Result<(FinishPlan, Vec<Ulid>), MetadataMaterializationError> {
     let mut plan = FinishPlan {
         deletes: Vec::with_capacity(finished.len().saturating_mul(2)),
@@ -703,12 +613,22 @@ fn plan_rows(
     };
     let mut planned: HashMap<Ulid, MaterializationStatusRecord> = HashMap::new();
     let mut superseding: HashMap<Ulid, Ulid> = HashMap::new();
+    let mut counted: BTreeMap<Ulid, u64> = BTreeMap::new();
     for finished in finished {
         match finished {
             FinishedMaterializationJob::Completed(job) => {
+                // The document, once the finish keeps the job's graph and so queues its capture.
+                let mut ready = None;
                 if let Some(status) = job.status {
                     let current = guard_status(snapshot, &planned, status.document_id);
+                    // A newer event not materialized yet leaves this graph the newest one made.
+                    let newer = current.is_some_and(|current| {
+                        current.event_id > status.event_id
+                            && current.state != MaterializationState::Materialized
+                    });
+                    ready = newer.then_some(status.document_id);
                     if should_write_final(current, &status) {
+                        ready = Some(status.document_id);
                         superseding.insert(status.document_id, status.event_id);
                         plan.writes.extend(job.iri_index_writes);
                         plan.deletes.extend(job.link_deletes);
@@ -725,6 +645,7 @@ fn plan_rows(
                         && let Some(raw_state_write) = job.raw_state_write
                     {
                         // A late merge keeps the newer status but stores the graph it published.
+                        ready = Some(status.document_id);
                         plan.writes.push(raw_state_write);
                     }
                 }
@@ -733,10 +654,19 @@ fn plan_rows(
                     ByteView::from(job.job_key),
                 ));
                 if let Some(document_job_key) = job.document_job_key {
-                    plan.deletes.push((
-                        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
-                        ByteView::from(document_job_key.clone()),
-                    ));
+                    let space = MATERIALIZATION_CAPTURE_KEYSPACE.to_string();
+                    let hold = ByteView::from(document_job_key.clone());
+                    plan.deletes.push((space.clone(), hold));
+                    // The finish that stores the graph, or keeps it the newest made, queues its
+                    // capture under the document's next sequence, so the drain takes finish order.
+                    if let (Some(capture), Some(document_id)) = (job.capture, ready) {
+                        let sequence = sequences.entry(document_id).or_default();
+                        let key = capture_key(document_id, *sequence);
+                        *sequence = sequence.saturating_add(1);
+                        plan.writes
+                            .push((space, key, ByteView::from(capture.to_bytes()?)));
+                        counted.insert(document_id, *sequence);
+                    }
                     plan.deletes.push((
                         DOCUMENT_JOB_KEYSPACE.to_string(),
                         ByteView::from(document_job_key),
@@ -834,28 +764,102 @@ fn plan_rows(
             }
         }
     }
+    for (document_id, next) in counted {
+        let key = ByteView::from(document_id.to_bytes().to_vec());
+        let value = ByteView::from(next.to_be_bytes().to_vec());
+        plan.writes
+            .push((CAPTURE_SEQUENCE_KEYSPACE.to_string(), key, value));
+    }
     Ok((plan, superseding.keys().copied().collect()))
 }
 
 #[derive(Debug, PartialEq)]
 enum CommitStage {
+    Read,
     Written,
     Deleted,
 }
 
-/// Writes and deletes one finish chunk's rows in one transaction.
+/// Settles one finish chunk in one write transaction: reads the statuses and dead letters it
+/// guards against and the capture sequences it counts on, then writes and deletes its rows. A
+/// status written meanwhile makes the commit lose its conflict, and the rerun judges it again.
 #[derive(Debug, PartialEq)]
 struct CommitFinishOperation {
+    finished: Vec<FinishedMaterializationJob>,
+    documents: BTreeSet<Ulid>,
+    parked: BTreeSet<(Ulid, Ulid)>,
+    /// The documents of jobs that hold a capture.
+    captures: BTreeSet<Ulid>,
+    now_ms: u64,
     plan: FinishPlan,
     stage: CommitStage,
 }
 
 impl CommitFinishOperation {
-    fn new(plan: FinishPlan) -> Self {
+    fn new(finished: Vec<FinishedMaterializationJob>) -> Self {
+        let documents = finished.iter().map(finished_document_id).collect();
+        let parked = (finished.iter())
+            .filter_map(|finished| match finished {
+                FinishedMaterializationJob::Parked { job, .. } => {
+                    Some((job.document_id, job.event_id))
+                }
+                _ => None,
+            })
+            .collect();
+        let captures = (finished.iter())
+            .filter_map(|finished| match finished {
+                FinishedMaterializationJob::Completed(job) if job.capture.is_some() => {
+                    Some(finished_document_id(finished))
+                }
+                _ => None,
+            })
+            .collect();
         Self {
-            plan,
-            stage: CommitStage::Written,
+            finished,
+            documents,
+            parked,
+            captures,
+            now_ms: 0,
+            plan: FinishPlan::default(),
+            stage: CommitStage::Read,
         }
+    }
+
+    fn plan(&mut self, values: Vec<Option<Value>>) -> MaterializationTurn<()> {
+        let mut values = values.into_iter();
+        let mut snapshot = HashMap::new();
+        for (document_id, value) in self.documents.iter().zip(values.by_ref()) {
+            if let Some(status) = decode_status(value)? {
+                snapshot.insert(*document_id, status);
+            }
+        }
+        let mut parked = HashMap::new();
+        for (target, value) in self.parked.iter().zip(values.by_ref()) {
+            if let Some(record) = value.and_then(|value| postcard::from_bytes(&value).ok()) {
+                parked.insert(*target, record);
+            }
+        }
+        let mut sequences = HashMap::new();
+        for (document_id, value) in self.captures.iter().zip(values) {
+            let next = value.map(|value| <[u8; 8]>::try_from(&value[..]));
+            let next = next.transpose().map_err(ConversionError::from)?;
+            sequences.insert(*document_id, next.map_or(0, u64::from_be_bytes));
+        }
+        let finished = std::mem::take(&mut self.finished);
+        let counted = (self.now_ms, sequences);
+        let (mut plan, superseding) = plan_rows(finished, &snapshot, &parked, counted)?;
+        // Linked repositories learn of the change in the same commit as the new status.
+        let changes = superseding
+            .into_iter()
+            .map(|id| link_change_entry(id, self.now_ms));
+        plan.writes.extend(changes);
+        let writes = std::mem::take(&mut plan.writes);
+        self.plan = plan;
+        if writes.is_empty() {
+            return self.delete();
+        }
+        self.stage = CommitStage::Written;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn delete(&mut self) -> MaterializationTurn<()> {
@@ -876,19 +880,41 @@ impl Operation for CommitFinishOperation {
         TransactionMode::Write
     }
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> MaterializationTurn<()> {
-        let writes = std::mem::take(&mut self.plan.writes);
-        if writes.is_empty() {
-            return self.delete();
+        let statuses = self
+            .documents
+            .iter()
+            .map(|document_id| status_read(*document_id));
+        let dead_letters = (self.parked.iter()).map(|(document_id, event_id)| {
+            let key = dead_letter_key(*document_id, *event_id);
+            (DEAD_LETTER_KEYSPACE.to_string(), key)
+        });
+        let sequences = (self.captures.iter()).map(|document_id| {
+            let key = ByteView::from(document_id.to_bytes().to_vec());
+            (CAPTURE_SEQUENCE_KEYSPACE.to_string(), key)
+        });
+        let reads: Vec<_> = statuses.chain(dead_letters).chain(sequences).collect();
+        if reads.is_empty() {
+            return self.plan(Vec::new());
         }
-        Ok(Next::Call(IoCall::Write(writes)))
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn next(&mut self, result: IoResult) -> MaterializationTurn<()> {
-        result.done()?;
         match self.stage {
-            CommitStage::Written => self.delete(),
-            CommitStage::Deleted => Ok(Next::Done(())),
+            CommitStage::Read => self.plan(result.values()?),
+            CommitStage::Written => {
+                result.done()?;
+                self.delete()
+            }
+            CommitStage::Deleted => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
         }
     }
 }
@@ -1051,7 +1077,7 @@ impl Operation for RequeueParkedOperation {
     fn next(&mut self, result: IoResult) -> MaterializationTurn<usize> {
         match std::mem::replace(&mut self.stage, RequeueStage::Page) {
             RequeueStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.rows = rows.into();
                 self.next = next;
             }
@@ -1413,12 +1439,12 @@ impl Operation for DueJobsOperation {
     fn next(&mut self, result: IoResult) -> MaterializationTurn<DueJobs> {
         match std::mem::replace(&mut self.stage, ScanStage::Page) {
             ScanStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.next = next;
                 self.scanned(rows)
             }
-            ScanStage::Sidecars(slice) => self.sidecars(slice, all_values(result)?),
-            ScanStage::Live(due) => self.live(due, all_values(result)?),
+            ScanStage::Sidecars(slice) => self.sidecars(slice, result.values()?),
+            ScanStage::Live(due) => self.live(due, result.values()?),
             ScanStage::Prune(full) => {
                 pruned(result)?;
                 self.after_prune(full)
@@ -1693,7 +1719,7 @@ impl Operation for GroupJobsOperation {
                 self.page(None)
             }
             LoadStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 for (key, value) in rows {
                     match postcard::from_bytes::<MetadataMaterializationRecord>(&value) {
                         Ok(job) if job.document_id == self.document_id => {
@@ -1831,14 +1857,15 @@ enum JobStage {
     Merged(Box<ProfileValidationStatus>),
     Raw,
     Apply(Box<RawEventPlan>),
+    /// Exports the graph a job without a displayed revision materialized, for its mark.
+    Render(Box<MaterializedCreateEvent>),
     Mark(Box<MaterializedCreateEvent>),
-    Capture(Box<MaterializedCreateEvent>),
     Checkpoint(Box<MaterializedCreateEvent>),
     Project(Box<MaterializedCreateEvent>),
 }
 
-/// Applies one job's event to the graph store, publishes its Git snapshot and projects its
-/// IRI and data link rows, all left for the finish transaction to store. An event that
+/// Applies one job's event to the graph store, marks its Git snapshot for the capture drain and
+/// projects its IRI and data link rows, all left for the finish transaction to store. An event that
 /// fails is rescheduled or parked; a terminal failure finishes with a failed status.
 #[derive(Debug, PartialEq)]
 struct MaterializationJobOperation {
@@ -1851,6 +1878,7 @@ struct MaterializationJobOperation {
     now_ms: u64,
     apply_started_ms: u64,
     craqle_elapsed: Duration,
+    capture: Option<CaptureMark>,
     stage: JobStage,
 }
 
@@ -1871,6 +1899,7 @@ impl MaterializationJobOperation {
             now_ms: 0,
             apply_started_ms: 0,
             craqle_elapsed: Duration::ZERO,
+            capture: None,
             stage: JobStage::Event,
         }
     }
@@ -2031,11 +2060,14 @@ impl MaterializationJobOperation {
                 status.dataset_digest =
                     (plan.revision.as_ref()).and_then(|revision| revision.dataset_digest);
                 let validation_write = profile_validation_entry(&status)?;
-                self.mark(MaterializedCreateEvent {
-                    raw_revision: plan.revision,
-                    raw_state_write: plan.state_write,
-                    validation_write: Some(validation_write),
-                })
+                self.mark(
+                    event,
+                    MaterializedCreateEvent {
+                        raw_revision: plan.revision,
+                        raw_state_write: plan.state_write,
+                        validation_write: Some(validation_write),
+                    },
+                )
             }
             JobStage::Raw => {
                 let plan = result.child::<RawEventPlan, RawReadError>()??;
@@ -2049,11 +2081,14 @@ impl MaterializationJobOperation {
                 | MetadataEvent::ApplyRoCrateResult { .. }
                 | MetadataEvent::EntityUpsertResult { .. } => {
                     plan.cache(&mut self.cache);
-                    self.mark(MaterializedCreateEvent {
-                        raw_revision: plan.revision,
-                        raw_state_write: plan.state_write,
-                        validation_write: None,
-                    })
+                    self.mark(
+                        event,
+                        MaterializedCreateEvent {
+                            raw_revision: plan.revision,
+                            raw_state_write: plan.state_write,
+                            validation_write: None,
+                        },
+                    )
                 }
                 other => Err(unexpected(other)),
             },
@@ -2093,19 +2128,38 @@ impl MaterializationJobOperation {
         self.finish(ProcessedMaterializationJob::deferred(finished, elapsed))
     }
 
-    // Refreshes keep off the raw view from here until the finish batch stores this graph.
+    // Refreshes keep off the raw view until the Git capture drain snapshots the graph the finish
+    // stored. The mark holds the displayed revision, or else the graph exported after the apply.
+    // The apply step passes the event, as it holds it outside `self.event` while it runs.
     fn mark(
         &mut self,
+        event: &MetadataEventRecord,
         materialized: MaterializedCreateEvent,
     ) -> MaterializationTurn<ProcessedMaterializationJob> {
         self.craqle_elapsed = elapsed(self.apply_started_ms, self.now_ms);
-        let mark = (
+        let Some(revision) = materialized.raw_revision.as_ref() else {
+            let graph_iri = event.record.graph_iri.clone();
+            self.stage = JobStage::Render(Box::new(materialized));
+            return Ok(graph_call(MetadataEffect::ExportRoCrate { graph_iri }));
+        };
+        let graph = (revision.winning_event_id, revision.jsonld.clone());
+        self.write_mark(materialized, graph)
+    }
+
+    fn write_mark(
+        &mut self,
+        materialized: MaterializedCreateEvent,
+        (event_id, jsonld): (Ulid, String),
+    ) -> MaterializationTurn<ProcessedMaterializationJob> {
+        // The hold keeps refreshes off the raw view; the finish queues the mark itself.
+        let hold = (
             MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             document_job_key(self.job.document_id, self.job.event_id),
             ByteView::from(Vec::new()),
         );
+        self.capture = Some(CaptureMark { event_id, jsonld });
         self.stage = JobStage::Mark(Box::new(materialized));
-        Ok(Next::Call(IoCall::Write(vec![mark])))
+        Ok(Next::Call(IoCall::Write(vec![hold])))
     }
 
     fn projected(
@@ -2134,6 +2188,7 @@ impl MaterializationJobOperation {
                 peers: event.record.holder_node_ids.clone(),
             }),
             merge: merges(event),
+            capture: self.capture.take(),
         };
         let elapsed = self.craqle_elapsed;
         self.finish(ProcessedMaterializationJob::completed(completed, elapsed))
@@ -2178,27 +2233,17 @@ impl Operation for MaterializationJobOperation {
                 );
                 self.settled(Some(status))
             }
+            JobStage::Render(materialized) => match graph_event(result) {
+                Ok(MetadataEvent::RoCrateExportResult { jsonld, .. }) => {
+                    let event_id = self.job.event_id;
+                    self.write_mark(*materialized, (event_id, jsonld))
+                }
+                Ok(other) => self.defer(&unexpected(other)),
+                Err(error) => self.defer(&error),
+            },
             JobStage::Mark(materialized) => {
                 if let Err(error) = result.done() {
                     return self.defer(&MetadataMaterializationError::from(error));
-                }
-                let event = self.event()?;
-                let snapshot = capture(
-                    &self.node,
-                    &event.record,
-                    materialized.raw_revision.as_ref(),
-                );
-                self.stage = JobStage::Capture(materialized);
-                Ok(Next::Call(IoCall::child(snapshot)))
-            }
-            JobStage::Capture(materialized) => {
-                let failed = match result.child::<(), GitError>() {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error.to_string()),
-                    Err(error) => Some(error.to_string()),
-                };
-                if let Some(message) = failed {
-                    return self.defer(&MetadataMaterializationError::UnexpectedEvent(message));
                 }
                 let event = self.event()?;
                 let checkpoint = CheckpointOperation::new(self.node.node(), event.record.clone());
@@ -2245,7 +2290,7 @@ fn graph_call(effect: MetadataEffect) -> Next<ProcessedMaterializationJob> {
 
 /// The graph store's answer to one metadata effect; an error answer is the effect's failure.
 fn graph_event(result: IoResult) -> Result<MetadataEvent, MetadataMaterializationError> {
-    match event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
         Event::Metadata(answer) => Ok(answer),
         other => Err(MetadataMaterializationError::UnexpectedEvent(
@@ -2462,7 +2507,7 @@ impl Operation for JobsExistOperation {
     fn next(&mut self, result: IoResult) -> MaterializationTurn<bool> {
         match std::mem::replace(&mut self.stage, ExistStage::Removed) {
             ExistStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.next = next;
                 let Some((key, _value)) = rows.into_iter().next() else {
                     return Ok(Next::Done(false));
@@ -2625,7 +2670,7 @@ impl Operation for PruneJobsOperation {
 
     fn next(&mut self, result: IoResult) -> MaterializationTurn<()> {
         match self.stage {
-            PruneStage::Read => self.delete(all_values(result)?),
+            PruneStage::Read => self.delete(result.values()?),
             PruneStage::Delete => {
                 result.done()?;
                 Ok(Next::Done(()))

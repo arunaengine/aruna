@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::compute::Secret;
@@ -13,6 +12,7 @@ use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionRef, TokenClaims,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use base64::Engine;
 use chrono::Months;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -184,13 +184,13 @@ mod test {
     use crate::auth::create_token::{
         CreateTokenConfig, CreateTokenError, CreateTokenOperation, mint_token,
     };
-    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{
         NodeCapabilities, SessionKind, SessionRef, TokenClaims,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
@@ -201,7 +201,7 @@ mod test {
     pub async fn test_token_creation() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
 
         let context = DriverContext {
             storage_handle,

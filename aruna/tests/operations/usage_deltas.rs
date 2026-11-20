@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
+use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -32,10 +32,9 @@ use aruna_core::structs::storage::usage::{
     BucketCounters, NodeUsageSnapshot, USAGE_BUCKET_PREFIX, USAGE_COMPLETE_KEY, UsageCounters,
     dirty_group_key, global_shard_keys, usage_bucket_key, usage_group_key, usage_snapshot_key,
 };
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
-use aruna_operations::blob::records::HeadAliasContext;
-use aruna_operations::node::realm_usage::{RealmUsageOperation, RealmUsageScope};
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
@@ -48,9 +47,6 @@ use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultip
 use aruna_operations::s3::multipart::part_upload::{
     UploadPartInput, UploadPartOperation, UploadPartResult,
 };
-use aruna_operations::s3::object::copy::{
-    CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
-};
 use aruna_operations::s3::object::delete::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
@@ -60,7 +56,12 @@ use aruna_operations::s3::object::put::{
 use aruna_operations::s3::policy::successor::{
     MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
-use aruna_storage::{StorageHandle, storage};
+use aruna_operations::s3::realm_usage::{RealmUsageOperation, RealmUsageScope};
+use aruna_operations::transfer::copy::{
+    CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
+};
+use aruna_storage::storage;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -74,7 +75,8 @@ struct Harness {
 
 async fn setup() -> Harness {
     let temp_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
     setup_on(temp_dir, storage_handle).await
 }
 
@@ -1023,7 +1025,7 @@ async fn copy_object(
     group_id: Ulid,
 ) -> CopyResultData {
     drive(
-        aruna_operations::s3::object::copy::CopyObjectOperation::new(
+        aruna_operations::transfer::copy::CopyObjectOperation::new(
             CopyObjectInput {
                 source_bucket: bucket.to_string(),
                 source_key: source_key.to_string(),
@@ -1224,9 +1226,8 @@ async fn mint_books_bytes() {
 /// Leaves an offered directory observation as the head of an ordinary bucket:
 /// the offer is withdrawn, then its delete marker is deleted.
 async fn promote_observation(h: &Harness, bucket: &str, group_id: Ulid) {
-    use aruna_operations::staging::offered_directory::{
-        OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
-    };
+    use aruna_operations::staging::offer::run::{offer_directory, withdraw_offer};
+    use aruna_operations::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
 
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("data.bin"), b"offered").unwrap();
@@ -1343,7 +1344,7 @@ struct Faulty {
 
 async fn setup_faulty() -> Faulty {
     let temp_dir = tempfile::tempdir().unwrap();
-    let real = storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+    let real = storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
     let (proxy, receivers) = real.proxy_channels();
     let fault: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
@@ -1441,7 +1442,7 @@ impl Faulty {
         .unwrap();
         self.real.close().await;
         let storage_handle =
-            storage::FjallStorage::open(_temp_dir.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(_temp_dir.path().to_str().unwrap()).unwrap();
         Harness {
             _temp_dir,
             driver: DriverContext {

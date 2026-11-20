@@ -12,11 +12,11 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::structs::execution::job::record_keys::{budget_key, id_key, record_key};
-use aruna_core::structs::execution::job::record_rows::from_bytes;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     ExpiryReason, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobSpec,
 };
+use aruna_core::structs::execution::job::record_keys::{budget_key, id_key, record_key};
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::Key;
 use tracing::warn;

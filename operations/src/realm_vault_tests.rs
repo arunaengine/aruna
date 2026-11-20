@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::realm_vault::{RealmVaultEntry, RealmVaultKey, RealmVaultPurpose};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 
@@ -53,8 +53,9 @@ fn realm_config(revision: u8) -> (RealmConfigDocument, RealmSecretRef) {
 
 fn context() -> (TempDir, DriverContext) {
     let dir = tempfile::tempdir().unwrap();
-    let storage_handle = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let storage_handle =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let context = DriverContext {
         storage_handle,
         net_handle: None,

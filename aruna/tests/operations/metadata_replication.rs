@@ -6,27 +6,29 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use aruna::tasks::incoming::OutboxDrainer;
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentSyncPublish, DocumentSyncRevision, DocumentTarget,
-    shard_topic_id,
+    DocumentChange, DocumentChangeKind, DocumentEffect, DocumentNetEvent, DocumentSyncPublish,
+    DocumentSyncRevision, DocumentTarget, shard_topic_id,
 };
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataBatchSource, MetadataDeleteRecord, MetadataEffect, MetadataEvent,
     MetadataEventPayload, MetadataEventRecord, MetadataLifecycleRecord,
 };
-use aruna_core::placement::{
-    PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
-    strategy_for_target, subject_bytes,
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, strategy_for_target, subject_bytes,
 };
+use aruna_core::placement::{choose_origin_bucket, held_buckets, resolve_shard_holders};
 use aruna_core::storage_entries::{
     create_event_entry, event_log_key, lifecycle_revision_change, metadata_registry_key,
 };
@@ -34,16 +36,18 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::{DocumentEffect, DocumentNetEvent, MetaResourceId, NodeId, StructuredId};
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
+use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use aruna_operations::metadata::update_entry::UpdateEntryOperation;
 use aruna_operations::realm::announce_presence::{
@@ -54,10 +58,12 @@ use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
 use aruna_operations::sync::shard_placement::sort_node_ids;
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{export_rocrate_jsonld, send_metadata_effect};
-use aruna_operations::testing::{project_create_events, replay_event_log};
-use aruna_operations::testing::{read_outbox_records, reconcile_topics};
+use aruna_test_support::documents::read_outbox_records;
+use aruna_test_support::documents::reconcile_topics;
+use aruna_test_support::metadata::export_rocrate_jsonld;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::project_create_events;
+use aruna_test_support::projection::replay_event_log;
 use tokio::time::sleep;
 use ulid::Ulid;
 
@@ -67,8 +73,8 @@ use crate::topology::store_realm_config;
 use crate::topology::{TestNode, spawn_replica, spawn_replica_with, wait_node_convergence};
 use convergence::wait_for_convergence;
 
-/// Retries of a write that lost a commit race to background work; 20 ms apart.
-const CONFLICT_ATTEMPTS: usize = 500;
+/// How long a write that loses commit races to background work is tried again: a hang cap.
+const CONFLICT_CAP: Duration = Duration::from_secs(120);
 
 /// Mints the held-bucket structured id a local create embeds on `node_id`.
 fn mint_local(
@@ -414,7 +420,7 @@ async fn seed_and_update(
     group_id: Ulid,
     document_id: Ulid,
     document_path: &str,
-) -> Result<(PlacementRef, Vec<aruna_core::NodeId>, Ulid), Box<dyn std::error::Error>> {
+) -> Result<(PlacementRef, Vec<aruna_core::id::NodeId>, Ulid), Box<dyn std::error::Error>> {
     let created = drive(
         CreateDocumentOperation::new(CreateDocumentConfig {
             actor: Actor {
@@ -491,8 +497,8 @@ async fn drain_origin(
     nodes: &[TestNode],
     realm_id: RealmId,
     placement: &PlacementRef,
-    initial_holders: &[aruna_core::NodeId],
-) -> Result<aruna_core::NodeId, Box<dyn std::error::Error>> {
+    initial_holders: &[aruna_core::id::NodeId],
+) -> Result<aruna_core::id::NodeId, Box<dyn std::error::Error>> {
     let obsolete = nodes[0].net.node_id();
     let updated_config = drive(
         MutatePlacementOperation::new(MutatePlacementConfig {
@@ -529,7 +535,7 @@ async fn drain_origin(
 async fn assert_update_reaches(
     nodes: &[TestNode],
     realm_id: RealmId,
-    replacement: aruna_core::NodeId,
+    replacement: aruna_core::id::NodeId,
     group_id: Ulid,
     document_id: Ulid,
     update_event_id: Ulid,
@@ -700,12 +706,12 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // The create's background drain may commit alongside; the write succeeds on a retry.
-    let mut updated = None;
-    for _ in 0..CONFLICT_ATTEMPTS {
+    let (first, jsonld) = (&nodes[0], &updated_jsonld);
+    let updated = poll_until(CONFLICT_CAP, move || async move {
         let outcome = drive(
             UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: Actor {
-                    node_id: nodes[0].net.node_id(),
+                    node_id: first.net.node_id(),
                     user_id: UserId::local(Ulid::generate(), realm_id),
                     realm_id,
                 },
@@ -713,24 +719,20 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
                 document_id,
                 public: true,
                 mutation: UpdateDocumentMutation::ReplaceRoCrate {
-                    jsonld: updated_jsonld.clone(),
+                    jsonld: jsonld.clone(),
                 },
                 expected_revision: None,
             }),
-            nodes[0].context.as_ref(),
+            first.context.as_ref(),
         )
         .await;
         match outcome {
-            Err(UpdateDocumentError::StorageError(StorageError::TransactionConflict)) => {
-                sleep(Duration::from_millis(20)).await
-            }
-            outcome => {
-                updated = Some(outcome?);
-                break;
-            }
+            Err(UpdateDocumentError::StorageError(StorageError::TransactionConflict)) => None,
+            outcome => Some(outcome),
         }
-    }
-    assert!(updated.ok_or("the update kept conflicting")?.public);
+    })
+    .await;
+    assert!(updated.ok_or("the update kept conflicting")??.public);
 
     wait_metadata_state(
         &nodes,
@@ -742,33 +744,27 @@ async fn updates_apply_locally() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let mut deleted = false;
-    for _ in 0..CONFLICT_ATTEMPTS {
+    let deleted = poll_until(CONFLICT_CAP, move || async move {
         let outcome = drive(
             DeleteDocumentOperation::new(
                 Actor {
-                    node_id: nodes[0].net.node_id(),
+                    node_id: first.net.node_id(),
                     user_id: UserId::local(Ulid::generate(), realm_id),
                     realm_id,
                 },
                 group_id,
                 document_id,
             ),
-            nodes[0].context.as_ref(),
+            first.context.as_ref(),
         )
         .await;
         match outcome {
-            Err(DeleteDocumentError::StorageError(StorageError::TransactionConflict)) => {
-                sleep(Duration::from_millis(20)).await
-            }
-            outcome => {
-                outcome?;
-                deleted = true;
-                break;
-            }
+            Err(DeleteDocumentError::StorageError(StorageError::TransactionConflict)) => None,
+            outcome => Some(outcome),
         }
-    }
-    assert!(deleted, "the delete kept conflicting");
+    })
+    .await;
+    deleted.ok_or("the delete kept conflicting")??;
 
     wait_metadata_absence(&nodes, group_id, document_id, &created.record.graph_iri).await?;
     shutdown_nodes(nodes).await;
@@ -841,7 +837,8 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
 {{"@id":"https://w3id.org/aruna/{document_id}","@type":"Dataset","name":"{name}","description":"Long history","datePublished":"2026-02-01","license":{{"@id":"https://creativecommons.org/licenses/by/4.0/"}}}}]}}"#
         );
         // A burst can outrun materialization; the window opens again once it catches up.
-        loop {
+        let jsonld = &jsonld;
+        let written = poll_until(CONFLICT_CAP, move || async move {
             let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
                 actor: actor(node),
                 group_id,
@@ -865,17 +862,19 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => Some(Ok(())),
                 // Backpressure and write conflicts are both answered by retrying.
                 Err(
                     UpdateDocumentError::RawLimit
                     | UpdateDocumentError::StorageError(
                         aruna_core::errors::StorageError::TransactionConflict,
                     ),
-                ) => sleep(Duration::from_millis(20)).await,
-                Err(error) => return Err(error.into()),
+                ) => None,
+                Err(error) => Some(Err(error)),
             }
-        }
+        })
+        .await;
+        Ok(written.ok_or("the write kept being refused")??)
     };
     let written = std::sync::atomic::AtomicUsize::new(0);
     let history = async {
@@ -1328,7 +1327,7 @@ async fn publish_to_peer(
     event_id: Ulid,
     target: DocumentTarget,
     bytes: Vec<u8>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     placement: aruna_core::structs::placement::record::PlacementRef,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match node
@@ -1356,7 +1355,7 @@ async fn publish_to_peer(
 }
 
 fn publish_change(
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     target: &DocumentTarget,
     bytes: &[u8],
     placement: aruna_core::structs::placement::record::PlacementRef,
@@ -1418,7 +1417,8 @@ async fn read_holder_set(
     node: &TestNode,
     group_id: Ulid,
     document_id: Ulid,
-) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::NodeId>)>, Box<dyn std::error::Error>> {
+) -> Result<Option<(MetadataRegistryRecord, Vec<aruna_core::id::NodeId>)>, Box<dyn std::error::Error>>
+{
     let key = metadata_registry_key(group_id, document_id);
     match node
         .context
@@ -1501,10 +1501,10 @@ async fn wait_persisted_update(
 
 async fn wait_holder_set(
     nodes: &[TestNode],
-    node_ids: &[aruna_core::NodeId],
+    node_ids: &[aruna_core::id::NodeId],
     group_id: Ulid,
     document_id: Ulid,
-    expected_holders: &[aruna_core::NodeId],
+    expected_holders: &[aruna_core::id::NodeId],
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_convergence(
         &format!("metadata holder indexes did not converge to {expected_holders:?}"),
@@ -1528,7 +1528,7 @@ async fn wait_holder_set(
     .await
 }
 
-fn same_holder_set(left: &[aruna_core::NodeId], right: &[aruna_core::NodeId]) -> bool {
+fn same_holder_set(left: &[aruna_core::id::NodeId], right: &[aruna_core::id::NodeId]) -> bool {
     left.len() == right.len()
         && left.iter().copied().collect::<HashSet<_>>()
             == right.iter().copied().collect::<HashSet<_>>()

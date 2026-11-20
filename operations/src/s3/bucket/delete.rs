@@ -7,6 +7,7 @@ use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError, schedule_snapshot_p
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, AUTH_KEYSPACE,
@@ -18,7 +19,7 @@ use aruna_core::keyspaces::{
     RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
     UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::storage_entries::outbox_write_entry;
@@ -36,14 +37,16 @@ use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyRecord
 use aruna_core::structs::storage::group_backend::{BUCKET_DELETING, BUCKET_STATE, GroupStorage};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::usage::{UsageDelta, usage_bucket_key};
-use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
+use aruna_core::structs::sync_relationship::{
+    SyncRelationship, sync_relationship_key, sync_relationship_prefix,
+};
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
-use crate::notifications::outbox_record::schedule_drain_effect;
-use crate::sync::mirror_repair::mirror_delete_entry;
+use aruna_core::structs::execution::notification::schedule_drain_effect;
+use aruna_core::structs::storage::mirror_repair::mirror_delete_entry;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteBucketState {
@@ -651,11 +654,11 @@ fn group_members(document: &GroupAuthorizationDocument, realm_id: RealmId) -> Ve
 #[cfg(test)]
 mod link_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -911,7 +914,9 @@ mod test {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::storage::usage::BucketCounters;
-    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key};
+    use aruna_core::structs::sync_relationship::{
+        SyncMode, SyncState, SyncStatusSnapshot, sync_relationship_key,
+    };
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;
@@ -922,7 +927,7 @@ mod test {
     async fn test_delete_bucket() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1045,7 +1050,7 @@ mod test {
         use aruna_core::structs::storage::encryption::{BucketKeyRef, EncryptionMode};
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1160,7 +1165,7 @@ mod test {
     async fn removes_replication_config() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1178,7 +1183,7 @@ mod test {
                 BucketInfo {
                     group_id: Ulid::generate(),
                     created_at: SystemTime::now(),
-                    created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
+                    created_by: aruna_core::user::id::UserId::nil(RealmId::from_bytes([0u8; 32])),
                     cors_configuration: None,
                     storage_routing: Vec::new(),
                     placement_policies: Vec::new(),
@@ -1213,7 +1218,7 @@ mod test {
     async fn deletes_sync_records() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1246,7 +1251,7 @@ mod test {
         let realm_id = RealmId::from_bytes([7; 32]);
         let local_node = iroh::SecretKey::from_bytes(&[8; 32]).public();
         let remote_node = iroh::SecretKey::from_bytes(&[9; 32]).public();
-        let creator = aruna_core::UserId::nil(realm_id);
+        let creator = aruna_core::user::id::UserId::nil(realm_id);
         let relationships = [
             SyncRelationship {
                 id: Ulid::from(1u128),
@@ -1334,7 +1339,7 @@ mod test {
     async fn nonempty_bucket_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -1403,7 +1408,7 @@ mod test {
     async fn versioned_bucket_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

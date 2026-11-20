@@ -13,10 +13,10 @@ use super::{
     MetadataFanoutStats, NodeId, ObjectKeyMatch, QUERY_MAX_NODES, RealmId, SearchNodePage,
     SignedCursor, SystemTime, object_search_fingerprint, select_fanout_nodes,
 };
-use crate::distribution::feed_walks::IndexProgress;
 use crate::metadata::search_cursor::blank_signature;
-use crate::s3::object::search_scan::changed_until;
+use crate::transfer::search_scan::changed_until;
 use aruna_core::cursor::OBJECT_CURSOR_CONTEXT;
+use aruna_core::structs::storage::distribution::search::IndexProgress;
 
 const OBJECT_CURSOR_VERSION: u8 = 1;
 

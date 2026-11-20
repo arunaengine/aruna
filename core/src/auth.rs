@@ -31,7 +31,7 @@ pub fn bearer_token_hash(token: &str) -> String {
 }
 
 /// Revocation hash that stands for every credential of one user issued before a cutoff.
-pub fn user_cutoff_hash(user_id: &crate::UserId) -> String {
+pub fn user_cutoff_hash(user_id: &crate::user::id::UserId) -> String {
     credential_hash(format!("aruna user cutoff {user_id}"))
 }
 

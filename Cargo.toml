@@ -6,6 +6,7 @@
 members = [
     "api",
     "aruna",
+    "config",
     "blob",
     "compute",
     "core",
@@ -20,6 +21,7 @@ members = [
     "operations",
     "drivers",
     "outbound",
+    "test-support",
     "aruna-doctor",
     "cli",
     "plugins",
@@ -52,6 +54,7 @@ aruna-blob = { path = "blob" }
 aruna-cli = { path = "cli" }
 aruna-compute = { path = "compute", default-features = false }
 aruna-clock = { path = "clock" }
+aruna-config = { path = "config" }
 aruna-core = { path = "core" }
 aruna-graph = { path = "graph" }
 aruna-net = { path = "net" }
@@ -63,6 +66,7 @@ aruna-plugin-types = { path = "plugin-types" }
 aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }
+aruna-test-support = { path = "test-support" }
 aruna-wire = { path = "wire" }
 
 # Third-party crates

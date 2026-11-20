@@ -2,14 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::events::{Event, PeerRequestError};
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::{MemoryPermit, PluginEvent, PublishedPlugin};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::user::id::UserId;
 use serde_json::{Value, json};
 use ulid::Ulid;
 
@@ -17,7 +17,7 @@ use super::install::InstallCaller;
 use super::rows::tests::child_result;
 use super::work::tests::sample_install;
 use crate::document_repository::GetConfigError;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message};
 
 pub(crate) fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()

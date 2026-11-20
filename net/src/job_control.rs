@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::events::JobControlEvent;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::stream::BackendStream;
 use futures::{Stream, StreamExt};

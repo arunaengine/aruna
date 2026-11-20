@@ -217,7 +217,7 @@ mod tests {
     use ulid::Ulid;
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn present(context: &DriverContext, key_space: &str, key: Vec<u8>) -> bool {
@@ -236,8 +236,10 @@ mod tests {
     async fn ownerless_after_grace() {
         let dir = tempfile::tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

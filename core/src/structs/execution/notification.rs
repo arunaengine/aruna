@@ -2,19 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
+use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
 use crate::structs::identity::realm::RealmId;
+use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key};
+use crate::user::id::UserId;
 
 pub const DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 pub const TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -492,6 +496,9 @@ pub enum NotificationTransportMessage {
     WatchEventsAck {
         written: u32,
     },
+    /// The holder could not take the request now and stored nothing; the sender keeps it and
+    /// tries again later, unlike after a `Reject`.
+    Unavailable(String),
 }
 
 impl NotificationTransportMessage {
@@ -514,6 +521,7 @@ impl NotificationTransportMessage {
             NotificationTransportMessage::WatchList { .. } => "watch_list",
             NotificationTransportMessage::DeliverWatchEvents { .. } => "deliver_watch_events",
             NotificationTransportMessage::WatchEventsAck { .. } => "watch_events_ack",
+            NotificationTransportMessage::Unavailable(_) => "unavailable",
         }
     }
 }
@@ -529,6 +537,19 @@ pub struct InboxWriteOutcome {
     pub cutoffs: usize,
     /// Batch records the inbox holds after the write, new or already present, never discarded.
     pub held: Vec<NotificationRecord>,
+}
+
+/// The outbox row of one notification record.
+pub fn new_outbox_record(outbox_id: Ulid, record: NotificationRecord) -> NotificationOutboxRecord {
+    NotificationOutboxRecord { outbox_id, record }
+}
+
+/// Arms the notification outbox drain now.
+pub fn schedule_drain_effect() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainNotificationOutbox,
+        after: Duration::ZERO,
+    })
 }
 
 #[cfg(test)]

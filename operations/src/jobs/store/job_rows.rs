@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 
 use super::mutation::{read_record, record_read};
 use super::*;
@@ -105,14 +105,14 @@ impl Operation for PutRowsOperation {
                 Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
             }
             RowsStep::Write => {
-                done(result)?;
+                result.done()?;
                 self.step = RowsStep::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             RowsStep::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }
@@ -152,7 +152,7 @@ impl Operation for PutEntryOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, JobMutationError> {
         let Some((key, value)) = self.entry.take() else {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         };
         let [row] = values::<1>(result)?;

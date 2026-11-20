@@ -5,17 +5,17 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_core::repository::{
-    LinkFailure, LinkRemote, LinkStatus, RepositoryLink, capabilities, descriptor,
-};
+use aruna_core::repository::capabilities;
+use aruna_core::repository::kind::descriptor;
+use aruna_core::repository::link::{LinkFailure, LinkRemote, LinkStatus, RepositoryLink};
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_drivers::driver::drive;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };
-use aruna_operations::jobs::export::CrateJsonOperation;
+use aruna_operations::jobs::export::snapshot::CrateJsonOperation;
 use aruna_operations::jobs::repository::check::{CrateCheck, RequirementCheck, profile_failure};
 use aruna_operations::jobs::repository::link_queue::OwnerHoldsOperation;
 use aruna_operations::jobs::repository::link_store::{
@@ -526,7 +526,7 @@ pub(in crate::routes) async fn view(
 
 pub(in crate::routes) async fn job_response(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let urls = job_urls(state, job_id).await?;
     Ok((
@@ -662,7 +662,7 @@ pub async fn create_link(
         updated_at: now,
         generation: 0,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind,
     };
     let change = LinkChange::Create {

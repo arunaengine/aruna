@@ -6,17 +6,17 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::structs::execution::job::{
-    JobFamilyId, JobId, JobPayload, JobProjection, JobRecord, LogicalJobState, PluginWorkSpec,
-    RETENTION_MS, WorkspaceMode,
-};
+use aruna_core::structs::execution::job::family::{JobFamilyId, JobProjection, LogicalJobState};
+use aruna_core::structs::execution::job::identity::{JobId, RETENTION_MS};
+use aruna_core::structs::execution::job::input::{JobPayload, PluginWorkSpec};
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::user::id::UserId;
 use aruna_plugin_types::calls::{ErrorKind, Field, HostError, JobStatus};
 use base64::Engine;
 use serde_json::Value;
@@ -25,25 +25,28 @@ use ulid::Ulid;
 
 use super::check::{CallError, RunScope};
 use super::grants::short_path;
+use super::held::ReplyShown;
+use super::host::steps::AdmitCall;
 use super::install::{config_answer, config_call};
 use super::rows::{Rows, StoreError, decode, delete_rows, read_call, scan_rows, values};
 use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
-use super::task_cancel::CancelTask;
-use super::task_row::{TaskRow, task_place};
+use super::task::cancel::CancelTask;
+use super::task::row::{TaskRow, task_place};
 use super::unavailable;
+use super::work::calls::JobRow;
 use super::work::{
     SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
     install_at, summary_of, update_work, work_scan, work_state,
 };
-use super::work_calls::JobRow;
 use crate::jobs::lifecycle::family_reads::{FamilyProjectionOperation, FamilyView};
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::route::JobRouteError;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult, SubmitJobSpec};
-use crate::jobs::submit_local::{DedupJobOperation, MintJobOperation, QueueJobOperation};
+use crate::jobs::submit::SubmitJobSpec;
+use crate::jobs::submit::local::{DedupJobOperation, MintJobOperation, QueueJobOperation};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 fn record_call(job: JobId) -> IoCall {
     IoCall::child(read_job_record(job))
@@ -756,6 +759,87 @@ impl Operation for StartWork {
                 recorded.map_err(|error| call_unavailable(error.0))?;
                 Ok(Next::Done(work_id))
             }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReadPhase {
+    Admit,
+    State(Box<PluginInstall>),
+    Row(Box<JobStatus>),
+    Shown(Box<JobStatus>),
+}
+
+/// The state of the run's job `id`, admitted as a host call. A kept reply comes with it only
+/// while [`ReplyShown`] says it may be shown; otherwise the state comes without the reply.
+#[derive(Debug, PartialEq)]
+pub struct ReadJob {
+    scope: RunScope,
+    holder: Ulid,
+    id: String,
+    phase: ReadPhase,
+}
+
+impl ReadJob {
+    /// The state of job `id` for the run's broker `holder`.
+    pub fn new((scope, holder): (&RunScope, Ulid), id: &str) -> Self {
+        Self {
+            scope: scope.clone(),
+            holder,
+            id: id.to_string(),
+            phase: ReadPhase::Admit,
+        }
+    }
+}
+
+/// A job state without its kept reply.
+fn without_reply(mut status: JobStatus) -> JobStatus {
+    (status.reply_status, status.reply_body) = (None, None);
+    status.reply_headers.clear();
+    status
+}
+
+impl Operation for ReadJob {
+    type Output = JobStatus;
+    type Error = CallError;
+
+    fn first(&mut self) -> Result<Next<JobStatus>, CallError> {
+        let admit = AdmitCall::new(&self.scope, None);
+        Ok(Next::Call(IoCall::child(admit)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<JobStatus>, CallError> {
+        match std::mem::replace(&mut self.phase, ReadPhase::Admit) {
+            ReadPhase::Admit => {
+                let install = result.child::<PluginInstall, CallError>()??;
+                let state = JobState::new((&install, self.scope.local), &self.id);
+                self.phase = ReadPhase::State(Box::new(install));
+                Ok(Next::Call(IoCall::child(state)))
+            }
+            ReadPhase::State(install) => {
+                let status = result.child::<JobStatus, CallError>()??;
+                if status.reply_status.is_none() {
+                    return Ok(Next::Done(status));
+                }
+                let row = JobRow::new(&install, &self.id);
+                self.phase = ReadPhase::Row(Box::new(status));
+                Ok(Next::Call(IoCall::child(row)))
+            }
+            ReadPhase::Row(status) => {
+                let row = result.child::<WorkRow, CallError>()??;
+                // A refused check answers the state without the reply.
+                let Some(context) = &row.context else {
+                    return Ok(Next::Done(without_reply(*status)));
+                };
+                self.phase = ReadPhase::Shown(status);
+                let shown = ReplyShown::new((&self.scope, self.holder), context);
+                Ok(Next::Call(IoCall::child(shown)))
+            }
+            ReadPhase::Shown(status) => match result.child::<bool, CallError>()?? {
+                true => Ok(Next::Done(*status)),
+                false => Ok(Next::Done(without_reply(*status))),
+            },
         }
     }
 }

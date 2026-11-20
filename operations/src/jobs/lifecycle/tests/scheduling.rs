@@ -2,12 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{JobErrorKind, JobFamilyRecord, PhysicalExecutionState};
+use aruna_core::structs::execution::job::family::{JobFamilyRecord, PhysicalExecutionState};
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use std::collections::BTreeSet;
 
 use crate::jobs::lifecycle::stage::stage_error;
-use crate::jobs::lifecycle::witness_arm::witness_rank;
-use crate::jobs::lifecycle::witness_round::suppressed;
+use crate::jobs::lifecycle::witness::arm::witness_rank;
+use crate::jobs::lifecycle::witness::round::suppressed;
 use crate::replication::bao_read::BaoReadError;
 use crate::tests::records::{Family, node};
 

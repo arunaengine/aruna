@@ -8,12 +8,14 @@ use crate::topology;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource, SubmissionId};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{InputMode, InputSelection, InputSource};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -29,14 +31,13 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::remote_inputs::{RemoteInputsOperation, ResolveCaller};
-use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::metadata::PutMetadataOperation;
-use aruna_operations::s3::bucket::release::access::{LoadAccessOperation, MembersCheckOperation};
-use aruna_operations::s3::bucket::release::holder::{AskHolderError, AskHolderOperation};
-use aruna_operations::s3::bucket::release::publish::ReleaseFilesOperation;
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::transfer::release::access::{LoadAccessOperation, MembersCheckOperation};
+use aruna_operations::transfer::release::holder::{AskHolderError, AskHolderOperation};
+use aruna_operations::transfer::release::publish::ReleaseFilesOperation;
+use aruna_operations::transfer::release::{BucketScope, MembershipCaller};
 use serde_json::json;
 use topology::{TestResult, Topology};
 use ulid::Ulid;
@@ -228,7 +229,7 @@ async fn releases_pin_versions() -> TestResult<()> {
     };
     let answers = ask(context, scope, restricted, &queries).await?;
     assert!(answers[0].releases.is_empty());
-    let stranger = realm.auth_for(aruna_core::UserId::local(
+    let stranger = realm.auth_for(aruna_core::user::id::UserId::local(
         Ulid::from(77u128),
         realm.realm_id,
     ));
@@ -306,7 +307,7 @@ async fn releases_pin_versions() -> TestResult<()> {
     assert!(captured.releases_complete);
 
     // READ on the one input key admits it but shows nothing of the bucket's metadata.
-    let one_key = aruna_core::UserId::local(Ulid::from(78u128), realm.realm_id);
+    let one_key = aruna_core::user::id::UserId::local(Ulid::from(78u128), realm.realm_id);
     let bytes = topology::read_group_auth(holder, group_id)
         .await?
         .ok_or("the group's authorization document")?;
@@ -362,7 +363,7 @@ async fn releases_pin_versions() -> TestResult<()> {
         assert_eq!(answer, HolderAnswer::Crate(expected));
     }
     // A caller without READ gets the generic refusal, not a holder failure.
-    let stranger_token = realm.bearer_for(aruna_core::UserId::local(
+    let stranger_token = realm.bearer_for(aruna_core::user::id::UserId::local(
         Ulid::from(77u128),
         realm.realm_id,
     ));

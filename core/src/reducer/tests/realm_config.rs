@@ -949,7 +949,7 @@ fn vault_entry_writes() {
         .apply_operation(&actor(node(2)), vault_set(2, None), ulid::Ulid::generate())
         .unwrap();
     assert_eq!(vault_revisions(&other), vec![ids(1, 1)]);
-    let path = crate::reducer::vault_entry_path(&crate::realm_vault::RealmVaultEntry::new(
+    let path = crate::reducer::paths::vault_entry_path(&crate::realm_vault::RealmVaultEntry::new(
         crate::realm_vault::RealmVaultPurpose::SmtpPassword,
         Ulid::from_bytes([2; 16]),
     ));

@@ -4,14 +4,14 @@
 
 use std::collections::HashMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::jobs::WaitTarget;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::KeyWait;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::encryption::ReadLease;
 
@@ -22,8 +22,7 @@ use super::sources::export_failure;
 use super::{CandidateOpen, ExportFailure, OpenStatus, SourceScope};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::get::leased;
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 /// What a local open needs after the access check.
 #[derive(Debug, PartialEq)]
@@ -144,7 +143,7 @@ impl OpenCandidateOperation {
                     }
                 } else {
                     let blob = match held {
-                        Some(lease) => leased(blob, lease),
+                        Some(lease) => blob.keep(lease),
                         None => blob,
                     };
                     BaoReadOutput::Stream {

@@ -5,20 +5,20 @@
 use super::*;
 use crate::auth::extract;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
-use crate::job_test_calls::mutate_job;
 use crate::routes::metadata::repositories::{
     ApiRepositoryKind, RepositoryRequest, create_repository,
 };
 use crate::tests::routes::{
     seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage,
 };
-use aruna_core::UserId;
-use aruna_core::structs::execution::job::JobState;
+use aruna_core::structs::execution::job::identity::JobState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
+use aruna_core::user::id::UserId;
 use aruna_drivers::testing::test_context;
 use aruna_operations::harvest::create_source::source_id;
 use aruna_operations::jobs::store::JobMutation;
+use aruna_test_support::jobs::mutate_job;
 use axum::http::StatusCode;
 use tempfile::TempDir;
 

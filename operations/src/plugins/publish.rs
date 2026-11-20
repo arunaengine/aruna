@@ -6,19 +6,19 @@
 use aruna_core::id_mint::IdMint;
 use std::collections::BTreeSet;
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, PeerRequestError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugins::{Chunk, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -27,20 +27,21 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
+use bytes::Bytes;
 use thiserror::Error;
 use tracing::{info, warn};
 
 use super::artifacts::{ArtifactError, managers};
 use super::copies_needed;
-use super::copy_rows::{StoreCopy, chunk_count, chunk_of};
+use super::copy::rows::{StoreCopy, chunk_count, chunk_of};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::protocol::{
-    METADATA_IO_TIMEOUT, MetadataTransportMessage, decode_message, encode_message, metadata_request,
-};
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
+use aruna_core::metadata::protocol::{
+    METADATA_IO_TIMEOUT, MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
 
 #[derive(Debug, Error, PartialEq)]
@@ -75,22 +76,86 @@ impl From<IoError> for PublishError {
 
 /// The entry of a checked artifact and the realm config it was checked against.
 #[derive(Debug, PartialEq)]
-pub struct PublishPlan {
+struct PublishPlan {
     config: RealmConfigDocument,
     entry: PublishedPlugin,
 }
 
-impl PublishPlan {
-    /// Stores the artifact on this node, as the copy the publish counts first.
-    pub fn store_copy<'a>(&self, artifact: &'a [u8]) -> StoreCopy<'a> {
-        let (digest, now_ms) = (&self.entry.digest, self.entry.published_at_ms);
-        StoreCopy::new(&self.config, digest, artifact, now_ms)
+/// Publishes `artifact` for a realm admin: checks it, stores it here, copies it to the other
+/// management nodes and writes the entry. Answers only after a majority stored it durably;
+/// otherwise nothing is published. The entry takes the time of the run's start.
+#[derive(Debug, PartialEq)]
+pub struct PublishPlugin {
+    actor: Actor,
+    auth: AuthContext,
+    artifact: Bytes,
+    now_ms: u64,
+    phase: PublishPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum PublishPhase {
+    Checking,
+    Storing(Box<PublishPlan>),
+    Finishing,
+}
+
+impl PublishPlugin {
+    pub fn new(actor: Actor, auth: AuthContext, artifact: Bytes) -> Self {
+        Self {
+            actor,
+            auth,
+            artifact,
+            now_ms: 0,
+            phase: PublishPhase::Checking,
+        }
+    }
+}
+
+impl Operation for PublishPlugin {
+    type Output = PublishedPlugin;
+    type Error = PublishError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<PublishedPlugin>, PublishError> {
+        let (actor, auth) = (&self.actor, &self.auth);
+        let check = CheckPublish::new(actor, auth, &self.artifact, self.now_ms)?;
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishedPlugin>, PublishError> {
+        match std::mem::replace(&mut self.phase, PublishPhase::Finishing) {
+            PublishPhase::Checking => match result.child::<PublishStep, PublishError>()?? {
+                PublishStep::Known(published) => Ok(Next::Done(published)),
+                PublishStep::Store(plan) => {
+                    let (digest, now_ms) = (&plan.entry.digest, plan.entry.published_at_ms);
+                    let bytes = self.artifact.clone();
+                    let store = StoreCopy::new(&plan.config, digest, bytes, now_ms);
+                    self.phase = PublishPhase::Storing(plan);
+                    Ok(Next::Call(IoCall::child(store)))
+                }
+            },
+            PublishPhase::Storing(plan) => {
+                result.child::<(), ArtifactError>()??;
+                let (actor, auth) = (self.actor.clone(), self.auth.clone());
+                let artifact = std::mem::take(&mut self.artifact);
+                let finish = FinishPublish::new(actor, auth, *plan, artifact);
+                Ok(Next::Call(IoCall::child(finish)))
+            }
+            PublishPhase::Finishing => {
+                let published = result.child::<PublishedPlugin, PublishError>()??;
+                Ok(Next::Done(published))
+            }
+        }
     }
 }
 
 /// What a checked publish does next.
 #[derive(Debug, PartialEq)]
-pub enum PublishStep {
+enum PublishStep {
     /// The identical version is already published.
     Known(PublishedPlugin),
     Store(Box<PublishPlan>),
@@ -98,7 +163,7 @@ pub enum PublishStep {
 
 /// Checks `artifact` for a realm admin on this management node and writes nothing.
 #[derive(Debug, PartialEq)]
-pub struct CheckPublish {
+struct CheckPublish {
     actor: Actor,
     auth: AuthContext,
     entry: PublishedPlugin,
@@ -106,7 +171,7 @@ pub struct CheckPublish {
 }
 
 impl CheckPublish {
-    pub fn new(
+    fn new(
         actor: &Actor,
         auth: &AuthContext,
         artifact: &[u8],
@@ -177,16 +242,16 @@ impl Operation for CheckPublish {
 /// Copies a locally stored artifact to the other management nodes and writes the entry once a
 /// majority holds it durably; otherwise nothing is published.
 #[derive(Debug, PartialEq)]
-pub struct FinishPublish {
+struct FinishPublish {
     actor: Actor,
     auth: AuthContext,
     plan: PublishPlan,
-    artifact: Vec<u8>,
+    artifact: Bytes,
     stored: Option<usize>,
 }
 
 impl FinishPublish {
-    pub fn new(actor: Actor, auth: AuthContext, plan: PublishPlan, artifact: Vec<u8>) -> Self {
+    fn new(actor: Actor, auth: AuthContext, plan: PublishPlan, artifact: Bytes) -> Self {
         Self {
             actor,
             auth,
@@ -259,7 +324,7 @@ fn same_version(
 /// Sends the artifact to every other management node at once, the chunks of one node one after
 /// another; answers the nodes that confirmed a complete, synced copy. A node that refuses or
 /// fails a chunk gets no more.
-pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8>) -> CopyArtifact {
+pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Bytes) -> CopyArtifact {
     CopyArtifact {
         peers,
         digest,
@@ -273,7 +338,7 @@ pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8
 pub struct CopyArtifact {
     peers: Vec<NodeId>,
     digest: String,
-    artifact: Vec<u8>,
+    artifact: Bytes,
     /// The node and chunk of each window member, by member index.
     members: Vec<(NodeId, u32)>,
     confirmed: BTreeSet<NodeId>,
@@ -389,7 +454,7 @@ pub struct PublishEntryConfig {
     pub auth_context: AuthContext,
     pub plugin: PublishedPlugin,
     /// Management nodes that confirmed a complete, synced copy, this one included.
-    pub copies: BTreeSet<aruna_core::NodeId>,
+    pub copies: BTreeSet<aruna_core::id::NodeId>,
 }
 
 /// Writes one published plugin version into the realm config in one transaction, after the
@@ -615,14 +680,14 @@ impl Operation for PublishEntryOperation {
                 }
             }
             EntryPhase::Write { stale } => {
-                done(result)?;
+                result.done()?;
                 match stale.is_empty() {
                     true => self.finish(),
                     false => Ok(Next::Call(IoCall::Delete(stale))),
                 }
             }
             EntryPhase::DeleteConflicts => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }

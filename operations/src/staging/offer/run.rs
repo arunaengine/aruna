@@ -12,7 +12,7 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::execution::offered_directory::{OFFERED_DIRECTORY_ROOT, OfferedDirectory};
 use aruna_core::structs::execution::source_access::{
     ListCursor, ListRequest, ResolvedSourceAccess, SourceEntry,
@@ -473,7 +473,9 @@ impl Operation for WithdrawOfferOperation {
         match self.step {
             WithdrawStep::Read => {
                 let bucket = &self.input.bucket;
-                let row = value(result)?.ok_or_else(|| OfferError::NotOffered(bucket.clone()))?;
+                let row = result
+                    .value()?
+                    .ok_or_else(|| OfferError::NotOffered(bucket.clone()))?;
                 self.group_id = Some(OfferedDirectory::from_bytes(&row)?.group_id);
                 self.step = WithdrawStep::Delete;
                 let row = (OFFERED_DIRECTORY_KEYSPACE.to_string(), offer_key(bucket));

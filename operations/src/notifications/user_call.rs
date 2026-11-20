@@ -3,10 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::operation::Operation;
@@ -15,6 +14,7 @@ use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEventMask, WatchInterestEntry, WatchSubscription,
 };
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -181,15 +181,16 @@ impl UserCallOperation {
                 now_ms,
             } => {
                 let watch = (path_prefix.clone(), *event_mask);
-                let watch_id = self.ids.mint(*now_ms);
+                let ids = (self.ids.mint(*now_ms), self.ids.mint(*now_ms));
                 let authorization = authorization.clone();
                 let create =
-                    CreateWatchOperation::new(watch_id, local, user, watch, authorization, *now_ms)
+                    CreateWatchOperation::new(ids, local, user, watch, authorization, *now_ms)
                         .map_err(watch_error)?;
                 IoCall::child(create)
             }
             UserCall::DeleteWatch { watch_id, now_ms } => {
-                let replication = watch_delete_replication(local, user, *watch_id, *now_ms);
+                let place = (local, self.ids.mint(*now_ms));
+                let replication = watch_delete_replication(place, user, *watch_id, *now_ms);
                 IoCall::child(StoreWatchOperation::delete(
                     user,
                     *watch_id,

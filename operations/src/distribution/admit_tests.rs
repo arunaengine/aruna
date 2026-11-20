@@ -6,17 +6,18 @@
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
-use aruna_core::UserId;
+use aruna_core::calls::CallRun;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::RANGE_INDEX_KEYSPACE;
-use aruna_core::operation::{EffectOperation, Runnable, SubOperation};
+use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::slot_key;
 use aruna_core::structs::storage::distribution::capacity::OBJECT_METADATA_BYTES;
 use aruna_core::structs::storage::format::Compression;
-use aruna_storage::storage::StorageHandle;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
 
 use super::*;
 use crate::distribution::test_store::{get, open, range, send};
@@ -133,7 +134,7 @@ async fn run_with(
     config: AdmitConfig,
     sign: bool,
 ) -> Result<SignedStatement, AdmitError> {
-    let mut operation = AdmitOperation::new(config).into_machine();
+    let mut operation = CallRun::new(AdmitOperation::new(config));
     drive_until(handle, &mut operation, sign, |_| false).await;
     operation.finalize()
 }
@@ -141,7 +142,7 @@ async fn run_with(
 /// Drives `operation` until `stop` matches the next effect or it ends.
 async fn drive_until(
     handle: &StorageHandle,
-    operation: &mut impl EffectOperation,
+    operation: &mut CallRun<impl Operation>,
     sign: bool,
     stop: impl Fn(&Effect) -> bool,
 ) -> VecDeque<Effect> {
@@ -162,7 +163,7 @@ async fn outside(handle: &StorageHandle, mut child: Box<dyn SubOperation>) -> Ev
 
 async fn resume(
     handle: &StorageHandle,
-    operation: &mut impl EffectOperation,
+    operation: &mut CallRun<impl Operation>,
     sign: bool,
     queue: &mut VecDeque<Effect>,
     stop: impl Fn(&Effect) -> bool,
@@ -473,7 +474,7 @@ async fn concurrent_admissions_conflict() {
     let (other, other_member) = (Ulid::from_bytes([6; 16]), Ulid::from_bytes([7; 16]));
     bound_bucket(&handle, ("other", other, other_member), 43, 43).await;
     let capacity = Some(NEED + NEED / 2);
-    let mut first = AdmitOperation::new(sized(capacity)).into_machine();
+    let mut first = CallRun::new(AdmitOperation::new(sized(capacity)));
     let staged = |effect: &Effect| {
         matches!(
             effect,

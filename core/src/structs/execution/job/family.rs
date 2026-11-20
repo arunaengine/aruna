@@ -2,6 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::identity::JobId;
+use super::input::{CapturedInput, ExecutionSpec};
+use super::local::OutputObject;
+use super::pages::PageManifest;
 use super::*;
 
 const SUBMISSION_KEYED_DOMAIN: &[u8] = b"aruna-submission-id-v1";
@@ -434,7 +438,7 @@ impl TryFrom<String> for ResultMessage {
 }
 
 /// Ordering of one output inside a canonical set.
-fn output_order(object: &OutputObject) -> (crate::NodeId, &str, &str, Ulid) {
+fn output_order(object: &OutputObject) -> (crate::id::NodeId, &str, &str, Ulid) {
     (
         object.node_id,
         &object.bucket,

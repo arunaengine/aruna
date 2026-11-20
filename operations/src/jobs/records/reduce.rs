@@ -4,12 +4,13 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     CancelAuthority, ExecutionOutputRecord, ExecutionReceipt, ExecutionRole, ExecutionUpdate,
-    JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope,
-    JobRecordError, LogicalJobState, OutputSet, PhysicalExecutionState, ProjectedExecution,
-    SubmissionClaim, canonical_execution_key, verify_update_chain,
+    JobFamilyId, JobFamilyRecord, JobProjection, JobRecordBody, JobRecordEnvelope, JobRecordError,
+    LogicalJobState, OutputSet, PhysicalExecutionState, ProjectedExecution, SubmissionClaim,
+    canonical_execution_key, verify_update_chain,
 };
+use aruna_core::structs::execution::job::identity::JobId;
 use ulid::Ulid;
 
 /// One physical execution as its own records describe it.

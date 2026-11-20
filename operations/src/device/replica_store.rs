@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{DEVICE_REPLICA_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::rows::{outside_answer, outside_call};
 use tracing::warn;
 use ulid::Ulid;
@@ -137,7 +137,9 @@ impl Operation for CacheBudgetOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<u64>, IoError> {
-        let stored = value(result)?.and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
+        let stored = result
+            .value()?
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok());
         Ok(Next::Done(
             stored.map_or(DEFAULT_CACHE_BYTES, u64::from_be_bytes),
         ))
@@ -166,7 +168,7 @@ impl Operation for StoreBudgetOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }

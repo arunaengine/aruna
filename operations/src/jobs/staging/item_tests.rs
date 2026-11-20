@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_run};
-use crate::s3::bucket::get::GetBucketError;
+use aruna_core::bucket_read::GetBucketError;
 
 fn paths() -> (String, String) {
     ("src/a".to_string(), "copy/a".to_string())
@@ -24,7 +24,7 @@ fn item() -> StagingJobItem {
 
 fn item_run() -> RunItemOperation {
     let run = test_run();
-    let checkpoint = crate::jobs::staging::initial_checkpoint(&run.spec);
+    let checkpoint = aruna_core::staging_checkpoint::initial_checkpoint(&run.spec);
     RunItemOperation::new(run, item(), checkpoint)
 }
 
@@ -61,9 +61,7 @@ fn replaced_bucket_lasts() {
 fn seed_failure_fails() {
     let mut stage = StageItemOperation::new(test_run(), paths(), Vec::new(), 0);
     stage.step = StageStep::Replicate(4);
-    let failed = child_answer(Err::<QueueBlobResult, _>(BlobQueueError::UnexpectedEvent(
-        "full".to_string(),
-    )));
+    let failed = child_answer(Err::<bool, _>(IoError::Codec("full".to_string())));
     assert!(matches!(stage.next(failed), Err(ItemFailure::Stage(_))));
 }
 

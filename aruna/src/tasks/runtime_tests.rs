@@ -6,43 +6,47 @@ use crate::tasks::runner::{
     claim_producer, finish_job, recover_stale_jobs, recover_until_stopped, run_job, shutdown_jobs,
     spawn_job, wait_for_terminal,
 };
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::heartbeat::RunningJobs;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::ProgressReporter;
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, JobClaim, JobExecutionClass, JobId, JobPayload, JobRecord, JobResultPayload,
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobClaim, JobError, JobRecord, JobResultPayload,
 };
-use aruna_core::structs::execution::job::{JobError, JobState};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::executor::RangeTurns;
 use aruna_drivers::jobs::runtime::*;
 use aruna_drivers::jobs::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
 use aruna_drivers::testing::import_record;
+use aruna_drivers::testing::task_context;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
 use aruna_operations::jobs::runtime_steps::requeue_call;
 use aruna_operations::jobs::store::JobMutation;
 use aruna_operations::jobs::store::job_calls::{AdoptOutcome, ClaimOutcome, RequeueOutcome};
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
-use aruna_operations::jobs::store::test_calls::{
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::jobs::{
     adopt_external_attempt, cancel_running_job, claim_job, complete_job, insert_job, mutate_job,
     read_job_record, record_attempt_intent, requeue_job, set_cancel_requested,
 };
-use aruna_operations::testing::task_context;
-use aruna_storage::{FjallStorage, StorageHandle};
 use byteview::ByteView;
 use futures_util::future::FutureExt;
-use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
+
+/// A hang cap for the waits on the job runtime, never a speed bound.
+const WAIT_CAP: Duration = Duration::from_secs(60);
 
 fn node_id(seed: u8) -> NodeId {
     let mut seed_bytes = [0u8; 32];
@@ -90,15 +94,12 @@ async fn reclaim(context: &DriverContext, job_id: JobId) -> JobRecord {
 }
 
 async fn wait_running(context: &DriverContext, job_id: JobId) {
-    for _ in 0..400 {
-        if let Ok(Some(record)) = read_job_record(context, job_id, None).await
-            && record.state == JobState::Running
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("job never reached Running");
+    let running = poll_until(WAIT_CAP, move || async move {
+        let record = read_job_record(context, job_id, None).await;
+        matches!(record, Ok(Some(record)) if record.state == JobState::Running).then_some(())
+    })
+    .await;
+    assert!(running.is_some(), "job never reached Running");
 }
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
@@ -151,12 +152,10 @@ async fn cancel_running_cleanup() {
     let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
 
     spawn_job(&runtime, ctx.clone(), claimed);
-    for _ in 0..100 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || {
+        std::future::ready(marker.exists().then_some(()))
+    })
+    .await;
     assert!(
         marker.exists(),
         "probe should create its marker while running"
@@ -168,12 +167,10 @@ async fn cancel_running_cleanup() {
         .unwrap();
     assert_eq!(state, JobState::Cancelled);
     // Cleanup follows the stored terminal state, so it may still be running here.
-    for _ in 0..1000 {
-        if !marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || {
+        std::future::ready((!marker.exists()).then_some(()))
+    })
+    .await;
     assert!(!marker.exists(), "cleanup hook must remove the marker");
 }
 
@@ -215,7 +212,7 @@ async fn cancel_runs_import() {
         claimed,
         token,
         (CancellationToken::new(), None),
-        (CancellationToken::new(), RangeTurns::default(), Vec::new()),
+        (CancellationToken::new(), RangeTurns::default()),
     )
     .await;
 
@@ -257,7 +254,7 @@ async fn cancel_after_claim() {
         claimed,
         token,
         (CancellationToken::new(), None),
-        (CancellationToken::new(), RangeTurns::default(), Vec::new()),
+        (CancellationToken::new(), RangeTurns::default()),
     )
     .await;
 
@@ -282,14 +279,12 @@ async fn zombie_skips_cleanup() {
         claimed,
         stale_token,
         (cancel.clone(), None),
-        (CancellationToken::new(), RangeTurns::default(), Vec::new()),
+        (CancellationToken::new(), RangeTurns::default()),
     ));
-    for _ in 0..100 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || {
+        std::future::ready(marker.exists().then_some(()))
+    })
+    .await;
     assert!(marker.exists(), "probe must reach its cleanup side effect");
 
     requeue_job(
@@ -615,12 +610,10 @@ async fn shutdown_skips_cleanup() {
     let runtime = JobsRuntime::new();
     spawn_job(&runtime, ctx.clone(), claimed);
     wait_running(&ctx, job_id).await;
-    for _ in 0..100 {
-        if marker.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    poll_until(WAIT_CAP, || {
+        std::future::ready(marker.exists().then_some(()))
+    })
+    .await;
     assert!(marker.exists(), "probe should create its marker");
 
     let report = shutdown_jobs(&runtime, &ctx, Duration::from_secs(10)).await;
@@ -679,7 +672,7 @@ async fn cancel_beats_capacity() {
         .unwrap();
     assert!(matches!(
         outcome,
-        aruna_operations::jobs::job_cancel::CancelJobOutcome::Requested(_)
+        aruna_operations::jobs::job::cancel::CancelJobOutcome::Requested(_)
     ));
 
     let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
@@ -717,15 +710,9 @@ async fn panic_frees_slot() {
     let claimed = claim(&ctx, record).await;
 
     spawn_job(&runtime, ctx.clone(), claimed);
-    let mut freed = false;
-    for _ in 0..400 {
-        if runtime.available_slots() == 1 {
-            freed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert!(freed, "panic must release the concurrency slot");
+    let one_free = || std::future::ready((runtime.available_slots() == 1).then_some(()));
+    let freed = poll_until(WAIT_CAP, one_free).await;
+    assert!(freed.is_some(), "panic must release the concurrency slot");
 
     let ok = JobId::from_bytes([0xAB; 16]);
     let claimed = claim(&ctx, probe_record(ok, 2, 0, None)).await;
@@ -843,23 +830,6 @@ async fn counts_running_jobs() {
     assert_eq!(runtime.running_jobs(), RunningJobs::default());
 }
 
-#[derive(Default)]
-struct RecordingReconciler {
-    seen: std::sync::Mutex<Vec<JobId>>,
-}
-
-impl ExternalReconciler for RecordingReconciler {
-    fn reconcile_lost_attempt<'a>(
-        &'a self,
-        _context: &'a DriverContext,
-        record: JobRecord,
-    ) -> futures_util::future::BoxFuture<'a, ()> {
-        Box::pin(async move {
-            self.seen.lock().unwrap().push(record.job_id);
-        })
-    }
-}
-
 // Internal and external slot accounting are independent: saturating one class
 // leaves the other class fully available.
 #[tokio::test]
@@ -914,14 +884,13 @@ fn paused_runtime_starts() {
     );
 }
 
-// Restart recovery routes an external attempt to the reconcile hook instead of
-// re-queuing it, so a container that may still be running is never re-run.
+// Restart recovery reconciles an external attempt instead of re-queuing it, so a container
+// that may still be running is never re-run; a node without an executor leaves it alone.
 #[tokio::test]
 async fn recover_reconciles_external() {
     let (_dir, storage) = temp_storage();
     let context = aruna_drivers::testing::test_context(storage.clone());
-    let recorder = Arc::new(RecordingReconciler::default());
-    let runtime = JobsRuntime::with_reconciler(recorder.clone());
+    let runtime = JobsRuntime::new();
     let job_id = JobId::from_bytes([0xE7; 16]);
     let mut record = probe_record(job_id, 3, 0, None);
     record.execution_class = JobExecutionClass::ExternalAttempt;
@@ -952,95 +921,39 @@ async fn recover_reconciles_external() {
     assert_eq!(after.state, JobState::Running, "not requeued");
     assert_eq!(after.attempts, 0, "the restart spends no attempt");
     assert!(after.claim.is_some());
-    assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
+    assert_eq!(
+        after.attempt_intent, record.attempt_intent,
+        "the attempt keeps its name"
+    );
 }
 
-fn external_running_record(job_id: JobId) -> JobRecord {
-    let mut record = probe_record(job_id, 3, 0, None);
-    record.execution_class = JobExecutionClass::ExternalAttempt;
-    record.state = JobState::Running;
-    record.claim = Some(JobClaim {
-        holder_node_id: node_id(3),
-        claim_token: Ulid::generate(),
-        lease_expires_ms: unix_timestamp_millis() + 60_000,
-    });
-    record.attempt_intent = Some(AttemptIntent {
-        attempt_no: 1,
-        external_name: "attempt".to_string(),
-        executor_kind: "docker".to_string(),
-        pinned_image: "alpine@sha256:digest".to_string(),
-        attempt_epoch: 1,
-        backend: "docker".to_string(),
-        config_generation: 0,
-        home_digest: aruna_core::compute::identity::home_digest("docker", None),
-    });
-    record
-}
-
-#[derive(Default)]
-struct BlockingReconciler {
-    seen: std::sync::Mutex<Vec<JobId>>,
-    entered: tokio::sync::Notify,
-    release: tokio::sync::Notify,
-}
-
-impl ExternalReconciler for BlockingReconciler {
-    fn reconcile_lost_attempt<'a>(
-        &'a self,
-        _context: &'a DriverContext,
-        record: JobRecord,
-    ) -> futures_util::future::BoxFuture<'a, ()> {
-        Box::pin(async move {
-            self.seen.lock().unwrap().push(record.job_id);
-            self.entered.notify_one();
-            self.release.notified().await;
-        })
-    }
-}
-
-// An observed required-service failure while one recovery unit is pending
-// lets that unit finish and admits no next one.
+// An observed required-service failure lets the current recovery unit finish and admits no
+// next one: the probe turns true at its check before the second unit.
 #[tokio::test]
 async fn stop_between_units() {
     let (_dir, storage) = temp_storage();
     let context = aruna_drivers::testing::test_context(storage.clone());
-    let reconciler = Arc::new(BlockingReconciler::default());
-    let runtime = JobsRuntime::with_reconciler(reconciler.clone());
+    let runtime = JobsRuntime::new();
     let first = JobId::from_bytes([0xE9; 16]);
     let second = JobId::from_bytes([0xEA; 16]);
-    insert_job(&context, &external_running_record(first))
-        .await
-        .unwrap();
-    insert_job(&context, &external_running_record(second))
-        .await
-        .unwrap();
+    claim(&context, probe_record(first, 1, 0, None)).await;
+    claim(&context, probe_record(second, 1, 0, None)).await;
 
+    // One check before the page read, one before each unit.
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let failure = || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
     let stop = CancellationToken::new();
-    let failure = std::sync::atomic::AtomicBool::new(false);
-    let recover = recover_until_stopped(&runtime, &context, &stop, || {
-        failure.load(std::sync::atomic::Ordering::SeqCst)
-    });
-    tokio::pin!(recover);
-    tokio::select! {
-        _ = &mut recover => panic!("recovery must hold on the first recovery unit"),
-        _ = reconciler.entered.notified() => {}
+    let recovered = recover_until_stopped(&runtime, &context, &stop, failure).await;
+    assert_eq!(recovered, Ok(1), "no next recovery unit after the failure");
+    let mut claimed = 0;
+    for job_id in [first, second] {
+        let record = read_job_record(&context, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        claimed += usize::from(record.state == JobState::Claimed);
     }
-    assert_eq!(reconciler.seen.lock().unwrap().len(), 1);
-
-    // The failure arrives while the unit is still pending; releasing it
-    // finishes that unit and the loop starts no next one.
-    failure.store(true, std::sync::atomic::Ordering::SeqCst);
-    reconciler.release.notify_one();
-    assert_eq!(recover.await.unwrap(), 0);
-    let processed = reconciler.seen.lock().unwrap().clone();
-    assert_eq!(processed.len(), 1, "no next recovery unit after the stop");
-    let unprocessed = if processed[0] == first { second } else { first };
-    let untouched = read_job_record(&context, unprocessed, None)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(untouched.state, JobState::Running);
-    assert!(untouched.claim.is_some());
+    assert_eq!(claimed, 1, "the unit after the failure stays as it was");
 }
 
 // A stop accepted before recovery admits no recovery unit at all.
@@ -1048,12 +961,9 @@ async fn stop_between_units() {
 async fn cancel_before_recovery() {
     let (_dir, storage) = temp_storage();
     let context = aruna_drivers::testing::test_context(storage.clone());
-    let recorder = Arc::new(RecordingReconciler::default());
-    let runtime = JobsRuntime::with_reconciler(recorder.clone());
+    let runtime = JobsRuntime::new();
     let job_id = JobId::from_bytes([0xEB; 16]);
-    insert_job(&context, &external_running_record(job_id))
-        .await
-        .unwrap();
+    claim(&context, probe_record(job_id, 1, 0, None)).await;
 
     let stop = CancellationToken::new();
     stop.cancel();
@@ -1063,29 +973,15 @@ async fn cancel_before_recovery() {
             .unwrap(),
         0
     );
-    assert!(recorder.seen.lock().unwrap().is_empty());
-}
-
-struct AdoptingReconciler;
-
-impl ExternalReconciler for AdoptingReconciler {
-    fn reconcile_lost_attempt<'a>(
-        &'a self,
-        context: &'a DriverContext,
-        record: JobRecord,
-    ) -> futures_util::future::BoxFuture<'a, ()> {
-        Box::pin(async move {
-            let outcome = adopt_external_attempt(
-                context,
-                record.job_id,
-                record.owner_node_id,
-                unix_timestamp_millis(),
-            )
-            .await
-            .unwrap();
-            assert!(matches!(outcome, AdoptOutcome::Adopted(..)), "must adopt");
-        })
-    }
+    let untouched = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        untouched.state,
+        JobState::Claimed,
+        "a recovered job would be requeued"
+    );
 }
 
 // Rolling restarts must never exhaust JOB_MAX_ATTEMPTS on an external attempt whose
@@ -1094,7 +990,7 @@ impl ExternalReconciler for AdoptingReconciler {
 async fn recovery_spares_attempts() {
     let (_dir, storage) = temp_storage();
     let context = aruna_drivers::testing::test_context(storage.clone());
-    let runtime = JobsRuntime::with_reconciler(Arc::new(AdoptingReconciler));
+    let runtime = JobsRuntime::new();
     let job_id = JobId::from_bytes([0xE8; 16]);
     let token = Ulid::generate();
     let mut record = probe_record(job_id, 3, 0, None);
@@ -1137,6 +1033,15 @@ async fn recovery_spares_attempts() {
         assert_eq!(after.state, JobState::Running, "restart {restart}");
         assert_eq!(after.attempts, 0, "restart {restart}");
         assert!(after.claim.is_some(), "restart {restart}");
+        // The executor node adopts the live container again after each restart.
+        let now_ms = unix_timestamp_millis();
+        let adopted = adopt_external_attempt(&context, job_id, record.owner_node_id, now_ms)
+            .await
+            .unwrap();
+        assert!(
+            matches!(adopted, AdoptOutcome::Adopted(..)),
+            "restart {restart}"
+        );
     }
 }
 
@@ -1157,10 +1062,10 @@ async fn cancel_owned_job(
     runtime: &JobsRuntime,
     user_id: UserId,
     job_id: JobId,
-) -> Result<aruna_operations::jobs::job_cancel::CancelJobOutcome, String> {
+) -> Result<aruna_operations::jobs::job::cancel::CancelJobOutcome, String> {
     let now_ms = unix_timestamp_millis();
     let cancel =
-        aruna_operations::jobs::job_cancel::CancelOwnedOperation::new(user_id, job_id, now_ms);
+        aruna_operations::jobs::job::cancel::CancelOwnedOperation::new(user_id, job_id, now_ms);
     let report = drive(cancel, context).await.map_err(|error| error.0)?;
     for running in report.running {
         runtime.request_cancel(running);

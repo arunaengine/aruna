@@ -7,16 +7,17 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data::identity::{CONTENT_URL, ObjectLocation, text_values};
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
-use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
 use aruna_core::types::{Key, Value as RowValue};
@@ -25,7 +26,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// At most this many entities are looked at per save.
 const MAX_ENTITIES: usize = 10_000;
@@ -351,7 +352,7 @@ mod tests {
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -398,7 +399,7 @@ mod tests {
         let info = BucketInfo {
             group_id: Ulid::from_bytes([3; 16]),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::local(Ulid::from_bytes([5; 16]), realm),
+            created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([5; 16]), realm),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -457,8 +458,10 @@ mod tests {
     async fn bound_entries_globalized() {
         let dir = tempfile::tempdir().unwrap();
         let context = aruna_drivers::driver::DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -560,7 +563,7 @@ mod tests {
             aruna_core::structs::storage::blob::BucketInfo,
             _,
         >(
-            crate::s3::bucket::get::GetBucketError::NotFound,
+            aruna_core::bucket_read::GetBucketError::NotFound,
         )));
         let Ok(Next::Done((_, count))) = normalize.next(missing) else {
             panic!("expected the unchanged document");

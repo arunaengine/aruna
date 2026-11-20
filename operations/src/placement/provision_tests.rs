@@ -5,13 +5,13 @@
 use super::*;
 use crate::placement::provision::AllocateBindingOperation;
 use crate::tests::calls::{child, runs_child};
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange};
 use aruna_core::structured_id::PlacementHandle;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use tempfile::tempdir;
 
@@ -29,7 +29,7 @@ fn actor(realm_id: RealmId) -> Actor {
 
 fn context(root: &str) -> DriverContext {
     DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(root).unwrap(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

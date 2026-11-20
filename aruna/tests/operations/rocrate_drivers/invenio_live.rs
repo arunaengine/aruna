@@ -34,6 +34,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
     require_import(run_rocrate_import(&ctx, &imported).await)?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let title = format!("Aruna acceptance {}", Ulid::generate());
     let mut destination = RepositoryDestination {
         group_id: fixture.group_id,
@@ -220,7 +221,7 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::change_link;
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
-    use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
+    use aruna_core::repository::link::{LinkFailure, LinkPatch, LinkStatus};
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -410,7 +411,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::change_link;
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
-    use aruna_core::repository::{LinkPatch, LinkReview};
+    use aruna_core::repository::link::{LinkPatch, LinkReview};
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
@@ -679,6 +680,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         assert!(count > 0, "{mode:?} imported nothing");
         replay_event_log(fixture.context.as_ref()).await?;
         process_materialization_batch(fixture.context.as_ref()).await?;
+        super::driven::queue_changes(&fixture.context).await?;
         let crate_json = aruna_drivers::driver::drive(
             aruna_operations::metadata::revision_read::RawViewOperation::revision(document),
             &fixture.context,
@@ -729,8 +731,9 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
 async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::drain_links;
     use super::driven::{change_link, list_links};
+    use aruna_core::repository::RepositoryPull;
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_core::repository::{LinkPatch, RepositoryPull};
+    use aruna_core::repository::link::LinkPatch;
     use aruna_core::structs::secondary_id::SecondaryIdKind;
     use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
@@ -801,6 +804,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     require_import(outcome)?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let (link, _) = list_links(&fixture.context, doc_id(2))
         .await?
         .pop()
@@ -849,6 +853,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     require_import(Box::pin(run_rocrate_import(&ctx, &update)).await)?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
 
     let (pulled, _) = list_links(&fixture.context, doc_id(2)).await?.remove(0);
     assert_eq!(pulled.active_job, None);
@@ -882,7 +887,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .await
     };
-    use aruna_operations::jobs::repository::RecordReference::{Doi, Url};
+    use aruna_operations::jobs::repository::invenio::query::RecordReference::{Doi, Url};
     let version_doi = first.identifier.clone().ok_or("v1 has no DOI")?;
     assert_eq!(resolve(Doi(version_doi.to_uppercase())).await?, first.id);
     let concept = second.concept_identifier.clone().ok_or("no concept DOI")?;

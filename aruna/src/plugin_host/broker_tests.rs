@@ -3,38 +3,39 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::plugin_host::read_config;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::ExportMetadataResult;
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_drivers::driver::drive;
-use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, ExportMetadataResult};
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
-use aruna_operations::plugins::calls::*;
 use aruna_operations::plugins::dataset::{
     content_urls, dataset_change, dataset_crate, same_revision,
 };
 use aruna_operations::plugins::grants::{install_scope, parse_grants};
-use aruna_operations::plugins::install::{pick_version, read_manifest};
 use std::collections::BTreeMap;
 
 use super::*;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
 use aruna_operations::metadata::api::read_types::DocumentQueryRequest;
-use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
-};
+use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::create_entry::CreateEntryOperation;
-use aruna_operations::plugins::dataset::merge_into;
-use aruna_operations::plugins::host_calls::VisibleObjects;
-use aruna_operations::plugins::store::Txn;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::queued;
-use aruna_operations::testing::drain_projection_queue;
-use aruna_operations::testing::process_materialization_batch;
+use aruna_operations::plugins::host::calls::VisibleObjects;
+use aruna_operations::plugins::host::steps::GrantedCall;
+use aruna_plugin_types::calls::merge_into;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::queued;
+use aruna_test_support::plugins::rows::Txn;
+use aruna_test_support::projection::drain_projection_queue;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {
@@ -50,12 +51,11 @@ const ENTITY: &str = r#"{"description":"first"}"#;
 async fn broker() -> (Fixture, RunBroker, Ulid, tempfile::TempDir) {
     let fixture = Fixture::new().await;
     let meta = format!("/{}/g/{}/meta/**", fixture.actor.realm_id, fixture.group_id);
-    let mut request = fixture.request(None);
-    request.grants = BTreeMap::from([
+    let grants = BTreeMap::from([
         ("read".into(), vec![meta.clone()]),
         ("write".into(), vec![meta]),
     ]);
-    let installed = fixture.install(&request).await.unwrap();
+    let installed = fixture.install_with(None, grants).await;
     let mut ctx = fixture.ctx.clone();
     let dir = tempfile::tempdir().unwrap();
     let graph = aruna_graph::GraphHandle::open(
@@ -171,24 +171,15 @@ async fn object_calls() {
     let refused = broker.objects_info(&cx(), &path, pinned).await.unwrap_err();
     assert_eq!(refused.kind, ErrorKind::NotGranted);
     let meta = format!("/{}/g/{}/meta/x", fixture.actor.realm_id, fixture.group_id);
-    assert!(
-        broker
-            .checked(Permission::MetadataRead, &meta)
-            .await
-            .is_ok()
-    );
-    assert!(
-        broker
-            .checked(Permission::ObjectsRead, &path)
-            .await
-            .is_err()
-    );
+    let meta_read = GrantedCall::target(&broker.scope, Permission::MetadataRead, &meta);
+    assert!(drive(meta_read, &broker.ctx).await.is_ok());
+    let object_read = GrantedCall::target(&broker.scope, Permission::ObjectsRead, &path);
+    assert!(drive(object_read, &broker.ctx).await.is_err());
 
     // With `read` on the whole group, objects of other nodes and buckets outside it are refused.
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
-    let mut request = fixture.request(None);
-    request.version = Some(fixture.publish("0.1.1", "cd", reads).await);
-    let installed = fixture.install(&request).await.unwrap();
+    let version = Some(fixture.publish("0.1.1", "cd", reads).await);
+    let installed = fixture.install_with(version, BTreeMap::new()).await;
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest;
@@ -247,11 +238,9 @@ async fn objects_broker(
     patterns: &[String],
 ) -> (RunBroker, PluginInstall) {
     let reads = serde_json::json!({ "permissions": { "required": ["objects.read"] } });
-    let mut request = fixture.request(None);
-    request.version = Some(fixture.publish("0.1.2", "ef", reads).await);
     let grants = BTreeMap::from([("read".to_string(), patterns.to_vec())]);
-    request.grants = grants;
-    let installed = fixture.install(&request).await.unwrap();
+    let version = Some(fixture.publish("0.1.2", "ef", reads).await);
+    let installed = fixture.install_with(version, grants).await;
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
@@ -476,12 +465,11 @@ async fn write_includes_read() {
         .await
         .unwrap();
     let meta = format!("/{}/g/{}/meta", fixture.actor.realm_id, fixture.group_id);
-    let mut request = fixture.request(None);
-    request.grants = BTreeMap::from([
+    let grants = BTreeMap::from([
         ("read".to_string(), vec![format!("{meta}/other/**")]),
         ("write".to_string(), vec![format!("{meta}/**")]),
     ]);
-    let installed = fixture.install(&request).await.unwrap();
+    let installed = fixture.install_with(None, grants).await;
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
@@ -557,9 +545,12 @@ async fn invalid_patches() {
 
 #[tokio::test]
 async fn secret_values_granted() {
+    use aruna_core::secrets::{Delivery, ResponseExposure, UseRule};
     use aruna_operations::plugins::account::{AccountChange, EnsureRole};
     use aruna_operations::plugins::grants::role_paths;
-    use aruna_operations::plugins::test_support::{TOKEN, bound, edit_config, hold_keys, secret};
+    use aruna_test_support::plugins::{
+        TOKEN, bound, edit_config, hold_keys, replace_rules, rule_for, secret,
+    };
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     secret(&fixture, &install).await;
@@ -595,14 +586,13 @@ async fn secret_values_granted() {
         .unwrap();
     // The secret's rules let this install inject it, not read its value.
     assert_eq!(kind(&granted).await, Err(ErrorKind::Denied));
-    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    let plugin = pick_version(&config, &granted.plugin, Some(&granted.digest)).unwrap();
-    let manifest = read_manifest(&plugin).unwrap();
-    ensure_rules(&fixture.ctx, &fixture.actor, &granted, &manifest)
-        .await
-        .unwrap();
+    // An admin adds the `value` rule that the granted `secrets.value` asks for.
+    let value = UseRule {
+        delivery: Delivery::Value,
+        origins: Vec::new(),
+        ..rule_for(&granted, ResponseExposure::Status)
+    };
+    replace_rules(&fixture, &granted, vec![value]).await;
     let held = broker(&granted);
     let fields = held.secret_value(&cx(), "api_key").await.unwrap();
     let fields: Vec<(String, String)> = (fields.into_iter())
@@ -632,12 +622,11 @@ async fn keyed_creates() {
     let (fixture, broker, _, _dir) = broker().await;
     let meta = format!("/{}/g/{}/meta", fixture.actor.realm_id, fixture.group_id);
     let creates = serde_json::json!({ "permissions": { "required": ["metadata.create"] } });
-    let mut request = fixture.request(None);
-    request.version = Some(fixture.publish("0.1.3", "12", creates).await);
     let read = ("read".to_string(), vec![format!("{meta}/**")]);
     let write = ("write".to_string(), vec![format!("{meta}/elabftw/**")]);
-    request.grants = BTreeMap::from([read, write]);
-    let installed = fixture.install(&request).await.unwrap();
+    let version = Some(fixture.publish("0.1.3", "12", creates).await);
+    let grants = BTreeMap::from([read, write]);
+    let installed = fixture.install_with(version, grants).await;
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
@@ -1036,9 +1025,8 @@ async fn object_references() {
 
     let reads = serde_json::json!({ "permissions": {
         "required": ["metadata.read", "metadata.write", "objects.read"] } });
-    let mut request = fixture.request(None);
-    request.version = Some(fixture.publish("0.1.4", "34", reads).await);
-    let installed = fixture.install(&request).await.unwrap();
+    let version = Some(fixture.publish("0.1.4", "34", reads).await);
+    let installed = fixture.install_with(version, BTreeMap::new()).await;
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
@@ -1067,7 +1055,7 @@ async fn superseded_merge_journaled() {
     };
     use aruna_core::plugin_runs::source_key;
     use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-    use aruna_operations::testing::project_create_events;
+    use aruna_test_support::projection::project_create_events;
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
     let revision = revision_of(&broker, document).await;
@@ -1084,7 +1072,7 @@ async fn superseded_merge_journaled() {
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./d.txt","@type":"File","name":"d"}"#.to_string(),
     };
-    let planned = aruna_operations::testing::send_metadata_effect(
+    let planned = aruna_drivers::testing::send_metadata_effect(
         &broker.ctx,
         MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
@@ -1215,9 +1203,8 @@ async fn hashed_files_rename() {
     let document = files_named(&fixture, &broker, &[id.as_str()]).await;
     let reads = serde_json::json!({ "permissions": {
         "required": ["metadata.read", "metadata.write", "objects.read"] } });
-    let mut request = fixture.request(None);
-    request.version = Some(fixture.publish("0.1.5", "56", reads).await);
-    let installed = fixture.install(&request).await.unwrap();
+    let version = Some(fixture.publish("0.1.5", "56", reads).await);
+    let installed = fixture.install_with(version, BTreeMap::new()).await;
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
@@ -1256,9 +1243,8 @@ async fn writer_broker(
 ) -> RunBroker {
     let reads = serde_json::json!({ "permissions": {
         "required": ["metadata.read", "metadata.write", "objects.read"] } });
-    let mut request = fixture.request(None);
-    request.version = Some(fixture.publish(version, byte, reads).await);
-    let installed = fixture.install(&request).await.unwrap();
+    let version = Some(fixture.publish(version, byte, reads).await);
+    let installed = fixture.install_with(version, BTreeMap::new()).await;
     let mut scope = broker.scope.clone();
     scope.run.install_id = installed.install_id;
     scope.run.digest = installed.digest.clone();
@@ -1620,7 +1606,7 @@ async fn unprojected_event_refused() {
         source: source.clone(),
     };
     let Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) =
-        aruna_operations::testing::send_metadata_effect(&broker.ctx, plan).await
+        aruna_drivers::testing::send_metadata_effect(&broker.ctx, plan).await
     else {
         panic!("expected a planned batch");
     };

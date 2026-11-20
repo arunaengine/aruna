@@ -6,12 +6,12 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::NodeId;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, GroupEvent, GroupResult};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE, IMPORT_INTENT_KEYSPACE,
@@ -48,8 +48,8 @@ use super::{
 use crate::auth::bearer_token::GrantValidOperation;
 use crate::auth::error::{ArunaBearerError, AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::{BucketAccess, BucketAccessOperation};
-use crate::s3::bucket::job_pages::{ProcessLinkedOperation, StillAdminOperation};
-use crate::s3::policy::count::ProcessCountsOperation;
+use crate::blob::migration::count::ProcessCountsOperation;
+use crate::blob::migration::job_pages::{ProcessLinkedOperation, StillAdminOperation};
 
 /// Versions one task run handles per bucket before it yields to other timers.
 pub(super) const MIGRATION_PAGE: usize = 64;
@@ -201,7 +201,7 @@ pub struct MigrationRun {
     pub cursor: Option<Key>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum RunStep {
     Queue,
     Progress(Key),
@@ -216,7 +216,7 @@ enum RunStep {
 }
 
 /// Advances the unfinished migrations of one page of queued buckets by one page each.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProcessMigrationsOperation {
     routing: NodeRouting,
     serving: Serving,

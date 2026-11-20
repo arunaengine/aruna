@@ -10,7 +10,8 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_COMPUTE_PATH};
+use aruna_core::reducer::paths::CONFIG_COMPUTE_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -26,7 +27,7 @@ use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
 use crate::realm::write_stage::{WriteStage, WriteStep};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -313,8 +314,6 @@ fn apply_reducer_compute(document: &mut RealmConfigDocument, reducer_state: &Adm
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use crate::testing::path_context;
-    use aruna_core::UserId;
     use aruna_core::compute::quota::ComputeQuota;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -323,7 +322,9 @@ mod tests {
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::structs::placement::compute_config::{GroupComputeQuota, LocationLink};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use tempfile::tempdir;
     use ulid::Ulid;
 

@@ -12,6 +12,7 @@ pub mod inputs;
 pub mod inventory;
 pub mod outputs;
 pub mod prepare;
+pub mod publish_run;
 pub mod purge;
 pub mod reconcile;
 pub mod recovery;
@@ -35,11 +36,12 @@ use aruna_core::compute::{
 };
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::scheduling::hosts_session;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, ExecutionSpec, JobError, JobId, JobPayload, JobRecord, LaunchRecord,
-    PhysicalExecutionState, recorded_env,
-};
+use aruna_core::scheduling::eligibility::hosts_session;
+use aruna_core::structs::execution::job::family::PhysicalExecutionState;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::launch::{LaunchRecord, recorded_env};
+use aruna_core::structs::execution::job::local::{AttemptIntent, JobError, JobRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
 use tracing::warn;
@@ -69,7 +71,8 @@ use super::store::job_calls::{
 use super::store::mutation_error::JobMutationError;
 use super::store::row_calls::read_job_record;
 use crate::jobs::fence::{FENCE_RECHECK, fence_read, fence_up};
-use crate::placement::policy::{LocalSubjectOperation, SubjectScanError};
+use crate::placement::policy::reconcile::LocalSubjectOperation;
+use crate::placement::policy::subject::SubjectScanError;
 
 /// Fallback walltime when a spec declares none. Enforcement, reconcile
 /// validation, and credential expiry must all agree on this value.

@@ -5,8 +5,8 @@
 use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::runs::tests::opened;
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 
@@ -132,7 +132,7 @@ async fn fetch_checks_copy() {
 
 mod operations {
     use super::*;
-    use crate::plugins::copy_rows::{chunk_count, chunk_of};
+    use crate::plugins::copy::rows::{chunk_count, chunk_of};
     use crate::plugins::fixtures::{
         config_result, is_child, is_effect, memory_answer, peer_says, peer_silent,
     };
@@ -187,8 +187,10 @@ mod operations {
             assert!(is_effect(&answer));
             answer = read.next(chunk_from(node(2), index));
         }
-        let Ok(Next::Done(fetched)) = answer else {
-            panic!("the last chunk completes the copy");
+        assert!(is_child(&answer), "the checked copy is kept here first");
+        let kept = child_result(Ok::<(), ArtifactError>(()));
+        let Ok(Next::Done(fetched)) = read.next(kept) else {
+            panic!("keeping the copy completes the fetch");
         };
         assert!(fetched.fresh);
         assert_eq!(fetched.copy.bytes, FIXTURE);

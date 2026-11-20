@@ -3,22 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_PRUNE_KEYSPACE,
     FAMILY_RECORD_KEYSPACE, FAMILY_TOMBSTONE_KEYSPACE, INPUT_PAGE_KEYSPACE,
 };
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState,
+};
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::pages::{InputPage, PageEntries, PageManifest};
+use aruna_core::structs::execution::job::prune::FamilyTombstone;
 use aruna_core::structs::execution::job::record_keys::{
     alias_key, family_prefix, prune_due_key, prune_slot_key, record_key,
 };
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
-use aruna_core::structs::execution::job::{
-    FamilyTombstone, InputPage, JobFamilyRecord, JobRecordEnvelope, PageEntries, PageManifest,
-    PhysicalExecutionState, RETENTION_MS,
-};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
 
@@ -26,7 +28,8 @@ use crate::jobs::lifecycle::family_reads::FamilyProjectionOperation;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::pages::{page_key, page_rows};
-use crate::jobs::records::prune::{FamilyPruneOutcome, PruneFamiliesOperation};
+use crate::jobs::records::prune::FamilyPruneOutcome;
+use crate::jobs::records::prune::pass::PruneFamiliesOperation;
 use crate::jobs::route::JobRouteError;
 use crate::tests::records::{Family, REALM, context, read_row, user};
 
@@ -225,7 +228,7 @@ async fn expires_tombstone() {
 async fn keeps_old_aliases() {
     let family = Family::new([96u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
-    let old_job = aruna_core::structs::execution::job::JobId::from_bytes([77u8; 16]);
+    let old_job = aruna_core::structs::execution::job::identity::JobId::from_bytes([77u8; 16]);
     let previous = FamilyTombstone {
         pruned_at_ms: 500,
         last_record_ms: 400,

@@ -4,13 +4,14 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};
-use aruna_core::structs::execution::job::{JobPayload, WorkspaceMode, user_dedup_key};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
 use aruna_core::structs::execution::webhook::WebhookDeliverySpec;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -19,9 +20,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, job_placement, mint_job_id,
-};
+use crate::jobs::submit::{SubmitJobOperation, SubmitJobSpec};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult, job_placement, mint_job_id};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnqueueError {
@@ -167,7 +167,7 @@ mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::execution::notification::NotificationClass;
 
     fn upload() -> NotificationRecord {

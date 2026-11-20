@@ -4,7 +4,7 @@
 
 use aruna_core::events::Event;
 use aruna_core::jobs::JobEvent;
-use aruna_core::structs::execution::job::JobError;
+use aruna_core::structs::execution::job::local::JobError;
 
 use super::super::OpenStatus;
 use super::super::tests::{export_scope, plain_entity};

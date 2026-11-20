@@ -14,7 +14,6 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -30,6 +29,8 @@ const PRUNE_PAGE: usize = 128;
 const PRUNE_CONNECTORS: usize = 16;
 /// Connector id bytes ahead of the version key in a reference row.
 const ROW_PREFIX: usize = 16;
+/// Delay before a failed connector reference pruning run is tried again.
+pub const PRUNE_RETRY: Duration = Duration::from_secs(5);
 
 /// Queues pruning of `connector_id`'s rows after `cursor`, the last row a check covered.
 pub(crate) fn prune_queue_write(connector_id: Ulid, cursor: Key) -> (KeySpace, Key, Value) {
@@ -85,7 +86,7 @@ impl Operation for RestorePruneOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, PruneError> {
-        match (self.scheduling, rows::event(result)?) {
+        match (self.scheduling, result.event()?) {
             (false, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 if values.is_empty() {
                     return Ok(Next::Done(()));
@@ -111,7 +112,7 @@ impl Operation for RestorePruneOperation {
 
 /// Advances every queued connector by one page, one page operation after another. Outputs
 /// whether queued work remains; the first failed page ends the run with its error.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PruneReferencesOperation {
     rows: VecDeque<(Key, Value)>,
     remaining: bool,
@@ -157,7 +158,7 @@ impl Operation for PruneReferencesOperation {
             self.remaining |= result.child::<bool, PruneError>()??;
             return Ok(self.next_page());
         }
-        let event = rows::event(result)?;
+        let event = result.event()?;
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             let expected = "StorageEvent::IterResult";
             return Err(IoError::Unexpected {
@@ -289,7 +290,7 @@ impl Operation for PrunePageOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, PruneError> {
         match self.stage {
             Stage::Rows => {
-                let (values, next) = rows::page(result)?;
+                let (values, next) = result.page()?;
                 self.rows = values.into_iter().map(|(row, _)| row).collect();
                 self.next = next;
                 let reads = (self.rows.iter())
@@ -304,13 +305,13 @@ impl Operation for PrunePageOperation {
                 self.stage = Stage::Versions;
                 Ok(Next::Call(IoCall::Read(reads)))
             }
-            Stage::Versions => self.plan_page(rows::all_values(result)?),
+            Stage::Versions => self.plan_page(result.values()?),
             Stage::Queue => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(self.delete_rows())
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.queued))
             }
         }
@@ -337,7 +338,7 @@ mod tests {
     use std::time::SystemTime;
 
     async fn write_rows(context: &DriverContext, writes: Vec<(KeySpace, Key, Value)>) {
-        crate::testing::write_entries(&context.storage_handle, writes).await;
+        aruna_drivers::testing::write_entries(&context.storage_handle, writes).await;
     }
 
     async fn count(context: &DriverContext, key_space: &str) -> usize {
@@ -407,7 +408,9 @@ mod tests {
     #[tokio::test]
     async fn background_prunes_stale() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = crate::distribution::test_store::context(&storage);
         let connector_id = Ulid::from_bytes([2; 16]);
         let mut writes: Vec<_> = (0..PRUNE_PAGE + 5)

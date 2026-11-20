@@ -2,15 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
+use aruna_core::placement::resolver::{build_view, resolve_holders};
 use aruna_core::structs::execution::notification_watch::WatchSubscription;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
-
-use aruna_core::placement::{build_view, resolve_holders};
 
 pub(crate) const INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
 

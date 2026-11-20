@@ -12,21 +12,22 @@ use aruna_core::keyspaces::{
     NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
 use aruna_core::types::{Key, Value};
 use std::collections::VecDeque;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::s3::listing::{PrefixTracker, common_prefix_of, split_after_marker};
+use crate::s3::listing::{PrefixTracker, split_after_marker};
 use aruna_core::managed_copy::{CopyRequest, validate_registration};
+use aruna_core::structs::storage::blob::common_prefix_of;
 
 /// Whether this node still holds a serveable registration for one governed
 /// copy. A listing never fails on the answer; it only stops describing bytes.
@@ -91,35 +92,6 @@ pub struct ListVersionsInput {
     pub key_marker: Option<String>,
     pub version_id_marker: Option<Ulid>,
     pub max_keys: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ListVersionsItem {
-    Version {
-        key: String,
-        version_id: Ulid,
-        is_latest: bool,
-        location: Option<BackendLocation>,
-        source_metadata: Option<SourceMetadata>,
-        created_at: SystemTime,
-        /// A link's binding, so a listing shows it only to callers who may read its target.
-        link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
-    },
-    DeleteMarker {
-        key: String,
-        version_id: Ulid,
-        is_latest: bool,
-        created_at: SystemTime,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListVersionsResult {
-    pub items: Vec<ListVersionsItem>,
-    pub common_prefixes: Vec<String>,
-    pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
-    pub next_version_marker: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -678,6 +650,7 @@ impl Operation for ListVersionsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_drivers::driver::drive;
 
     fn limited_rounds(
@@ -716,7 +689,6 @@ mod test {
         ));
     }
 
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::checksum::HASH_MD5;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -727,6 +699,7 @@ mod test {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -763,7 +736,11 @@ mod test {
         }
     }
 
-    async fn seed_head(storage_handle: &storage::StorageHandle, key: &str, version_id: Ulid) {
+    async fn seed_head(
+        storage_handle: &storage::handle::StorageHandle,
+        key: &str,
+        version_id: Ulid,
+    ) {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -778,7 +755,7 @@ mod test {
     }
 
     async fn seed_version(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         key: &str,
         version_id: Ulid,
         version: BlobVersion,
@@ -797,7 +774,7 @@ mod test {
     }
 
     async fn seed_materialized(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         key: &str,
         version_id: Ulid,
         hash: [u8; 32],
@@ -843,7 +820,7 @@ mod test {
     async fn newest_first_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -891,7 +868,7 @@ mod test {
     async fn head_breaks_tie() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -930,7 +907,7 @@ mod test {
     async fn delete_markers_included() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
@@ -975,7 +952,7 @@ mod test {
     async fn markers_resume() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Two keys, "a" with two versions and "b" with one version.
@@ -1037,7 +1014,7 @@ mod test {
     async fn delimiter_groups() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
@@ -1077,7 +1054,7 @@ mod test {
     async fn reference_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();
@@ -1145,7 +1122,7 @@ mod test {
     async fn keys_sort() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["b", "aa", "a/1"].iter().enumerate() {
@@ -1176,7 +1153,7 @@ mod test {
     async fn scan_cap_truncates() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Three delimiter groups; each head round makes bounded progress so the
@@ -1236,7 +1213,7 @@ mod test {
     async fn keeps_all_versions() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         // Seed more versions than the scan limit; every storage page must

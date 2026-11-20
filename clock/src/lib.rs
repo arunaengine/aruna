@@ -9,8 +9,11 @@ use nix::{sys::time::TimeValLike, time::ClockId};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aruna_core::structured_id::IdEnvironment;
+use aruna_core::structured_id::clock_health::IdEnvironment;
 use ulid::Ulid;
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod testing;
 
 /// The 48 bits of a structured id's nonce.
 const NONCE_MASK: u64 = (1 << 48) - 1;

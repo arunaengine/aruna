@@ -6,14 +6,15 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{EffectiveResources, JobId};
+use aruna_core::structs::execution::job::family::EffectiveResources;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
 use super::HeldReservations;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::reservation::MAX_RESERVATION_SCAN;
-use aruna_core::structs::execution::job::record_rows::to_bytes;
 
 fn row(seed: u8) -> JobReservationRecord {
     JobReservationRecord {

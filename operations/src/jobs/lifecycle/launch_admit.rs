@@ -1,6 +1,5 @@
-//! Decides one launch offer at the execution target: spec, submitter, placement and fit are
-//! checked, the receipt is signed and committed with its reservation; a replay answers with the
-//! stored receipt and a family that already ran here is declined.
+//! Decides one launch offer at the target: checks spec, submitter, placement and fit, then signs
+//! and commits the receipt with its reservation; a replay answers it, a rerun family is declined.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -16,14 +15,19 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, ExecutionSignEvent, LaunchDecline, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::scheduling::{PlannedInput, backend_verdict, hosts_session};
-use aruna_core::structs::execution::job::{
-    ExecutionClaim, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobId, JobPayload,
-    JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
-    Membership, PhysicalExecutionState, WorkspaceMode, membership, tagged,
+use aruna_core::structs::execution::job::family::{
+    ExecutionClaim, ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobRecordBody,
+    JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
+};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{InputSource, JobPayload, tagged};
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
+use aruna_core::structs::execution::job::membership::membership::membership::membership::{
+    Membership, membership,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
@@ -33,7 +37,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
-use super::cancel::FlagLocalRunOperation;
+use super::cancel::FlagRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
 use super::ids::{session_of, workspace_of};
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
@@ -54,8 +58,9 @@ use crate::jobs::records::pages::{
 };
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::submit::{mint_configured_job, schedule_drain_effect};
+use crate::jobs::submit::schedule_drain_effect;
 use crate::secrets::owner::WriterView;
+use aruna_core::job_request::{mint_configured_job, workspace_of};
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -461,7 +466,7 @@ impl Operation for AcceptLaunchOperation {
         let admitted = matches!(self.decision, Some(Ok(_)));
         match self.cancel.filter(|_| admitted) {
             Some(job_id) => {
-                let flag = FlagLocalRunOperation::new(job_id, self.serving, self.now_ms);
+                let flag = FlagRunOperation::new(job_id, self.serving, self.now_ms);
                 Ok(Next::Call(IoCall::child(flag)))
             }
             None => self.wake(),
@@ -942,7 +947,7 @@ impl Operation for AdmitLaunchOperation {
 fn materialize_local(
     spec: &LogicalJobSpec,
     intent: &LaunchIntent,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
     local: NodeId,
     now_ms: u64,
 ) -> Result<JobRecord, LaunchDecline> {
@@ -1016,7 +1021,7 @@ pub(crate) fn existing_receipt(
     records: &[JobRecordEnvelope],
     intent: &LaunchIntent,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let digest = aruna_core::structs::execution::job::JobRecordBody::digest(intent).ok()?;
+    let digest = aruna_core::structs::execution::job::family::JobRecordBody::digest(intent).ok()?;
     records.iter().find_map(|envelope| match &envelope.record {
         JobFamilyRecord::Receipt(receipt) if receipt.launch_id == intent.launch_id => {
             match receipt.launch_digest == digest {
@@ -1077,9 +1082,10 @@ pub(crate) fn suits_offer(spec: &LogicalJobSpec, capability: &ExecutorCapability
 
 #[cfg(test)]
 mod tests {
-    use crate::jobs::lifecycle::ids;
+    use aruna_core::job_request;
     use aruna_core::scheduling::PlannedInput;
-    use aruna_core::structs::execution::job::{InputMode, InputSelection, JobId, WorkspaceOutput};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{InputMode, InputSelection, WorkspaceOutput};
 
     use super::*;
     use crate::tests::records::{Family, REALM};
@@ -1310,7 +1316,7 @@ mod tests {
         launch.inputs.push(PlannedInput {
             destination_key: "reads.fastq".to_string(),
             version_id,
-            content: aruna_core::structs::execution::job::InputContent::Blake3([12u8; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([12u8; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_node_id: None,
@@ -1381,7 +1387,7 @@ mod tests {
             container_path: "/out/result.txt".to_string(),
             dest_key: "results/result.txt".to_string(),
         });
-        ids::store_workspace(
+        job_request::store_workspace(
             &mut spec.payload,
             WorkspaceMode::Existing,
             Some("existing".to_string()),

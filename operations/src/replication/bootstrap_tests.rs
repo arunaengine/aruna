@@ -6,7 +6,7 @@
 use super::*;
 use crate::distribution::test_store::{apply, context, get, install, open, range, write};
 use aruna_drivers::driver::drive;
-use aruna_storage::storage::StorageHandle as Handle;
+use aruna_storage::storage::handle::StorageHandle as Handle;
 
 fn set() -> Ulid {
     Ulid::from_bytes([9; 16])

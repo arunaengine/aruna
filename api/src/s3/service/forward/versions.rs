@@ -9,7 +9,7 @@ use aruna_drivers::driver::drive;
 use aruna_operations::distribution::versions::{
     InventoryVersionsInput, InventoryVersionsOperation,
 };
-use aruna_operations::s3::object::member_merge::{
+use aruna_operations::s3::object::member::merge::{
     MarkerQuery, MergedMarkersOperation, RemoteVersion, VersionSource, VersionsPart,
 };
 use s3s::dto::{

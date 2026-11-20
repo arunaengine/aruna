@@ -3,16 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage};
+use aruna_core::structs::synced_folder::{
+    SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal, SyncVersionPage,
+};
 use aruna_core::task::{PullEffect, PullEvent, PullProgress, TaskEffect, TaskEvent};
 use tracing::warn;
 use ulid::Ulid;
@@ -20,9 +21,10 @@ use ulid::Ulid;
 use super::ServeNode;
 use crate::metadata::device_pull::{
     Admission, AdmitPullOperation, CommitPullOperation, ListHeadsOperation, PullCallerOperation,
-    PullError, ReceiptOperation, SetListing, receipt_of, refusal_kind, refused,
+    PullError, ReceiptOperation, SetListing, receipt_of, refused,
 };
-use crate::metadata::protocol::MetadataTransportMessage as Message;
+use aruna_core::metadata::protocol::MetadataTransportMessage as Message;
+use aruna_core::structs::synced_folder::refusal_kind;
 
 /// A forwarded synced-folder request with the owner's token.
 #[derive(Debug, PartialEq)]
@@ -199,8 +201,8 @@ impl Operation for PullServeOperation {
                 }
                 Err(error) => self.refused(error.refusal()),
             },
-            PullStage::Claim(holder) => self.claimed(event(result)?, *holder),
-            PullStage::Started(total) => match event(result)? {
+            PullStage::Claim(holder) => self.claimed(result.event()?, *holder),
+            PullStage::Started(total) => match result.event()? {
                 Event::Task(TaskEvent::BackgroundStarted { started: true }) => {
                     status(SyncPullStatus::Pending {
                         bytes_done: 0,
@@ -210,7 +212,7 @@ impl Operation for PullServeOperation {
                 // The run never started, so its claim was dropped with it.
                 _ => self.refused(SyncRefusal::Unavailable),
             },
-            PullStage::Registry => match event(result) {
+            PullStage::Registry => match result.event() {
                 Ok(Event::Task(TaskEvent::Pull(PullEvent::Status(Some(running))))) => {
                     status(running)
                 }

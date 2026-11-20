@@ -3,33 +3,32 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
-use std::time::SystemTime;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, DISTRIBUTION_KEYSPACE, GROUP_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
+use aruna_core::search::BucketSearchHit;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, incarnation, object_permission_path,
 };
-use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, StoredMetadata};
-use aruna_core::structs::storage::distribution::DistributionView;
+use aruna_core::structs::storage::bucket_metadata::StoredMetadata;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::types::{GroupId, Key, Value};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::PolicyRequestExtras;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {
@@ -60,35 +59,6 @@ pub struct SearchBucketsOutput {
     pub next_start_after: Option<Key>,
     /// Number of raw bucket rows consumed while producing this page.
     pub scanned_rows: usize,
-}
-
-/// One node's page: its readable hits, and where its scan stopped when the row budget ran out
-/// before the end.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BucketPage {
-    pub hits: Vec<BucketSearchHit>,
-    /// The last bucket scanned, past every hit, sealed so only this node reads it; `None` when
-    /// the scan was not cut.
-    pub scanned_to: Option<Vec<u8>>,
-    /// The cursor's position no longer opens here, for example after a restart, so this node's
-    /// part of the listing ends incomplete.
-    pub retired: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BucketSearchHit {
-    pub arn: String,
-    pub bucket: String,
-    pub node_id: NodeId,
-    pub group_id: GroupId,
-    pub group_name: Option<String>,
-    pub created_at: SystemTime,
-    /// The distributed bucket this local bucket is a member of; `None` for an ordinary bucket.
-    pub set_id: Option<ulid::Ulid>,
-    /// The bucket's current metadata, if it has any.
-    pub metadata: Option<BucketMetadata>,
-    /// Anyone, also without a login, may read the bucket; set for a database search only.
-    pub public: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -375,8 +345,8 @@ impl Operation for SearchBucketsOperation {
 mod tests {
     use aruna_core::structs::storage::format::Compression;
     use std::collections::{HashMap, HashSet};
+    use std::time::SystemTime;
 
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BUCKET_METADATA_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -388,6 +358,7 @@ mod tests {
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::bucket_metadata::BucketMetadata;
     use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::user::id::UserId;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -611,14 +582,14 @@ mod tests {
     }
 
     async fn write_value(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     #[tokio::test]
     async fn filters_permissions() {
         let directory = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

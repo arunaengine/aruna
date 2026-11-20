@@ -14,9 +14,9 @@ use tracing::warn;
 use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, abort_effects};
 use crate::errors::StorageError;
 use crate::events::{Event, GroupEvent, StorageEvent};
+use crate::keyspaces::USAGE_STATS_KEYSPACE;
 use crate::operation::{
-    AfterConflict, EffectOperation, HoldScope, Operation, Runnable, SubOperation, TransactionMode,
-    boxed_suboperation,
+    AfterConflict, HoldScope, Operation, SubOperation, TransactionMode, boxed_suboperation,
 };
 use crate::structs::storage::distribution::accounting::RangeCounters;
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
@@ -98,11 +98,10 @@ pub enum IoResult {
 }
 
 impl IoCall {
-    /// Runs `operation` of either kind as a child; its result comes back as [`IoResult::Child`].
-    pub fn child<O, K>(operation: O) -> Self
+    /// Runs `operation` as a child; its result comes back as [`IoResult::Child`].
+    pub fn child<O>(operation: O) -> Self
     where
-        O: Runnable<K> + 'static,
-        K: 'static,
+        O: Operation + 'static,
         O::Output: PartialEq + 'static,
         O::Error: PartialEq + 'static,
     {
@@ -113,10 +112,9 @@ impl IoCall {
 
     /// Starts `operation` beside the caller while a background slot is free; the caller gets
     /// only `TaskEvent::BackgroundStarted` and never the child's result.
-    pub fn background<O, K>(operation: O) -> Self
+    pub fn background<O>(operation: O) -> Self
     where
-        O: Runnable<K> + 'static,
-        K: 'static,
+        O: Operation + 'static,
         O::Output: Send + 'static,
         O::Error: Send + 'static,
     {
@@ -127,7 +125,10 @@ impl IoCall {
 
 /// A child's `Result<Output, Error>`, boxed so events stay free of operation types. The value
 /// sits behind a mutex, so an output that is only `Send`, such as a stream, can be carried.
-pub struct ChildOutcome(Box<dyn ChildValue>);
+pub struct ChildOutcome {
+    value: Box<dyn ChildValue>,
+    failed: bool,
+}
 
 trait ChildValue: Any + Send + Sync + Debug {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool;
@@ -163,12 +164,21 @@ impl ChildOutcome {
         T: Send + Debug + PartialEq + 'static,
         E: Send + Debug + PartialEq + 'static,
     {
-        Self(Box::new(Held(Mutex::new(result))))
+        let failed = result.is_err();
+        Self {
+            value: Box::new(Held(Mutex::new(result))),
+            failed,
+        }
+    }
+
+    /// Whether the child ended with its error, readable without knowing its types.
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     /// The child's result, or `None` when the child's output or error has another type.
     pub fn take<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
-        let value: Box<dyn Any> = self.0;
+        let value: Box<dyn Any> = self.value;
         let held = value.downcast::<Held<Result<T, E>>>().ok()?;
         Some(held.0.into_inner().unwrap_or_else(PoisonError::into_inner))
     }
@@ -176,13 +186,13 @@ impl ChildOutcome {
 
 impl Debug for ChildOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.value.fmt(f)
     }
 }
 
 impl PartialEq for ChildOutcome {
     fn eq(&self, other: &Self) -> bool {
-        self.0.eq_dyn(&*other.0)
+        self.value.eq_dyn(&*other.value)
     }
 }
 
@@ -218,20 +228,28 @@ impl IoResult {
         }
     }
 
-    /// The values of a read, or the error naming the result that came instead.
+    /// The values of a read, one per requested key. A batch read effect, used inside a caller's
+    /// transaction, answers the same way.
     pub fn values(self) -> Result<Vec<Option<Value>>, IoError> {
         match self {
             Self::Values(values) => Ok(values),
+            Self::Event(event) => match *event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    Ok(values.into_iter().map(|(_, value)| value).collect())
+                }
+                other => Err(failure("IoResult::Values", other)),
+            },
             other => Err(other.other("IoResult::Values")),
         }
     }
 
     /// The value of a read of exactly one row.
     pub fn value(self) -> Result<Option<Value>, IoError> {
-        match self {
-            Self::Values(values) if values.len() == 1 => Ok(values.into_iter().next().flatten()),
-            other => Err(other.other("IoResult::Values with one value")),
-        }
+        let [value] = <[_; 1]>::try_from(self.values()?).map_err(|_| IoError::Unexpected {
+            expected: "IoResult::Values with one value",
+            got: "IoResult::Values",
+        })?;
+        Ok(value)
     }
 
     /// The end of a write, a delete or a sync.
@@ -242,10 +260,18 @@ impl IoResult {
         }
     }
 
-    /// The rows of a page and the key to continue after.
+    /// The rows of a page and the key to continue after. An iteration effect, used to start at a
+    /// key or inside a caller's transaction, answers the same way.
     pub fn page(self) -> Result<crate::types::PageRows, IoError> {
         match self {
             Self::Page { rows, next } => Ok((rows, next)),
+            Self::Event(event) => match *event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => Ok((values, next_start_after)),
+                other => Err(failure("IoResult::Page", other)),
+            },
             other => Err(other.other("IoResult::Page")),
         }
     }
@@ -297,7 +323,7 @@ pub enum IoError {
 }
 
 /// A runner failure says nothing about the request, so the node counts as unavailable.
-impl From<IoError> for crate::structs::SyncRefusal {
+impl From<IoError> for crate::structs::synced_folder::SyncRefusal {
     fn from(_: IoError) -> Self {
         Self::Unavailable
     }
@@ -348,7 +374,7 @@ impl From<IoError> for crate::errors::AuthorizationError {
 /// storage calls in the operation's transaction mode, commits its outcome
 /// and aborts on an error.
 #[derive(Debug)]
-pub(crate) struct CallRun<P: Operation> {
+pub struct CallRun<P: Operation> {
     operation: P,
     mode: TransactionMode,
     txn_id: Option<TxnId>,
@@ -446,7 +472,8 @@ impl<P: Operation> PartialEq for CallRun<P> {
 }
 
 impl<P: Operation> CallRun<P> {
-    pub(crate) fn new(operation: P) -> Self {
+    /// The machine that runs `operation` from its first call.
+    pub fn new(operation: P) -> Self {
         Self {
             mode: operation.transaction(),
             operation,
@@ -473,8 +500,14 @@ impl<P: Operation> CallRun<P> {
             }
             if self.txn_id.is_none() && in_mode(&mut call, self.mode) {
                 self.state = State::Starting(call);
-                let read = self.mode == TransactionMode::ReadSnapshot;
-                let start = StorageEffect::StartTransaction { read };
+                let start = match self.mode {
+                    TransactionMode::UsageRebuild => StorageEffect::BeginUsageRebuild {
+                        key_space: USAGE_STATS_KEYSPACE.to_string(),
+                    },
+                    mode => StorageEffect::StartTransaction {
+                        read: mode == TransactionMode::ReadSnapshot,
+                    },
+                };
                 return smallvec![Effect::Storage(start)];
             }
             return self.request(call);
@@ -571,16 +604,17 @@ impl<P: Operation> CallRun<P> {
     }
 }
 
-impl<P: Operation> EffectOperation for CallRun<P> {
-    type Output = P::Output;
-    type Error = P::Error;
-
-    fn start(&mut self) -> Effects {
+/// The effect protocol the runner and the child wrappers drive: `start` asks the first effects,
+/// `step` feeds each event, `is_complete` ends the run and `finalize` reads its outcome.
+impl<P: Operation> CallRun<P> {
+    /// The effects of the operation's first call.
+    pub fn start(&mut self) -> Effects {
         let turn = self.operation.first();
         self.advance(turn)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    /// Feeds one event; an event the run does not wait for fails it.
+    pub fn step(&mut self, event: Event) -> Effects {
         match std::mem::replace(&mut self.state, State::Created) {
             State::Starting(call) => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -595,7 +629,7 @@ impl<P: Operation> EffectOperation for CallRun<P> {
             },
             State::Waiting(wait) => self.deliver(wait, event),
             State::Committing(output, calls) => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id })
+                Event::Storage(StorageEvent::TransactionCommitted { txn_id, .. })
                     if Some(txn_id) == self.txn_id =>
                 {
                     self.txn_id = None;
@@ -603,6 +637,17 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                 }
                 other => {
                     // The commit was sent: the runner owns its outcome, so no abort follows.
+                    // A refused commit is certain, so the operation may release what it opened.
+                    if matches!(
+                        &other,
+                        Event::Storage(StorageEvent::Error {
+                            error: StorageError::TransactionConflict
+                                | StorageError::TransactionNotFound
+                                | StorageError::RolledBack(_),
+                        })
+                    ) {
+                        self.operation.rolled_back();
+                    }
                     self.state = State::Committing(output, calls);
                     self.fail(failure("StorageEvent::TransactionCommitted", other))
                 }
@@ -625,8 +670,17 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                 calls,
                 wait,
             } => {
-                if let Err(error) = answer(wait, event) {
-                    warn!(%error, "A call after the commit failed");
+                match answer(wait, event) {
+                    Err(error) => warn!(%error, "A call after the commit failed"),
+                    // An adapter refusal is a valid answer of its family, yet the call failed.
+                    Ok(IoResult::Event(event)) if event.label().ends_with("::Error") => {
+                        warn!(event = ?event, "A call after the commit failed");
+                    }
+                    // A child's error may carry private values, so only its failure is logged.
+                    Ok(IoResult::Child(outcome)) if outcome.failed() => {
+                        warn!(call = "child operation", "A call after the commit failed");
+                    }
+                    Ok(_) => {}
                 }
                 self.after(output, calls)
             }
@@ -638,19 +692,21 @@ impl<P: Operation> EffectOperation for CallRun<P> {
         }
     }
 
-    fn is_complete(&self) -> bool {
+    pub fn is_complete(&self) -> bool {
         matches!(self.state, State::Finished(_))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    /// The outcome; a run that did not finish, even one whose calls after the commit still
+    /// run, reports `IoError::Unfinished`. `abort` settles a committed run first.
+    pub fn finalize(self) -> Result<P::Output, P::Error> {
         match self.state {
             State::Finished(result) => result,
-            State::After { output, .. } => Ok(output),
             _ => Err(IoError::Unfinished.into()),
         }
     }
 
-    fn abort(&mut self) -> Effects {
+    /// The cleanup of a run that stops before it finished; its effects are best effort.
+    pub fn abort(&mut self) -> Effects {
         match std::mem::replace(&mut self.state, State::Created) {
             State::After { output, .. } => {
                 self.state = State::Finished(Ok(output));
@@ -664,31 +720,25 @@ impl<P: Operation> EffectOperation for CallRun<P> {
         }
     }
 
-    fn stamp(&mut self, now_ms: u64) {
+    /// The runner's clock in Unix milliseconds, given before `start` and each `step`.
+    pub fn stamp(&mut self, now_ms: u64) {
         self.operation.stamp(now_ms);
     }
 
-    fn seed(&mut self, entropy: u128) {
+    /// The runner's entropy for this run, given once before `start`.
+    pub fn seed(&mut self, entropy: u128) {
         self.operation.seed(entropy);
     }
 
-    fn hold_scope(&self) -> Option<HoldScope> {
+    pub fn hold_scope(&self) -> Option<HoldScope> {
         self.operation.hold_scope()
     }
 
-    fn expected_error(error: &Self::Error) -> bool {
-        P::expected_error(error)
-    }
-
-    fn is_conflict(error: &Self::Error) -> bool {
+    pub fn is_conflict(error: &P::Error) -> bool {
         P::is_conflict(error)
     }
 
-    fn conflict_retries() -> u32 {
-        P::conflict_retries()
-    }
-
-    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<P::Output> {
+    pub fn on_conflict(&mut self, attempt: u32) -> AfterConflict<P::Output> {
         self.operation.on_conflict(attempt)
     }
 }
@@ -778,7 +828,7 @@ fn in_mode(call: &mut IoCall, mode: TransactionMode) -> bool {
     let snapshot = match mode {
         TransactionMode::None => return false,
         TransactionMode::Write => false,
-        TransactionMode::ReadSnapshot => true,
+        TransactionMode::ReadSnapshot | TransactionMode::UsageRebuild => true,
     };
     match call {
         IoCall::Read(_) | IoCall::Page { .. } => true,

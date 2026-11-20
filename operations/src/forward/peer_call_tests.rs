@@ -4,13 +4,13 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::id::NodeId;
 
 use super::*;
-use crate::metadata::protocol::encode_message;
+use aruna_core::metadata::protocol::encode_message;
 
 fn peer() -> NodeId {
     iroh::SecretKey::from_bytes(&[1; 32]).public()

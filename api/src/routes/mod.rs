@@ -56,10 +56,6 @@ pub mod webhooks;
 
 // Temporary aliases for the pre-family module paths; the access, execution
 // and storage families own these modules now. Remove once consumers migrate.
-pub use access::{credentials, group_join, groups, sessions, tokens, users};
-pub use execution::{compute, device_compute, jobs, tes};
-pub use storage::bucket::usage as bucket_usage;
-pub use storage::{blobs, connectors, group_backends};
 
 /// The single REST source: every route is registered from a `#[utoipa::path]`
 /// handler, so the runtime router and the generated document cannot diverge.

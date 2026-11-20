@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::execution::job::JobErrorKind;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::multipart::MultipartUploadStatus;
@@ -30,7 +30,7 @@ fn spec(scope: StoragePurgeScope) -> StoragePurgeSpec {
         scope,
         group_id: group(),
         auth_context: AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -60,7 +60,7 @@ fn file_scope() -> StoragePurgeScope {
 }
 
 fn info(group_id: Ulid) -> BucketInfo {
-    crate::tests::s3::bucket_info(group_id, Default::default())
+    aruna_test_support::s3::bucket_info(group_id, Default::default())
 }
 
 fn run_at(scope: StoragePurgeScope, phase: PurgePhase) -> PurgeRun {

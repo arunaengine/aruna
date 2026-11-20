@@ -4,13 +4,14 @@
 
 use std::array::TryFromSliceError;
 
-use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::calls::IoError;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::TokenGrant;
+use aruna_core::structs::synced_folder::SyncRefusal;
+use aruna_core::user::id::UserId;
 use jsonwebtoken::dangerous::insecure_decode;
 use thiserror::Error;
 
@@ -58,6 +59,18 @@ pub(crate) fn check_error(error: AuthorizationError) -> AuthorizeError {
         | AuthorizationError::DocNotFound => AuthorizeError::PermissionDenied,
         AuthorizationError::StorageError(error) => AuthorizeError::Storage(error),
         other => AuthorizeError::CheckFailed(other.to_string()),
+    }
+}
+
+/// Only a real denial refuses the caller; an unreadable policy state or a failed check is this
+/// node's problem and stays retryable.
+pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
+    match error {
+        AuthorizeError::PermissionDenied
+        | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => SyncRefusal::Forbidden,
+        AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_))
+        | AuthorizeError::Storage(_)
+        | AuthorizeError::CheckFailed(_) => SyncRefusal::Unavailable,
     }
 }
 

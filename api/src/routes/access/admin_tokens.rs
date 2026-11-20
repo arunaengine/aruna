@@ -10,9 +10,9 @@ use crate::routes::access::groups::ensure_group_admin;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::NEVER_EXPIRES_SECS;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::revoke_token::RevokeTokenError;
 use aruna_operations::s3::access::tokens::TokenCursor;
@@ -168,7 +168,7 @@ async fn run_revocation(
     .await
     .map_err(map_tokens_error)?;
     if revocation.credentials > 0 {
-        crate::routes::storage::abe::epoch_due(state, &auth, Some(group_id)).await;
+        crate::routes::storage::abe::records::epoch_due(state, &auth, Some(group_id)).await;
     }
     Ok(RevocationResponse {
         revoked: revocation.revoked,

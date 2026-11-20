@@ -3,18 +3,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::JobErrorKind;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use ulid::Ulid;
 
 use super::*;
-use aruna_core::plugin_installs::InstallState;
-use aruna_operations::plugins::calls::*;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::edit_config;
-#[allow(unused_imports)]
-pub(crate) use aruna_operations::plugins::test_support::{
-    copier, job_context, ready_copy, recorded,
-};
+use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::plugins::check::RunScope;
+use aruna_operations::plugins::install::InstallCaller;
+use aruna_operations::plugins::lifecycle::SetPaused;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::edit_config;
+use aruna_test_support::plugins::{copier, install_run, job_context, ready_copy, recorded};
+
+/// The scope of the fixture node's queued run of `install`.
+pub(crate) fn scope(fixture: &Fixture, install: &PluginInstall) -> RunScope {
+    RunScope {
+        realm_id: fixture.actor.realm_id,
+        local: fixture.actor.node_id,
+        run: install_run(install),
+    }
+}
 
 fn failure(outcome: JobRunOutcome) -> (JobErrorKind, String) {
     match outcome {
@@ -63,8 +72,9 @@ async fn paused_install_waits() {
     let fixture = Fixture::new().await;
     let (_root, blob, install, spec) = ready_copy(&fixture).await;
     let ctx = job_context(&blob, &fixture);
-    let (actor, auth) = (&fixture.actor, fixture.auth());
-    let paused = pause_install(&fixture.ctx, actor, &auth, install.install_id).await;
+    let caller = || InstallCaller::new(&fixture.actor, &fixture.auth(), unix_timestamp_millis());
+    let pause = SetPaused::new(caller(), install.install_id, true);
+    let paused = drive(pause, &fixture.ctx).await;
     assert_eq!(paused.unwrap().state, InstallState::Paused);
     let outcome = run_plugin_work(&ctx, &spec).await;
     assert!(
@@ -72,9 +82,8 @@ async fn paused_install_waits() {
         "{}",
         outcome_name(&outcome)
     );
-    resume_install(&fixture.ctx, actor, &auth, install.install_id)
-        .await
-        .unwrap();
+    let resume = SetPaused::new(caller(), install.install_id, false);
+    drive(resume, &fixture.ctx).await.unwrap();
     let outcome = run_plugin_work(&ctx, &spec).await;
     assert!(copied(&outcome, &spec), "{}", outcome_name(&outcome));
 }
@@ -191,10 +200,10 @@ async fn marked_source_refused() {
     use aruna_drivers::driver::drive;
     use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
-    use aruna_operations::plugins::submit::WorkRequest;
-    use aruna_operations::plugins::test_support::{request, scope};
     use aruna_operations::plugins::work::WorkKind;
     use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+    use aruna_plugin_types::calls::Intent;
+    use aruna_plugins::broker::JobCopy;
     let fixture = Fixture::new().await;
     let (_root, blob, install, spec) = ready_copy(&fixture).await;
     let head = HeadObjectInput {
@@ -215,20 +224,23 @@ async fn marked_source_refused() {
     drive(write_rows(vec![marked]), &blob).await.unwrap();
     let (kind, message) = failure(run_plugin_work(&job_context(&blob, &fixture), &spec).await);
     assert_eq!((kind, message.as_str()), (JobErrorKind::Permanent, MARKED));
-    let run = scope(&fixture, &install);
-    let mut copy = request(&fixture, &install, "out/b.txt");
-    copy.ordinal = 7;
-    let refused = start_work(&blob, &run, WorkRequest::Copy(copy)).await;
-    assert_eq!(
-        refused.map_err(|error| error.message),
-        Err(MARKED.to_string())
-    );
-    let broker = RunBroker::new(Arc::new(blob.clone()), run);
+    let broker = RunBroker::new(Arc::new(blob.clone()), scope(&fixture, &install));
     let cx = aruna_plugins::broker::CallContext {
         run: "run".into(),
         install: install.install_id.to_string(),
         max_bytes: 1 << 20,
     };
+    let copy = JobCopy {
+        source: "in/a.txt".into(),
+        version: None,
+        target: "out/b.txt".into(),
+        intent: Intent::new(7, &[b"copy"]),
+    };
+    let refused = broker.jobs_copy(&cx, copy).await;
+    assert_eq!(
+        refused.map_err(|error| error.message),
+        Err(MARKED.to_string())
+    );
     let info = broker.objects_info(&cx, "in/a.txt", None).await.unwrap();
     assert!(info.marked);
 }
@@ -243,7 +255,6 @@ async fn small_reads_unmarked() {
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
-    use aruna_operations::plugins::test_support::scope;
     use aruna_operations::plugins::work::WorkKind;
     let fixture = Fixture::new().await;
     let (_root, blob, install, _) = ready_copy(&fixture).await;
@@ -304,7 +315,6 @@ async fn versioned_info() {
     use aruna_drivers::driver::drive;
     use aruna_operations::plugins::marks::{Mark, mark_row};
     use aruna_operations::plugins::rows::write_rows;
-    use aruna_operations::plugins::test_support::scope;
     use aruna_operations::plugins::work::WorkKind;
     use aruna_operations::s3::object::put::PutObjectOperation;
     use aruna_operations::testing_objects::put_config;

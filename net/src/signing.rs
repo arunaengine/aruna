@@ -57,11 +57,11 @@ pub(crate) fn sign_records(key: &iroh::SecretKey, mut records: VaultRecords) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::vault::VaultRevision;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn realm() -> RealmId {

@@ -2,14 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::USER_KEYSPACE;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -181,13 +181,13 @@ impl Operation for ResolveUsersOperation {
 mod pure_tests {
     use super::ResolveUsersOutput;
     use super::{ResolveUsersInput, ResolveUsersOperation, ResolvedUser};
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use ulid::Ulid;
 

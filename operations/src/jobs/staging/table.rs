@@ -13,8 +13,8 @@ use aruna_core::jobs::{ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent};
 use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::execution::job::input::{
     StagingJobCheckpoint, StagingJobDirectory, StagingJobPhase, TableRead,
 };
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
@@ -46,30 +46,30 @@ use crate::connectors::get_connector::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::gate::PolicyGateError;
-use crate::placement::policy::read::ReadPolicyError;
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
-use crate::replication::queue::{
-    BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
+use crate::placement::policy::gate::{
+    GateContext, GateContextError, GateOperation, PolicyGateError,
 };
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
+use crate::placement::policy::read::ReadPolicyError;
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use crate::s3::object::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::s3::object::read::GetRoutedOperation;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::QuotaGateError;
-use crate::staging::head_source::{
-    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
-};
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
+use crate::transfer::read::GetRoutedOperation;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 
 /// Directories the queue holds before the table is read further.
 const QUEUE_PAUSE: u64 = 1024;
@@ -422,7 +422,7 @@ impl ChunkReadOperation {
 /// Holds a kept stream's place while its work is out at the adapter.
 fn empty_work() -> GzipWork {
     GzipWork {
-        stream: BackendStream::new(futures_util::stream::empty::<Result<Bytes, StreamError>>()),
+        stream: BackendStream::empty(),
         cursor: GzipCursor::new(0, 0),
     }
 }
@@ -1298,9 +1298,7 @@ impl PutFolderOperation {
     ) -> Next<()> {
         let spec = &self.run.spec;
         let auth = &spec.auth_context;
-        let body = BackendStream::new(futures_util::stream::iter([Ok::<_, StreamError>(
-            Bytes::new(),
-        )]));
+        let body = BackendStream::once(Bytes::new());
         let mut operation = PutObjectOperation::new(PutObjectConfig {
             user_id: auth.user_id,
             group_id: self.bucket.group_id,
@@ -1412,11 +1410,9 @@ impl Operation for PutFolderOperation {
                 ))))
             }
             PutStep::Replicate => {
-                result
-                    .child::<QueueBlobResult, BlobQueueError>()?
-                    .map_err(|error| {
-                        ItemFailure::Stage(format!("replication queue failed: {error}"))
-                    })?;
+                result.child::<bool, IoError>()?.map_err(|error| {
+                    ItemFailure::Stage(format!("replication queue failed: {error}"))
+                })?;
                 Ok(Next::Done(()))
             }
         }

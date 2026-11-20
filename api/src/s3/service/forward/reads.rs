@@ -10,12 +10,12 @@ use aruna_core::member_read::MemberBody;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::drive;
-use aruna_operations::distribution::status::node_reach;
-use aruna_operations::s3::object::member_read::{
+use aruna_operations::s3::object::member::read::{
     MemberCallOperation, MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
     MemberTextOperation,
 };
 use aruna_operations::s3::object::range_list::DelegatedCaller;
+use aruna_operations::transfer::status_view::node_reach;
 use http::HeaderMap;
 use s3s::dto::{
     ChecksumType, ETag, GetObjectOutput, HeadObjectOutput, StreamingBlob, Timestamp,
@@ -24,10 +24,13 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 use ulid::Ulid;
 
-use super::{Forward, ForwardRequest, passed_headers, passed_query, refused_error, unix_secs};
+use super::{passed_headers, passed_query, refused_error, unix_secs};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 use crate::s3::service::ArunaS3Service;
+use aruna_operations::s3::object::member::read::{
+    MemberRequest as ForwardRequest, MemberTarget as Forward,
+};
 
 /// How long an anonymous caller's stand-in credential lasts; the delegation is shorter.
 const ANONYMOUS_SECS: u64 = 60;

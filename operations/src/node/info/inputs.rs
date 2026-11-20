@@ -5,7 +5,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Display;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::identity::BackendConfigRecord;
@@ -15,12 +14,14 @@ use aruna_core::compute::quota::{
     availability, backend_reserved,
 };
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     METADATA_INDEX_KEYSPACE, NODE_SUBJECT_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
-use aruna_core::node_facts::NodeFacts;
+use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::Operation;
-use aruna_core::placement::{build_view, held_buckets};
+use aruna_core::placement::held_buckets;
+use aruna_core::placement::resolver::build_view;
 use aruna_core::rows::{PrefixPages, decode, read_row, values};
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};

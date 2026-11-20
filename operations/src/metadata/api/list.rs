@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, all_values, decode};
+use aruna_core::rows::{PrefixPages, decode};
 use aruna_core::storage_entries::metadata_registry_prefix;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::types::Key;
@@ -28,7 +28,7 @@ use crate::groups::list_groups::ListGroupError;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::RecordMaterializedOperation;
-use crate::metadata::repository::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 type Records = Vec<MetadataRegistryRecord>;
 type PendingRecords = HashMap<GroupId, Records>;
@@ -177,7 +177,7 @@ impl PendingRecordsOperation {
     }
 
     fn events(&mut self, result: IoResult) -> Result<Next<PendingRecords>, MetadataApiError> {
-        let values = all_values(result).map_err(internal)?;
+        let values = result.values().map_err(internal)?;
         if values.len() != self.targets.len() {
             return Err(internal(format!(
                 "metadata pending event batch returned {} values for {} targets",
@@ -591,12 +591,12 @@ mod call_tests {
 
     use super::*;
     use crate::metadata::api::access::tests::{access_for, realm};
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::{GroupEvent, GroupResult};
     use aruna_core::metadata::{MetadataError, MetadataEventPayload};
     use aruna_core::storage_entries::pending_projection_key;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn group() -> GroupId {

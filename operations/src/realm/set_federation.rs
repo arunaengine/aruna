@@ -15,9 +15,8 @@ use aruna_core::federation::{
 };
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH,
-};
+use aruna_core::reducer::paths::{CONFIG_DESCRIPTION_PATH, CONFIG_FEDERATION_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -34,7 +33,7 @@ use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
 use crate::realm::write_stage::{WriteStage, WriteStep};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -467,8 +466,6 @@ fn apply_reducer_federation(
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use crate::testing::path_context;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentDot;
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
@@ -476,7 +473,9 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         OidcProviderConfig, RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -519,7 +518,7 @@ mod tests {
     }
 
     async fn write(ctx: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, kind: RealmNodeKind, admin: bool) {

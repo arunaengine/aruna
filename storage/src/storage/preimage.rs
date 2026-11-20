@@ -15,7 +15,7 @@ use byteview::ByteView;
 use fjall::Readable;
 use tracing::warn;
 
-use super::{FjallStorage, Store, iterate_page};
+use super::worker::{FjallStorage, Store, iterate_page};
 
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
 

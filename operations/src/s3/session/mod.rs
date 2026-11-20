@@ -3,35 +3,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod create;
-mod get;
-mod list;
-mod purge;
-mod refresh;
-mod revoke;
-mod touch;
+pub mod create;
+pub mod get;
+pub mod list;
+pub mod purge;
+pub mod refresh;
+pub mod revoke;
+pub mod touch;
 
-pub use create::{CreateS3Config, CreateS3Operation};
-pub use get::GetS3Operation;
-pub use list::ListSessionsOperation;
-pub use purge::{PurgeSessionsOperation, PurgeSessionsResult};
-pub use refresh::{RefreshS3Config, RefreshS3Operation};
-pub use revoke::{RevokeS3Config, RevokeS3Operation};
-pub use touch::{TouchS3Config, TouchS3Operation};
-
-use aruna_core::UserId;
-use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::calls::IoError;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
 };
-use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent};
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -204,22 +194,6 @@ fn session_age(session: &S3Session) -> (u128, SystemTime) {
     (issued, session.expiry)
 }
 
-/// The call that draws a secret of `length` letters and digits from the OS random source.
-pub(crate) fn draw_secret(length: usize) -> IoCall {
-    Effect::Net(NetEffect::DrawSecret(length)).into()
-}
-
-/// The secret a draw answered.
-pub(crate) fn drawn_secret(result: IoResult) -> Result<Secret, IoError> {
-    match result.event()? {
-        Event::Net(NetEvent::SecretDrawn(secret)) => Ok(secret),
-        other => Err(IoError::Unexpected {
-            expected: "NetEvent::SecretDrawn",
-            got: other.label(),
-        }),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_session(
     access_key: String,
@@ -264,6 +238,11 @@ fn build_session(
 
 #[cfg(test)]
 mod tests {
+    use super::create::{CreateS3Config, CreateS3Operation};
+    use super::get::GetS3Operation;
+    use super::purge::PurgeSessionsOperation;
+    use super::refresh::{RefreshS3Config, RefreshS3Operation};
+    use super::touch::{TouchS3Config, TouchS3Operation};
     use super::*;
     use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
     use crate::s3::access::list::{ListUserInput, ListUserOperation};
@@ -273,7 +252,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::s3_session::SESSION_MAX_TTL;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::time::Duration;
     use tempfile::TempDir;
     use ulid::Ulid;

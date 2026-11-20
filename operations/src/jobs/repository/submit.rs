@@ -8,18 +8,18 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::repository::remote::NodeScope;
-use aruna_core::structs::execution::job::{
-    ExportRoCrateSpec, ImportRoCrateSpec, JobPayload, WorkspaceMode, user_dedup_key,
+use aruna_core::structs::execution::job::input::{
+    ExportRoCrateSpec, ImportRoCrateSpec, JobPayload,
 };
+use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use tracing::warn;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::submit::{
-    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
-};
-use crate::jobs::submit_execution::mint_unplaced;
+use crate::jobs::submit::execution::mint_unplaced;
+use crate::jobs::submit::{SubmitJobOperation, SubmitJobSpec};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult, mint_configured_job};
 
 /// A job a repository link starts.
 #[derive(Clone, Debug, PartialEq)]
@@ -113,7 +113,7 @@ impl LinkJobOperation {
         }
     }
 
-    fn submit(&mut self, job_id: aruna_core::structs::execution::job::JobId) -> Turn {
+    fn submit(&mut self, job_id: aruna_core::structs::execution::job::identity::JobId) -> Turn {
         let job = self.job.take().ok_or_else(spent)?;
         let key = job.dedup_key(&self.key);
         let spec = job.spec(self.scope.node_or(self.owner), key, self.now_ms);

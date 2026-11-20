@@ -334,7 +334,7 @@ async fn unanswered_range_fails() {
 
 /// Writes a link at `key` in the test bucket to `target`, as the owner.
 async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link::LinkTarget) {
-    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let write = ReferenceWrite {
         job_id: None,
         preassigned_version_id: None,
@@ -572,7 +572,9 @@ async fn open_prefix(node: &Node, pattern: &str) {
         role_id,
         name: "public".to_string(),
         permissions: std::collections::HashMap::from([(path, Permission::READ)]),
-        assigned_users: std::collections::HashSet::from([aruna_core::UserId::nil(realm_id)]),
+        assigned_users: std::collections::HashSet::from([aruna_core::user::id::UserId::nil(
+            realm_id,
+        )]),
     };
     document.roles.insert(role_id, role);
     let group = Group {

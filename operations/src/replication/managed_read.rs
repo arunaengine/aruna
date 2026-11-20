@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
@@ -15,12 +15,13 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 
 use super::bao_read::{BaoReadError, BaoReadOperation, BaoReadOutput};
-use super::protocol::BaoReadRequest;
-use crate::placement::policy::{
+use crate::placement::policy::gate::{
     GateContext, GateContextError, GateOperation, PolicyGateError, PolicyGateOutcome,
-    ReadPolicyError, gate_decision, union_refs, write_gate,
+    gate_decision, union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::replication_protocol::BaoReadRequest;
 
 /// One teach-then-retry round. The source only ever teaches the refs it needs,
 /// so a second `Required` for the same set is a protocol dead end, not a loop.
@@ -240,12 +241,12 @@ impl Operation for LocalUserOperation {
 mod tests {
     use super::*;
     use crate::placement::policy::cache::PolicyCacheStats;
-    use crate::replication::protocol::BaoReadTarget;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::replication_protocol::BaoReadTarget;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::placement::policy::{PlacementDecision, PlacementSubject};
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use std::collections::{BTreeMap, HashMap};
     use ulid::Ulid;
 

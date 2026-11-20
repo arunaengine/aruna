@@ -4,11 +4,11 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
 use aruna_core::document::{DocumentChange, DocumentTarget};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
@@ -21,7 +21,7 @@ use aruna_core::structs::storage::node_info::{
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 
-use aruna_core::node_state::OPERATOR_DRAIN_KEY;
+use aruna_core::node::state::OPERATOR_DRAIN_KEY;
 
 /// The newest advertisement revision not yet handed to replication. It is written in the same
 /// transaction as that revision, so a failure after the commit only delays the publish.

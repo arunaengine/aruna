@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna::inbound::{initialize_incoming_fixture, initialize_net_holder};
-use aruna::tasks::incoming::start_task_queues;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture, initialize_net_holder};
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_blob::blob::BlobHandler;
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::REALMS_LIST_KEY;
@@ -23,17 +24,19 @@ use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentSyncPublish
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::placement::transition::{TransitionRequest, plan_transition};
-use aruna_core::placement::{
-    PlacementResolutionContext, bucket_membership, choose_origin_bucket, meta_bucket_subject,
-    resolve_shard_holders, strategy_for_target,
+use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, meta_bucket_subject, strategy_for_target,
 };
+use aruna_core::placement::transition::{TransitionRequest, plan_transition};
+use aruna_core::placement::{bucket_membership, choose_origin_bucket, resolve_shard_holders};
 use aruna_core::reducer::AdminDocumentState;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
@@ -43,11 +46,13 @@ use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, group_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, StructuredId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -55,7 +60,7 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
@@ -66,11 +71,11 @@ use aruna_operations::realm::announce_presence::{
 };
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
-use aruna_operations::testing::sync_topics;
-use aruna_operations::testing::{project_logged_events, replay_event_log};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
+use aruna_test_support::documents::sync_topics;
+use aruna_test_support::projection::{project_logged_events, replay_event_log};
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -79,7 +84,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use tempfile::TempDir;
 use ulid::Ulid;
 
-pub use convergence::{hang_cap, wait_for_convergence};
+use convergence::{hang_cap, wait_for_convergence};
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -102,6 +107,8 @@ pub struct TestNode {
     pub kind: RealmNodeKind,
     /// Owner of the production net holder and task queues, when the node installed them.
     pub shutdown: Option<Shutdown>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 impl TestNode {
@@ -1043,7 +1050,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         outbound_handle: None,
     });
 
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
@@ -1059,6 +1066,7 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
         context,
         kind,
         shutdown: None,
+        _incoming: incoming,
     })
 }
 
@@ -1247,7 +1255,7 @@ async fn seed_config_topic(
     let topic = target.sync_topic_id(realm_id, &placement);
     let actor = Actor {
         node_id: seeder.node_id(),
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
@@ -1336,7 +1344,7 @@ pub async fn replicate_config(nodes: &[TestNode], realm_id: RealmId) {
             node = %&node.node_id().to_string()[..8]
         );
         tracing::Instrument::instrument(
-            aruna::tasks::incoming::drive_sync_drain(node.context.clone()),
+            aruna::tasks::incoming::outbox::drive_sync_drain(node.context.clone()),
             span,
         )
     }))
@@ -1587,12 +1595,13 @@ pub async fn spawn_node_with(
     });
 
     let shutdown = Shutdown::new();
-    if hold_shutdown {
+    let incoming = if hold_shutdown {
         let limits = RoCrateLimits::default();
         initialize_net_holder(context.clone(), limits, JobsRuntime::new(), &shutdown);
+        None
     } else {
-        initialize_incoming_fixture(context.clone());
-    }
+        initialize_incoming_fixture(context.clone())
+    };
     start_task_queues(context.clone(), task_handle, JobsRuntime::new(), &shutdown).await;
 
     Ok(TestNode {
@@ -1601,6 +1610,7 @@ pub async fn spawn_node_with(
         context,
         kind: RealmNodeKind::Management,
         shutdown: hold_shutdown.then_some(shutdown),
+        _incoming: incoming,
     })
 }
 
@@ -1611,8 +1621,8 @@ pub async fn respawn_with_retry(
     dir: &Path,
     hold_shutdown: bool,
 ) -> Result<TestNode, BoxError> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
+    let mut last = String::new();
+    let spawned = poll_until(Duration::from_secs(20), async || {
         let spawned = spawn_node_with(
             realm_id,
             Some(secret_key.clone()),
@@ -1620,15 +1630,15 @@ pub async fn respawn_with_retry(
             hold_shutdown,
         );
         match spawned.await {
-            Ok(node) => return Ok(node),
+            Ok(node) => Some(node),
             Err(error) => {
-                if Instant::now() >= deadline {
-                    return Err(format!("respawn failed after retries: {error}").into());
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                last = error.to_string();
+                None
             }
         }
-    }
+    })
+    .await;
+    spawned.ok_or_else(|| format!("respawn failed after retries: {last}").into())
 }
 
 /// Installs the default realm config with every node as a management node, then repeats
@@ -1980,12 +1990,13 @@ pub async fn spawn_replica_with(
     });
     let jobs_runtime = JobsRuntime::new();
     let shutdown = Shutdown::new();
-    if holder {
+    let incoming = if holder {
         let limits = RoCrateLimits::default();
         initialize_net_holder(context.clone(), limits, jobs_runtime.clone(), &shutdown);
+        None
     } else {
-        initialize_incoming_fixture(context.clone());
-    }
+        initialize_incoming_fixture(context.clone())
+    };
     if start_tasks {
         start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
     }
@@ -1995,6 +2006,7 @@ pub async fn spawn_replica_with(
         context,
         kind: RealmNodeKind::Management,
         shutdown: holder.then_some(shutdown),
+        _incoming: incoming,
     })
 }
 

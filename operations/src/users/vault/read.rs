@@ -10,16 +10,17 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{HolderList, MAX_FETCH_HOLDERS, VaultFetchEffect, VaultQuery};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, VaultFetchEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::operation::{Operation, SubOperation, boxed_suboperation};
-use aruna_core::rows::{event, page, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
     retain_newest_keys, user_record_prefix,
 };
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -28,7 +29,7 @@ use aruna_core::placement::{
 };
 
 use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadVaultConfig {
@@ -157,7 +158,7 @@ impl ReadVaultOperation {
 
     /// Keeps the newest key records over every page; heads are bounded by one page.
     fn local(&mut self, result: IoResult) -> ReadTurn {
-        let (rows, next) = page(result)?;
+        let (rows, next) = result.page()?;
         let keys = match decode_page(self.reads_heads(), rows)? {
             VaultRecords::Keys(keys) => keys,
             heads => return Ok(Next::Done(heads)),
@@ -226,7 +227,7 @@ impl Operation for ReadVaultOperation {
                 self.route(value)
             }
             Stage::Local => self.local(result),
-            Stage::Fetch => match event(result)? {
+            Stage::Fetch => match result.event()? {
                 Event::Net(NetEvent::VaultFetch(fetched)) => Ok(Next::Done(self.fetched(fetched)?)),
                 other => Err(ReadVaultError::UnexpectedEvent {
                     state: "fetch".to_string(),
@@ -610,7 +611,7 @@ mod tests {
         result: Result<VaultRecords, MetadataReadError>,
     ) -> Event {
         let message = MetadataTransportMessage::FetchedVaultRecords { result };
-        let frame = crate::metadata::protocol::encode_message(&message).unwrap();
+        let frame = aruna_core::metadata::protocol::encode_message(&message).unwrap();
         reply(peer, seconds, Ok(frame))
     }
 

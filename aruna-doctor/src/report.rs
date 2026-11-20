@@ -16,14 +16,18 @@ use aruna_core::keyspaces::{
     RUN_LINK_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_MANIFEST_KEYSPACE, STAGING_QUEUE_KEYSPACE,
     STAGING_STATE_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::node_state::{DISCARD_KEY, LAST_CONTACT_KEY};
+use aruna_core::node::state::{DISCARD_KEY, LAST_CONTACT_KEY};
 use aruna_core::plugin_runs::{PluginRun, RUN_ROW};
+use aruna_core::structs::execution::job::family::JobRecordKey;
+use aruna_core::structs::execution::job::identity::{
+    DUE_INDEX_PREFIX, JobId, LEASE_INDEX_PREFIX, PRUNE_INDEX_PREFIX,
+};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    JobRecord, cleanup_job_id, job_record_key, parse_schedule_key,
+};
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, PendingRecord, ProjectionCache,
-};
-use aruna_core::structs::execution::job::{
-    DUE_INDEX_PREFIX, JobId, JobPayload, JobRecord, JobRecordKey, LEASE_INDEX_PREFIX,
-    PRUNE_INDEX_PREFIX, cleanup_job_id, job_record_key, parse_schedule_key,
 };
 use aruna_operations::plugins::work::{WORK_ROW, WorkRow, WorkState, index_key};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};

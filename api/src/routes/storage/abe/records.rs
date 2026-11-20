@@ -5,12 +5,14 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::auth::UnrestrictedAuth;
+use crate::routes::access::groups::KeyRequestFailure;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
-use aruna_operations::abe::{MemberKeysOperation, ReissueOperation};
+use aruna_operations::abe::member::MemberKeysOperation;
+use aruna_operations::abe::reissue::ReissueOperation;
 use aruna_operations::auth::epoch_due::EpochDueOperation;
-use aruna_operations::s3::abe_rekey::RekeyOperation;
+use aruna_operations::transfer::abe_rekey::RekeyOperation;
 use axum::extract::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -139,21 +141,49 @@ async fn execute(
         .await
         .map_err(key_error)
 }
-/// Opens key requests for members in the group's encrypted buckets and returns open ids.
+/// The key requests a member grant opened, the pairs that failed, and whether all were opened.
+#[derive(Debug, Default)]
+pub(crate) struct MemberKeyRequests {
+    pub opened: Vec<String>,
+    pub failed: Vec<KeyRequestFailure>,
+    pub complete: bool,
+}
+
+impl MemberKeyRequests {
+    /// The outcome of a change that opens no key request.
+    pub fn none() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Opens key requests for members in the group's encrypted buckets; the membership change holds
+/// whatever fails, and the failed pairs are named so the caller can retry them.
 pub(crate) async fn member_requests(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
-    members: Vec<aruna_core::UserId>,
-) -> Vec<String> {
+    members: Vec<aruna_core::user::id::UserId>,
+) -> MemberKeyRequests {
     let now = aruna_clock::unix_timestamp_millis();
     let node = state.get_node_id();
     let operation = MemberKeysOperation::new(auth.clone(), node, group_id, members, now);
     match drive(operation, &state.get_ctx()).await {
-        Ok(ids) => ids.iter().map(Ulid::to_string).collect(),
+        Ok(keys) => MemberKeyRequests {
+            opened: keys.opened.iter().map(Ulid::to_string).collect(),
+            complete: keys.failed.is_empty(),
+            failed: (keys.failed.into_iter())
+                .map(|(bucket, member)| KeyRequestFailure {
+                    bucket,
+                    user_id: member.to_string(),
+                })
+                .collect(),
+        },
         Err(error) => {
             tracing::warn!(event = "abe.member_requests.failed", error = %error);
-            Vec::new()
+            MemberKeyRequests::default()
         }
     }
 }

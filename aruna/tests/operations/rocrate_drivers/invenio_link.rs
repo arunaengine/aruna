@@ -8,9 +8,11 @@ use super::driven::seal_link_token;
 use super::remote::{RemoteServer, remote};
 use super::*;
 use crate::job_calls::{complete_job, fail_job};
+use aruna_core::job_request::SubmitJobError;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
-use aruna_core::repository::{
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_core::repository::link::{
     LinkFailure, LinkPatch, LinkQueueEntry, LinkRemote, LinkStatus, RepositoryLink, link_key,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -18,17 +20,12 @@ use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
-use aruna_operations::jobs::submit::SubmitJobError;
-use aruna_operations::jobs::submit_local::SubmitLocalOperation;
-use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
-};
+use aruna_operations::jobs::submit::local::SubmitLocalOperation;
+use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::revision_read::RawViewOperation;
-use aruna_operations::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
-};
-use aruna_operations::testing::process_prune_batch;
+use aruna_operations::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
+use aruna_test_support::metadata::process_prune_batch;
 
 pub(super) const LINK_TOKEN: &str = "link-token";
 
@@ -66,6 +63,7 @@ pub(super) async fn import_dataset(
     }
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     Ok(())
 }
 
@@ -131,7 +129,7 @@ pub(super) async fn attach(
         updated_at: now,
         generation: 0,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     };
     let change = LinkChange::Create {
@@ -297,6 +295,7 @@ pub(super) async fn replace_crate(
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     Ok(())
 }
 
@@ -683,7 +682,8 @@ async fn full_slots_wait() -> Result<(), Box<dyn std::error::Error>> {
     let filler = fillers[0];
     let payload = JobPayload::ExportRoCrate(spec);
     let ctx = claim_context(&fixture, filler, payload).await?;
-    let error = aruna_core::structs::execution::job::JobError::retryable("freed".to_string());
+    let error =
+        aruna_core::structs::execution::job::local::JobError::retryable("freed".to_string());
     let now = unix_timestamp_millis();
     fail_job(&fixture.context, filler, ctx.claim_token, error, now).await?;
     due_now(&fixture, &link).await?;
@@ -757,6 +757,7 @@ async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let raw = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await
         .map(|(_, revision)| revision)?;
@@ -810,7 +811,8 @@ async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn admins_read_pushes() -> Result<(), Box<dyn std::error::Error>> {
-    use crate::job_calls::{JobReportLookup, read_job_routed, read_report_routed};
+    use crate::job_calls::{read_job_routed, read_report_routed};
+    use aruna_operations::jobs::job::reports::JobReportLookup;
 
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;
@@ -1050,6 +1052,7 @@ async fn deleted_dataset_unlinks() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_prune_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     assert!(has_row(&fixture, LINK_QUEUE_KEYSPACE, &link).await);
 
     due_now(&fixture, &link).await?;
@@ -1107,6 +1110,7 @@ async fn paged_links_unlinked() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_prune_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     for link in &links {
         assert!(has_row(&fixture, LINK_QUEUE_KEYSPACE, link).await);
         due_now(&fixture, link).await?;

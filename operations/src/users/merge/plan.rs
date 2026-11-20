@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::MergeError;
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{Permission, Role};
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::RoleId;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{
     MAX_USER_ATTRIBUTES, counted_attributes, is_reserved_attribute,
 };

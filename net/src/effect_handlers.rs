@@ -15,11 +15,11 @@ use aruna_core::events::{
 };
 use aruna_core::id::{DhtKeyId, hex_prefix};
 use aruna_core::metadata::MetadataError;
-use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
+use aruna_core::structs::execution::job::family::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
-use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
-use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
+use aruna_core::structs::storage::distribution::snapshot::{SignedSnapshot, SnapshotClaim};
+use aruna_core::structs::storage::distribution::statement::{SignedStatement, StatementClaim};
 use aruna_core::structs::storage::read_grant::{ReadGrant, SignedGrant};
 use parking_lot::Mutex;
 #[cfg(test)]
@@ -29,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, trace, warn};
 
-use crate::{DhtHandle, DocumentSyncService};
+use crate::dht::handle::DhtHandle;
+use crate::document_sync::DocumentSyncService;
 use aruna_core::events::ShardNetEvent;
 
 /// A snapshot younger than this answers without any DHT work.
@@ -203,28 +204,28 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
     match effect {
         NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, dht_effect).await,
         NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
-            aruna_core::DocumentEffect::PublishDocuments { documents, peers } => {
+            aruna_core::document::DocumentEffect::PublishDocuments { documents, peers } => {
                 NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
             }
-            aruna_core::DocumentEffect::SyncDocument { topic, peers } => {
+            aruna_core::document::DocumentEffect::SyncDocument { topic, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_document_event(topic, peers).await)
             }
-            aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
+            aruna_core::document::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
-            aruna_core::DocumentEffect::ReconcileBatch {
+            aruna_core::document::DocumentEffect::ReconcileBatch {
                 topic,
                 stored_cursor,
             } => NetEvent::DocumentSync(document_sync.reconcile_batch_event(topic, stored_cursor)),
-            aruna_core::DocumentEffect::OverflowPage {
+            aruna_core::document::DocumentEffect::OverflowPage {
                 topic,
                 start,
                 applied,
             } => NetEvent::DocumentSync(document_sync.overflow_page_event(topic, start, applied)),
-            aruna_core::DocumentEffect::NoteGitRecord { document_id } => {
+            aruna_core::document::DocumentEffect::NoteGitRecord { document_id } => {
                 NetEvent::DocumentSync(document_sync.note_git_record(document_id))
             }
-            aruna_core::DocumentEffect::ReloadRealmPeers => {
+            aruna_core::document::DocumentEffect::ReloadRealmPeers => {
                 NetEvent::DocumentSync(aruna_core::document::DocumentNetEvent::Error {
                     target: None,
                     error: "a peer reload must be dispatched by the operations runner".to_string(),
@@ -714,7 +715,7 @@ mod tests {
     // Only a record naming this node as publisher is signed, and its signature verifies.
     #[test]
     fn signs_own_execution() {
-        use aruna_core::structs::execution::job::{
+        use aruna_core::structs::execution::job::family::{
             ExecutionUpdate, JobFamilyRecord, PhysicalExecutionState, SubmissionId,
         };
         let key = iroh::SecretKey::from_bytes(&[3; 32]);
@@ -747,7 +748,7 @@ mod tests {
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::events::{DhtEvent, NetEvent};
     use aruna_core::keys::realm_presence_key;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -757,13 +758,13 @@ mod tests {
             .expect("test storage");
         let realm_id = RealmId::from_bytes([seed; 32]);
         let handle = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
                 secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
                 realm_id,
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             storage,
         )
@@ -808,28 +809,28 @@ mod tests {
         let second_secret = iroh::SecretKey::from_bytes(&[seed + 1; 32]);
         let second_id = second_secret.public();
         let first = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("first bind address"),
                 secret_key: Some(first_secret),
                 realm_id,
                 peer_nodes: vec![second_id],
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             first_storage,
         )
         .await
         .expect("first net handle");
         let second = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("second bind address"),
                 secret_key: Some(second_secret),
                 realm_id,
                 peer_nodes: vec![first.node_id()],
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             second_storage,
         )

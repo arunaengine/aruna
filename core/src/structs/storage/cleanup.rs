@@ -3,9 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::effects::Effect;
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::BackendRef;
 use crate::structs::storage::format::EncodingClass;
+use crate::task::{TaskEffect, TaskKey};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 
@@ -107,6 +109,14 @@ impl ReclaimCandidate {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+}
+
+/// Arms the blob cleanup drain to run now.
+pub fn schedule_cleanup_effect() -> Effect {
+    Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::DrainCleanupQueue,
+        after: Duration::ZERO,
+    })
 }
 
 #[cfg(test)]

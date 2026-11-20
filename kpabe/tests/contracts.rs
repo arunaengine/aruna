@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_kpabe::{
-    Attribute, Envelope, Policy, PublicParameters, issue, open, seal, setup_from_seed,
-};
+use aruna_kpabe::envelope::{Envelope, open, seal};
+use aruna_kpabe::policy::{Attribute, Policy};
+use aruna_kpabe::scheme::{PublicParameters, issue, setup_from_seed};
 use rand::{SeedableRng, rngs::StdRng};
 
 #[test]
@@ -68,7 +68,8 @@ fn policy_shapes() {
 #[test]
 fn sealed_boundary() {
     use aes_gcm_core::{Aes256Gcm, KeyInit, aead::AeadInOut};
-    use aruna_kpabe::{Error, MAX_BYTES, UserKey};
+    use aruna_kpabe::scheme::UserKey;
+    use aruna_kpabe::{Error, MAX_BYTES};
     use zeroize::Zeroizing;
 
     let (parameters, master) = setup_from_seed(&[7; 32], b"bucket generation").unwrap();

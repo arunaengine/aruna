@@ -10,8 +10,10 @@ use crate::forwarded::{DirectOrigin, client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::holder_choice::{HolderChoiceOperation, pick};
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::node::state::ReadInfoOperation;
+use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
@@ -22,7 +24,6 @@ use aruna_core::structs::storage::replication::{
 };
 use aruna_drivers::driver::{DriverContext, drive, drive_until};
 use aruna_operations::auth::error::token_grant;
-use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_operations::distribution::resolve::{
     GlobalResolution, content_resolved, resolve_content, resolve_version, resolved,
 };
@@ -30,9 +31,12 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, redeem_ticket, unsigned_ticket,
 };
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
-use aruna_operations::replication::protocol::LocationSummaryRequest;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::holder_choice::PickHolderOperation;
+use aruna_operations::replication::locations::LocationSummaryError;
+use aruna_operations::replication::locations::holders::{
+    HolderAnswer, HolderResolveError, HolderResolveOperation,
+};
+use aruna_operations::replication::locations::remote::RemoteLocationOperation;
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use axum::body::Body;
@@ -59,8 +63,6 @@ const ACCESS_ID_HTTPS: &str = "https";
 /// Whole-request budget for the routed probes one call may need, however many
 /// identifiers it names.
 const DRS_ROUTED_TIMEOUT: Duration = Duration::from_secs(5);
-/// Holders of a distributed version asked in turn before it counts as unavailable.
-const MAX_HOLDER_TRIES: usize = 3;
 /// Identifiers one bulk request may name. Each foreign one costs a routed probe.
 const MAX_OBJECT_IDS: usize = 100;
 /// Routed probes of one bulk request that may be in flight at once.
@@ -229,7 +231,7 @@ enum RequestedObjectId {
     CanonicalW3id([u8; 32]),
     ContentHashArn {
         realm_id: aruna_core::structs::identity::realm::RealmId,
-        node_id: aruna_core::NodeId,
+        node_id: aruna_core::id::NodeId,
         hash: [u8; 32],
     },
     VersionedObject(VersionedObjectArn),
@@ -256,11 +258,11 @@ struct ResolvedObject {
     /// The owning node's published base URL when the bytes live there.
     origin: Option<String>,
     /// The members that keep the bytes of a distributed object; empty for ordinary objects.
-    holders: Vec<aruna_core::NodeId>,
+    holders: Vec<aruna_core::id::NodeId>,
     /// The base URL of the holder chosen to serve; its access URL is pinned there.
     pinned: Option<String>,
     /// The node that answered for bytes that live elsewhere.
-    answered_by: Option<aruna_core::NodeId>,
+    answered_by: Option<aruna_core::id::NodeId>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -979,7 +981,7 @@ async fn redeem(
 async fn chosen_holder(
     state: &ServerState,
     resolved: &ResolvedObject,
-) -> Option<aruna_core::NodeId> {
+) -> Option<aruna_core::id::NodeId> {
     if resolved.holders.is_empty() {
         return None;
     }
@@ -990,9 +992,9 @@ async fn chosen_holder(
         .copied()
         .filter(|node_id| *node_id != local || resolved.location.is_some())
         .collect();
-    let choice = HolderChoiceOperation::new(&candidates, unix_timestamp_millis());
-    let candidates = drive(choice, state.get_ctx().as_ref()).await;
-    pick(candidates.unwrap_or_default(), Ulid::generate().random())
+    let choice = PickHolderOperation::new(&candidates, unix_timestamp_millis());
+    let chosen = drive(choice, state.get_ctx().as_ref()).await.ok().flatten();
+    chosen
         .map(|chosen| chosen.node_id)
         .filter(|node_id| *node_id != local)
 }
@@ -1009,7 +1011,7 @@ async fn pin_holder(state: &ServerState, resolved: &mut ResolvedObject) {
 /// The pinned download URL of `object_id` on `node_id`.
 async fn pinned_url(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object_id: &str,
 ) -> Option<String> {
     let origin = owner_origin(state, node_id).await.ok()??;
@@ -1023,7 +1025,7 @@ async fn pinned_url(
 /// pinned URL to request with the same credential instead.
 async fn holder_hint(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object_id: &str,
 ) -> Response {
     match pinned_url(state, node_id, object_id).await {
@@ -1042,7 +1044,7 @@ async fn holder_hint(
 /// caller is authenticated. The URL is never logged.
 async fn holder_redirect(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object_id: &str,
     ticket: Option<TicketInput>,
 ) -> Response {
@@ -1328,38 +1330,78 @@ async fn resolve_global(
         }
     }
     let local = state.get_node_id();
-    let mut remote: Vec<_> = found
-        .holders
-        .iter()
-        .copied()
+    let remote: Vec<_> = (found.holders.iter().copied())
         .filter(|node_id| *node_id != local)
         .collect();
-    // A holder of the range may lack this version's bytes, so its miss proves no absence.
-    let mut outcome = ResolveOutcome::Unavailable;
-    for _ in 0..MAX_HOLDER_TRIES {
-        // A spent budget would make a healthy holder look unavailable.
-        if Instant::now() >= deadline {
-            break;
-        }
-        let choice = HolderChoiceOperation::new(&remote, unix_timestamp_millis());
-        let candidates = drive(choice, context.as_ref()).await.unwrap_or_default();
-        let Some(holder) = pick(candidates, Ulid::generate().random()) else {
-            break;
-        };
-        remote.retain(|node_id| *node_id != holder.node_id);
-        match resolve_at(state, auth, requested_id, holder.node_id, &object, deadline).await? {
-            ResolveOutcome::Found(object) => {
-                return Ok(with_holders(ResolveOutcome::Found(object)));
+    // The routing operation chooses, asks and skips the holders; this only maps its answer.
+    let request = location_request(state, auth, &object);
+    let left = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64;
+    let deadline_ms = unix_timestamp_millis().saturating_add(left);
+    let routing = HolderResolveOperation::new(remote, request, version_id, deadline_ms);
+    let outcome = match drive_until(routing, &context, deadline).await {
+        Ok(HolderAnswer::Found {
+            node_id,
+            summary,
+            api_url,
+        }) => {
+            let origin = origin_url(&api_url);
+            match held_object(requested_id, &object, node_id, &summary, origin) {
+                Some(resolved) => ResolveOutcome::Found(resolved),
+                None => ResolveOutcome::Unavailable,
             }
-            ResolveOutcome::Denied => outcome = ResolveOutcome::Denied,
-            // A holder that could not answer is skipped by the next choices for a while.
-            ResolveOutcome::Unavailable => {
-                context.avoid_holder(holder.node_id, unix_timestamp_millis())
-            }
-            ResolveOutcome::NotFound => {}
         }
+        Ok(HolderAnswer::Denied) => ResolveOutcome::Denied,
+        Ok(HolderAnswer::Unavailable) => ResolveOutcome::Unavailable,
+        Err(HolderResolveError::Info(error)) => return Err(DrsError::internal(error.to_string())),
+        Err(_) => ResolveOutcome::Unavailable,
+    };
+    Ok(with_holders(outcome))
+}
+
+/// The request that asks a node where it keeps `object`, for the caller's authorization.
+fn location_request(
+    state: &ServerState,
+    auth: &AuthContext,
+    object: &ObjectRef<'_>,
+) -> LocationSummaryRequest {
+    LocationSummaryRequest {
+        realm_id: state.get_realm_id(),
+        bucket: object.bucket.to_string(),
+        key: object.key.to_string(),
+        version_id: Some(object.version_id),
+        auth_context: auth.clone(),
     }
-    Ok(outcome)
+}
+
+/// The object `node_id` answered for, served from `origin`; `None` without its group or size.
+fn held_object(
+    requested_id: &str,
+    object: &ObjectRef<'_>,
+    node_id: aruna_core::id::NodeId,
+    summary: &LocationSummary,
+    origin: String,
+) -> Option<ResolvedObject> {
+    let (Some(group_id), Some(size)) = (summary.group_id, summary.blob_size) else {
+        return None;
+    };
+    Some(ResolvedObject {
+        bucket: object.bucket.to_string(),
+        key: object.key.to_string(),
+        group_id,
+        version_id: object.version_id,
+        canonical_w3id: object.canonical_w3id.to_string(),
+        requested_id: requested_id.to_string(),
+        size,
+        hashes: summary.hashes.clone().into_iter().collect(),
+        source_metadata: None,
+        location: None,
+        origin: Some(origin),
+        holders: Vec::new(),
+        pinned: None,
+        answered_by: Some(node_id),
+    })
 }
 
 /// One exact object version a resolution names.
@@ -1403,21 +1445,12 @@ async fn resolve_at(
     state: &ServerState,
     auth: &AuthContext,
     requested_id: &str,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     object: &ObjectRef<'_>,
     deadline: Instant,
 ) -> Result<ResolveOutcome, DrsError> {
     let summary = drive_until(
-        RemoteLocationOperation::new(
-            node_id,
-            LocationSummaryRequest {
-                realm_id: state.get_realm_id(),
-                bucket: object.bucket.to_string(),
-                key: object.key.to_string(),
-                version_id: Some(object.version_id),
-                auth_context: auth.clone(),
-            },
-        ),
+        RemoteLocationOperation::new(node_id, location_request(state, auth, object)),
         &state.get_ctx(),
         deadline,
     )
@@ -1431,34 +1464,20 @@ async fn resolve_at(
     if summary.version_id != Some(object.version_id) || !summary.materialized {
         return Ok(ResolveOutcome::NotFound);
     }
-    let (Some(group_id), Some(size)) = (summary.group_id, summary.blob_size) else {
+    if summary.group_id.is_none() || summary.blob_size.is_none() {
         return Ok(ResolveOutcome::Unavailable);
-    };
+    }
     let Some(origin) = owner_origin(state, node_id).await? else {
         return Ok(ResolveOutcome::Unavailable);
     };
-    Ok(ResolveOutcome::Found(ResolvedObject {
-        bucket: object.bucket.to_string(),
-        key: object.key.to_string(),
-        group_id,
-        version_id: object.version_id,
-        canonical_w3id: object.canonical_w3id.to_string(),
-        requested_id: requested_id.to_string(),
-        size,
-        hashes: summary.hashes.into_iter().collect(),
-        source_metadata: None,
-        location: None,
-        origin: Some(origin),
-        holders: Vec::new(),
-        pinned: None,
-        answered_by: Some(node_id),
-    }))
+    let held = held_object(requested_id, object, node_id, &summary, origin);
+    Ok(held.map_or(ResolveOutcome::Unavailable, ResolveOutcome::Found))
 }
 
 /// The owner's published base URL, or `None` when it has not published one.
 async fn owner_origin(
     state: &ServerState,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> Result<Option<String>, DrsError> {
     let documents = drive(
         ReadInfoOperation::new(vec![node_id]),
@@ -1466,14 +1485,15 @@ async fn owner_origin(
     )
     .await
     .map_err(|error| DrsError::internal(error.to_string()))?;
-    let Some(published) = documents.get(&node_id).and_then(|doc| doc.urls.api.clone()) else {
-        return Ok(None);
-    };
+    let published = documents.get(&node_id).and_then(|doc| doc.urls.api.clone());
+    Ok(published.map(|published| origin_url(&published)))
+}
+
+/// The base URL of a node's published API.
+fn origin_url(published: &str) -> String {
     // The published url is absolute, so no bind address is used.
     let unused = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
-    Ok(Some(
-        RestInterfaceRuntime::from_bind_address(unused, Some(&published)).base_url,
-    ))
+    RestInterfaceRuntime::from_bind_address(unused, Some(published)).base_url
 }
 
 async fn resolve_versioned(
@@ -1599,7 +1619,7 @@ async fn resolve_content_hash(
     requested_id: &str,
     requested_scope: Option<(
         aruna_core::structs::identity::realm::RealmId,
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
     )>,
     hash: &[u8; 32],
 ) -> Result<ResolveOutcome, DrsError> {

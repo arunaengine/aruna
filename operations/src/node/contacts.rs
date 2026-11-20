@@ -4,12 +4,11 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 
 /// The last contact of each peer this node saw, in unix milliseconds; a peer never seen, or a
 /// node without a network, has none.
@@ -35,7 +34,7 @@ impl Operation for PeerContactsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<BTreeMap<NodeId, u64>>, IoError> {
-        match event(result)? {
+        match result.event()? {
             Event::Net(NetEvent::PeerContacts(seen)) => Ok(Next::Done(seen)),
             other => Err(IoError::Unexpected {
                 expected: "the peer contacts",

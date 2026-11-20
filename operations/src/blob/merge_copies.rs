@@ -31,11 +31,11 @@ use aruna_core::structs::storage::linked_job::LinkedJob;
 use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
-use super::cleanup_rows::schedule_cleanup_effect;
 use super::import_rows::{BackendRulesOperation, ImportRowsError};
 use super::migration::shared::MigrationError;
 use super::unify::{Duplicate, id_named};
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate};
+use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
 
 const RULE_PAGE: usize = 128;
 

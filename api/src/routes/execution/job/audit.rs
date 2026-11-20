@@ -9,7 +9,10 @@ use std::sync::Arc;
 use crate::jobs::family_report;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
+use aruna_core::structs::execution::job::family::{
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+};
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::lifecycle::family_reads::{
     AuditEndpointsOperation, FamilyLogOperation,
@@ -412,8 +415,8 @@ mod tests {
         assert!(parse_paging(&query(Some("not base64 !"), None)).is_err());
         assert!(parse_paging(&query(Some(&aruna_core::cursor::encode([1u8; 200])), None)).is_err());
         assert!(parse_paging(&query(Some(&aruna_core::cursor::encode([1u8; 32])), None)).is_err());
-        let mut key = [0u8; aruna_core::structs::execution::job::RECORD_KEY_BYTES];
-        key[64] = aruna_core::structs::execution::job::JobRecordKind::Spec.as_byte();
+        let mut key = [0u8; aruna_core::structs::execution::job::family::RECORD_KEY_BYTES];
+        key[64] = aruna_core::structs::execution::job::family::JobRecordKind::Spec.as_byte();
         assert!(parse_paging(&query(Some(&aruna_core::cursor::encode(key)), None)).is_ok());
         assert!(parse_paging(&query(None, Some(0))).is_err());
         assert!(parse_paging(&query(None, Some(MAX_AUDIT_PAGE + 1))).is_err());

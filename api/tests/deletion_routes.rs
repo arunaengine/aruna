@@ -17,7 +17,6 @@ use aruna_api::routes::storage::deletion::{
     delete_preview, deletion_preflight, submit_purge,
 };
 use aruna_api::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -33,9 +32,10 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, VersionKey,
 };
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::State;
 use axum::http::StatusCode;

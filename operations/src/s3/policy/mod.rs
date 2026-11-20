@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod bulk;
-pub mod count;
 pub mod coverage;
 pub mod mutation;
 pub mod successor;

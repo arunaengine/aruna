@@ -5,10 +5,10 @@
 use std::str::FromStr;
 
 use super::{Step, invalid};
-use crate::NodeId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::DocumentTarget;
+use crate::id::NodeId;
 use crate::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use crate::reducer::{AdminDocumentState, decode_reducer_state};
 use crate::row_plan::PlanRows;

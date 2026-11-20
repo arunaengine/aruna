@@ -4,10 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use aruna_core::task::PullProgress;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -22,23 +20,21 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, KeyRange, RouteError, WriteRoute,
-};
+use aruna_core::structs::storage::distribution::route::{RouteError, WriteRoute};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
+use aruna_core::structs::storage::distribution::{DistributionBinding, KeyRange};
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ORIGIN_DEVICE_TAG, RemoteHead, SYNC_VERSION_TAG, SyncListCursor, SyncPageLimit, SyncPull,
-    SyncPullAck, SyncRefusal, SyncVersionPage,
+    SyncPullAck, SyncRefusal, SyncVersionPage, refusal_kind,
 };
 use aruna_core::types::{GroupId, Key, Value};
-use futures_util::StreamExt;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
+use crate::auth::error::{AuthorizeError, pull_refusal};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::{bound_view, local_fence, route_write};
 use crate::distribution::versions::{
@@ -46,28 +42,27 @@ use crate::distribution::versions::{
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation, QueueLiveOperation};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::replication::queue::LiveVersionInput;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::s3::object::versions::{
-    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-    ListVersionsResult,
+use crate::s3::object::versions::{ListVersionsError, ListVersionsInput, ListVersionsOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::live_version::LiveVersionInput;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, peer_call, peer_reply,
 };
-use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
-use crate::staging::offered_directory::OfferedDirectoryError;
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
 
 /// How long a forwarded listing waits for the holder of a range.
 const HOLDER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -349,8 +344,8 @@ fn read_bucket(result: IoResult, bucket: &str) -> Result<BucketInfo, SyncRefusal
 
 /// A pull writes like a client, so a bucket that is read-only for clients refuses it too.
 fn guard_refusal(error: BucketGuardError, bucket: &str) -> SyncRefusal {
-    match OfferedDirectoryError::from(error) {
-        OfferedDirectoryError::ReadOnly(_) => SyncRefusal::Forbidden,
+    match error {
+        BucketGuardError::ReadOnly(_) => SyncRefusal::Forbidden,
         error => {
             debug!(error = %error, bucket = %bucket, "A sync pull could not check its target bucket");
             SyncRefusal::Unavailable
@@ -424,29 +419,7 @@ fn authorization(
     AuthorizeOperation::new(auth.realm_id, auth, &path, &permission, extras)
 }
 
-/// Only a real denial refuses the caller; an unreadable policy state or a failed check is this
-/// node's problem and stays retryable.
-pub(crate) fn pull_refusal(error: AuthorizeError) -> SyncRefusal {
-    match error {
-        AuthorizeError::PermissionDenied
-        | AuthorizeError::Policy(PolicyEnforcementError::Denied { .. }) => SyncRefusal::Forbidden,
-        AuthorizeError::Policy(PolicyEnforcementError::Unavailable(_))
-        | AuthorizeError::Storage(_)
-        | AuthorizeError::CheckFailed(_) => SyncRefusal::Unavailable,
-    }
-}
-
 type PullBody = BackendStream<Result<bytes::Bytes, StreamError>>;
-
-/// The device's bytes as the write consumes them, adding each chunk to `bytes_done`.
-fn counted(blob: PullBody, bytes_done: Arc<AtomicU64>) -> PullBody {
-    let chunks = blob.0.inspect(move |chunk| {
-        if let Ok(chunk) = chunk {
-            bytes_done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        }
-    });
-    BackendStream(Box::pin(chunks))
-}
 
 /// Why a device read failed. Bytes that do not answer for the hash the upload named are the
 /// request's own fault: retrying re-reads the same mismatch, so the row is parked for the owner
@@ -688,7 +661,7 @@ impl Operation for CommitPullOperation {
                     .map_err(unavailable);
                 let blob = match read {
                     Ok(Ok(BaoReadOutput::Stream { blob, .. })) => {
-                        counted(blob, self.bytes_done.0.clone())
+                        blob.counted(self.bytes_done.0.clone())
                     }
                     // A metadata-only answer to a full read is a broken exchange, not an absent
                     // object: parking the upload on it would lose the file.
@@ -766,17 +739,6 @@ impl Operation for CommitPullOperation {
                 }
             }
         }
-    }
-}
-
-pub(crate) fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
-    match refusal {
-        SyncRefusal::Unauthorized => "unauthorized",
-        SyncRefusal::Forbidden => "forbidden",
-        SyncRefusal::NotFound => "not_found",
-        SyncRefusal::Invalid(_) => "invalid",
-        SyncRefusal::Unavailable => "unavailable",
-        SyncRefusal::Coordinator(_) => "coordinator",
     }
 }
 
@@ -1215,7 +1177,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
 
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{ConversionError, StorageError};
     use aruna_core::events::{Event, StorageEvent};
@@ -1228,8 +1189,10 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncRefusal> {
@@ -1476,15 +1439,15 @@ mod tests {
     // being unbound after its offer is gone. The cleanup on this node still deletes the bucket.
     #[tokio::test]
     async fn guards_folder_pull() {
-        use crate::device::sync::folders::finish_unbind;
-        use crate::device::sync::repository::folder_bucket;
-        use crate::staging::offered_directory::{
-            OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
-        };
+        use crate::device::sync::folders::unbind::finish_unbind;
+        use crate::staging::offer::run::{offer_directory, withdraw_offer};
+        use crate::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
         use crate::tests::device::store_folder;
-        use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
+        use aruna_core::structs::synced_folder::{
+            FolderMode, FolderState, RemoteBinding, SyncedFolder, folder_bucket,
+        };
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("note.txt"), b"note").unwrap();
@@ -1758,10 +1721,16 @@ mod tests {
     // no records of begins, and a forwarded listing that starts there is refused, not passed on.
     #[tokio::test]
     async fn lists_set_ranges() {
-        use crate::distribution::test_record::{binding, record, store_record};
+        use crate::distribution::test_record::{binding, record};
         let fixture = policy_fixture(None).await;
         let (snapshot, bytes) = record(true);
-        store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &fixture.context.storage_handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         let binding = binding(&snapshot, 1, 5);
         let listing = |cursor| SetListing {
             bucket: "spire".to_string(),
@@ -1786,10 +1755,16 @@ mod tests {
 
     #[tokio::test]
     async fn pulls_follow_coordinator() {
-        use crate::distribution::test_record::{binding, record, secret, store_record};
+        use crate::distribution::test_record::{binding, record, secret};
         let fixture = policy_fixture(None).await;
         let (snapshot, bytes) = record(true);
-        store_record(&fixture.context.storage_handle, snapshot.set_id(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &fixture.context.storage_handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         let mut bucket = bucket_info(fixture.group_id, fixture.auth.user_id);
         bucket.distribution = Some(binding(&snapshot, 1, 5));
         assert_eq!(coordinates(&fixture.context, &bucket, "a").await, Ok(()));

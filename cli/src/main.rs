@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = aruna_cli::Cli::parse();
+    let cli = aruna_cli::args::Cli::parse();
     let mut stdout = std::io::stdout();
     match aruna_cli::run(cli, &mut stdout).await {
         Ok(()) => ExitCode::SUCCESS,

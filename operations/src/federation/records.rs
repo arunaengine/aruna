@@ -10,17 +10,16 @@ use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::rows::{decode, done, encode, encoded_row, read_row, values};
-use aruna_core::structs::execution::job::{
-    JobRecord, RoCrateUploadRecord, job_record_key, parse_dedup_value,
-};
+use aruna_core::rows::{decode, encode, encoded_row, read_row, values};
+use aruna_core::structs::execution::job::input::RoCrateUploadRecord;
+use aruna_core::structs::execution::job::local::{JobRecord, job_record_key, parse_dedup_value};
 use aruna_core::transfer::{ExportGrant, ImportIntent};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use aruna_core::structs::execution::job::{upload_key, upload_stale};
+use aruna_core::structs::execution::job::input::{upload_key, upload_stale};
 use aruna_core::transfer::GrantRecord;
 
 type Writes = Vec<(String, Key, Value)>;
@@ -290,7 +289,7 @@ impl Operation for RecordOperation {
                 self.confirm(&stale, None, held)
             }
             (Phase::Write, _) => {
-                done(result)?;
+                result.done()?;
                 let unfinished = RecordError::Io(IoError::Unfinished);
                 self.pending.take().map(Next::Done).ok_or(unfinished)
             }
@@ -320,11 +319,11 @@ pub struct ImportRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::federation::Signed;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::transfer::ExportGrant;
+    use aruna_core::user::id::UserId;
     use ed25519_dalek::SigningKey;
     use url::Url;
 
@@ -441,9 +440,10 @@ mod tests {
     /// The rows a stale binding check reads; with `job`, the dedup row names job `[7; 16]`.
     fn checked(binding: Ulid, upload: Option<&RoCrateUploadRecord>, job: bool) -> IoResult {
         let upload = upload.map(|upload| postcard::to_allocvec(upload).unwrap());
-        let job_id = aruna_core::structs::execution::job::JobId::from_bytes([7; 16]);
-        let dedup =
-            job.then(|| aruna_core::structs::execution::job::encode_dedup_value(job_id, [0; 32]));
+        let job_id = aruna_core::structs::execution::job::identity::JobId::from_bytes([7; 16]);
+        let dedup = job.then(|| {
+            aruna_core::structs::execution::job::local::encode_dedup_value(job_id, [0; 32])
+        });
         stored(vec![Some(binding.to_bytes().to_vec()), upload, dedup])
     }
 
@@ -495,9 +495,8 @@ mod tests {
         assert_eq!((writes.len(), retired.expires_at_ms), (3, 0));
         let mut operation = RecordOperation::new(binding(stale(old)));
         operation.first().unwrap();
-        upload.claimed_by = Some(aruna_core::structs::execution::job::JobId::from_bytes(
-            [7; 16],
-        ));
+        upload.claimed_by =
+            Some(aruna_core::structs::execution::job::identity::JobId::from_bytes([7; 16]));
         assert_eq!(
             operation.next(checked(old, Some(&upload), false)),
             Ok(Next::Done(RecordOutcome::Bound(old)))
@@ -507,7 +506,9 @@ mod tests {
     #[test]
     fn held_upload_kept() {
         // A gone upload stays bound while the import job of its key exists in this transaction.
-        use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord};
+        use aruna_core::structs::execution::job::identity::JobId;
+        use aruna_core::structs::execution::job::input::JobPayload;
+        use aruna_core::structs::execution::job::local::JobRecord;
         let old = Ulid::from_bytes([1; 16]);
         let node = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let payload = JobPayload::Probe {

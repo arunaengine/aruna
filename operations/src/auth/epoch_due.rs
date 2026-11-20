@@ -10,6 +10,9 @@ use aruna_core::structs::storage::abe_access::{due_rows, indexed_buckets};
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
+/// Encrypted buckets of the index read, checked and marked per page.
+const DUE_PAGE: usize = 256;
+
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum EpochDueError {
     #[error("encryption storage is unavailable")]
@@ -29,8 +32,12 @@ impl From<IoError> for EpochDueError {
 pub struct DueMarks {
     group_id: Option<GroupId>,
     now: u64,
-    /// The indexed buckets, once the index is scanned.
+    /// The buckets of the current index page, once it is read.
     buckets: Option<Vec<String>>,
+    /// The index key the next page starts after.
+    next_page: Option<Key>,
+    /// The due rows of the current page were written.
+    written: bool,
     managed: Vec<String>,
 }
 
@@ -40,8 +47,27 @@ impl DueMarks {
             group_id,
             now,
             buckets: None,
+            next_page: None,
+            written: false,
             managed: Vec::new(),
         }
+    }
+
+    fn page(&self, after: Option<Key>) -> IoCall {
+        let prefix = self.group_id.map(|group| group.to_bytes().to_vec());
+        IoCall::Page {
+            space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            prefix: Key::from(prefix.unwrap_or_default()),
+            after,
+            limit: DUE_PAGE,
+        }
+    }
+
+    /// The next index page, or `None` after the last one.
+    fn next_page(&mut self) -> Option<IoCall> {
+        self.buckets = None;
+        let after = self.next_page.take()?;
+        Some(self.page(Some(after)))
     }
 
     /// Takes the run's time; a run stamps it before every step.
@@ -54,24 +80,20 @@ impl DueMarks {
         self.now
     }
 
-    /// The scan of the encrypted bucket index.
+    /// The first page of the encrypted bucket index.
     pub fn first(&self) -> IoCall {
-        let prefix = self.group_id.map(|group| group.to_bytes().to_vec());
-        IoCall::Page {
-            space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
-            prefix: Key::from(prefix.unwrap_or_default()),
-            after: None,
-            limit: usize::MAX,
-        }
+        self.page(None)
     }
 
-    /// The call after `result`, or `None` when the marks are done. Without `write` it only finds
-    /// the node managed buckets to raise.
+    /// The call after `result`, or `None` when the marks are done. Each index page has its
+    /// settings read and its due rows written before the next page. Without `write` it only
+    /// finds the node managed buckets to raise.
     pub fn next(&mut self, result: IoResult, write: bool) -> Result<Option<IoCall>, EpochDueError> {
         if self.buckets.is_none() {
-            let IoResult::Page { rows, .. } = result else {
+            let IoResult::Page { rows, next } = result else {
                 return Err(EpochDueError::Storage);
             };
+            self.next_page = next;
             let buckets = indexed_buckets(&rows);
             let reads = (buckets.iter())
                 .map(|bucket| {
@@ -79,12 +101,16 @@ impl DueMarks {
                     (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key)
                 })
                 .collect::<Vec<_>>();
+            if reads.is_empty() {
+                return Ok(self.next_page());
+            }
             self.buckets = Some(buckets);
-            return Ok((!reads.is_empty()).then_some(IoCall::Read(reads)));
+            self.written = false;
+            return Ok(Some(IoCall::Read(reads)));
         }
         let values = match result {
-            IoResult::Values(values) => values,
-            IoResult::Done => return Ok(None),
+            IoResult::Values(values) if !self.written => values,
+            IoResult::Done if self.written => return Ok(self.next_page()),
             _ => return Err(EpochDueError::Storage),
         };
         let buckets = self.buckets.as_deref().unwrap_or_default();
@@ -92,8 +118,12 @@ impl DueMarks {
             .map(|(bucket, value)| (Key::from(bucket.as_bytes().to_vec()), value))
             .collect();
         let (writes, managed) = due_rows(buckets, settings, self.now);
-        self.managed = managed;
-        Ok((write && !writes.is_empty()).then_some(IoCall::Write(writes)))
+        self.managed.extend(managed);
+        if write && !writes.is_empty() {
+            self.written = true;
+            return Ok(Some(IoCall::Write(writes)));
+        }
+        Ok(self.next_page())
     }
 
     /// The node managed buckets whose raise was marked.
@@ -146,6 +176,30 @@ mod tests {
             marks.next(IoResult::Done, true),
             Err(EpochDueError::Storage)
         );
+    }
+
+    #[test]
+    fn marks_each_page() {
+        // An empty index page with a cursor goes on to the next page instead of ending.
+        let mut marks = DueMarks::new(None, 1);
+        let IoCall::Page { limit, .. } = marks.first() else {
+            panic!("expected the index page");
+        };
+        assert_eq!(limit, DUE_PAGE);
+        let after = Key::from(b"cursor".to_vec());
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: Some(after.clone()),
+        };
+        let Ok(Some(IoCall::Page { after: asked, .. })) = marks.next(page, true) else {
+            panic!("expected the next index page");
+        };
+        assert_eq!(asked, Some(after));
+        let last = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(marks.next(last, true), Ok(None));
     }
 
     #[test]

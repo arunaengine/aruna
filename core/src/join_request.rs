@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::reducer::AdminDocumentState;
 use crate::types::{GroupId, RoleId};
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use ulid::Ulid;

@@ -5,8 +5,8 @@
 use crate::error::ErrorResponse;
 use crate::forwarded::client_ip;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -346,8 +346,8 @@ fn too_many_requests(retry_after: u64) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{ApiRateLimits, LOCAL_PERMITS, LOCAL_TABLE_LIMIT, LocalKey, LocalLease};
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use std::net::IpAddr;
     use std::str::FromStr;
     use ulid::Ulid;

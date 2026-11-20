@@ -10,19 +10,20 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, NODE_SECRETS_KEYSPACE};
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::secrets::{SecretName, SecretRecord, SecretScope};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, apply_change, widening_notices};
 use crate::node_vault::{delete_secret, write_secret};
-use crate::notifications::outbox_record::schedule_drain_effect;
+use aruna_core::structs::execution::notification::schedule_drain_effect;
 
 /// One node secret change, with the time and write id it uses.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,7 +97,7 @@ pub(super) fn written(result: IoResult) -> Result<(), IoError> {
         {
             Ok(())
         }
-        other => rows::done(other),
+        other => other.done(),
     }
 }
 
@@ -268,7 +269,7 @@ impl Operation for NodeSecretsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, NodeSecretError> {
-        let values = match rows::event(result)? {
+        let values = match result.event()? {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values,
             other => return Err(unexpected_iter(&other).into()),
         };

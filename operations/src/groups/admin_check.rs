@@ -93,8 +93,8 @@ impl Operation for AdminCheckOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn auth(user_realm: u8) -> AuthContext {

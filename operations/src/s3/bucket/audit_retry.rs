@@ -341,6 +341,28 @@ impl Operation for ResumeAuditOperation {
     }
 }
 
+/// Converts audit retry failures into an operation error that names the state `$state`.
+macro_rules! audit_failure {
+    ($error:ty, $state:literal) => {
+        impl From<$crate::s3::bucket::audit_retry::AuditError> for $error {
+            fn from(error: $crate::s3::bucket::audit_retry::AuditError) -> Self {
+                use $crate::s3::bucket::audit_retry::AuditError;
+                match error {
+                    AuditError::Conversion(error) => Self::Conversion(error),
+                    AuditError::Storage(error) => Self::Storage(error),
+                    AuditError::NotAuditTimer => Self::NotFinished,
+                    AuditError::Unexpected(received) => Self::InvalidStateEvent {
+                        state: $state.to_string(),
+                        expected: "the audit retry timer's answer",
+                        received,
+                    },
+                }
+            }
+        }
+    };
+}
+pub(crate) use audit_failure;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,7 +376,8 @@ mod tests {
     #[tokio::test]
     async fn kept_records_resume() {
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -410,7 +433,11 @@ mod tests {
     }
 
     /// Whether `key` holds a row in `key_space`.
-    async fn stored(storage: &aruna_storage::StorageHandle, key_space: &str, key: Vec<u8>) -> bool {
+    async fn stored(
+        storage: &aruna_storage::storage::handle::StorageHandle,
+        key_space: &str,
+        key: Vec<u8>,
+    ) -> bool {
         let read = StorageEffect::Read {
             key_space: key_space.to_string(),
             key: key.into(),
@@ -427,7 +454,8 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -597,6 +625,7 @@ mod tests {
         let timer = PersistedTaskTimer {
             key: retry_timer(&record),
             due_unix_millis: 0,
+            admission: 0,
         };
         let value = Value::from(postcard::to_allocvec(&timer).unwrap());
         let mut resume = ResumeAuditOperation::default();
@@ -625,25 +654,3 @@ mod tests {
         );
     }
 }
-
-/// Converts audit retry failures into an operation error that names the state `$state`.
-macro_rules! audit_failure {
-    ($error:ty, $state:literal) => {
-        impl From<$crate::s3::bucket::audit_retry::AuditError> for $error {
-            fn from(error: $crate::s3::bucket::audit_retry::AuditError) -> Self {
-                use $crate::s3::bucket::audit_retry::AuditError;
-                match error {
-                    AuditError::Conversion(error) => Self::Conversion(error),
-                    AuditError::Storage(error) => Self::Storage(error),
-                    AuditError::NotAuditTimer => Self::NotFinished,
-                    AuditError::Unexpected(received) => Self::InvalidStateEvent {
-                        state: $state.to_string(),
-                        expected: "the audit retry timer's answer",
-                        received,
-                    },
-                }
-            }
-        }
-    };
-}
-pub(crate) use audit_failure;

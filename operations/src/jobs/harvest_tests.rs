@@ -306,7 +306,7 @@ fn protocol_error_permanent() {
     assert!(error.message.starts_with("OAI response"));
     assert_eq!(
         error.kind,
-        aruna_core::structs::execution::job::JobErrorKind::Permanent
+        aruna_core::structs::execution::job::local::JobErrorKind::Permanent
     );
 }
 

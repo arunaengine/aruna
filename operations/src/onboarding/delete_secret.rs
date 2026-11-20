@@ -7,11 +7,11 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::onboarding::create_secret::secret_record_key;
+use crate::onboarding::create_secret::{secret_expiry_key, secret_record_key};
 use crate::onboarding::secret_state::secret_state_key;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,14 +88,16 @@ impl Operation for DeleteSecretOperation {
         result: IoResult,
     ) -> Result<Next<OnboardingSecretRecord>, DeleteSecretError> {
         if let Some(record) = self.record.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(record));
         }
         let [value] = values::<1>(result)?;
         let value = value.ok_or(DeleteSecretError::NotFound)?;
-        let record = postcard::from_bytes(&value).map_err(ConversionError::from)?;
-        self.record = Some(record);
+        let record: OnboardingSecretRecord =
+            postcard::from_bytes(&value).map_err(ConversionError::from)?;
         let enrollment_id = self.input.enrollment_id;
+        let expiry = secret_expiry_key(record.expires_at, enrollment_id);
+        self.record = Some(record);
         Ok(Next::Call(IoCall::Delete(vec![
             (
                 ONBOARDING_KEYSPACE.to_string(),
@@ -105,6 +107,7 @@ impl Operation for DeleteSecretOperation {
                 ONBOARDING_KEYSPACE.to_string(),
                 secret_state_key(enrollment_id),
             ),
+            (ONBOARDING_KEYSPACE.to_string(), expiry),
         ])))
     }
 }

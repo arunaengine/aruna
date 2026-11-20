@@ -6,7 +6,8 @@
 use crate::blob_node::{
     BUCKET, TestContext, bucket_info, content, progress, put, read, run, setup_on, version, write,
 };
-use aruna_blob::blob::{BackendRegistry, BlobHandler, NodeBackend};
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::{BackendRegistry, NodeBackend};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{BlobEvent, Event};
@@ -42,7 +43,7 @@ fn filesystem(root: String, prefix: &str) -> BackendConfig {
 async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(&root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

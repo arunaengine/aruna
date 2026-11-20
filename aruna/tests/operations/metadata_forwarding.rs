@@ -9,10 +9,8 @@ use std::time::Duration;
 
 use crate::metadata_calls::route_metadata_update;
 use aruna::tasks::incoming::OutboxDrainer;
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_secs;
-use aruna_core::NodeId;
-use aruna_core::StructuredId;
-use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
@@ -21,9 +19,11 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{
@@ -34,38 +34,38 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::StructuredId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
-use aruna_operations::device::drain::{DrainOutcome, drain_publish_queue};
 use aruna_operations::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
 use aruna_operations::device::inspect_draft::InspectDraftOperation;
 use aruna_operations::device::publish_queue::{
-    PUBLISH_PAGE_SIZE, PublishEntry, PublishState, publish_entry,
+    DrainOutcome, PUBLISH_PAGE_SIZE, PublishEntry, PublishState, publish_entry,
 };
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::forward::{ForwardGroupError, ForwardGroupOperation};
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
-    mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_forward_document, mint_local_document,
 };
+use aruna_operations::metadata::device::drain::drain_publish_queue;
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
+use aruna_operations::metadata::update_document::UpdateDocumentError;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
-use aruna_operations::sync::outbox_record::outbox_key;
-use aruna_operations::sync::outbox_record::{new_outbox_record, write_outbox_effect};
-use aruna_operations::testing::read_outbox_record;
+use aruna_operations::sync::outbox::record::outbox_key;
+use aruna_operations::sync::outbox::record::{new_identified_record, write_outbox_effect};
+use aruna_test_support::documents::read_outbox_record;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
@@ -95,30 +95,26 @@ async fn user_forwards_create() -> Result<(), Box<dyn std::error::Error>> {
 
     // Whichever holder answered the forward publishes the create onto the bucket's
     // topic, so it reaches every holder of that bucket.
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let mut pending = false;
-        for node in nodes
+    let (listed, holders, created) = (&nodes, &holders, &created);
+    let reached = poll_until(CONVERGENCE_TIMEOUT, move || async move {
+        let holding = listed
             .iter()
-            .filter(|node| holders.contains(&node.net.node_id()))
-        {
-            match registry_record(node, document_id).await? {
-                Some(stored) => {
+            .filter(|node| holders.contains(&node.net.node_id()));
+        for node in holding {
+            match registry_record(node, document_id).await {
+                Err(error) => return Some(Err(error)),
+                Ok(None) => return None,
+                Ok(Some(stored)) => {
                     assert_eq!(stored.document_id, document_id);
                     assert_eq!(stored.group_id, group_id);
                     assert_eq!(stored.placement, created.placement);
                 }
-                None => pending = true,
             }
         }
-        if !pending {
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err("the forwarded create never reached every holder".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Some(Ok(()))
+    })
+    .await;
+    reached.ok_or("the forwarded create never reached every holder")??;
 
     shutdown(nodes).await;
     Ok(())
@@ -276,18 +272,17 @@ async fn first_record(
     nodes: &[TestNode],
     document_id: Ulid,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
+    let found = poll_until(CONVERGENCE_TIMEOUT, move || async move {
         for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
-            if let Some(record) = registry_record(node, document_id).await? {
-                return Ok(record);
+            match registry_record(node, document_id).await {
+                Ok(None) => {}
+                found => return found.transpose(),
             }
         }
-        if Instant::now() >= deadline {
-            return Err("the drained create never reached a holder".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        None
+    })
+    .await;
+    found.ok_or("the drained create never reached a holder")?
 }
 
 #[tokio::test]
@@ -728,25 +723,21 @@ async fn wait_holder_records(
     holders: &[NodeId],
     document_id: Ulid,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let mut pending = false;
-        for node in nodes
+    let reached = poll_until(CONVERGENCE_TIMEOUT, move || async move {
+        let holding = nodes
             .iter()
-            .filter(|node| holders.contains(&node.net.node_id()))
-        {
-            if registry_record(node, document_id).await?.is_none() {
-                pending = true;
+            .filter(|node| holders.contains(&node.net.node_id()));
+        for node in holding {
+            match registry_record(node, document_id).await {
+                Err(error) => return Some(Err(error)),
+                Ok(None) => return None,
+                Ok(Some(_)) => {}
             }
         }
-        if !pending {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("the create never reached every holder".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Some(Ok(()))
+    })
+    .await;
+    reached.ok_or("the create never reached every holder")?
 }
 
 /// A node holding no bucket of a document can resolve it, and cannot be tricked into relaying a
@@ -797,26 +788,20 @@ async fn nonholder_resolves_document() -> Result<(), Box<dyn std::error::Error>>
         .find(|node| !holders.contains(&node.net.node_id()))
         .expect("replica 3 of 5 nodes leaves a non-holder");
 
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        match registry_record(outsider, document_id).await? {
-            Some(record) => {
-                assert_eq!(record.document_id, document_id);
-                assert_eq!(record.placement, created.placement);
-                // The point of the row: the non-holder can route to the holders.
-                assert_eq!(resolve_shard_holders(&config, &record.placement), holders);
-                break;
-            }
-            None if Instant::now() >= deadline => {
-                return Err("the registry row never reached a non-holder".into());
-            }
-            None => sleep(Duration::from_millis(50)).await,
-        }
-    }
+    let found = poll_until(CONVERGENCE_TIMEOUT, move || async move {
+        registry_record(outsider, document_id).await.transpose()
+    })
+    .await;
+    let record = found.ok_or("the registry row never reached a non-holder")??;
+    assert_eq!(record.document_id, document_id);
+    assert_eq!(record.placement, created.placement);
+    // The point of the row: the non-holder can route to the holders.
+    assert_eq!(resolve_shard_holders(&config, &record.placement), holders);
     wait_holder_records(&nodes, &holders, document_id).await?;
 
     // Plant a delete for the document's bucket into the non-holder's outbox.
-    let forged = new_outbox_record(
+    let forged = new_identified_record(
+        Ulid::generate(),
         outsider.net.node_id(),
         DocumentTarget::MetadataDocumentLifecycle { document_id },
         Vec::new(),
@@ -1021,22 +1006,17 @@ async fn wait_for_group(
         "datasets/forwarded",
         Ulid::nil(),
     );
-    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
-    loop {
-        let mut pending = false;
+    let path = &path;
+    let granted = poll_until(CONVERGENCE_TIMEOUT, move || async move {
         for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
             if !owner_can_write(realm, node, path.clone()).await {
-                pending = true;
+                return None;
             }
         }
-        if !pending {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("the group owner never gained write on every holder".into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+        Some(())
+    })
+    .await;
+    Ok(granted.ok_or("the group owner never gained write on every holder")?)
 }
 
 /// Whether the realm's owner is granted WRITE on the group path by this node's

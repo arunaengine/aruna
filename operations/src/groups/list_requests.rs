@@ -197,13 +197,13 @@ impl Operation for ListJoinOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::join_request::JoinRequest;
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::reducer_state_entry;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
 
     fn realm() -> RealmId {
         RealmId::from_bytes([7; 32])

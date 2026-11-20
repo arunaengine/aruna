@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::inbound::settle_followups;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 
 impl DrainInvocation {
@@ -84,10 +85,13 @@ pub(super) fn publish_from_outbox(
     }
 }
 
+/// The realm configuration the drain decides with: `None` on a node that has none yet, where the
+/// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
+/// rather than let an unknown membership publish.
 pub(super) async fn load_drain_config(
     context: &Arc<DriverContext>,
     realm_id: aruna_core::structs::identity::realm::RealmId,
-) -> Option<aruna_core::structs::identity::realm::RealmConfigDocument> {
+) -> Result<Option<aruna_core::structs::identity::realm::RealmConfigDocument>, String> {
     let target = DocumentTarget::RealmConfig { realm_id };
     match context
         .storage_handle
@@ -98,10 +102,18 @@ pub(super) async fn load_drain_config(
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value.and_then(|bytes| {
-            aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes).ok()
-        }),
-        _ => None,
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
+            None => Ok(None),
+            Some(bytes) => {
+                let config =
+                    aruna_core::structs::identity::realm::RealmConfigDocument::from_bytes(&bytes);
+                config.map(Some).map_err(|error| error.to_string())
+            }
+        },
+        other => Err(format!(
+            "the realm configuration read answered {}",
+            other.label()
+        )),
     }
 }
 
@@ -148,40 +160,11 @@ impl DrainSubBatch {
 
     /// Ordering domains blocked together when a publish or sync leaves records
     /// behind.
-    pub(super) fn ordering_domains(&self) -> (Vec<irokle::TopicId>, Vec<aruna_core::NodeId>) {
+    pub(super) fn ordering_domains(&self) -> (Vec<irokle::TopicId>, Vec<aruna_core::id::NodeId>) {
         (
             self.topics.clone(),
             self.origins.iter().flatten().copied().collect(),
         )
-    }
-}
-
-impl OutboxRotation {
-    pub(super) fn admits(&self, key: &[u8]) -> bool {
-        if !self.stream_boundaries.is_empty() {
-            return self
-                .stream_boundaries
-                .iter()
-                .find(|(prefix, _)| key.starts_with(prefix))
-                .is_some_and(|(_, boundary)| key <= boundary.as_slice());
-        }
-        self.boundary
-            .as_deref()
-            .is_none_or(|boundary| key <= boundary)
-    }
-
-    pub(super) fn at_end(&self, cursor: Option<&[u8]>) -> bool {
-        cursor.is_some_and(|cursor| {
-            self.boundary
-                .as_deref()
-                .is_some_and(|boundary| cursor >= boundary)
-        })
-    }
-
-    pub(super) fn close(&mut self) -> RotationTotals {
-        let totals = self.totals;
-        *self = Self::default();
-        totals
     }
 }
 
@@ -224,109 +207,6 @@ impl OutboxBarrier {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-    }
-}
-
-/// Whether a record whose shard topic is missing locally can ever publish from here.
-/// Holdership comes from the live realm config, never a local copy (rebalances leave
-/// stale copies). Without a readable config nothing is decided and the record retries.
-pub(super) fn classify_deferred_record(
-    config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-    net_handle: &aruna_net::NetHandle,
-    record: &DocumentOutboxRecord,
-) -> DeferOutcome {
-    let Some(config) = config else {
-        return DeferOutcome::Retry;
-    };
-    let node_id = net_handle.node_id();
-    // Draining former holders may publish until flushed; true non-holders remain undeliverable.
-    // The receiver history cutoff bounds a departing holder.
-    if aruna_core::placement::holds_placement(config, &record.placement, node_id)
-        || aruna_core::placement::is_draining_holder(config, &record.placement, node_id)
-        || aruna_core::placement::retained_departing_holder(config, &record.placement, node_id)
-    {
-        DeferOutcome::Retry
-    } else {
-        DeferOutcome::Undeliverable
-    }
-}
-
-/// Splits FIFO-ordered drain records into publish-now, deferred (no local shard genesis
-/// yet) and undeliverable. Holdership decides publishability, not local topic presence,
-/// and a topic never straddles the defer/publish boundary; `publishes_shared` gates devices.
-pub(super) fn partition_drain_records(
-    records: Vec<DrainRecord>,
-    defer: &mut DrainDeferState,
-    publishes_shared: bool,
-    mut topic_available: impl FnMut(irokle::TopicId) -> bool,
-    mut classify_defer: impl FnMut(&DocumentOutboxRecord) -> DeferOutcome,
-) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
-    let mut to_publish = Vec::with_capacity(records.len());
-    let mut deferred = Vec::new();
-    let mut undeliverable = Vec::new();
-    for (record_key, record, topic) in records {
-        // Origin order is the contract, whatever topic the later records ride.
-        if admin_origin(&record).is_some_and(|origin| defer.blocked_origins.contains(&origin)) {
-            deferred.push((record_key, record, topic));
-            continue;
-        }
-        if !record.target.uses_shard_topic() {
-            match publishes_shared {
-                true => to_publish.push((record_key, record, topic)),
-                false => undeliverable.push((record_key, record, topic)),
-            }
-            continue;
-        }
-        if defer.undeliverable_topics.contains(&topic) {
-            if let Some(origin) = admin_origin(&record) {
-                defer.blocked_origins.insert(origin);
-            }
-            undeliverable.push((record_key, record, topic));
-            continue;
-        }
-        let held = *defer
-            .topic_held
-            .entry(topic)
-            .or_insert_with(|| classify_defer(&record) == DeferOutcome::Retry);
-        if !held {
-            defer.undeliverable_topics.insert(topic);
-            if let Some(origin) = admin_origin(&record) {
-                defer.blocked_origins.insert(origin);
-            }
-            undeliverable.push((record_key, record, topic));
-            continue;
-        }
-        let already_deferred = defer.deferred_topics.contains(&topic);
-        let available = !already_deferred
-            && *defer
-                .topic_exists
-                .entry(topic)
-                .or_insert_with(|| topic_available(topic));
-        if available {
-            to_publish.push((record_key, record, topic));
-            continue;
-        }
-        defer.deferred_topics.insert(topic);
-        if let Some(origin) = admin_origin(&record) {
-            defer.blocked_origins.insert(origin);
-        }
-        debug!(
-            event = "pipeline.drain.deferred",
-            target = ?record.target,
-            %topic,
-            "Deferring outbox record: shard topic genesis not yet known"
-        );
-        deferred.push((record_key, record, topic));
-    }
-    (to_publish, deferred, undeliverable)
-}
-
-/// The admin origin stream a record belongs to. Origin sequence is ordered
-/// within one origin node.
-pub(super) fn admin_origin(record: &DocumentOutboxRecord) -> Option<aruna_core::NodeId> {
-    match &record.event {
-        DocumentOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
-        _ => None,
     }
 }
 
@@ -401,12 +281,20 @@ impl OperationsTaskHandler {
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(task_id = ?retry_key, "Cannot drain document sync outbox without net handle");
-            self.reschedule_with_backoff(retry_key).await;
+            self.retry_drain(retry_key, self.take_rotation()).await;
             return;
         };
 
         let realm_id = *net_handle.realm_id();
-        let realm_config = load_drain_config(&self.context, realm_id).await;
+        let realm_config = match load_drain_config(&self.context, realm_id).await {
+            Ok(config) => config,
+            Err(error) => {
+                // No row is decided while membership is unknown, so all keep their order.
+                warn!(task_id = ?retry_key, %error, "Outbox drain waits for the realm config");
+                self.retry_drain(retry_key, self.take_rotation()).await;
+                return;
+            }
+        };
 
         let rotation = self.take_rotation();
         let Some(rotation) = self.open_rotation(&retry_key, rotation).await else {
@@ -476,7 +364,7 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn close_rotation(&self, retry_key: TaskKey, mut rotation: OutboxRotation) {
-        let closed = rotation.close();
+        let (closed, after) = rotation.close_plan();
         self.store_rotation(rotation);
         if closed.examined > 0 {
             info!(
@@ -491,18 +379,8 @@ impl OperationsTaskHandler {
             );
         }
 
-        if closed.retry_invocations > 0 {
-            if closed.deleted > 0 {
-                self.reset_backoff(&retry_key);
-            }
-            self.reschedule_with_backoff(retry_key).await;
-        } else if closed.deferred > 0 {
-            if closed.deleted > 0 {
-                self.reset_backoff(&retry_key);
-            }
-            self.reschedule_timer(retry_key, DEFER_RETRY_AFTER).await;
-        } else {
-            self.reset_backoff(&retry_key);
+        if let Some(after) = after {
+            self.reschedule_timer(retry_key, after).await;
         }
     }
 }
@@ -515,18 +393,15 @@ impl OperationsTaskHandler {
     ) -> Option<OutboxRotation> {
         if rotation.boundary.is_none() {
             match drive(OutboxTailsOperation::new(), self.context.as_ref()).await {
-                Ok(boundaries) if boundaries.is_empty() => {
-                    self.reset_backoff(retry_key);
-                    return None;
-                }
+                // An empty outbox drops the rotation, and with it the retry ladder.
+                Ok(boundaries) if boundaries.is_empty() => return None,
                 Ok(boundaries) => {
                     rotation.boundary = boundaries.iter().map(|(_, key)| key).max().cloned();
                     rotation.stream_boundaries = boundaries;
                 }
                 Err(error) => {
                     warn!(task_id = ?retry_key, %error, "Failed to open document sync outbox rotation");
-                    self.store_rotation(rotation);
-                    self.reschedule_with_backoff(retry_key.clone()).await;
+                    self.retry_drain(retry_key.clone(), rotation).await;
                     return None;
                 }
             }
@@ -589,7 +464,7 @@ impl OperationsTaskHandler {
             &mut invocation.defer,
             !self.is_device(config),
             |topic| net_handle.sync_topic_exists(topic).unwrap_or(false),
-            |record| classify_deferred_record(config, net_handle, record),
+            |record| classify_deferred_record(config, net_handle.node_id(), record),
         );
         invocation.deferred += deferred.len();
         let now_ms = unix_timestamp_millis();
@@ -664,8 +539,8 @@ impl OperationsTaskHandler {
         // Pull a missing shard genesis from stamped ex-holders and live holders.
         // Only current or draining former holders may adopt it for publication.
         let mut missing_topics: BTreeMap<
-            Vec<aruna_core::NodeId>,
-            (Vec<aruna_core::NodeId>, BTreeSet<irokle::TopicId>),
+            Vec<aruna_core::id::NodeId>,
+            (Vec<aruna_core::id::NodeId>, BTreeSet<irokle::TopicId>),
         > = BTreeMap::new();
         for (_, record, topic) in &records {
             if !record.target.uses_shard_topic()
@@ -712,7 +587,8 @@ impl OperationsTaskHandler {
                 *net_handle.realm_id(),
                 topics.into_iter().collect(),
                 peers,
-            );
+            )
+            .queuing_metadata(net_handle.node_id());
             let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
                 drive(sync, self.context.as_ref()).await,
             )));
@@ -857,8 +733,10 @@ impl OperationsTaskHandler {
 }
 
 /// Sub-batches keyed by whether their records only sync and by their sorted peers.
-type PublishGroups =
-    BTreeMap<(bool, Vec<aruna_core::NodeId>), (Vec<aruna_core::NodeId>, Vec<DrainSubBatch>)>;
+type PublishGroups = BTreeMap<
+    (bool, Vec<aruna_core::id::NodeId>),
+    (Vec<aruna_core::id::NodeId>, Vec<DrainSubBatch>),
+>;
 
 impl OperationsTaskHandler {
     /// Groups records by peers into sub-batches. A record already published by this process
@@ -929,7 +807,8 @@ impl OperationsTaskHandler {
         let (batch_topics, batch_origins) = subbatch.ordering_domains();
         let sync_started = Instant::now();
         let sync =
-            SyncTopicsOperation::new(*net_handle.realm_id(), subbatch.topics, subbatch.peers);
+            SyncTopicsOperation::new(*net_handle.realm_id(), subbatch.topics, subbatch.peers)
+                .queuing_metadata(net_handle.node_id());
         let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(
             drive(sync, self.context.as_ref()).await,
         )));
@@ -962,8 +841,7 @@ impl OperationsTaskHandler {
         if reached_end {
             self.close_rotation(retry_key, rotation).await;
         } else {
-            self.store_rotation(rotation);
-            self.reschedule_with_backoff(retry_key).await;
+            self.retry_drain(retry_key, rotation).await;
         }
     }
 }
@@ -1107,45 +985,6 @@ pub async fn drive_sync_drain(context: Arc<DriverContext>) {
 }
 
 impl OperationsTaskHandler {
-    async fn project_create_events(
-        &self,
-        retry_key: &TaskKey,
-        targets: Vec<DocumentTarget>,
-        metadata_create_events: Vec<aruna_core::metadata::MetadataEventRecord>,
-    ) -> Result<(), ()> {
-        if !metadata_create_events.is_empty() {
-            let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
-            let project = ProjectEventsOperation::new(metadata_create_events, local_node_id);
-            if let Err(error) = drive(project, &self.context).await {
-                warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
-                return Err(());
-            }
-            return Ok(());
-        }
-
-        let mut create_event_targets = Vec::new();
-        for target in targets {
-            let DocumentTarget::MetadataCreateEvent {
-                document_id,
-                event_id,
-                ..
-            } = target
-            else {
-                continue;
-            };
-            create_event_targets.push((document_id, event_id));
-        }
-        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
-        let project = ProjectLoggedOperation::new(create_event_targets, false, local_node);
-        if let Err(error) = drive(project, &self.context).await {
-            warn!(task_id = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
-            return Err(());
-        }
-        Ok(())
-    }
-}
-
-impl OperationsTaskHandler {
     pub(super) async fn finish_sync_batch(
         &self,
         retry_key: &TaskKey,
@@ -1157,14 +996,8 @@ impl OperationsTaskHandler {
         match event {
             Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
                 targets,
-                metadata_create_events,
-                metadata_graph_tombstones,
                 ..
             })) => {
-                let tombstones = TombstonesOperation::new(metadata_graph_tombstones);
-                if let Err(error) = drive(tombstones, self.context.as_ref()).await {
-                    warn!(error = ?error, "Failed to prune deleted metadata graphs");
-                }
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {
@@ -1186,12 +1019,13 @@ impl OperationsTaskHandler {
                 if let Err(error) = drive(refresh, self.context.as_ref()).await {
                     warn!(%error, "Mail settings refresh stopped after an outbox drain");
                 }
+                // Each apply stored its metadata follow-up with it, and the applied drain owns it;
+                // the records stay for a rerun while its leftover work has no armed timer.
                 let project_started = Instant::now();
-                let projected = self
-                    .project_create_events(retry_key, targets, metadata_create_events)
-                    .await;
+                let settled = settle_followups(self.context.as_ref()).await;
                 outcome.project_elapsed = project_started.elapsed();
-                if projected.is_err() {
+                if !settled {
+                    warn!(task_id = ?retry_key, "Metadata follow-ups of an outbox drain wait");
                     outcome.retry_needed = true;
                     return outcome;
                 }

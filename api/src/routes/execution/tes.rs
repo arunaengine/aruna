@@ -8,24 +8,27 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::job_service::{
-    RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
-};
+use crate::job_service::{cancel_job_routed, list_owned_jobs, read_record_routed};
 use crate::jobs::{family_report, submit_external_job};
 use crate::routes::routes_at;
 use aruna_core::compute::{
     directory_pattern, has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
-use aruna_core::structs::execution::job::{
-    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
-    JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    MAX_EXECUTION_OUTPUTS, PhysicalExecutionResult, ResultMessage,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobPayload,
+    OutputDestination, OutputSelection,
+};
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_drivers::driver::drive;
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::local_run::LocalExecutionConfig;
 use aruna_operations::jobs::route::JobRouteError;
@@ -1327,7 +1330,7 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
             "reserved_tag",
         ));
     }
-    if let Some(key) = aruna_core::structs::execution::job::plugin_tag(&task.tags) {
+    if let Some(key) = aruna_core::structs::execution::job::input::plugin_tag(&task.tags) {
         return Err(TesError::coded(
             StatusCode::BAD_REQUEST,
             format!("tag `{key}` is reserved for plugin tasks"),
@@ -1616,7 +1619,7 @@ fn output_prefix(output: &TesOutput) -> Result<Option<String>, TesError> {
 
 /// An input url is `s3://bucket/key` on this node, or a versioned object ARN naming the node
 /// that holds the exact version to read.
-fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::NodeId>), TesError> {
+fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::id::NodeId>), TesError> {
     if !url.starts_with("arn:") {
         let (bucket, key) = parse_s3_url(url, "input")?;
         let source = InputSource::S3 {
@@ -2317,7 +2320,7 @@ impl TesError {
 
     /// Task creation shares the REST submit mapping, so a refusal a TES client
     /// must not retry never reaches it as a retryable 500.
-    fn from_submit(error: aruna_operations::jobs::submit::SubmitJobError) -> Self {
+    fn from_submit(error: aruna_core::job_request::SubmitJobError) -> Self {
         Self::from_server(super::jobs::map_submit_error(error))
     }
 

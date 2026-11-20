@@ -11,18 +11,17 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
 use crate::compute::ExecutionTargetId;
 use crate::compute::runtimes::{SESSION_RUNTIME_TAG, SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use crate::errors::ConversionError;
-use crate::structs::MintPersistentSpec;
+use crate::id::NodeId;
 use crate::structs::checksum::ChecksumAlgorithm;
 use crate::structs::execution::harvest::HarvestJobSpec;
 use crate::structs::execution::notification::invert_timestamp_ms;
 use crate::structs::execution::staging::StagingStrategy;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::persistent_id::MintPersistentSpec;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::blob::{BackendLocation, HiddenBlobKey};
@@ -33,30 +32,20 @@ use crate::structured_id::{
     BucketId, FieldError, JobId as RoutableJobId, PlacementHandle, StructuredId,
 };
 use crate::types::{GroupId, Key};
+use crate::user::id::UserId;
 
-mod family;
-mod identity;
-mod input;
-mod key_wait;
-mod launch;
-mod local;
-mod membership;
-mod pages;
-mod prune;
+pub mod family;
+pub mod identity;
+pub mod input;
+pub mod key_wait;
+pub mod launch;
+pub mod local;
+pub mod membership;
+pub mod pages;
+pub mod prune;
 pub mod record_keys;
 pub mod record_rows;
-mod rows;
-
-pub use family::*;
-pub use identity::*;
-pub use input::*;
-pub use key_wait::*;
-pub use launch::*;
-pub use local::*;
-pub use membership::*;
-pub use pages::*;
-pub use prune::*;
-pub use rows::*;
+pub mod rows;
 
 #[cfg(test)]
 mod tests;

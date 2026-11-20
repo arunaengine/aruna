@@ -9,9 +9,13 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryPull;
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ImportReportDetail, ImportReportRow, ImportRoCrateSource, ReasonCode,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, schedule_watch_drain, watch_event_entry,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
@@ -19,7 +23,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data::identity::normalized_id;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::release::MembershipQuery;
-use tracing::info;
+use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::plan::{federated_call, federated_result, metadata_permission_call};
@@ -35,28 +39,28 @@ use super::{
     entry_arn, entry_location, entry_report, failure_message, hidden_delete, hidden_deleted,
     permission_result, rollback_required, transfer_failure, validation_failure,
 };
-use crate::forward::transport::MetadataWriteError;
-use crate::jobs::export::CrateJsonOperation;
+use crate::jobs::export::snapshot::CrateJsonOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::jobs::repository::pull::{PullRunningOperation, SettleImportOperation};
 use crate::jobs::repository::{TransferError, is_reference};
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
-use crate::jobs::submit_local::SubmitLocalOperation;
+use crate::jobs::submit::local::SubmitLocalOperation;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, CreateDocumentResult,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentResult,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
-use crate::notifications::watch::origin::EmitEventOperation;
-use crate::s3::bucket::release::BucketScope;
+use crate::metadata::update_document::UpdateDocumentError;
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
 };
-use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
+use crate::transfer::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
+use crate::transfer::release::BucketScope;
 use aruna_core::errors::StorageReadError;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
 
 fn actor_of(run: &ImportRun) -> Actor {
     let auth = &run.spec.auth_context;
@@ -286,19 +290,32 @@ impl Operation for CreateDatasetOperation {
                 }
                 self.step = CreateStep::Emit;
                 let auth = &spec.auth_context;
-                Ok(Next::Call(IoCall::child(
-                    EmitEventOperation::metadata_created(
-                        auth.realm_id,
-                        auth.user_id,
-                        created.record.group_id,
-                        created.record.document_id,
-                        &created.record.document_path,
-                        created.event_id,
-                    ),
-                )))
+                let event = WatchEvent::metadata_created(
+                    auth.realm_id,
+                    auth.user_id,
+                    created.record.group_id,
+                    created.record.document_id,
+                    &created.record.document_path,
+                    created.event_id,
+                );
+                match watch_event_entry(&event) {
+                    Ok(entry) => Ok(Next::Call(outside_call(IoCall::Write(vec![entry])))),
+                    Err(error) => {
+                        warn!(%error, "The import's watch event could not be queued");
+                        Ok(Next::Done(self.checkpoint.clone()))
+                    }
+                }
             }
-            // Failures only warn inside the operation.
-            CreateStep::Emit => Ok(Next::Done(self.checkpoint.clone())),
+            // A failed queue write only warns, as a failed emission did.
+            CreateStep::Emit => {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
+                    warn!(%error, "The import's watch event could not be queued");
+                }
+                Ok(Next::Then {
+                    output: self.checkpoint.clone(),
+                    calls: vec![IoCall::from(schedule_watch_drain())],
+                })
+            }
         }
     }
 }

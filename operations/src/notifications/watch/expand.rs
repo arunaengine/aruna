@@ -11,10 +11,9 @@ mod tests {
         expansion_budget, page_limit,
     };
     use crate::notifications::watch::expansion::{RetryDrainOperation, WatchExpandOperation};
-    use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
         WATCH_INTEREST_KEYSPACE,
@@ -31,8 +30,9 @@ mod tests {
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::structs::storage::blob::object_permission_path;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive, drive_retry};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use ulid::Ulid;
 
     use crate::tests::notifications::{create_holder_watch, create_local_watch};
@@ -70,14 +70,14 @@ mod tests {
     }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
-        crate::testing::temp_context()
+        aruna_drivers::testing::temp_context()
     }
 
     fn user(realm: RealmId, seed: u8) -> UserId {
         UserId::new(Ulid::from_bytes([seed; 16]), realm)
     }
 
-    fn local_config(realm: RealmId) -> (aruna_core::NodeId, RealmConfigDocument) {
+    fn local_config(realm: RealmId) -> (aruna_core::id::NodeId, RealmConfigDocument) {
         let local_node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
         let mut config = RealmConfigDocument::default_for_realm(realm, Vec::new());
         config.ensure_node(local_node_id, RealmNodeKind::Server);
@@ -88,7 +88,7 @@ mod tests {
         realm: RealmId,
         actor: UserId,
         group_id: Ulid,
-        node_id: aruna_core::NodeId,
+        node_id: aruna_core::id::NodeId,
     ) -> WatchEvent {
         let path = watch_resource_path(group_id, node_id, "bucket", "object");
         WatchEvent {
@@ -166,7 +166,7 @@ mod tests {
     async fn install_authorization(
         context: &DriverContext,
         realm: RealmId,
-        node_id: aruna_core::NodeId,
+        node_id: aruna_core::id::NodeId,
         group_id: Ulid,
         owner: UserId,
     ) {

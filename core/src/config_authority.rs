@@ -2,11 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::admin_checks::{origin_may_publish, revocation_origin_known};
 use crate::admin_documents::{AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget};
 use crate::deferred_topics::DocumentSyncDependency;
-use crate::reducer::{AdminDocumentState, overlay_placement};
+use crate::id::NodeId;
+use crate::reducer::AdminDocumentState;
+use crate::reducer::placement::overlay_placement;
 use crate::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use crate::structs::placement::record::{
     FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, PoolAdmission, admit_band_pool, coordinator_spans,

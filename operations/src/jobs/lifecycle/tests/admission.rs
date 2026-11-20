@@ -6,13 +6,18 @@ use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ADMISSION_QUOTA_KEYSPACE, FAMILY_OUTBOX_KEYSPACE};
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId, JobState,
-    LogicalJobSpec, SubmissionClaim, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, LogicalJobSpec, SubmissionClaim,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputMode, InputSelection, InputSource,
+};
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -22,9 +27,10 @@ use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
-use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
-use crate::jobs::submit::SubmitJobError;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
+use aruna_core::job_request::{
+    SubmissionRequest, SubmissionScope, SubmitJobError, store_workspace,
+};
 use aruna_core::metadata::AuthToken;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
@@ -131,7 +137,7 @@ async fn admits_local_claim() {
         drive(AliasFamilyOperation::new(job_id), &ctx).await,
         Ok(Some(family.family()))
     );
-    let record = crate::jobs::store::test_calls::read_job_record(&ctx, job_id, None)
+    let record = aruna_test_support::jobs::read_job_record(&ctx, job_id, None)
         .await
         .expect("logical row read")
         .expect("logical row exists");
@@ -212,7 +218,7 @@ async fn refuses_undeliverable_submit() {
 
     assert!(matches!(
         error,
-        crate::jobs::submit::SubmitJobError::PlacementUnavailable(_)
+        aruna_core::job_request::SubmitJobError::PlacementUnavailable(_)
     ));
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,
@@ -249,7 +255,7 @@ async fn answers_by_alias() {
     assert_eq!(status.job.job_id, family.job_id);
 
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
+        user_id: aruna_core::user::id::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
         realm_id: REALM,
         path_restrictions: None,
         session: None,
@@ -302,7 +308,7 @@ fn identity_is_deterministic() {
         destination_key: "reads.fastq".to_string(),
         source_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         version_id: Ulid::from_bytes([1u8; 16]),
-        content: aruna_core::structs::execution::job::InputContent::Blake3([2u8; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([2u8; 32]),
         bytes: 3,
         policies: Vec::new(),
         source_group_id: Default::default(),
@@ -460,7 +466,7 @@ fn refuses_reserved_tags() {
 #[tokio::test]
 async fn waits_for_pruning() {
     use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
-    use aruna_core::structs::execution::job::FamilyTombstone;
+    use aruna_core::structs::execution::job::prune::FamilyTombstone;
     use aruna_core::structs::execution::job::record_keys::family_prefix;
     let family = Family::new([5u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
@@ -498,8 +504,6 @@ async fn waits_for_pruning() {
 #[tokio::test]
 async fn replay_waits_pruning() {
     use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
-    use aruna_core::structs::execution::job::FamilyTombstone;
-    use aruna_core::structs::execution::job::record_keys::family_prefix;
     let family = Family::new([6u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let first = admit(&ctx, &family, family.job_id).await;

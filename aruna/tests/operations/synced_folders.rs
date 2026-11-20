@@ -2,55 +2,63 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::convergence::HANG_CAP;
 use crate::topology;
 
 use aruna_core::structs::storage::format::Compression;
 use std::time::SystemTime;
 
+use crate::convergence::wait_for_convergence;
 use aruna::tasks::incoming::folder_pass::{reconcile_folder, reconcile_folders};
-use aruna_core::UserId;
+use aruna_clock::testing::poll_until;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REPLICATION_OBLIGATION_KEYSPACE;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::origin::{UploadClient, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, ORIGIN_DEVICE_TAG,
     RemoteBinding, SyncBase, SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_operations::device::sync::ReconcileFolderError;
 use aruna_operations::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
+use aruna_operations::device::sync::folders::bind::{
+    bind_folder as reserve_folder, create_realm_bucket, finish_binding,
+};
+use aruna_operations::device::sync::folders::reads::{
+    list_entries, list_folders, list_transfers, read_bound,
+};
+use aruna_operations::device::sync::folders::unbind::unbind_folder;
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, RealmBucketInput, bind_folder as reserve_folder,
-    create_realm_bucket, finish_binding, list_entries, list_folders, list_transfers, read_bound,
-    set_folder_state, unbind_folder,
+    BindFolderInput, FolderError, RealmBucketInput, set_folder_state,
 };
 use aruna_operations::device::sync::outbox::{drain_sync_outbox, local_origin};
 use aruna_operations::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_operations::metadata::protocol::MetadataTransportMessage;
-use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, needs_view};
+use aruna_operations::metadata::serve::forwards::needs_view;
+use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::origin::ReadOriginOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::staging::offer::list::ListOffersOperation;
-use aruna_operations::staging::offered_directory::{
-    OfferDirectoryInput, OfferedDirectoryError, offer_directory,
-};
+use aruna_operations::staging::offer::run::offer_directory;
+use aruna_operations::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
+use aruna_operations::transfer::origin::ReadOriginOperation;
 use futures_util::StreamExt;
-use topology::{TestResult, Topology, hang_cap, wait_for_convergence, wait_until};
+use topology::{TestResult, Topology, wait_until};
 use ulid::Ulid;
 
 const MANAGEMENT_NODES: usize = 2;
@@ -60,10 +68,11 @@ const REMOTE_BUCKET: &str = "lab-data";
 
 /// Binds a folder as the device API does: reserves it, then confirms its realm bucket under the
 /// folder's pass scope.
+#[allow(clippy::result_large_err)]
 async fn bind_folder(
     context: &std::sync::Arc<DriverContext>,
     input: BindFolderInput,
-) -> Result<aruna_core::structs::SyncedFolder, FolderError> {
+) -> Result<aruna_core::structs::synced_folder::SyncedFolder, FolderError> {
     let folder_id = drive(reserve_folder(input), context).await?.folder_id;
     drive(finish_binding(folder_id), context).await
 }
@@ -280,7 +289,7 @@ async fn bind(
     realm: &Topology,
     root: &std::path::Path,
     group_id: GroupId,
-) -> TestResult<aruna_core::structs::SyncedFolder> {
+) -> TestResult<aruna_core::structs::synced_folder::SyncedFolder> {
     let device = realm.user_node();
     let server = realm.node(0);
     let folder = bind_folder(
@@ -390,7 +399,7 @@ async fn wakes_replication_drain() -> TestResult<()> {
 /// shell serves it.
 async fn served_pull(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     request: MetadataTransportMessage,
 ) -> SyncPullStatus {
     let view = needs_view(&request);
@@ -412,7 +421,7 @@ async fn served_pull(
 /// Starts pulling one device version of `peer` and answers at once.
 async fn accept_pull(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     auth_token: AuthToken,
     pull: SyncPull,
 ) -> SyncPullStatus {
@@ -424,7 +433,7 @@ async fn accept_pull(
 /// Where the pull of one device version of `peer` stands on this node.
 async fn pull_status(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     auth_token: AuthToken,
     pull: &SyncPull,
 ) -> SyncPullStatus {
@@ -436,23 +445,27 @@ async fn pull_status(
 /// Polls an accepted pull until the realm node answers for good.
 async fn pull_done(
     context: &std::sync::Arc<DriverContext>,
-    peer: aruna_core::NodeId,
+    peer: aruna_core::id::NodeId,
     token: &AuthToken,
     pull: &SyncPull,
-    mut status: SyncPullStatus,
+    status: SyncPullStatus,
 ) -> TestResult<SyncPullAck> {
-    hang_cap("a sync pull never finished", async {
-        loop {
-            match status {
-                SyncPullStatus::Done(ack) => return Ok(ack),
-                SyncPullStatus::Pending { .. } => {}
-                other => return Err(format!("the pull ended without a version: {other:?}").into()),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            status = pull_status(context, peer, token.clone(), pull).await;
+    let mut first = Some(status);
+    let ended = poll_until(HANG_CAP, async || {
+        let status = match first.take() {
+            Some(status) => status,
+            None => pull_status(context, peer, token.clone(), pull).await,
+        };
+        match status {
+            SyncPullStatus::Done(ack) => Some(Ok(ack)),
+            SyncPullStatus::Pending { .. } => None,
+            other => Some(Err(
+                format!("the pull ended without a version: {other:?}").into()
+            )),
         }
     })
-    .await
+    .await;
+    ended.unwrap_or_else(|| panic!("hang cap fired: `a sync pull never finished`"))
 }
 
 /// Two pulls of one device version released together run once, commit it once and answer

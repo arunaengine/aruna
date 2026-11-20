@@ -13,7 +13,7 @@ use crate::routes::git::location::StorageLocationRequest;
 use crate::routes::plugin_installs::{refuse_plugin_account, refuse_plugin_role};
 use crate::routes::storage::objects::object_page;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -23,9 +23,10 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeEitherOperation;
-use aruna_operations::device::realm_documents::install_group_docs;
+use aruna_operations::device_node::realm_documents::install_group_docs;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::git::GitError;
@@ -49,7 +50,6 @@ use aruna_operations::groups::update_group::{
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::stats::GroupPurposeOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
@@ -114,6 +114,13 @@ pub struct RoleResponse {
     pub public: bool,
 }
 
+/// A bucket and member whose key request could not be opened; granting again retries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct KeyRequestFailure {
+    pub bucket: String,
+    pub user_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreatedRoleResponse {
     #[serde(flatten)]
@@ -121,6 +128,12 @@ pub struct CreatedRoleResponse {
     /// Open scoped key request ids created for assigned users in encrypted buckets on this node.
     #[serde(default)]
     pub key_requests: Vec<String>,
+    /// False when a key request could not be opened; granting the role again retries it.
+    #[serde(default)]
+    pub key_requests_complete: bool,
+    /// The buckets and users whose key request could not be opened.
+    #[serde(default)]
+    pub key_requests_failed: Vec<KeyRequestFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -138,6 +151,12 @@ pub struct GroupRolesResponse {
     /// Open scoped key request ids created for the member in encrypted buckets on this node.
     #[serde(default)]
     pub key_requests: Vec<String>,
+    /// False when a key request could not be opened; adding the member again retries it.
+    #[serde(default)]
+    pub key_requests_complete: bool,
+    /// The buckets and users whose key request could not be opened.
+    #[serde(default)]
+    pub key_requests_failed: Vec<KeyRequestFailure>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
@@ -1048,7 +1067,7 @@ pub async fn delete_group(
     let token =
         forwarded_bearer(bearer.as_ref().map(|bearer| bearer.as_str())).map_err(map_api_error)?;
     let ctx = state.get_ctx();
-    let delete = aruna_operations::groups::deletion::DeleteGroupOperation::new(
+    let delete = aruna_operations::groups::deletion::coordinator::DeleteGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         token,
@@ -1164,7 +1183,7 @@ pub async fn get_deletion_blockers(
     }
     let group_id = parse_group_id(&group_id)?;
     let ctx = state.get_ctx();
-    let check = aruna_operations::groups::deletion::CheckGroupOperation::new(
+    let check = aruna_operations::groups::deletion::check::CheckGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         group_id,
@@ -1355,7 +1374,7 @@ pub(crate) async fn run_group_usage(
     let local = crate::routes::info::load_usage_counters(state, usage_group_key(group_id)).await?;
     let realm = crate::routes::info::load_realm_usage(
         state,
-        aruna_operations::node::realm_usage::RealmUsageScope::Group(group_id),
+        aruna_operations::s3::realm_usage::RealmUsageScope::Group(group_id),
     )
     .await?;
 
@@ -1548,7 +1567,8 @@ administrative path for the user being added, so authority can be granted per me
   is rejected when that role is missing or ambiguous.
 - Adding a user who already holds the roles is accepted and changes nothing.
 - `key_requests` lists open scoped key requests for the member in encrypted buckets on this node;
-  holders are notified when the caller holds no bucket key.
+  holders are notified when the caller holds no bucket key. `key_requests_complete` is false when
+  a request could not be opened; the member is added anyway, and adding again retries it.
 - The change commits here and reaches the rest of the realm through document sync."#,
     request_body(
         content = AddMemberRequest,
@@ -1578,7 +1598,9 @@ administrative path for the user being added, so authority can be granted per me
                         "public": false
                     }
                 ],
-                "key_requests": ["01JABCDEF0123456789ABCDEFG"]
+                "key_requests": ["01JABCDEF0123456789ABCDEFG"],
+                "key_requests_complete": true,
+                "key_requests_failed": []
             })
         ),
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
@@ -1647,14 +1669,17 @@ pub async fn add_group_member(
     .await
     .map_err(map_member_error)?;
     let members = vec![user_id];
-    let key_requests =
-        crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
+    let keys =
+        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
+            .await;
 
     Ok((
         StatusCode::CREATED,
         Json(GroupRolesResponse {
             roles: map_roles(auth_doc, state.get_realm_id()),
-            key_requests,
+            key_requests: keys.opened,
+            key_requests_complete: keys.complete,
+            key_requests_failed: keys.failed,
         }),
     ))
 }
@@ -1734,7 +1759,7 @@ pub async fn remove_group_member(
     )
     .await
     .map_err(map_removal_error)?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1785,7 +1810,7 @@ pub async fn leave_group(
     )
     .await
     .map_err(map_removal_error)?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1805,7 +1830,8 @@ administrative path.
   reported capitalised.
 - The role commits here and reaches the rest of the realm through document sync.
 - `key_requests` lists open scoped key requests for assigned users in encrypted buckets on this
-  node; holders are notified when the caller holds no bucket key.
+  node; holders are notified when the caller holds no bucket key. `key_requests_complete` is
+  false when a request could not be opened; the role is created anyway.
 
 **Limits**
 - The name is trimmed, must not be empty, and must not be `admin` or `user`, which are reserved for
@@ -1844,7 +1870,9 @@ administrative path.
                     "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
                 ],
                 "public": false,
-                "key_requests": ["01JABCDEF0123456789ABCDEFG"]
+                "key_requests": ["01JABCDEF0123456789ABCDEFG"],
+                "key_requests_complete": true,
+                "key_requests_failed": []
             })
         ),
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than `READ`", body = ErrorResponse),
@@ -1941,12 +1969,18 @@ pub async fn create_group_role(
 
     // A DENY rule can narrow existing READ scopes.
     if narrows {
-        crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+        crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
     }
     let members = assigned_users.into_iter().collect();
-    let key_requests =
-        crate::routes::storage::abe::member_requests(&state, &auth, group_id, members).await;
-    let role = CreatedRoleResponse { role, key_requests };
+    let keys =
+        crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
+            .await;
+    let role = CreatedRoleResponse {
+        role,
+        key_requests: keys.opened,
+        key_requests_complete: keys.complete,
+        key_requests_failed: keys.failed,
+    };
     Ok((StatusCode::CREATED, Json(role)))
 }
 
@@ -2018,7 +2052,7 @@ pub async fn delete_group_role(
         }
         other => ServerError::InternalError(other.into()),
     })?;
-    crate::routes::storage::abe::epoch_due(&state, &auth, Some(group_id)).await;
+    crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

@@ -3,25 +3,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::plugin_host::read_config;
 use aruna_drivers::driver::drive;
-use aruna_operations::plugins::calls::*;
+use aruna_operations::plugins::marks::SweepMarks;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aruna_core::structs::checksum::ChecksumAlgorithm;
-use aruna_core::structs::execution::job::{JobErrorKind, PluginWorkAction};
+use aruna_core::structs::execution::job::input::PluginWorkAction;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::json;
 
 use super::*;
 use crate::plugin_host::plugin_work::run_plugin_work;
 use aruna_drivers::driver::DriverContext;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::job_context;
+use aruna_drivers::testing::{seed_bucket, with_blob};
 use aruna_operations::plugins::work::{Identity, RequestContext, WorkKind, reserve};
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
-use aruna_operations::testing_objects::{seed_bucket, with_blob};
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::job_context;
 
 const BODY: &[u8] = b"ACGTACGT";
 
@@ -49,14 +51,12 @@ async fn server(status: u16) -> (String, Arc<AtomicUsize>) {
 async fn downloader(fixture: &Fixture) -> PluginInstall {
     let download = json!({ "permissions": { "required": ["transfers.download"] } });
     let digest = fixture.publish("0.2.0", "cd", download).await;
-    let mut request = fixture.request(None);
-    request.version = Some(digest);
     let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
-    request.grants = std::collections::BTreeMap::from([
+    let grants = std::collections::BTreeMap::from([
         ("read".into(), vec![data.clone()]),
         ("write".into(), vec![data]),
     ]);
-    fixture.install(&request).await.unwrap()
+    fixture.install_with(Some(digest), grants).await
 }
 
 /// A recorded download of `install` from `base` into `in/reads.fq`, and the spec of its job.
@@ -273,7 +273,7 @@ async fn ungranted_target() {
     let ctx = job_context(&blob, &fixture);
     let (base, hits) = server(200).await;
     let (_, spec) = recorded(&fixture, &install, &base, (Vec::new(), None)).await;
-    aruna_operations::plugins::test_support::edit_config(&fixture, |config| {
+    aruna_test_support::plugins::edit_config(&fixture, |config| {
         config.installs[0].grants.insert("write".into(), Vec::new());
     })
     .await;
@@ -287,9 +287,7 @@ async fn narrowed_rule() {
     // A secret whose rule shows the status only would hide what the bucket keeps, so the work
     // ends after the release and before any request.
     use aruna_core::secrets::ResponseExposure;
-    use aruna_operations::plugins::test_support::{
-        ORIGIN, TOKEN, bound, edit_config, hold_keys, secret_with,
-    };
+    use aruna_test_support::plugins::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret_with};
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     let data = format!("/{}/g/{}/data/**", fixture.actor.realm_id, fixture.group_id);
@@ -344,7 +342,7 @@ async fn sweep_during_download() {
     let ctx = job_context(&blob, &fixture);
     let sweep = async {
         gate.arrived.notified().await;
-        let swept = sweep_marks(&blob).await;
+        let swept = drive(SweepMarks::new(), &blob).await;
         gate.release.notify_one();
         swept
     };
@@ -354,7 +352,11 @@ async fn sweep_during_download() {
         panic!("the held download did not succeed");
     };
     assert_eq!(version_id, row.version_id);
-    assert_eq!(sweep_marks(&blob).await, Ok(0), "the version exists");
+    assert_eq!(
+        drive(SweepMarks::new(), &blob).await,
+        Ok(0),
+        "the version exists"
+    );
     assert!(drive(is_marked(version).unwrap(), &blob).await.unwrap());
     assert_eq!(stored(&blob, &fixture, &install).await, BODY);
 }

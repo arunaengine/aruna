@@ -9,7 +9,7 @@ use aruna_core::structs::placement::coverage::CoverageCount;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::drive;
-use aruna_operations::s3::policy::count::{
+use aruna_operations::blob::migration::count::{
     ReadCountOperation, StartCountError, StartCountOperation,
 };
 use axum::extract::{Path, State};

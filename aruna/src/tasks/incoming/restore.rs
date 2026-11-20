@@ -2,17 +2,52 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::drained::remove_drained_backends;
 use super::*;
-use crate::tasks::runner::{claim_producer, spawn_job};
+use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use aruna_drivers::driver::node_routing;
 use aruna_operations::federation::registration::PublishRegistrationOperation;
-use aruna_operations::jobs::records::prune::{FamilyTimerOperation, PruneFamiliesOperation};
-use aruna_operations::node::catch_up::{
-    CATCH_UP_REFRESH, CatchUpOperation, catch_up_timer, next_pass,
-};
+use aruna_operations::jobs::records::prune::pass::ArmFamiliesOperation;
+use aruna_operations::node::catch_up::catch_up_timer;
 use std::time::SystemTime;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The first and the longest wait before an incomplete timer restoration resumes.
+const TIMER_RESUME_FIRST: Duration = Duration::from_secs(1);
+const TIMER_RESUME_MOST: Duration = Duration::from_secs(60);
+
+/// Resumes an incomplete timer restoration from where it stopped until every persisted timer is
+/// armed, so a durable retry on a later page does not stay dormant for the process lifetime.
+fn spawn_timer_resume(
+    context: &Arc<DriverContext>,
+    task_handle: &TaskHandle,
+    shutdown: &Shutdown,
+    mut resume_after: Option<byteview::ByteView>,
+) {
+    let (context, task_handle) = (Arc::downgrade(context), task_handle.clone());
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
+        let mut wait = TIMER_RESUME_FIRST;
+        loop {
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+            let Some(context) = context.upgrade() else {
+                return;
+            };
+            let storage = &context.storage_handle;
+            match restore_task_timers(storage, &task_handle, resume_after.take()).await {
+                Ok(()) => return,
+                Err(stopped) => {
+                    error!(error = %stopped.error, "Persisted task timers are still not restored");
+                    resume_after = stopped.resume_after;
+                    wait = wait.saturating_mul(2).min(TIMER_RESUME_MOST);
+                }
+            }
+        }
+    });
+}
 
 fn spawn_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle, shutdown: &Shutdown) {
     if tokio::runtime::Handle::try_current().is_err() {
@@ -146,16 +181,6 @@ async fn restore_notification_prune(context: &DriverContext, task_handle: &TaskH
     }
 }
 
-// A batch that processed nothing is blocked behind jobs that are not due yet, so
-// it backs off instead of rescanning the same head at batch pace.
-pub(super) fn drain_delay(result: &MetadataDrainResult) -> Duration {
-    if result.processed == 0 {
-        MATERIALIZATION_RETRY_AFTER
-    } else {
-        NEXT_BATCH_AFTER
-    }
-}
-
 // Parked materialization jobs come back on their own backoff, so a node that hit
 // the failure cap during a storm converges again without an operator or restart.
 async fn sweep_dead_letters(context: &DriverContext) {
@@ -234,12 +259,6 @@ async fn install_task_handler(
     refresh_holders: bool,
 ) -> TaskQueues {
     let handler_context = context.clone();
-    if context.compute_handle.is_some() {
-        jobs_runtime.set_reconciler(crate::tasks::runner::ComputeReconciler::new(
-            context.clone(),
-            Arc::downgrade(&jobs_runtime),
-        ));
-    }
     let handler = Arc::new(
         OperationsTaskHandler::new(handler_context, jobs_runtime.clone())
             .with_rocrate_limits(rocrate_limits)
@@ -290,7 +309,11 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_task_timers(&context.storage_handle, &task_handle).await;
+        let restored = restore_task_timers(&context.storage_handle, &task_handle, None).await;
+        if let Err(incomplete) = restored {
+            warn!(error = %incomplete.error, "Persisted task timers not fully restored; resuming");
+            spawn_timer_resume(&context, &task_handle, shutdown, incomplete.resume_after);
+        }
         if stopped() {
             return;
         }
@@ -306,7 +329,7 @@ impl TaskQueues {
         // holder would hand back.
         if context.graph_handle.is_some() {
             drive(
-                aruna_operations::device::edit::replay_queued_edits(),
+                aruna_operations::metadata::device::edit::replay_queued_edits(),
                 &context,
             )
             .await
@@ -384,6 +407,18 @@ impl TaskQueues {
         if stopped() {
             return;
         }
+        // Watch events queued before a restart leave once the drain runs.
+        handler
+            .reschedule_timer(TaskKey::DrainWatchEvents, Duration::ZERO)
+            .await;
+        // Follow-ups of shard reconciles applied before a restart run once the drain does.
+        handler
+            .reschedule_timer(TaskKey::DrainAppliedSync, Duration::ZERO)
+            .await;
+        // Git snapshots whose capture marks outlived a restart are taken once the drain runs.
+        handler
+            .reschedule_timer(TaskKey::DrainCaptures, Duration::ZERO)
+            .await;
         if context.blob_handle.is_some() {
             let arm = ArmSweepOperation::new(TaskKey::SweepHiddenBlobs);
             if let Err(error) = drive(arm, &context).await {
@@ -406,9 +441,7 @@ impl TaskQueues {
                 .reschedule_timer(TaskKey::MigrateCompression, Duration::ZERO)
                 .await;
             // The run computes every rule's next due time and re-arms itself.
-            handler
-                .reschedule_timer(TaskKey::RunBackendImports, Duration::ZERO)
-                .await;
+            handler.arm_backend_imports().await;
             // Each pass re-arms itself; a node without distributed buckets finds no accounts.
             handler
                 .reschedule_timer(TaskKey::MaintainRanges, Duration::ZERO)
@@ -423,62 +456,6 @@ impl TaskQueues {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn publish_usage_snapshots(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(task_id = ?TaskKey::PublishUsageSnapshots, "Cannot publish usage snapshots without net handle");
-            return;
-        };
-        let node_id = net_handle.node_id();
-        let realm_id = *net_handle.realm_id();
-        let publish = aruna_operations::node::usage_publish::PublishUsageOperation::new(
-            (node_id, realm_id),
-            Some(realm_id),
-            false,
-            true,
-        );
-        match drive(publish, &self.context).await {
-            Ok(_) => {}
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
-                self.reschedule_timer(
-                    TaskKey::PublishUsageSnapshots,
-                    aruna_operations::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE,
-                )
-                .await;
-            }
-        }
-    }
-
-    pub(super) async fn publish_node_info(&self) {
-        if let Some(net_handle) = self.context.net_handle.as_ref() {
-            let node_id = net_handle.node_id();
-            let realm_id = *net_handle.realm_id();
-            let sequence = self
-                .heartbeat_sequence
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            let refresh = aruna_operations::node::info::flows::RefreshInfoOperation::new(
-                realm_id,
-                node_id,
-                sequence,
-                Some(self.jobs_runtime.running_jobs()),
-                node_facts(&self.context),
-            );
-            if let Err(error) = drive(refresh, &self.context).await {
-                warn!(task_id = ?TaskKey::PublishNodeInfo, error = %error, "Failed to publish node info heartbeat");
-            }
-        } else {
-            warn!(task_id = ?TaskKey::PublishNodeInfo, "Cannot publish node info without net handle");
-        }
-        // Periodic heartbeat: always re-arm for the next interval regardless of
-        // outcome so a transient failure never stops the heartbeat.
-        self.reschedule_timer(
-            TaskKey::PublishNodeInfo,
-            aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
-        )
-        .await;
-    }
-
     pub(super) async fn publish_registration(&self) {
         let key = TaskKey::PublishRegistration;
         match (self.context.net_handle.as_ref(), &self.node_capabilities) {
@@ -494,202 +471,9 @@ impl OperationsTaskHandler {
             }
             _ => warn!(task_id = ?key, "Cannot publish registration without net handle or keys"),
         }
-        self.reschedule_timer(key, aruna_core::federation::PUBLISH_INTERVAL)
+        // The fired row is gone, so a refused rearm keeps a live renewal that stores it again.
+        self.keep_retrying(key, aruna_core::federation::PUBLISH_INTERVAL)
             .await;
-    }
-
-    pub(super) async fn drain_materialization_queue(&self) {
-        let bulk = self.context.bulk();
-        let node = aruna_operations::git::GitNode {
-            ids: bulk.node_and_realm(),
-            routing: node_routing(&bulk),
-        };
-        let concurrency = materialization_group_concurrency();
-        let batch =
-            MaterializationBatchOperation::new(node, concurrency, bulk.task_handle.is_some());
-        match drive(batch, &bulk).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainMaterializationQueue, drain_delay(&result))
-                    .await;
-            }
-            Ok(result) if result.next_due_after.is_some() => {
-                self.reschedule_timer(
-                    TaskKey::DrainMaterializationQueue,
-                    result.next_due_after.unwrap_or(MATERIALIZATION_POLL_AFTER),
-                )
-                .await;
-            }
-            Ok(_) => match drive(JobsExistOperation::new(), &bulk).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    self.reschedule_timer(
-                        TaskKey::DrainMaterializationQueue,
-                        MATERIALIZATION_POLL_AFTER,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainMaterializationQueue, error = ?error, "Failed to probe metadata materialization jobs");
-                    self.reschedule_timer(
-                        TaskKey::DrainMaterializationQueue,
-                        MATERIALIZATION_RETRY_AFTER,
-                    )
-                    .await;
-                }
-            },
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainMaterializationQueue, error = ?error, "Failed to drain metadata materialization queue");
-                self.reschedule_timer(
-                    TaskKey::DrainMaterializationQueue,
-                    MATERIALIZATION_RETRY_AFTER,
-                )
-                .await;
-            }
-        }
-    }
-
-    pub(super) async fn drain_graph_queue(&self) {
-        let bulk = self.context.bulk();
-        match drive(PruneBatchOperation::new(bulk.node_scope()), &bulk).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainPruneQueue, std::time::Duration::ZERO)
-                    .await;
-            }
-            Ok(result) if result.next_due_after.is_some() => {
-                self.reschedule_timer(
-                    TaskKey::DrainPruneQueue,
-                    result.next_due_after.unwrap_or(GRAPH_POLL_AFTER),
-                )
-                .await;
-            }
-            Ok(_) => match drive(jobs_queued(), &bulk)
-                .await
-                .map(|due| !due.jobs.is_empty())
-            {
-                Ok(false) => {}
-                Ok(true) => {
-                    self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
-                        .await;
-                }
-                Err(error) => {
-                    warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to probe metadata graph prune jobs");
-                    self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_RETRY_AFTER)
-                        .await;
-                }
-            },
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainPruneQueue, error = ?error, "Failed to drain metadata graph prune queue");
-                self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
-}
-
-impl OperationsTaskHandler {
-    pub(super) async fn drain_projection_queue(&self) {
-        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
-        let drain = DrainProjectionOperation::new(local_node);
-        match drive(drain, &self.context).await {
-            Ok(result) if result.has_more => {
-                self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)
-                    .await;
-            }
-            Ok(result) if result.markers_examined == 0 => {
-                if let Err(error) = replay_event_log(&self.context).await {
-                    warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to replay metadata event log fallback");
-                    self.reschedule_timer(TaskKey::DrainProjectionQueue, PROJECTION_RETRY_AFTER)
-                        .await;
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to drain metadata projection queue");
-                self.reschedule_timer(TaskKey::DrainProjectionQueue, PROJECTION_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
-
-    pub(super) async fn drain_replication_queue(&self) {
-        // A failed drain leaves the cursors where they were.
-        let cursors = (self.catch_up.lock())
-            .map(|cursors| cursors.clone())
-            .unwrap_or_default();
-        let drain = ProcessBatchOperation::new(
-            MetadataPages,
-            node_routing(&self.context),
-            self.context.node_and_realm(),
-        )
-        .with_catch_up(cursors);
-        let drained = drive(drain, &self.context).await;
-        if let (Ok(result), Ok(mut cursors)) = (drained.as_ref(), self.catch_up.lock()) {
-            *cursors = result.catch_up.clone();
-        }
-        match drained {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainReplicationQueue, Duration::ZERO)
-                    .await;
-            }
-            Ok(result) => {
-                if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainReplicationQueue, after)
-                        .await;
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainReplicationQueue, error = ?error, "Failed to drain blob replication queue");
-                self.reschedule_timer(TaskKey::DrainReplicationQueue, REPLICATION_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
-
-    pub(super) async fn drain_mirror_repair(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
-                .await;
-            return;
-        };
-        let drain = DrainRepairsOperation::new(net_handle.node_id());
-        match drive(drain, self.context.as_ref()).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainMirrorRepair, Duration::ZERO)
-                    .await;
-            }
-            Ok(result) => {
-                if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainMirrorRepair, after)
-                        .await;
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainMirrorRepair, %error, "Failed to drain sync mirror repair queue");
-                self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
-
-    pub(super) async fn drain_refresh_queue(&self) {
-        let drain = aruna_operations::s3::object::metadata_drain::DrainRefreshOperation::new();
-        match drive(drain, &self.context).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainRefreshQueue, Duration::ZERO)
-                    .await;
-            }
-            Ok(result) => {
-                if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainRefreshQueue, after)
-                        .await;
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainRefreshQueue, error = ?error, "Failed to drain reference metadata refresh queue");
-                self.reschedule_timer(TaskKey::DrainRefreshQueue, REFRESH_RETRY_AFTER)
-                    .await;
-            }
-        }
     }
 }
 
@@ -708,73 +492,6 @@ impl OperationsTaskHandler {
         };
         if let Some(after) = after {
             self.reschedule_timer(TaskKey::DrainLinkQueue, after).await;
-        }
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Runs every witness round whose persisted deadline has elapsed.
-    pub(super) async fn drain_witness_queue(&self) {
-        let now_ms = unix_timestamp_millis();
-        let context = self.context.as_ref();
-        let drain = WitnessDrainOperation::new(
-            witness_node(
-                context.node_and_realm(),
-                context.fresh_heartbeats(),
-                context.compute_limits(),
-            ),
-            now_ms,
-        );
-        let remaining = drive(drain, context).await.unwrap_or_else(|error| {
-            warn!(error = %error, "Witness deadline scan failed");
-            true
-        });
-        if remaining {
-            self.reschedule_timer(TaskKey::DrainWitnessQueue, WITNESS_RETRY_AFTER)
-                .await;
-        }
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Retries the terminal publications receipted executions still owe. The
-    /// reservation row keeps the obligation durable, so the retry re-arms until
-    /// every one of them is published and its capacity released.
-    pub(super) async fn settle_job_terminals(&self) {
-        let context = self.context.as_ref();
-        let settle =
-            SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
-        let pending = match drive(settle, context).await {
-            Ok(pending) => pending,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::SettleJobTerminals, error = %error, "Failed to settle terminal job publications");
-                true
-            }
-        };
-        if pending {
-            self.reschedule_timer(TaskKey::SettleJobTerminals, SETTLE_RETRY_AFTER)
-                .await;
-        }
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Replicates locally published job-family records to the other holders.
-    /// The pass is bounded, so a large backlog re-arms instead of blocking.
-    pub(super) async fn drain_family_outbox(&self) {
-        let Some(net) = self.context.net_handle.as_ref() else {
-            return;
-        };
-        let drain = DrainOutboxOperation::new(*net.realm_id(), net.node_id());
-        let remaining = drive(drain, self.context.as_ref())
-            .await
-            .unwrap_or_else(|error| {
-                warn!(error = %error, "Job family outbox drain failed");
-                true
-            });
-        if remaining {
-            self.reschedule_timer(TaskKey::DrainFamilyOutbox, OUTBOX_RETRY_AFTER)
-                .await;
         }
     }
 }
@@ -815,13 +532,8 @@ impl OperationsTaskHandler {
             }
         };
 
-        // A node without a reconciler leaves the attempt alone: it cannot observe the container.
-        if let Some(reconciler) = self.jobs_runtime.reconciler() {
-            for record in std::mem::take(&mut result.lost_attempts) {
-                reconciler
-                    .reconcile_lost_attempt(self.context.as_ref(), record)
-                    .await;
-            }
+        for record in std::mem::take(&mut result.lost_attempts) {
+            reconcile_lost_attempt(&self.jobs_runtime, self.context.as_ref(), record).await;
         }
 
         for record in result.claimed {
@@ -870,129 +582,26 @@ impl OperationsTaskHandler {
         }
     }
 
-    pub(super) async fn prune_jobs(&self) {
-        let handlers = self.jobs_runtime.handlers();
-        let after = match prune_job_page(&self.context, &handlers).await {
-            Ok(outcome) if outcome.has_more => Duration::ZERO,
-            Ok(outcome) => outcome
-                .next_due_after
-                .unwrap_or(PRUNE_POLL_AFTER)
-                .min(PRUNE_POLL_AFTER),
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PruneJobs, error = %error, "Failed to prune jobs");
-                PRUNE_RETRY_AFTER
-            }
-        };
-        self.reschedule_timer(TaskKey::PruneJobs, after).await;
-    }
-
-    pub(super) async fn prune_families(&self) {
-        let serving = self.context.node_and_realm();
-        let pass = PruneFamiliesOperation::new(serving);
-        let after = match drive(pass, &self.context).await {
-            Ok(outcome) if outcome.has_more => Duration::ZERO,
-            Ok(outcome) => (outcome.next_due_after)
-                .unwrap_or(PRUNE_POLL_AFTER)
-                .min(PRUNE_POLL_AFTER),
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PruneFamilies, error = %error, "Failed to prune job families");
-                PRUNE_RETRY_AFTER
-            }
-        };
-        self.reschedule_timer(TaskKey::PruneFamilies, after).await;
-    }
-
-    /// One realm config catch-up pass; a node without a network refreshes nothing.
-    pub(super) async fn catch_up(&self) {
-        let after = match self.context.node_and_realm() {
-            Some((local, realm_id)) => {
-                let pass = drive(CatchUpOperation::new(local, realm_id), &self.context).await;
-                next_pass(&pass)
-            }
-            None => CATCH_UP_REFRESH,
-        };
-        self.reschedule_timer(TaskKey::ConfigCatchUp, after).await;
-    }
-
-    pub(super) async fn drain_blob_cleanup(&self) {
-        let node = CleanupNode {
-            routing: node_routing(&self.context),
-            has_blob: self.context.blob_handle.is_some(),
-        };
-        let after = match drive(ProcessCleanupOperation::new(node), &self.context).await {
-            Ok(outcome) if outcome.failed > 0 => BLOB_CLEANUP_RETRY,
-            Ok(outcome) if outcome.more => std::time::Duration::from_secs(1),
-            Ok(_) => BLOB_CLEANUP_AFTER,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to drain blob cleanup");
-                BLOB_CLEANUP_RETRY
-            }
-        };
-        // The parts a reclaimed upload frees become cleanup rows, so the sweep
-        // rides the same timer that drains them.
-        let sweep = SweepUploadsOperation::new(unix_timestamp_millis());
-        if let Err(error) = drive(sweep, &self.context).await {
-            warn!(task_id = ?TaskKey::DrainCleanupQueue, error = %error, "Failed to sweep stale multipart uploads");
-        }
-        self.reschedule_timer(TaskKey::DrainCleanupQueue, after)
-            .await;
-    }
-
-    fn reclaim_sweep(&self) -> ReclaimSweepOperation {
-        let catalog = node_routing(&self.context).catalog;
-        ReclaimSweepOperation::new(catalog, SystemTime::now(), self.reclaim_start())
-    }
-
     pub(super) async fn drain_blob_reclaim(&self) {
         let key = TaskKey::DrainReclaimQueue;
-        // A failed candidate earns the fast retry, then doubles up to the normal interval, so a permanently
-        // failing one cannot hold a one-minute rescan of the whole queue forever.
-        let (after, drained) = match drive(self.reclaim_sweep(), &self.context).await {
-            Ok(outcome) => {
-                self.set_reclaim_start(outcome.next_start_after);
-                match (outcome.capped, outcome.failed) {
-                    (true, _) => {
-                        self.reset_backoff(&key);
-                        (RECLAIM_SWEEP_RETRY, false)
-                    }
-                    (false, 0) => {
-                        self.reset_backoff(&key);
-                        (RECLAIM_SWEEP_AFTER, true)
-                    }
-                    (false, _) => (
-                        self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                        true,
-                    ),
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
-                (
-                    self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                    false,
-                )
-            }
-        };
+        let memory = self.kept_memory(&key);
+        let catalog = node_routing(&self.context).catalog;
+        let start = memory.cursor.clone().map(Key::from);
+        let sweep = ReclaimSweepOperation::new(catalog, SystemTime::now(), start);
+        let outcome = drive(sweep, &self.context).await;
+        if let Err(error) = &outcome {
+            warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
+        }
+        let (plan, drained) = reclaim_plan(outcome.as_ref().ok(), &memory);
+        self.keep_memory(&key, plan.memory);
         // Removal walks whole keyspaces too, so it only rides a sweep that
         // reached the end of the queue, never the fast retries behind a backlog.
         if drained && let Err(error) = remove_drained_backends(&self.context).await {
             warn!(error = %error, "Failed to remove drained storage backends");
         }
-        self.reschedule_timer(key, after).await;
-    }
-
-    pub(super) async fn sweep_hidden_blobs(&self) {
-        let sweep = ProcessHiddenOperation::new(unix_timestamp_millis());
-        let after = match drive(sweep, &self.context).await {
-            Ok(outcome) if outcome.cleanup_pending => HIDDEN_SWEEP_RETRY,
-            Ok(_) => HIDDEN_SWEEP_AFTER,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::SweepHiddenBlobs, error = %error, "Failed to sweep hidden blobs");
-                HIDDEN_SWEEP_RETRY
-            }
-        };
-        self.reschedule_timer(TaskKey::SweepHiddenBlobs, after)
-            .await;
+        if let Some(after) = plan.after {
+            self.reschedule_timer(key, after).await;
+        }
     }
 }
 
@@ -1032,25 +641,25 @@ async fn restore_info_timer(task_handle: &TaskHandle) {
 /// Arms the registration timer at startup without postponing a restored due time. The due
 /// time is persisted, so repeated restarts do not keep moving the first publication.
 async fn restore_registration_timer(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     task_handle: &TaskHandle,
 ) {
     let effect = TaskEffect::ShortenTimer {
         key: TaskKey::PublishRegistration,
         after: aruna_core::federation::PUBLISH_INTERVAL,
     };
-    if let Err(message) = persist_task_effect(storage, &effect).await {
-        warn!(message = %message, "Failed to persist registry publication timer");
-    }
     if let Event::Task(TaskEvent::Error { message, .. }) =
-        task_handle.send_effect(Effect::Task(effect)).await
+        change_timer(storage, Some(task_handle), effect, true).await
     {
         warn!(message = %message, "Failed to arm registry publication timer");
     }
 }
 
 /// Re-arms the debounced publish task when dirty markers survived a restart.
-async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle: &TaskHandle) {
+async fn restore_usage_timer(
+    storage: &aruna_storage::storage::handle::StorageHandle,
+    task_handle: &TaskHandle,
+) {
     let has_markers = match storage
         .send_storage_effect(aruna_core::effects::StorageEffect::Iter {
             key_space: aruna_core::keyspaces::NODE_STATS_KEYSPACE.to_string(),
@@ -1085,6 +694,23 @@ async fn restore_usage_timer(storage: &aruna_storage::StorageHandle, task_handle
     }
 }
 
+async fn arm_drain_timer(context: &DriverContext) {
+    let timer = DrainTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job drain timer");
+    }
+}
+
+async fn arm_prune_timer(context: &DriverContext) {
+    let timer = PruneTimerOperation::new(unix_timestamp_millis());
+    if let Err(error) = drive(timer, context).await {
+        warn!(error = %error, "Failed to restore job prune timer");
+    }
+    if let Err(error) = drive(ArmFamiliesOperation::new(), context).await {
+        warn!(error = %error, "Failed to restore the family prune timer");
+    }
+}
+
 /// Arms the first realm config catch-up pass of this start.
 async fn arm_catch_up(task_handle: &TaskHandle) {
     if let Event::Task(TaskEvent::Error { message, .. }) =
@@ -1097,7 +723,8 @@ async fn arm_catch_up(task_handle: &TaskHandle) {
 #[cfg(test)]
 mod stop_tests {
     use super::*;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::task_timers::persist_task_effect;
     use tempfile::tempdir;
 
     async fn restore_queues() -> (tempfile::TempDir, TaskHandle, TaskQueues, Shutdown) {
@@ -1196,43 +823,5 @@ mod stop_tests {
             "the later restore unit must not run after the stop"
         );
         drop(temp);
-    }
-}
-
-/// One prune pass; the payload handlers decide first which due jobs stay for now.
-async fn prune_job_page(
-    context: &DriverContext,
-    handlers: &[Arc<dyn PayloadHandler>],
-) -> Result<JobPruneOutcome, String> {
-    let now_ms = unix_timestamp_millis();
-    let due = drive(PruneDueOperation::new(now_ms, JOB_PRUNE_PAGE), context)
-        .await
-        .map_err(|error| error.0)?;
-    let mut kept = BTreeSet::new();
-    for (job_id, payload) in due {
-        for handler in handlers {
-            if handler.keeps_job(context, &payload).await? {
-                kept.insert(job_id);
-            }
-        }
-    }
-    let prune = PruneJobsOperation::new(now_ms, JOB_PRUNE_PAGE, kept);
-    drive(prune, context).await.map_err(|error| error.0)
-}
-
-async fn arm_drain_timer(context: &DriverContext) {
-    let timer = DrainTimerOperation::new(unix_timestamp_millis());
-    if let Err(error) = drive(timer, context).await {
-        warn!(error = %error, "Failed to restore job drain timer");
-    }
-}
-
-async fn arm_prune_timer(context: &DriverContext) {
-    let timer = PruneTimerOperation::new(unix_timestamp_millis());
-    if let Err(error) = drive(timer, context).await {
-        warn!(error = %error, "Failed to restore job prune timer");
-    }
-    if let Err(error) = drive(FamilyTimerOperation::new(), context).await {
-        warn!(error = %error, "Failed to restore the family prune timer");
     }
 }

@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime};
 use crate::blob_node::{seed_config, write_value};
 use crate::metadata_calls::route_metadata_delete;
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{Event, StorageEvent};
@@ -22,7 +21,9 @@ use aruna_core::structs::execution::harvest::{
     HarvestJobSpec, HarvestProvenance, HarvestRecordState, HarvestSelector, HarvestSource,
     RepositoryConnector, RepositoryConnectorKind,
 };
-use aruna_core::structs::execution::job::{JobError, JobErrorKind, JobProgress, JobResultPayload};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobErrorKind, JobProgress, JobResultPayload,
+};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
@@ -30,20 +31,24 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig};
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_operations::connectors::harvest_rows::connector_writes;
 use aruna_operations::harvest::repository::{
-    connector_writes, parse_provenance_read, parse_source_read, read_provenance_effect,
-    read_source_effect, write_source_effect,
+    parse_provenance_read, parse_source_read, read_provenance_effect, read_source_effect,
+    write_source_effect,
 };
 use aruna_operations::jobs::harvest::{HarvestJobOperation, harvest_outcome};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::testing::fresh_job_id;
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::replay_event_log;
 use axum::Router;
 use axum::extract::Query;
 use axum::routing::get;
@@ -91,7 +96,6 @@ impl Fixture {
             shutdown: shutdown.clone(),
             progress: ProgressReporter::from_progress(&JobProgress::new("records")),
             range_turns: Default::default(),
-            handlers: Default::default(),
         };
         (ctx, cancel, shutdown)
     }

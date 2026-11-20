@@ -5,9 +5,9 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::PENDING_PROJECTION_KEYSPACE;
 use aruna_core::metadata::AuthToken;
@@ -15,13 +15,12 @@ use aruna_core::operation::Operation;
 use aruna_core::repository::remote::{
     NodeScope, RemoteAnswer, RemoteCall, RemoteFailure, StopReason,
 };
-use aruna_core::rows::{event, page};
 use aruna_core::structs::execution::harvest::{
     HarvestCursor, HarvestJobSpec, HarvestProvenance, HarvestRecordState, HarvestSource,
     IncomingRecord, ProvenanceDecision, RepositoryConnector, RepositoryConnectorKind,
     provenance_decision,
 };
-use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -34,32 +33,33 @@ use ulid::Ulid;
 use super::repository::link_store::time_of;
 use super::repository::{JobScope, remote_answer, remote_call};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
-use crate::auth::request_policy::PolicyRequestExtras;
+use crate::connectors::harvest_rows::{parse_connector_read, read_connector_effect};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::authorize::{AuthorizeCreateOperation, CreateScope};
-use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;
 use crate::harvest::oai_pmh::parse::{
     OaiPage, OaiParseError, OaiRecord, parse_datestamp_ms, parse_granularity, parse_list_page,
 };
 use crate::harvest::oai_pmh::request::{format_window, identify_url, list_records_url};
 use crate::harvest::repository::{
-    StorageReadError, parse_connector_read, parse_provenance_read, parse_source_read,
-    read_connector_effect, read_provenance_effect, read_source_effect, write_provenance_effect,
-    write_source_effect,
+    parse_provenance_read, parse_source_read, read_provenance_effect, read_source_effect,
+    write_provenance_effect, write_source_effect,
 };
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    CreateDocumentResult, mint_document_for,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
+    mint_document_for,
 };
 use crate::metadata::forward::route_create::RouteCreateOperation;
 use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use crate::metadata::forward::routed::write::RouteDeleteOperation;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
-use crate::metadata::update_document::UpdateDocumentMutation;
+use aruna_core::errors::StorageReadError;
 use aruna_core::jobs::JobRunOutcome;
+use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a
@@ -469,7 +469,7 @@ impl Operation for HarvestJobOperation {
     fn next(&mut self, result: IoResult) -> Turn<HarvestCounts> {
         match std::mem::replace(&mut self.step, HarvestStep::Gate) {
             HarvestStep::Source => {
-                let source = parse_source_read(event(result)?)
+                let source = parse_source_read(result.event()?)
                     .map_err(read_failure)?
                     .ok_or_else(|| permanent("harvest source not found"))?;
                 let call = read_connector_effect(source.group_id, source.connector_id, None);
@@ -478,7 +478,7 @@ impl Operation for HarvestJobOperation {
                 Ok(Next::Call(call.into()))
             }
             HarvestStep::Connector => {
-                let connector = parse_connector_read(event(result)?)
+                let connector = parse_connector_read(result.event()?)
                     .map_err(read_failure)?
                     .ok_or_else(|| permanent("repository connector not found"))?;
                 self.connector(connector)
@@ -499,7 +499,7 @@ impl Operation for HarvestJobOperation {
                 self.save_source(&source, AfterSave::Listing)
             }
             HarvestStep::Save(then) => {
-                expect_write(event(result)?)?;
+                expect_write(result.event()?)?;
                 self.after_save(then)
             }
             HarvestStep::Gate => {
@@ -807,12 +807,13 @@ impl ApplyRecordOperation {
 }
 
 fn stored_record(result: IoResult) -> Result<Option<MetadataRegistryRecord>, HarvestFailure> {
-    parse_registry_read(event(result)?)
+    parse_registry_read(result.event()?)
         .map_err(|error| retryable(format!("harvest record read: {error:?}")))
 }
 
 fn confirm_absent(result: IoResult, document_id: Ulid) -> Result<(), HarvestFailure> {
-    let (rows, _) = page(result)
+    let (rows, _) = result
+        .page()
         .map_err(|error| retryable(format!("harvest pending projection scan: {error}")))?;
     if rows.is_empty() {
         return Ok(());
@@ -859,7 +860,7 @@ impl Operation for ApplyRecordOperation {
     fn next(&mut self, result: IoResult) -> ApplyTurn {
         match std::mem::replace(&mut self.step, ApplyStep::Provenance) {
             ApplyStep::Provenance => {
-                let existing = parse_provenance_read(event(result)?).map_err(read_failure)?;
+                let existing = parse_provenance_read(result.event()?).map_err(read_failure)?;
                 self.decide(existing)
             }
             // A pending row before the create leaves a retry the same id, so a replay converges
@@ -881,7 +882,7 @@ impl Operation for ApplyRecordOperation {
                 self.write_row(ApplyStep::MintPending(document_id))
             }
             ApplyStep::MintPending(document_id) => {
-                expect_write(event(result)?)?;
+                expect_write(result.event()?)?;
                 self.create_access(document_id)
             }
             ApplyStep::CreateAccess(document_id) => {
@@ -984,7 +985,7 @@ impl Operation for ApplyRecordOperation {
                 self.write_row(ApplyStep::Final(RecordApplied::Tombstoned))
             }
             ApplyStep::Final(applied) => {
-                expect_write(event(result)?)?;
+                expect_write(result.event()?)?;
                 Ok(Next::Done(applied))
             }
         }

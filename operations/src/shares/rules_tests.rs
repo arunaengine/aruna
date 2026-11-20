@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::permission_path::permission_pattern_matches;
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 fn realm() -> RealmId {

@@ -5,16 +5,16 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{EntryState, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, SyncBase, SyncedFolder};
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 use super::materialize::{
     MaterializeEntryOperation, MaterializeError, MaterializeInput, MaterializeOutcome,
@@ -49,7 +49,7 @@ impl From<IoError> for FetchError {
 pub(super) struct FetchRemoteOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
     bucket: String,
     key: String,
     version: Ulid,
@@ -302,10 +302,10 @@ impl Operation for MarkFailedOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
-        let Some(bytes) = value(result)? else {
+        let Some(bytes) = result.value()? else {
             warn!(relative = %self.relative, "The failed download has no row");
             return Ok(Next::Done(()));
         };

@@ -12,22 +12,22 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{SubmissionId, plugin_tag};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::plugin_tag;
 use tracing::{debug, warn};
 
-use super::admit_here::AcceptedSubmission;
-use super::ids::{RequestIdentity, SubmissionRequest};
-use crate::jobs::submit::SubmitJobError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use super::admit::here::AcceptedSubmission;
+use aruna_core::job_request::{RequestIdentity, SubmissionRequest, SubmitJobError};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// Upper bound of one forwarded request; the transport's own step limits end it earlier.
 const FORWARD_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Forwards the complete request and its preassigned identity one hop. The holder revalidates
-/// the caller and recomputes the identity itself, so this node never becomes the authority for
-/// a job it does not hold. A holder that read the request and refused it answers for every
-/// holder; an unreachable or unwilling one leaves the next to try.
+/// Forwards the request and its preassigned identity one hop; the holder revalidates both, so this
+/// node is never the authority for a job it does not hold. A holder that read and refused it
+/// answers for all; an unreachable or unwilling one leaves the next to try.
 #[derive(Debug, PartialEq)]
 pub(super) struct ForwardSubmissionOperation {
     submission_id: SubmissionId,
@@ -136,7 +136,7 @@ impl Operation for ForwardSubmissionOperation {
             if !matches!(reply, MetadataTransportMessage::ForwardedWriteUnavailable) {
                 warn!(
                     peer = %peer,
-                    reply = crate::metadata::transport_message_kind(&reply),
+                    reply = aruna_core::metadata::protocol::transport_message_kind(&reply),
                     "Unexpected submission forwarding reply"
                 );
             }
@@ -175,9 +175,9 @@ mod tests {
     use super::*;
     use crate::tests::records::{node, payload, user};
     use aruna_core::events::PeerRequestError;
-    use aruna_core::structs::execution::job::{JobId, LogicalJobState};
-
-    use super::super::ids::SubmissionScope;
+    use aruna_core::job_request::SubmissionScope;
+    use aruna_core::structs::execution::job::family::LogicalJobState;
+    use aruna_core::structs::execution::job::identity::JobId;
 
     fn request() -> SubmissionRequest {
         SubmissionRequest {
@@ -280,7 +280,7 @@ mod tests {
     }
     fn task_forward() -> ForwardSubmissionOperation {
         let mut request = request();
-        let tag = aruna_core::structs::execution::job::PLUGIN_WORK_TAG.to_string();
+        let tag = aruna_core::structs::execution::job::input::PLUGIN_WORK_TAG.to_string();
         request.spec.tags.insert(tag, ulid::Ulid::nil().to_string());
         let identity = request.identity().expect("identity derives");
         ForwardSubmissionOperation::new(&request, &identity, vec![node(2), node(3)], token())

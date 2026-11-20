@@ -6,8 +6,6 @@
 // That transaction holds the signed revision, the accepted request and the outbox row.
 // Only committed revisions are published.
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -16,6 +14,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, SnapshotSignEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
@@ -24,23 +23,25 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::group_admin_path;
-use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
-use aruna_core::structs::storage::distribution::{
-    DistributionError, DistributionRequest, DistributionRevision, DistributionSnapshot,
-    DistributionView, SetPhase, SignedSnapshot, next_snapshot, publisher_key,
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot, SnapshotClaim,
 };
+use aruna_core::structs::storage::distribution::validate::DistributionError;
+use aruna_core::structs::storage::distribution::{DistributionRevision, SetPhase, publisher_key};
 use aruna_core::structs::storage::usage::dirty_share_key;
+use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -465,7 +466,7 @@ impl Operation for PublishOperation {
             },
             // A missed drain timer leaves the durable outbox row for the next drain.
             PublishState::Write => {
-                done(result)?;
+                result.done()?;
                 let output = self.revision.take().ok_or(PublishError::NotFinished)?;
                 Ok(Next::Then {
                     output,

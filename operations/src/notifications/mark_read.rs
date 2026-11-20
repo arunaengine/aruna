@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
@@ -12,6 +11,7 @@ use aruna_core::structs::execution::notification::{
     NotificationRecord, invert_timestamp_ms, notification_inbox_prefix, parse_inbox_key,
 };
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -196,7 +196,7 @@ mod tests {
     use aruna_core::keyspaces::PRUNE_INDEX_KEYSPACE;
     use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
 
     fn record(recipient: UserId, created_at_ms: u64) -> NotificationRecord {
         crate::tests::notifications::record(recipient, NotificationClass::Direct, created_at_ms)

@@ -6,15 +6,15 @@ pub mod bind;
 pub mod reads;
 pub mod unbind;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
+use aruna_core::structs::synced_folder::{FolderMode, FolderState, RemoteBinding, SyncedFolder};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -26,15 +26,6 @@ use crate::s3::object::versions::ListVersionsError;
 use crate::staging::offered_directory::OfferedDirectoryError;
 
 use super::repository::{folder_entry, folder_key};
-pub use bind::{
-    BindFolderOperation, CreateRealmOperation, FinishBindingOperation, RequestSyncOperation,
-    bind_folder, create_realm_bucket, finish_binding, request_sync,
-};
-pub use reads::{
-    folder_counters, list_actions, list_entries, list_folders, list_transfers, read_bound,
-    read_entry,
-};
-pub use unbind::{FinishUnbindOperation, UnbindFolderOperation, finish_unbind, unbind_folder};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BindFolderInput {
@@ -219,10 +210,10 @@ impl Operation for UpdateFolderOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<SyncedFolder>, FolderError> {
         if let Some(changed) = self.changed.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(changed));
         }
-        let row = value(result)?;
+        let row = result.value()?;
         let current = row.and_then(|row| SyncedFolder::from_bytes(&row).ok());
         let current = current.ok_or(FolderError::NotFound)?;
         let change = self.change.take().ok_or(IoError::Unfinished)?;
@@ -254,18 +245,21 @@ pub(super) fn store_progress(progress: &SyncedFolder) -> UpdateFolderOperation {
 mod tests {
     use std::sync::Arc;
 
-    use super::super::repository::folder_bucket;
     use super::super::{folder_pass, folder_scope};
-    use super::bind::ReserveBindingOperation;
-    use super::unbind::{ClearRowsOperation, DeleteLocalOperation};
+    use super::bind::{ReserveBindingOperation, finish_binding};
+    use super::reads::{list_actions, list_entries, list_folders, read_bound};
+    use super::unbind::{ClearRowsOperation, DeleteLocalOperation, finish_unbind, unbind_folder};
     use super::*;
     use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
     use crate::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
-    use crate::staging::offered_directory::{WithdrawOfferInput, withdraw_offer};
+    use crate::staging::offer::run::withdraw_offer;
+    use crate::staging::offered_directory::WithdrawOfferInput;
     use crate::tests::device::{context, delete_rows, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, UPLOAD_KEYSPACE};
     use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-    use aruna_core::structs::{EntrySide, EntryState, SyncBase, SyncedBytes};
+    use aruna_core::structs::synced_folder::{
+        EntrySide, EntryState, SyncBase, SyncedBytes, folder_bucket,
+    };
     use aruna_drivers::driver::{DriverContext, drive};
 
     fn realm() -> RealmId {
@@ -389,7 +383,7 @@ mod tests {
     #[tokio::test]
     async fn actions_refuse_deleting() {
         use super::super::actions::{ActionError, ApplyActionInput, apply_action};
-        use aruna_core::structs::{ActionKind, ActionScope};
+        use aruna_core::structs::synced_folder::{ActionKind, ActionScope};
 
         let (_dir, context) = context().await;
         let context = Arc::new(context);
@@ -421,7 +415,8 @@ mod tests {
         context: &Arc<DriverContext>,
     ) -> (tempfile::TempDir, SyncedFolder, MultipartUpload) {
         use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
-        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+        use crate::staging::offer::run::offer_directory;
+        use crate::staging::offered_directory::OfferDirectoryInput;
         use aruna_core::structs::storage::routing::RoutingSnapshot;
 
         let root = tempfile::tempdir().expect("root created");
@@ -465,7 +460,7 @@ mod tests {
     }
 
     async fn bucket_gone(context: &Arc<DriverContext>, bucket: &str) -> bool {
-        use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+        use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
         let bucket = GetBucketOperation::new(bucket.to_string());
         matches!(drive(bucket, context).await, Err(GetBucketError::NotFound))
     }
@@ -474,7 +469,7 @@ mod tests {
     // after the bucket delete finds it gone and finishes.
     #[tokio::test]
     async fn deletes_local_bucket() {
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, _) = offered_folder(&context).await;
         let withdrawal = WithdrawOfferInput {
@@ -512,10 +507,11 @@ mod tests {
     #[tokio::test]
     async fn limits_cleanup_pass() {
         use crate::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
-        use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+        use crate::staging::offer::run::offer_directory;
+        use crate::staging::offered_directory::OfferDirectoryInput;
         use aruna_core::structs::storage::routing::RoutingSnapshot;
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, _) = offered_folder(&context).await;
         let second = CreateMultipartOperation::new(CreateMultipartInput {
@@ -586,10 +582,10 @@ mod tests {
     // is read-only for clients, and the cleanup still deletes it.
     #[tokio::test]
     async fn guards_unoffered_bucket() {
-        use crate::staging::bucket_guard::BucketGuardOperation;
+        use crate::s3::bucket::write_guard::BucketGuardOperation;
         use crate::staging::offered_directory::OfferedDirectoryError;
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, _) = offered_folder(&context).await;
         let bucket = folder.local_bucket.clone();
@@ -628,10 +624,10 @@ mod tests {
     // for clients, so no upload can be opened before the next pass deletes it.
     #[tokio::test]
     async fn guards_interrupted_cleanup() {
-        use crate::staging::bucket_guard::BucketGuardOperation;
+        use crate::s3::bucket::write_guard::BucketGuardOperation;
         use crate::staging::offered_directory::OfferedDirectoryError;
 
-        let fixture = crate::tests::staging::setup_driver_context().await;
+        let fixture = aruna_test_support::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, mut upload) = offered_folder(&context).await;
         upload.status = MultipartUploadStatus::Completing;
@@ -817,17 +813,17 @@ mod tests {
     /// for `release` on its own thread, so the effects behind it still run. `committed` gets the
     /// error the commit of that write's transaction answered with.
     fn hold_write(
-        storage: aruna_storage::StorageHandle,
-        receivers: aruna_storage::storage::StorageReceivers,
+        storage: aruna_storage::storage::handle::StorageHandle,
+        receivers: aruna_storage::storage::handle::StorageReceivers,
         held: FolderState,
         reached: tokio::sync::oneshot::Sender<()>,
         release: std::sync::mpsc::Receiver<()>,
         committed: tokio::sync::oneshot::Sender<Option<aruna_core::errors::StorageError>>,
     ) {
         fn forward(
-            storage: &aruna_storage::StorageHandle,
+            storage: &aruna_storage::storage::handle::StorageHandle,
             effect: aruna_core::effects::StorageEffect,
-            response: aruna_storage::storage::ResponseSender,
+            response: aruna_storage::storage::handle::ResponseSender,
         ) -> Option<aruna_core::errors::StorageError> {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -900,7 +896,7 @@ mod tests {
             let folder = bound_folder(start);
             let folder_id = folder.folder_id;
             store_folder(&context, &folder).await.expect("row stored");
-            let (storage, receivers) = aruna_storage::StorageHandle::new();
+            let (storage, receivers) = aruna_storage::storage::handle::StorageHandle::new();
             let (reached, held) = tokio::sync::oneshot::channel();
             let (release, gate) = std::sync::mpsc::channel();
             let (committed, commit) = tokio::sync::oneshot::channel();

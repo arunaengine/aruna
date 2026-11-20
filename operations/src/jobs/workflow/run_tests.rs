@@ -4,7 +4,7 @@
 
 use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
 use aruna_core::compute::{AttemptPhase, NOBODY};
-use aruna_core::structs::execution::job::LocalAdmission;
+use aruna_core::structs::execution::job::local::LocalAdmission;
 
 use super::fixtures::{
     child, claimed, compute, control, facts, is_child, job, node, prepared, realm, record,

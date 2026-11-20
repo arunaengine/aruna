@@ -3,18 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::family::{
+    ExecutionClaim, ExecutionReceipt, ExecutionStop, JobFamilyId, JobFamilyRecord, JobRecordBody,
+    JobRecordEnvelope, JobRecordKind, StopEvidence,
+};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{JobError, RunLink};
 use aruna_core::structs::execution::job::record_keys::{prune_rows, record_key};
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
-use aruna_core::structs::execution::job::{
-    ExecutionClaim, ExecutionReceipt, ExecutionStop, JobError, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecordBody, JobRecordEnvelope, JobRecordKind, JobWrites, RunLink, StopEvidence,
-};
+use aruna_core::structs::execution::job::rows::JobWrites;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::Value;
 

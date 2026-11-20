@@ -4,14 +4,15 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::effects::{JobRecordFrame, LaunchFrame};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobRecordKind, JobState, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordKind, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 
 use super::admission_race::{commit_receipt, commit_with, config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
@@ -20,10 +21,10 @@ use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::store::test_calls::read_job_record;
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::tests::records::{Family, REALM, serve_job_record, user};
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_test_support::jobs::read_job_record;
 
 fn auth(user_id: UserId) -> AuthContext {
     AuthContext::new(user_id, REALM)
@@ -374,13 +375,12 @@ async fn deletion_hides_family() {
 async fn unrecorded_deletion_kept() {
     // A node that cannot record the deletion in the run's family keeps the run, so a retried
     // delete records it again; a holder records it before the run goes.
-    use crate::jobs::job_reads::tests::delete_owned_run;
+    use crate::jobs::job::reads::tests::delete_owned_run;
     use crate::jobs::store::RunDelete;
-    use crate::jobs::store::test_calls::insert_job;
     use crate::tests::records::secret;
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobPayload, JobRecord,
-    };
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::JobRecord;
+    use aruna_test_support::jobs::insert_job;
     let family = Family::new([45u8; 32]);
     let job_id = family.spec().job_id;
     let finished = |node| {

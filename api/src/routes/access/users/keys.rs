@@ -11,12 +11,13 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
-use aruna_core::structs::identity::user::vault::{KEY_ID_BYTES, UserKeyRecord, VaultRecords};
+use aruna_core::structs::identity::user::vault::{
+    KEY_ID_BYTES, UserKeyRecord, VaultAppended, VaultChange, VaultRecords,
+};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::s3::holder_seal::SealPublishedOperation;
-use aruna_operations::users::vault_write::{VaultAppended, VaultChange};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

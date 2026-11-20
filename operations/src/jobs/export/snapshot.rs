@@ -4,14 +4,14 @@
 
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::repository::ExportIdentity;
-use aruna_core::structs::PersistentIdMapping;
-use aruna_core::structs::execution::job::{ExportRoCrateSpec, ReasonCode};
+use aruna_core::structs::execution::job::input::{ExportRoCrateSpec, ReasonCode};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::persistent_id::PersistentIdMapping;
 use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
@@ -19,11 +19,10 @@ use super::archive::{keep_references, map_crate_error, recognize_entities, web_e
 use super::{ExportCheckpoint, ExportEntity, ExportFailure, ExportPhase};
 use crate::jobs::repository::TransferError;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
-};
+use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::forward::routed::export::RoutedExportOperation;
 use crate::metadata::pid_read::ReadPidOperation;
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 
 fn unexpected_view() -> ExportFailure {
     ExportFailure::Permanent("metadata export returned an unexpected view".to_string())

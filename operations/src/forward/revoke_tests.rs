@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::tests::calls::{child, node, runs_child};
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 const CALLER_TOKEN: &str = "caller-token";

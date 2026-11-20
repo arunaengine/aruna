@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
-use crate::node_vault::{VaultEntry, VaultPurpose};
+use crate::node::vault::{VaultEntry, VaultPurpose};
 use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -334,9 +334,9 @@ impl GroupStorageSecret {
 #[cfg(test)]
 mod tests {
     use super::{GroupBackendKind, GroupStorage, GroupStorageSecret};
-    use crate::UserId;
     use crate::structs::identity::realm::RealmId;
     use crate::structs::storage::cleanup::CleanupStrategy;
+    use crate::user::id::UserId;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;

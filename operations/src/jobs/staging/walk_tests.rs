@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::jobs::staging::initial_checkpoint;
 use crate::jobs::staging::pure_tests::{child_answer, test_bucket, test_connector, test_run};
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::s3::bucket::get::GetBucketError;
+use aruna_core::bucket_read::GetBucketError;
+use aruna_core::staging_checkpoint::initial_checkpoint;
 use aruna_core::structs::execution::source_access::ListCursor;
 
 fn walk() -> StagingWalk {

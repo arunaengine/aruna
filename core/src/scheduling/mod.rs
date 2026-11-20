@@ -2,22 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod cost;
-mod digest;
-mod eligibility;
-mod inputs;
+pub mod cost;
+pub mod digest;
+pub mod eligibility;
+pub mod inputs;
 mod rank;
-mod scan;
+pub mod scan;
 
-pub use cost::{InputRoute, UNKNOWN_PERMILLE};
-pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
-pub use eligibility::{PolicyVerdict, RejectionVerdict, backend_verdict, hosts_session};
-pub use inputs::{
-    InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES,
-    MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
-    TargetScore,
-};
-pub use scan::Planner;
+use cost::InputRoute;
+use eligibility::RejectionVerdict;
+use inputs::{MAX_TARGET_SCAN, PlanError, PlanRequest, TargetCandidate, TargetScore};
+use scan::Planner;
 
 use crate::compute::ExecutionTargetId;
 use crate::structs::placement::compute_config::RealmComputeConfig;
@@ -29,11 +24,11 @@ use ulid::Ulid;
 pub struct PlannedInput {
     pub destination_key: String,
     pub version_id: Ulid,
-    pub content: crate::structs::execution::job::InputContent,
+    pub content: crate::structs::execution::job::input::InputContent,
     pub bytes: u64,
     pub policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.
-    pub source_node_id: Option<crate::NodeId>,
+    pub source_node_id: Option<crate::id::NodeId>,
     pub transfer_ms: u64,
     pub known_link: bool,
 }
@@ -99,7 +94,7 @@ impl CandidateVerdict {
 /// One target of a planning round as an external report shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanCandidate {
-    pub node_id: crate::NodeId,
+    pub node_id: crate::id::NodeId,
     pub backend: Option<String>,
     pub executor_kind: Option<String>,
     pub verdict: CandidateVerdict,

@@ -4,7 +4,6 @@
 
 use crate::groups::backends::{RecordReadError, index_prefix};
 use crate::groups::fence::GroupWriteOperation;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, GroupStorageRouting, RoutingError, RoutingTarget, validate_tenant_target,
 };
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -466,7 +466,7 @@ mod pure_tests {
             public_config: HashMap::new(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: false,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
@@ -477,7 +477,7 @@ mod pure_tests {
             group_id: group(),
             default_target: target,
             updated_at: SystemTime::UNIX_EPOCH,
-            updated_by: aruna_core::UserId::default(),
+            updated_by: aruna_core::user::id::UserId::default(),
         }
     }
 
@@ -487,7 +487,7 @@ mod pure_tests {
         let mut operation = PutGroupOperation::new(
             group(),
             Some(target.clone()),
-            aruna_core::UserId::default(),
+            aruna_core::user::id::UserId::default(),
             SystemTime::UNIX_EPOCH,
         );
 
@@ -514,7 +514,7 @@ mod pure_tests {
         let mut operation = PutGroupOperation::new(
             group(),
             Some(RoutingTarget::Backend(BackendRef::Node("cold".to_string()))),
-            aruna_core::UserId::default(),
+            aruna_core::user::id::UserId::default(),
             SystemTime::UNIX_EPOCH,
         );
 
@@ -531,7 +531,7 @@ mod pure_tests {
         let mut operation = PutGroupOperation::new(
             group(),
             None,
-            aruna_core::UserId::default(),
+            aruna_core::user::id::UserId::default(),
             SystemTime::UNIX_EPOCH,
         );
         loaded(&mut operation, BTreeSet::new()).unwrap();
@@ -550,7 +550,7 @@ mod pure_tests {
         let mut operation = PutGroupOperation::new(
             group(),
             Some(RoutingTarget::Backend(BackendRef::Group(folder))),
-            aruna_core::UserId::default(),
+            aruna_core::user::id::UserId::default(),
             SystemTime::UNIX_EPOCH,
         );
         let inputs = GroupRoutingInputs {
@@ -573,7 +573,7 @@ mod pure_tests {
         let mut operation = PutGroupOperation::new(
             group(),
             Some(RoutingTarget::Backend(BackendRef::Group(foreign))),
-            aruna_core::UserId::default(),
+            aruna_core::user::id::UserId::default(),
             SystemTime::UNIX_EPOCH,
         );
 

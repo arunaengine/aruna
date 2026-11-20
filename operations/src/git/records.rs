@@ -10,7 +10,7 @@ use aruna_core::git::{GitRecord, MAX_RECORDS, git_record_prefix};
 use aruna_core::keyspaces::GIT_RECORD_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::WriteFence;
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::types::{Key, Value};
 use serde::{Serialize, de::DeserializeOwned};
 use ulid::Ulid;
@@ -64,7 +64,7 @@ impl Operation for SaveRowOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, GitError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -94,7 +94,7 @@ impl<T: Row> Operation for LoadRowOperation<T> {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<T>>, GitError> {
-        let row = value(result)?.map(|bytes| decode(&bytes)).transpose()?;
+        let row = result.value()?.map(|bytes| decode(&bytes)).transpose()?;
         Ok(Next::Done(row))
     }
 }
@@ -130,7 +130,7 @@ where
 
     fn next(&mut self, result: IoResult) -> Result<Next<O::Output>, GitError> {
         if let Some(output) = self.output.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(output));
         }
         self.output = Some(result.child::<O::Output, GitError>()??);
@@ -176,10 +176,10 @@ impl<T: Row> Operation for InsertRowOperation<T> {
 
     fn next(&mut self, result: IoResult) -> Result<Next<T>, GitError> {
         if let Some(kept) = self.kept.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(decode(&kept)?));
         }
-        if let Some(old) = value(result)? {
+        if let Some(old) = result.value()? {
             return Ok(Next::Done(decode(&old)?));
         }
         let bytes = std::mem::replace(&mut self.bytes, Err(GitError::Unavailable))?;
@@ -275,7 +275,7 @@ impl Operation for CommitRowsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, GitError> {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let keys = self.fence.reads().into_iter().map(|(_, key)| key);
@@ -344,7 +344,7 @@ impl Operation for RemoveRowOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, GitError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -362,7 +362,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().to_str().expect("path");
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(path).expect("storage"),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(path)
+                .expect("storage"),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

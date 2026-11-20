@@ -135,10 +135,8 @@ pub(crate) fn request_auth(
         .ok_or_else(|| server_error(crate::error::ServerError::Unauthorized))
 }
 
-pub(crate) fn empty_extras(
-    tool: &str,
-) -> aruna_operations::auth::request_policy::PolicyRequestExtras {
-    aruna_operations::auth::request_policy::PolicyRequestExtras {
+pub(crate) fn empty_extras(tool: &str) -> aruna_core::request_policy::PolicyRequestExtras {
+    aruna_core::request_policy::PolicyRequestExtras {
         operation: format!("mcp:{tool}"),
         params: BTreeMap::new(),
         headers: BTreeMap::new(),
@@ -149,7 +147,7 @@ pub(crate) fn empty_extras(
 pub(crate) fn tool_extras<T: serde::Serialize>(
     tool: &str,
     arguments: &T,
-) -> Result<aruna_operations::auth::request_policy::PolicyRequestExtras, CallToolResult> {
+) -> Result<aruna_core::request_policy::PolicyRequestExtras, CallToolResult> {
     let value = serde_json::to_value(arguments)
         .map_err(|error| internal_error(format!("failed to encode tool arguments: {error}")))?;
     let object = value
@@ -165,14 +163,12 @@ pub(crate) fn tool_extras<T: serde::Serialize>(
             (key.clone(), value)
         })
         .collect();
-    Ok(
-        aruna_operations::auth::request_policy::PolicyRequestExtras {
-            operation: format!("mcp:{tool}"),
-            params,
-            headers: BTreeMap::new(),
-            body: None,
-        },
-    )
+    Ok(aruna_core::request_policy::PolicyRequestExtras {
+        operation: format!("mcp:{tool}"),
+        params,
+        headers: BTreeMap::new(),
+        body: None,
+    })
 }
 
 pub(crate) fn server_error(error: crate::error::ServerError) -> CallToolResult {
@@ -221,7 +217,7 @@ pub(crate) async fn authorize_tool(
     auth: &aruna_core::structs::identity::auth::AuthContext,
     path: String,
     permission: aruna_core::structs::identity::auth::Permission,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     crate::auth::ensure_permission_with(state, auth, path, permission, extras).await
 }
@@ -232,10 +228,10 @@ pub(crate) async fn authorize_self(
     state: &ServerState,
     auth: &aruna_core::structs::identity::auth::AuthContext,
     permission: aruna_core::structs::identity::auth::Permission,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let realm_id = state.get_realm_id();
-    let request = aruna_operations::auth::request_policy::policy_request_with(
+    let request = aruna_core::request_policy::policy_request_with(
         &format!("/{realm_id}/u/{}", auth.user_id),
         &permission,
         Some(auth),

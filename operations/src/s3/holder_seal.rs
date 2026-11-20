@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{BlobError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row};
@@ -16,7 +17,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::holders::KeyLookup;
 use aruna_core::types::Value;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
 use crate::s3::bucket::seal_missing::{SealMissingError, SealMissingInput, SealMissingOperation};
@@ -166,12 +167,11 @@ mod tests {
     use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
     use crate::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::UserId;
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, KEY_COPY_KEYSPACE};
-    use aruna_core::node_vault::NodeVaultKey;
+    use aruna_core::node::vault::NodeVaultKey;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig};
     use aruna_core::structs::storage::encryption::{
@@ -179,6 +179,7 @@ mod tests {
     };
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -205,7 +206,7 @@ mod tests {
     async fn seals_admin_key() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let storage = aruna_storage::FjallStorage::open(root).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(root).unwrap();
         storage.open_vault(NodeVaultKey::random());
         let net = aruna_net::NetHandle::new(aruna_drivers::testing::local_net(), storage.clone())
             .await

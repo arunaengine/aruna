@@ -9,9 +9,11 @@ use aruna_core::effects::Effect;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    DUE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord, LEASE_INDEX_PREFIX,
-    lease_index_key, parse_schedule_key,
+use aruna_core::structs::execution::job::identity::{
+    DUE_INDEX_PREFIX, JobExecutionClass, JobId, LEASE_INDEX_PREFIX,
+};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobRecord, lease_index_key, parse_schedule_key,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
@@ -59,10 +61,10 @@ pub struct JobDrainResult {
     pub terminal: Vec<JobRecord>,
     pub cancelled_fresh: usize,
     pub swept: usize,
-    /// Expired external attempts routed to the reconcile hook instead of a requeue.
+    /// Expired external attempts left to reconcile instead of a requeue.
     pub reconciled: usize,
-    /// The records of those attempts, for the caller's reconcile hook. A node without a
-    /// hook must not charge the attempt: it cannot even observe the container.
+    /// The records of those attempts, which the node reconciles. A node without an executor
+    /// must not charge the attempt: it cannot even observe the container.
     pub lost_attempts: Vec<JobRecord>,
     pub next_due_after: Option<Duration>,
     /// A per-job error stopped the batch early; the caller should re-drive after a
@@ -519,26 +521,23 @@ impl Operation for DrainTimerOperation {
 mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::read_job_record;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;
     use aruna_core::handle::Handle;
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,
-    };
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::{AttemptIntent, JobClaim, due_index_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEvent;
     use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_drivers::jobs::context::ExternalReconciler;
-    use aruna_storage::FjallStorage;
     use aruna_storage::scan::iter_prefix_page;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
     use byteview::ByteView;
-    use std::sync::Arc;
-    use std::sync::Mutex;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -546,16 +545,9 @@ mod tests {
         context: &DriverContext,
         owner: NodeId,
         budget: JobClassBudget,
-        reconciler: Option<&Arc<dyn ExternalReconciler>>,
     ) -> Result<JobDrainResult, DrainError> {
         let drain = DrainJobsOperation::new(owner, budget, unix_timestamp_millis());
-        let mut result = drive(drain, context).await?;
-        for record in std::mem::take(&mut result.lost_attempts) {
-            if let Some(reconciler) = reconciler {
-                reconciler.reconcile_lost_attempt(context, record).await;
-            }
-        }
-        Ok(result)
+        drive(drain, context).await
     }
 
     async fn next_drain_delay(context: &DriverContext) -> Result<Option<Duration>, IoError> {
@@ -717,23 +709,6 @@ mod tests {
         assert!(matches!(timer.next(none()), Ok(Next::Then { .. })));
     }
 
-    #[derive(Default)]
-    struct RecordingReconciler {
-        seen: Mutex<Vec<JobId>>,
-    }
-
-    impl ExternalReconciler for RecordingReconciler {
-        fn reconcile_lost_attempt<'a>(
-            &'a self,
-            _context: &'a DriverContext,
-            record: JobRecord,
-        ) -> futures_util::future::BoxFuture<'a, ()> {
-            Box::pin(async move {
-                self.seen.lock().unwrap().push(record.job_id);
-            })
-        }
-    }
-
     fn node_id(seed: u8) -> NodeId {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
@@ -784,9 +759,7 @@ mod tests {
             in_process: 2,
             external: 0,
         };
-        let result = drain_job_batch(&context, node_id(7), budget, None)
-            .await
-            .unwrap();
+        let result = drain_job_batch(&context, node_id(7), budget).await.unwrap();
         assert_eq!(result.claimed.len(), 2, "capacity caps claims");
         // A due job remains, so the re-arm is immediate.
         assert_eq!(result.next_due_after, Some(Duration::ZERO));
@@ -812,9 +785,7 @@ mod tests {
             in_process: 4,
             external: 0,
         };
-        let result = drain_job_batch(&context, node_id(7), budget, None)
-            .await
-            .unwrap();
+        let result = drain_job_batch(&context, node_id(7), budget).await.unwrap();
 
         assert_eq!(
             result
@@ -852,7 +823,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = drain_job_batch(&context, node_id(3), JobClassBudget::default(), None)
+        let result = drain_job_batch(&context, node_id(3), JobClassBudget::default())
             .await
             .unwrap();
 
@@ -879,7 +850,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
 
@@ -908,7 +879,7 @@ mod tests {
         });
         insert_job(&context, &record).await.unwrap();
 
-        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert_eq!(result.swept, 1);
@@ -949,9 +920,7 @@ mod tests {
         });
         insert_job(&context, &record).await.unwrap();
 
-        let recorder = Arc::new(RecordingReconciler::default());
-        let reconciler: Arc<dyn ExternalReconciler> = recorder.clone();
-        let result = drain_job_batch(&context, node_id(3), budget_of(8), Some(&reconciler))
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert_eq!(result.swept, 0, "external attempt is not swept");
@@ -969,8 +938,9 @@ mod tests {
         assert_eq!(stored.state, JobState::Running, "not requeued");
         assert_eq!(stored.attempts, 0, "the sweep charges nothing");
         assert!(stored.claim.is_some());
-        // The hook saw exactly this job, proving no blind re-run path was taken.
-        assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
+        // The caller gets exactly this job to reconcile, proving no blind re-run path was taken.
+        assert_eq!(result.lost_attempts.len(), 1);
+        assert_eq!(result.lost_attempts[0].job_id, job_id);
     }
 
     #[tokio::test]
@@ -988,7 +958,7 @@ mod tests {
         });
         insert_job(&context, &record).await.unwrap();
 
-        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert_eq!(result.swept, 0);
@@ -1059,7 +1029,7 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let result = drain_job_batch(&context, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert!(result.claimed.is_empty());

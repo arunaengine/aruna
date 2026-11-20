@@ -13,7 +13,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -23,7 +23,7 @@ use aruna_core::types::{Key, KeySpace, RoleId};
 use byteview::ByteView;
 use thiserror::Error;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
@@ -259,14 +259,14 @@ impl Operation for ClaimInitialOperation {
                 self.emit_auth_write(auth_doc, reducer)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }
@@ -351,7 +351,6 @@ fn materialize_admin_assignment(
 mod tests {
     use super::{ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
@@ -364,8 +363,10 @@ mod tests {
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
@@ -375,7 +376,7 @@ mod tests {
     async fn setup_context() -> (DriverContext, NetHandle, RealmId, iroh::PublicKey, TempDir) {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -669,7 +670,8 @@ mod tests {
         storage_handle.close().await;
 
         let reopened = DriverContext {
-            storage_handle: storage::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap(),
+            storage_handle: storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap())
+                .unwrap(),
             blob_handle: None,
             net_handle: None,
             graph_handle: None,

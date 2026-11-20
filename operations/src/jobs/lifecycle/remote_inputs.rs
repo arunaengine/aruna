@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
@@ -12,12 +11,15 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{InputResolveRequest, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{CapturedInput, InputSelection, SubmissionId};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection};
+use aruna_core::user::id::UserId;
 
 use super::submission_rules::{batch_len, resolve_answer};
-use crate::jobs::submit::SubmitJobError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use aruna_core::job_request::SubmitJobError;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// Upper bound of one resolve request; the transport's own step limits end it earlier.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(60);
@@ -33,10 +35,9 @@ pub struct ResolveCaller {
 type RemoteAnswers = Vec<(InputSelection, CapturedInput)>;
 type RemoteNext = Result<Next<RemoteAnswers>, SubmitJobError>;
 
-/// The inputs of another node, resolved and granted by that node for the caller's own bearer.
-/// Every input must name its exact version, so nothing depends on a remote head. Each request
-/// carries the inputs that fit one batch and the node answers a prefix of them, so the rest go
-/// out again until every input is answered.
+/// Another node's inputs, resolved and granted there for the caller's bearer, each at its exact
+/// version. A request carries one batch and the node answers a prefix, so the rest go out again
+/// until every input is answered.
 #[derive(Debug, PartialEq)]
 pub struct RemoteInputsOperation {
     node: NodeId,
@@ -109,7 +110,7 @@ fn resolve_reply(
         MetadataTransportMessage::ResolvedJobInputs { result } => Ok(result),
         other => Err(format!(
             "the node answered {}",
-            crate::metadata::transport_message_kind(&other)
+            aruna_core::metadata::protocol::transport_message_kind(&other)
         )),
     }
 }
@@ -150,7 +151,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{node, user};
     use aruna_core::events::PeerRequestError;
-    use aruna_core::structs::execution::job::{InputMode, InputSource};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSource};
 
     fn input() -> InputSelection {
         InputSelection {

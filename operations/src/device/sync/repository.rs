@@ -9,8 +9,7 @@ use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
-use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -179,18 +178,6 @@ pub fn scan_folder(
     })
 }
 
-/// The device-local bucket a folder is observed as. The owner never names it:
-/// a derived name cannot collide with a bucket they already use.
-pub fn folder_bucket(folder_id: Ulid) -> String {
-    format!("folder-{}", folder_id.to_string().to_lowercase())
-}
-
-/// The folder whose device-local bucket `bucket` is, if it is one.
-pub fn bucket_folder(bucket: &str) -> Option<Ulid> {
-    let folder_id = Ulid::from_string(bucket.strip_prefix("folder-")?).ok()?;
-    (folder_bucket(folder_id) == bucket).then_some(folder_id)
-}
-
 /// Whether two rows publish the same local version of one file.
 pub(crate) fn same_version(stored: &SyncUpload, upload: &SyncUpload) -> bool {
     stored.local_version == upload.local_version && stored.deleted == upload.deleted
@@ -276,7 +263,7 @@ impl Operation for StoreUploadOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, StoreUploadError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(true));
         }
         let stored = result.values()?.into_iter().next().flatten();

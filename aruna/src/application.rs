@@ -927,7 +927,7 @@ mod tests {
         assert!(signals.escalation_action.is_none());
     }
 
-    fn startup_settings(path: &str) -> crate::settings::Settings {
+    fn startup_settings(path: &str) -> aruna_config::settings::Settings {
         let map: std::collections::BTreeMap<String, String> = [
             ("DATABASE_DIR".to_string(), path.to_string()),
             ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
@@ -939,7 +939,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        crate::settings::read_settings_from(&map).expect("settings parse")
+        aruna_config::settings::read_settings_from(&map).expect("settings parse")
     }
 
     /// A tracked timer handler that holds the production task drain at its
@@ -1008,7 +1008,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
         let settings = startup_settings(&path);
-        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let storage = aruna_config::open_storage(&settings).expect("storage opens");
         let task_handle = aruna_tasks::TaskHandle::new();
 
         // The tracked handler blocks the real tasks-phase join that cleanup
@@ -1094,7 +1094,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
         let settings = startup_settings(&path);
-        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let storage = aruna_config::open_storage(&settings).expect("storage opens");
         let task_handle = aruna_tasks::TaskHandle::new();
 
         let mut checkpoint = |stage: StartupStage| -> Result<(), Box<dyn std::error::Error>> {
@@ -1195,7 +1195,7 @@ mod tests {
     /// mapping test runs a real `NodeShutdown` sequence.
     fn node_shutdown(
         shutdown: aruna_tasks::shutdown::Shutdown,
-        storage_handle: aruna_storage::StorageHandle,
+        storage_handle: aruna_storage::storage::handle::StorageHandle,
         grace: std::time::Duration,
     ) -> NodeShutdown {
         NodeShutdown {
@@ -1227,9 +1227,10 @@ mod tests {
     #[tokio::test]
     async fn cancellation_requires_cleanup() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage_handle =
-            aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
-                .expect("storage opens");
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(
+            dir.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
 
         let complete = node_shutdown(
             aruna_tasks::shutdown::Shutdown::new(),

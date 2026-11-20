@@ -5,8 +5,9 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::ROCRATE_UPLOAD_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, values};
-use aruna_core::structs::execution::job::{JobId, RoCrateUploadRecord, upload_key};
+use aruna_core::rows::values;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{RoCrateUploadRecord, upload_key};
 use byteview::ByteView;
 use ulid::Ulid;
 
@@ -85,7 +86,7 @@ impl Operation for WriteUploadOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, UploadStoreError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -118,7 +119,7 @@ impl Operation for DeleteUploadOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, UploadStoreError> {
         if self.deleting {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         let [value] = values::<1>(result)?;

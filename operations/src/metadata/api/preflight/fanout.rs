@@ -6,14 +6,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::cursor::SEARCH_CURSOR_CONTEXT;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::Span;
@@ -26,10 +25,7 @@ use super::super::node_fanout::{
     FanoutParts, NodeCalls, NodeFanoutOperation, discovery_answer, discovery_call, peer_answer,
     peer_request,
 };
-use super::super::preflight_types::{
-    MetadataResolvedTarget, ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest,
-    ReferenceRequest, preflight_fingerprint,
-};
+use super::super::preflight_types::{ReferenceExecution, ReferenceRequest, preflight_fingerprint};
 use super::super::realm_search::{cursor_signers, resume_cursor};
 use super::super::{
     ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MAX_PAGINATION_DEPTH, MetadataApiError,
@@ -41,9 +37,12 @@ use super::{
     PreflightCursorPlan, PreflightPlan, ResolvedPreflightTargets, assemble_preflight_execution,
     plan_preflight_request,
 };
-use crate::forward::transport::read_error;
-use crate::metadata::protocol::MetadataTransportMessage;
+use crate::metadata::forward::write::read_error;
 use crate::metadata::search_cursor::{SearchCursor, resume_fetch_limit};
+use aruna_core::metadata::api::{
+    MetadataResolvedTarget, ReferenceNodeExecution, ReferenceNodeRequest,
+};
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 /// How the preflight fanout asks each node, deeper for nodes a cursor resumes.
 #[derive(Debug, PartialEq)]
@@ -327,7 +326,7 @@ impl Operation for ReferencesPreflightOperation {
                 Ok(Next::Call(IoCall::Effect(Box::new(sign))))
             }
             PreflightStage::Sign(unsigned) => {
-                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = event(result) else {
+                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = result.event() else {
                     return Err(MetadataApiError::Internal(
                         "net handle unavailable for preflight cursor signing".to_string(),
                     ));

@@ -11,12 +11,13 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, SecretAudit, 
 use aruna_drivers::driver::drive;
 
 use super::*;
-use crate::plugins::bound::tests::edit_config;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::encode;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::page_result;
-use crate::plugins::store::Txn;
+use crate::plugins::test_support::{install_as, install_request};
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::edit_config;
+use aruna_test_support::plugins::rows::Txn;
 
 const DAY: u64 = 24 * 3600 * 1000;
 const NOW: u64 = 100 * DAY;
@@ -62,7 +63,9 @@ async fn ids(fixture: &Fixture, index: AuditIndex) -> Vec<u64> {
 #[tokio::test]
 async fn prunes_old_uses() {
     let fixture = Fixture::new().await;
-    let install = fixture.install(&fixture.request(None)).await.unwrap();
+    let install = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let mut kept = AdminAuditRecord::for_install(
         ulid::Ulid::from_parts(1, 3),
         AdminAuditAction::PluginInstalled,
@@ -94,7 +97,9 @@ async fn config(fixture: &Fixture) -> RealmConfigDocument {
 #[tokio::test]
 async fn prunes_old_hooks() {
     let fixture = Fixture::new().await;
-    let install = fixture.install(&fixture.request(None)).await.unwrap();
+    let install = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
     let id = install.install_id;
     let rows = [("old", NOW - 8 * DAY), ("new", NOW - DAY)]
         .into_iter()
@@ -131,6 +136,35 @@ async fn prunes_old_hooks() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn removed_hooks_paged() {
+    // A removing install's delivery ids go a page at a time, each before the next is read.
+    let install = Ulid::from_parts(1, 1);
+    let mut plan = PruneHooks {
+        cutoff: 100,
+        removing: vec![install],
+        phase: HooksPhase::Times,
+        pruned: 0,
+    };
+    plan.first().unwrap();
+    let no_old = plan.next(page_result(Vec::new(), None)).unwrap();
+    assert_eq!(no_old, Next::Call(delete_call(Vec::new())));
+    assert!(matches!(
+        plan.next(IoResult::Done).unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
+    let id = hook_key(install, "d1");
+    let page = page_result(vec![(id.clone(), encode(&7u64).unwrap())], Some(id.clone()));
+    let Next::Call(IoCall::Delete(keys)) = plan.next(page).unwrap() else {
+        panic!("the page's ids go before the next page");
+    };
+    assert_eq!(keys.len(), 2);
+    let Next::Call(IoCall::Page { after, .. }) = plan.next(IoResult::Done).unwrap() else {
+        panic!("expected the next page of the install");
+    };
+    assert_eq!(after.map(|after| after.to_vec()), Some(id));
 }
 
 #[test]

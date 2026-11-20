@@ -14,14 +14,14 @@ use ulid::Ulid;
 use url::Url;
 
 use super::ImportMode;
-use crate::UserId;
 use crate::credential_encryption::CredentialEncryptionKey;
 use crate::id::NodeId;
 use crate::structs::checksum::Hasher;
-use crate::structs::execution::job::{ArtifactRef, RoCrateLimits};
+use crate::structs::execution::job::input::{ArtifactRef, RoCrateLimits};
 use crate::structs::execution::source_access::SourceMetadata;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::BackendLocation;
+use crate::user::id::UserId;
 
 /// What an operation needs to know about this node; the caller reads it before the run.
 #[derive(Clone, Debug, PartialEq)]

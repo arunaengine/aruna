@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::execution::job::{JobErrorKind, PhysicalExecutionState};
+use aruna_core::structs::execution::job::family::PhysicalExecutionState;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 use aruna_core::{NodeId, UserId};
 use ulid::Ulid;
 

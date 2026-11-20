@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_plugin_types::calls::{ErrorKind, HostError};
+use aruna_plugin_types::calls::{ErrorKind, HostError, merge_into};
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -202,26 +202,6 @@ fn plain_objects(dataset: &mut Value) {
                 Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
                 other => other,
             };
-        }
-    }
-}
-
-/// Applies a JSON merge patch to `target`.
-pub fn merge_into(target: &mut Value, patch: Value) {
-    let Value::Object(changes) = patch else {
-        *target = patch;
-        return;
-    };
-    if !target.is_object() {
-        *target = Value::Object(Default::default());
-    }
-    let Value::Object(fields) = target else {
-        return;
-    };
-    for (key, value) in changes {
-        match value {
-            Value::Null => drop(fields.remove(&key)),
-            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
         }
     }
 }

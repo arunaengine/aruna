@@ -3,10 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
     PENDING_PROJECTION_KEYSPACE,
@@ -16,7 +16,7 @@ use aruna_core::metadata::{
     MetadataEvent, MetadataEventPayload, MetadataEventRecord,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     document_job_prefix, event_log_prefix, materialization_status_key,
 };
@@ -24,15 +24,13 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::Key;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{effect_event, page_rows};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::profile::rules::stale_status;
 use crate::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, submission_verdict,
 };
-use crate::metadata::update_document::{
-    UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-};
+use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentOperation};
+use aruna_core::metadata::api::UpdateDocumentMutation;
 
 /// Pending projection markers read per page while looking for an unapplied event.
 const MARKER_PAGE: usize = 100;
@@ -94,7 +92,7 @@ impl ReadyBaseOperation {
     }
 
     fn newest_read(&mut self, result: IoResult) -> BaseTurn {
-        let (rows, _) = page_rows(result)?;
+        let (rows, _) = result.page()?;
         let current = (rows.first())
             .and_then(|(key, _)| <[u8; 16]>::try_from(key.get(16..32)?).ok())
             .map_or(Ulid::nil(), Ulid::from_bytes);
@@ -110,7 +108,8 @@ impl ReadyBaseOperation {
     }
 
     fn status_read(&mut self, result: IoResult) -> BaseTurn {
-        let status = value(result)?
+        let status = result
+            .value()?
             .and_then(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok());
         let applied = status.is_some_and(|status| {
             status.state == MaterializationState::Materialized && status.event_id >= self.expected
@@ -134,7 +133,7 @@ impl ReadyBaseOperation {
     }
 
     fn markers_read(&mut self, result: IoResult) -> BaseTurn {
-        let (rows, next) = page_rows(result)?;
+        let (rows, next) = result.page()?;
         let keys = rows.into_iter().map(|(key, _)| key).collect();
         self.next_marker(keys, next)
     }
@@ -154,7 +153,8 @@ impl ReadyBaseOperation {
     /// A marker of an applied batch is only a deferred lifecycle mint; any other one is a
     /// received change the graph has not applied.
     fn marker_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
-        let event = value(result)?
+        let event = result
+            .value()?
             .and_then(|bytes| postcard::from_bytes::<MetadataEventRecord>(&bytes).ok());
         let Some(MetadataEventPayload::ApplyBatch { batch, .. }) = event.map(|event| event.payload)
         else {
@@ -170,7 +170,7 @@ impl ReadyBaseOperation {
     }
 
     fn dot_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::ContainsDotResult { contains: true, .. })
             // A node without the graph store has nothing to wait for.
             | Event::Metadata(MetadataEvent::Error {
@@ -224,7 +224,7 @@ impl Operation for ReadyBaseOperation {
             BaseStage::Marker(keys, next) => self.marker_read(result, keys, next),
             BaseStage::Dot(keys, next) => self.dot_read(result, keys, next),
             BaseStage::Jobs => {
-                let (queued, _) = page_rows(result)?;
+                let (queued, _) = result.page()?;
                 match queued.is_empty() {
                     true => Ok(Next::Done(())),
                     false => Err(self.pending()),
@@ -323,9 +323,7 @@ impl UpdateEntryOperation {
 
     fn generation_read(&mut self, result: IoResult) -> EntryTurn {
         // A node without the metadata handle keeps no cache.
-        if let Event::Metadata(MetadataEvent::CacheGeneration { generation }) =
-            effect_event(result)?
-        {
+        if let Event::Metadata(MetadataEvent::CacheGeneration { generation }) = result.event()? {
             self.generation = Some(generation);
         }
         let operation = self
@@ -382,7 +380,7 @@ impl Operation for UpdateEntryOperation {
             EntryStage::Update => self.updated(result),
             EntryStage::Cache => {
                 // The row is committed; a cache that missed it refills from storage.
-                let _ = effect_event(result);
+                let _ = result.event();
                 let updated = self
                     .updated
                     .take()
@@ -536,7 +534,7 @@ mod tests {
         let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
             actor: Actor {
                 node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
-                user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+                user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
                 realm_id,
             },
             group_id: Ulid::from_parts(2, 2),

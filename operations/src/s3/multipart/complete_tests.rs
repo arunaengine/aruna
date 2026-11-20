@@ -176,7 +176,7 @@ fn starts_child(turn: &Turn) -> bool {
 
 /// The cleanup rows among `calls`, in order.
 fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
-    crate::tests::s3::cleanup_works(calls)
+    aruna_test_support::s3::cleanup_works(calls)
 }
 
 fn released(calls: &[IoCall]) -> Option<Ulid> {
@@ -1710,7 +1710,7 @@ fn share_outlives_compose() {
 /// The placement gate runs as a child before the compose and is rechecked in the finalize.
 mod decisions {
     use super::*;
-    use crate::placement::policy::PolicyCacheStats;
+    use crate::placement::policy::cache::PolicyCacheStats;
     use aruna_core::structs::placement::policy::{
         PlacementDecision, PlacementSubject, VerifiedPolicy,
     };

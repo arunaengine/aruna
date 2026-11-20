@@ -393,7 +393,7 @@ async fn upload_never_overwrites() {
 }
 
 /// Gives `user` a role in the node's group with exactly `rules` below the bucket.
-async fn grant(node: &Node, user: aruna_core::UserId, rules: &[(&str, Permission)]) {
+async fn grant(node: &Node, user: aruna_core::user::id::UserId, rules: &[(&str, Permission)]) {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::identity::auth::{Actor, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};

@@ -4,7 +4,7 @@
 
 use aruna_core::effects::LaunchFrame;
 use aruna_core::events::LaunchDecline;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
 use aruna_core::time::unix_timestamp_millis;
 
 use super::admit_launch;

@@ -2,17 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_operations::shard::recovery::RecoveryError;
 use aruna_operations::shard::recovery::RecoveryStop;
-use aruna_operations::shard::restore_plan::ShardRestoreCursor;
+use aruna_operations::shard::restore::plan::ShardRestoreCursor;
 use aruna_operations::tests::shard::flat_config;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
@@ -21,8 +20,10 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
+use aruna_net::config::NetConfig;
 use aruna_operations::node::recovery_run::{
     PresencePhaseOperation, RECOVERY_RETRY_BASE, RECOVERY_RETRY_MAX, RecoveryConfig,
     RecoveryOperation,
@@ -30,7 +31,7 @@ use aruna_operations::node::recovery_run::{
 use aruna_operations::placement::process_placements::ReconcilePlacementsOperation;
 use aruna_operations::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
 use aruna_operations::shard::restore::*;
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
@@ -44,6 +45,8 @@ struct RecoveryNode {
     net: NetHandle,
     task_handle: TaskHandle,
     context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<aruna::inbound::IncomingFixture>,
 }
 
 async fn make_node(realm_id: RealmId, seed: u8) -> RecoveryNode {
@@ -71,12 +74,13 @@ async fn make_node(realm_id: RealmId, seed: u8) -> RecoveryNode {
         compute_handle: None,
         outbound_handle: None,
     });
-    aruna::inbound::initialize_incoming_fixture(context.clone());
+    let incoming = aruna::inbound::initialize_incoming_fixture(context.clone());
     RecoveryNode {
         _dir: dir,
         net,
         task_handle,
         context,
+        _incoming: incoming,
     }
 }
 

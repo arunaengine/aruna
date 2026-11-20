@@ -8,20 +8,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::plugins::artifacts::ArtifactError;
 use crate::plugins::calls::*;
-use crate::plugins::copy_rows::tests::stale_progress;
-use crate::plugins::copy_rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
+use crate::plugins::copy::rows::tests::stale_progress;
+use crate::plugins::copy::rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
 use crate::plugins::rows::{Scan, scan_rows};
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
 use aruna_core::plugins::{ArtifactBytes, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::{TempDir, tempdir};
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");

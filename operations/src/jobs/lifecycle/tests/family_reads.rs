@@ -5,7 +5,7 @@
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     ExecutionReceipt, JobFamilyRecord, JobRecordKey, JobRecordKind, LogicalJobSpec,
 };
 use aruna_core::types::Value;
@@ -120,8 +120,8 @@ async fn reads_kind_only() {
 #[tokio::test]
 async fn resolves_session_alias() {
     use super::session_job;
-    use crate::jobs::job_reads::tests::{read_owned_job, read_report_routed};
-    use crate::jobs::job_reports::{JobReportLookup, ReportQuery};
+    use crate::jobs::job::reads::tests::{read_owned_job, read_report_routed};
+    use crate::jobs::job::reports::{JobReportLookup, ReportQuery};
     use crate::jobs::route::JobRouteError;
 
     let family = Family::new([7u8; 32]);
@@ -141,27 +141,28 @@ async fn resolves_session_alias() {
     assert_eq!(record.owner_node_id, family.target.public());
     assert_eq!(physical, Some(receipt.physical_job_id));
     let now = aruna_core::time::unix_timestamp_millis();
-    let mut physical = aruna_core::structs::execution::job::JobRecord::new(
+    let mut physical = aruna_core::structs::execution::job::local::JobRecord::new(
         receipt.physical_job_id,
-        aruna_core::structs::execution::job::JobPayload::Execution(spec.payload.clone()),
+        aruna_core::structs::execution::job::input::JobPayload::Execution(spec.payload.clone()),
         spec.created_by,
         family.target.public(),
         now,
         now,
         None,
     );
-    physical.state = aruna_core::structs::execution::job::JobState::Succeeded;
+    physical.state = aruna_core::structs::execution::job::identity::JobState::Succeeded;
     physical.finished_at_ms = Some(now);
     physical.report_digest = Some([4; 32]);
-    crate::jobs::store::test_calls::insert_job(&ctx, &physical)
+    aruna_test_support::jobs::insert_job(&ctx, &physical)
         .await
         .unwrap();
-    let auth = |user_id: aruna_core::UserId| aruna_core::structs::identity::auth::AuthContext {
-        user_id,
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
-    };
+    let auth =
+        |user_id: aruna_core::user::id::UserId| aruna_core::structs::identity::auth::AuthContext {
+            user_id,
+            realm_id: REALM,
+            path_restrictions: None,
+            session: None,
+        };
     let query = || ReportQuery {
         expected_digest: None,
         last_key: None,
@@ -172,7 +173,7 @@ async fn resolves_session_alias() {
         .unwrap();
     assert!(matches!(report, JobReportLookup::Ready { job, .. }
         if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32]));
-    let stranger = aruna_core::UserId::new(ulid::Ulid(42), REALM);
+    let stranger = aruna_core::user::id::UserId::new(ulid::Ulid(42), REALM);
     assert!(matches!(
         read_report_routed(&ctx, &auth(stranger), spec.job_id, query()).await,
         Ok(JobReportLookup::NotFound)

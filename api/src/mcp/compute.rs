@@ -7,16 +7,14 @@ use super::{
     JsonPayload, McpServer, bad_request, empty_extras, explained, internal_error, parse_ulid,
     request_auth, server_error, tool_extras,
 };
-use crate::job_service::{
-    RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_job_routed,
-};
+use crate::job_service::{cancel_job_routed, list_owned_jobs, read_job_routed};
 use crate::jobs::family_report;
 use aruna_core::compute::runtimes::{
     QUICK_RUNTIMES, QuickRuntime, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
     SessionRuntime, quick_runtime,
 };
 use aruna_core::compute::session::{EndReason, SessionAnswer, SessionRequest};
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, key_content_type};
 use aruna_drivers::driver::drive;
@@ -24,6 +22,7 @@ use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
     InputMode, SessionMountSpec, SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
 };
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
@@ -896,7 +895,7 @@ async fn artifact_output(
     server: &McpServer,
     job_id: &str,
     output: crate::jobs::JobOutputResponse,
-    node_id: Option<aruna_core::NodeId>,
+    node_id: Option<aruna_core::id::NodeId>,
 ) -> JobArtifactOutput {
     let local = node_id.is_none_or(|node_id| node_id == server.state.get_node_id());
     let head = match (local, Ulid::from_string(&output.version_id)) {
@@ -980,7 +979,9 @@ pub(super) fn request_bearer(parts: &http::request::Parts) -> Option<crate::auth
 
 /// A malformed job id is absence to the shared parser, which reads to a caller
 /// as a missing job rather than a wrong argument.
-fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::JobId, CallToolResult> {
+fn parse_job(
+    id: &str,
+) -> Result<aruna_core::structs::execution::job::identity::JobId, CallToolResult> {
     crate::jobs::parse_job_id(id).map_err(|_| {
         bad_request(
             "id must be a 26-character job ULID such as 01JZ8Y6T0K4W7M2N9Q5R3S8V1X; read job_id \
@@ -991,7 +992,7 @@ fn parse_job(id: &str) -> Result<aruna_core::structs::execution::job::JobId, Cal
 
 fn parse_job_state(
     value: &str,
-) -> Result<aruna_core::structs::execution::job::JobState, CallToolResult> {
+) -> Result<aruna_core::structs::execution::job::identity::JobState, CallToolResult> {
     crate::jobs::parse_state(value).map_err(|_| {
         bad_request(
             "state must be one of queued, claimed, preparing, ready, running, cancelling, \
@@ -1042,7 +1043,7 @@ async fn compute_probe(
     server: &McpServer,
     auth: &aruna_core::structs::identity::auth::AuthContext,
     permission: Permission,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, permission, extras)
         .await

@@ -2,20 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, config_node_path, overlay_placement, parse_config_node,
-};
-use aruna_core::rows::{done, values};
+use aruna_core::reducer::paths::{config_node_path, parse_config_node};
+use aruna_core::reducer::placement::overlay_placement;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -32,7 +32,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -502,14 +502,14 @@ impl Operation for EnsureConfigOperation {
                 self.emit_document_write(document, reducer)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }
@@ -628,7 +628,6 @@ fn remove_config_node(config: &mut RealmConfigDocument, node_id: &NodeId) {
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
         AdminDocumentTarget,
@@ -640,9 +639,8 @@ mod pure_tests {
         SYNC_OUTBOX_KEYSPACE,
     };
     use aruna_core::operation::{Operation, TransactionMode};
-    use aruna_core::reducer::{
-        AdminConflict, AdminConflictValue, AdminDocumentState, CONFIG_STRATEGY_PATH,
-    };
+    use aruna_core::reducer::paths::CONFIG_STRATEGY_PATH;
+    use aruna_core::reducer::{AdminConflict, AdminConflictValue, AdminDocumentState};
     use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -652,6 +650,7 @@ mod pure_tests {
         StrategyBinding, band_start, coordinator_spans,
     };
     use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_core::user::id::UserId;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
@@ -660,7 +659,7 @@ mod pure_tests {
         overlay_reducer_state,
     };
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -828,7 +827,7 @@ mod pure_tests {
 
     fn run_ensure(
         actor: &Actor,
-        target: aruna_core::NodeId,
+        target: aruna_core::id::NodeId,
         kind: RealmNodeKind,
         document: &RealmConfigDocument,
     ) -> (RealmConfigDocument, Vec<u8>) {
@@ -870,7 +869,7 @@ mod pure_tests {
 
         let (after_a, state_a) = run_ensure(&actor_a, joiner_a, RealmNodeKind::Server, &document);
         let (after_b, _) = run_ensure(&actor_b, joiner_b, RealmNodeKind::Server, &document);
-        let granted = |after: &RealmConfigDocument, owner: &aruna_core::NodeId| {
+        let granted = |after: &RealmConfigDocument, owner: &aruna_core::id::NodeId| {
             let granted = after.handle_range_directory().granted_to(owner);
             assert_eq!(granted.len(), 1, "one usable grant per joiner");
             granted[0]

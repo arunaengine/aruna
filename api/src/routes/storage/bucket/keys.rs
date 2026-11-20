@@ -14,11 +14,10 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
-use aruna_core::operation::Runnable;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, HolderOrigin, UnlockStatus};
@@ -26,6 +25,7 @@ use aruna_core::structs::storage::holders::{
     HolderEntry, HolderState, KeyLookup, holder_revision, revision_with_facts,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;
@@ -38,7 +38,7 @@ use aruna_operations::s3::bucket::key::removal::{
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockError, UnlockInput};
 use aruna_operations::s3::bucket::rotate::KeyChange;
 use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
-use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
+use aruna_operations::transfer::key_status::{AuditPageOperation, KeySnapshot};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -330,7 +330,8 @@ pub async fn unlock_bucket(
         })?;
     seal_missing(&state, &bucket, group_id, status.key).await;
     // An unlocked node is an issuer: a due raise happens now and its requests are issued.
-    if let Err(error) = crate::routes::storage::abe::epoch_run(&state, &auth, &bucket, false).await
+    if let Err(error) =
+        crate::routes::storage::abe::records::epoch_run(&state, &auth, &bucket, false).await
     {
         tracing::warn!(event = "abe.epoch_raise.failed", error = %error);
     }
@@ -861,14 +862,14 @@ pub async fn bucket_audit(
 
 /// Runs `operation`, an install or an unlock, then resumes the work that waited for its key; a
 /// failed resume is only reported, since the key is usable either way.
-pub(crate) async fn activate_and_wake<O, K>(
+pub(crate) async fn activate_and_wake<O>(
     context: &DriverContext,
     operation: O,
     origin: (RealmId, NodeId),
     limits: &RoCrateLimits,
 ) -> Result<UnlockStatus, O::Error>
 where
-    O: Runnable<K, Output = UnlockStatus>,
+    O: Operation<Output = UnlockStatus>,
 {
     let status = drive(operation, context).await?;
     let now_ms = unix_timestamp_millis();

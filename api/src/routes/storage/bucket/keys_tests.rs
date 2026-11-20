@@ -19,8 +19,9 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_storage::FjallStorage;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::storage::worker::FjallStorage;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tempfile::TempDir;
@@ -40,7 +41,7 @@ async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let storage = FjallStorage::open(root).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId([3; 32]);
     let config = NetConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),

@@ -4,17 +4,17 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
-use aruna_core::structs::execution::job::{RunCrateStatus, RunLink};
+use aruna_core::structs::execution::job::local::{RunCrateStatus, RunLink};
 use aruna_core::structs::identity::auth::{Actor, PathRestriction, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::user::id::UserId;
 
 use super::*;
-use crate::jobs::store::test_calls::put_crate_outcome;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_test_support::jobs::put_crate_outcome;
 
 async fn read_run(
     context: &DriverContext,
@@ -105,7 +105,10 @@ fn auth(user_id: UserId, realm_id: RealmId) -> AuthContext {
 async fn run_read_rights() {
     let temp = tempfile::tempdir().unwrap();
     let context = DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().unwrap(),
+        )
+        .unwrap(),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,

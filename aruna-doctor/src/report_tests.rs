@@ -7,12 +7,17 @@ use aruna_core::keyspaces::{
     FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE,
     PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
 };
-use aruna_core::structs::execution::job::record_rows::{OutboxEntry, PendingNeed, PendingRecord};
-use aruna_core::structs::execution::job::{
-    CollisionPolicy, ExecutionSpec, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord,
-    JobRecordEnvelope, JobState, PluginWorkAction, PluginWorkSpec, SubmissionClaim, SubmissionId,
-    cleanup_job_id, due_index_key, job_prune_key, job_record_key,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, SubmissionClaim, SubmissionId,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CollisionPolicy, ExecutionSpec, JobPayload, PluginWorkAction, PluginWorkSpec,
+};
+use aruna_core::structs::execution::job::local::{
+    JobRecord, cleanup_job_id, due_index_key, job_prune_key, job_record_key,
+};
+use aruna_core::structs::execution::job::record_rows::{OutboxEntry, PendingNeed, PendingRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::plugins::work::{
@@ -293,7 +298,7 @@ fn refuses_missing_database() {
 fn reports_discard_state() {
     use aruna_core::compute::quota::JobReservationRecord;
     use aruna_core::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, JOB_RESERVATION_KEYSPACE};
-    use aruna_core::structs::execution::job::EffectiveResources;
+    use aruna_core::structs::execution::job::family::EffectiveResources;
     let temp = tempdir().unwrap();
     let path = temp.path().join("db");
     {

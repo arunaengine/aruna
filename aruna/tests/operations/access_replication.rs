@@ -5,14 +5,14 @@
 use std::time::{Duration, SystemTime};
 
 use crate::topology::{TestNode, install_replica_config, spawn_replicas};
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::s3::access::create::{CreateUserConfig, CreateUserOperation};
 use aruna_operations::s3::access::get::GetAccessOperation;
 use aruna_operations::s3::access::revoke::RevokeUserOperation;
-use aruna_operations::testing::sync_topics;
+use aruna_test_support::documents::sync_topics;
 use ulid::Ulid;
 
 #[tokio::test]

@@ -2,20 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::calls::{
-    configured_call, git_call, git_event, has_store, metadata_call, metadata_event,
-};
+use super::calls::{configured_call, git_call, git_event, has_store, metadata_event};
 use super::dataset::{self, PushTarget};
 use super::snapshot::held_refresh;
-use super::{GitError, GitNode, records};
+use super::{GitError, records};
+use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::update_document::{
-    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
+    UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageReadError;
-use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
+use aruna_core::git::{GitEffect, GitEvent, GitNode, PENDING, PendingMerge, ZERO_OID};
+use aruna_core::metadata::api::UpdateDocumentMutation;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn rows_keep_order() {
         let merge = |new: char| PendingMerge {
-            user_id: aruna_core::UserId::new(Ulid::from(1), RealmId([1; 32])),
+            user_id: aruna_core::user::id::UserId::new(Ulid::from(1), RealmId([1; 32])),
             old: ZERO_OID.into(),
             new: new.to_string().repeat(40),
         };
@@ -408,7 +408,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().to_str().expect("path");
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(path).expect("storage"),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(path)
+                .expect("storage"),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -417,7 +418,7 @@ mod tests {
             outbound_handle: None,
         };
         let merge = PendingMerge {
-            user_id: aruna_core::UserId::new(Ulid::from(1), RealmId([1; 32])),
+            user_id: aruna_core::user::id::UserId::new(Ulid::from(1), RealmId([1; 32])),
             old: ZERO_OID.into(),
             new: "a".repeat(40),
         };

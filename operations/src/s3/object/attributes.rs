@@ -142,7 +142,6 @@ impl Operation for GetAttributesOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
@@ -156,6 +155,7 @@ mod tests {
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartObjectKey;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
@@ -262,7 +262,7 @@ mod tests {
     }
 
     async fn write(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         key_space: &str,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -278,7 +278,7 @@ mod tests {
     }
 
     async fn seed_current_version(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         location: &BackendLocation,
         version_id: Ulid,
     ) {
@@ -325,7 +325,7 @@ mod tests {
     }
 
     async fn seed_multipart_metadata(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         version_id: Ulid,
         checksum_type: MultipartChecksumType,
         part_numbers: &[u16],
@@ -369,7 +369,7 @@ mod tests {
     async fn multipart_returns_parts() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
@@ -412,7 +412,7 @@ mod tests {
     async fn simple_omits_parts() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
@@ -441,7 +441,7 @@ mod tests {
     async fn targets_specific_version() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let location = location();
@@ -499,7 +499,7 @@ mod tests {
     async fn delete_marker_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();

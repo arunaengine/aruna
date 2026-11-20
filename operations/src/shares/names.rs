@@ -55,10 +55,11 @@ impl Operation for ClaimNameOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ShareError> {
         if self.writing {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(true));
         }
-        let held = rows::value(result)?
+        let held = result
+            .value()?
             .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).ok())
             .is_some_and(|until| u64::from_be_bytes(until) > self.now);
         if held {
@@ -101,7 +102,7 @@ impl Operation for ReleaseNameOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareError> {
-        rows::done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -112,7 +113,7 @@ mod tests {
     use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 
     fn context(dir: &tempfile::TempDir) -> DriverContext {
-        crate::testing::path_context(dir.path().to_str().unwrap())
+        aruna_drivers::testing::path_context(dir.path().to_str().unwrap())
     }
 
     /// Reads the name row and answers it with `stored`.

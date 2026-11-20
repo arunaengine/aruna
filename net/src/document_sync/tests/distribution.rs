@@ -7,10 +7,13 @@ use super::*;
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, DISTRIBUTION_KEYSPACE, PARKED_INDEX_KEYSPACE};
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::publisher_key;
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement, StatementKind};
 use aruna_core::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionSettings, DistributionSnapshot,
-    DistributionView, MemberState, PublisherCutoff, SetRoot, SignedSnapshot, Statement,
-    StatementKind, next_snapshot,
+    DistributionConfig, DistributionSettings, MemberState, PublisherCutoff,
 };
 
 const PUBLISHER: u8 = 41;

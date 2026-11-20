@@ -15,9 +15,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::{
-    JobId, JobRecord, JobResultPayload, RoCrateUploadCleanup, RoCrateUploadRecord, job_record_key,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{RoCrateUploadCleanup, RoCrateUploadRecord};
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, job_record_key};
 use aruna_core::structs::storage::blob::{HiddenBlobEntry, HiddenBlobKey};
 use aruna_core::structs::storage::distribution::on_use::{
     ATTACHMENT_NAMESPACE, Attachment, CACHE_NAMESPACE, CacheEntry, attachment_key,
@@ -61,7 +61,7 @@ impl Default for SweepCursor {
     }
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HiddenSweepOutcome {
     pub cleanup_pending: bool,
     pub uploads_deleted: usize,
@@ -139,7 +139,7 @@ impl Operation for DeleteHiddenOperation {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum SweepStep {
     Cursor,
     Page(SweepPhase),
@@ -147,7 +147,7 @@ enum SweepStep {
 }
 
 /// Runs one page of the phase the stored cursor names and stores where the next run goes on.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProcessHiddenOperation {
     /// The runner clock, read at the start for the sweep budget.
     clock_ms: u64,
@@ -797,7 +797,7 @@ impl Operation for IsProtectedOperation {
         if namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE {
             // An evicted copy a read still holds stays until the read ends.
             self.step = ProtectStep::Held(namespace);
-            let held = crate::distribution::pull::held_call(&self.key.backend_path);
+            let held = crate::distribution::held::held_call(&self.key.backend_path);
             return Ok(Next::Call(held));
         }
         let key = namespace.to_bytes().to_vec();
@@ -807,7 +807,7 @@ impl Operation for IsProtectedOperation {
     fn next(&mut self, result: IoResult) -> Turn<bool> {
         match std::mem::replace(&mut self.step, ProtectStep::Job) {
             ProtectStep::Held(namespace) => {
-                if crate::distribution::pull::held_answer(result)? {
+                if crate::distribution::held::held_answer(result)? {
                     return Ok(Next::Done(true));
                 }
                 let Some((key_space, row_key)) = kept_row(&self.key, namespace) else {
@@ -918,20 +918,21 @@ impl Operation for DeleteUnclaimedOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::execution::job::{
-        ArtifactRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload, JobState,
-        RoCrateCheckpointRefs, RoCrateLimits, RoCrateMediaType,
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::{
+        ArtifactRef, ExportRoCrateResult, ExportRoCrateSpec, JobPayload, RoCrateCheckpointRefs,
+        RoCrateLimits, RoCrateMediaType,
     };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendLocation;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use byteview::ByteView;
     use serde::Serialize;
     use std::collections::HashMap;
@@ -1050,7 +1051,7 @@ mod tests {
     }
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
-        crate::testing::temp_context()
+        aruna_drivers::testing::temp_context()
     }
 
     async fn is_protected(

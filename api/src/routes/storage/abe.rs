@@ -3,25 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod content;
-mod records;
+pub(crate) mod records;
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::relay::{RestRead, holder_json, missed_json};
 use crate::server::state::ServerState;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::abe::envelope::EnvelopeOperation;
 use aruna_operations::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use axum::extract::{Query, State};
 use axum::{Extension, Json};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, StatusCode};
-pub(crate) use records::ScopeView;
-pub(crate) use records::{epoch_due, epoch_run, member_requests};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -71,7 +69,7 @@ fn abe_error(error: AbeError) -> ServerError {
 pub(crate) async fn drive_key(
     bucket: String,
     auth: AuthContext,
-    node: aruna_core::NodeId,
+    node: aruna_core::id::NodeId,
     action: KeyAction,
     context: &DriverContext,
 ) -> Result<KeyResult, KeyError> {
@@ -88,7 +86,9 @@ pub(crate) fn key_error(error: KeyError) -> ServerError {
         KeyError::Abe(e) => abe_error(e),
         KeyError::Missing => ServerError::NotFound,
         KeyError::Denied => ServerError::Forbidden,
-        KeyError::Storage | KeyError::Conflict => ServerError::ServiceUnavailable,
+        KeyError::Storage | KeyError::Conflict | KeyError::Unprepared => {
+            ServerError::ServiceUnavailable
+        }
         KeyError::Busy => ServerError::Refused(StatusCode::CONFLICT, "rekey_running", message),
         KeyError::Locked => ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message),
         KeyError::Bound(_) => {

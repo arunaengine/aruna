@@ -20,7 +20,6 @@ use aruna_core::metadata::{
     MetadataError, MetadataEvent,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{all_values, event};
 use aruna_core::storage_entries::{
     iri_object_prefix, iri_reference_entry, iri_reference_prefix, materialization_status_key,
 };
@@ -32,7 +31,6 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::api::access::{child_results, children};
-use crate::metadata::call_results::page_rows;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
@@ -41,7 +39,7 @@ use super::data_links::{
     AssociateVersionsOperation, DataLinkError, DocumentRowsOperation, LinkBudget, LinkRows,
     LinkRowsOperation,
 };
-use super::repository::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 const INDEX_PAGE_SIZE: usize = 128;
 
@@ -217,7 +215,7 @@ impl BacklinksOperation {
     }
 
     fn rows(&mut self, result: IoResult) -> BacklinkTurn {
-        let (values, next) = page_rows(result)?;
+        let (values, next) = result.page()?;
         self.budget.rows =
             (self.budget.rows.checked_sub(values.len())).ok_or(BacklinkError::BudgetExhausted)?;
         for (_, value) in values {
@@ -242,7 +240,7 @@ impl BacklinksOperation {
     }
 
     fn group_found(&mut self, result: IoResult) -> BacklinkTurn {
-        let (values, _) = page_rows(result)?;
+        let (values, _) = result.page()?;
         let Some(prefix) = values.first().and_then(|(key, _)| key.get(..64)) else {
             return Ok(Next::Done(self.page()));
         };
@@ -501,7 +499,7 @@ impl Operation for ProjectRowsOperation {
         let (document_id, cursor, graph_iri) = self.document.clone();
         match std::mem::replace(&mut self.stage, ProjectStage::References) {
             ProjectStage::References => {
-                let references = match event(result)? {
+                let references = match result.event()? {
                     Event::Metadata(MetadataEvent::IriReferences { references }) => references,
                     Event::Metadata(MetadataEvent::Error { error, .. }) => {
                         return Err(MetadataIriError::UnexpectedEvent(error.to_string()));
@@ -686,7 +684,7 @@ impl Operation for RebuildIrisOperation {
                 "rebuild not started".to_string(),
             )),
             Some(RebuildStage::Page) => {
-                let (rows, next) = page_rows(result).map_err(|error| backend(&error))?;
+                let (rows, next) = result.page().map_err(|error| backend(&error))?;
                 self.next = next;
                 let records: Vec<MetadataRegistryRecord> = rows
                     .iter()
@@ -707,7 +705,7 @@ impl Operation for RebuildIrisOperation {
                 Ok(Next::Call(IoCall::Read(reads)))
             }
             Some(RebuildStage::Statuses(live)) => {
-                let values = all_values(result).map_err(|error| backend(&error))?;
+                let values = result.values().map_err(|error| backend(&error))?;
                 for (record, value) in live.into_iter().zip(values) {
                     let status = value.and_then(|bytes| {
                         postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok()
@@ -903,8 +901,8 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
 
     const OBJECT: &str = "https://example.test/object";
 

@@ -3,16 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::effects::{Effect, StorageEffect};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::storage::replication::ArunaArn;
-use crate::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_key};
+use crate::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, sync_relationship_key,
+};
+use crate::task::{TaskEffect, TaskKey};
 use crate::types::Key;
 use byteview::ByteView;
 
@@ -21,6 +26,10 @@ pub enum ReplicationMode {
     Live,
     OnDemand,
 }
+
+/// Hard bound on automatic successors per explicit binding: the interval only
+/// slows growth, this stops it. Only a WRITE or rebind starts a fresh count.
+pub const MAX_AUTO_ADVANCES: u16 = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceAdvance {
@@ -509,4 +518,11 @@ pub fn merge_due_job(
         jobs.push((key, job));
         jobs.len() >= limit
     }
+}
+
+pub fn schedule_blob_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainReplicationQueue,
+        after: Duration::ZERO,
+    })
 }

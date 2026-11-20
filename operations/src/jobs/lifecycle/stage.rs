@@ -7,7 +7,8 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{InputSelection, InputSource, JobError, JobRecord};
+use aruna_core::structs::execution::job::input::{InputSelection, InputSource};
+use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use tracing::{debug, warn};
@@ -18,7 +19,7 @@ use crate::jobs::records::pages::ServingNode;
 use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 /// The staged bytes of one input plus the size the caller writes with.
 #[derive(Debug, PartialEq)]
@@ -43,7 +44,7 @@ impl From<IoError> for StageError {
 /// a missing or corrupt source moves to the next one without ever changing the stored input.
 #[derive(Debug, PartialEq)]
 pub struct StageInputOperation {
-    created_by: aruna_core::UserId,
+    created_by: aruna_core::user::id::UserId,
     source_node: Option<NodeId>,
     /// The endpoint owning the bucket, key and version identity of this input.
     ingress: Option<NodeId>,
@@ -236,7 +237,8 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, node, payload, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{JobId, JobPayload};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::JobPayload;
     use futures_util::stream;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
@@ -256,7 +258,7 @@ mod tests {
             },
             source_node_id: Some(node(5)),
             dest_key: "input".to_string(),
-            mode: aruna_core::structs::execution::job::InputMode::Snapshot,
+            mode: aruna_core::structs::execution::job::input::InputMode::Snapshot,
             container_path: None,
             name: None,
             description: None,

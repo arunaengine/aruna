@@ -8,7 +8,7 @@
 pub(super) mod copy;
 pub(super) mod list;
 pub(super) mod parts;
-pub(super) mod reads;
+pub(crate) mod reads;
 mod uploads;
 mod versions;
 
@@ -16,7 +16,7 @@ use aruna_drivers::driver::drive;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::member_read::{MemberBody, MemberMethod, TrailerValue};
 use aruna_core::outbound::xml_field;
 use aruna_core::stream::BackendStream;
@@ -25,17 +25,17 @@ use aruna_core::structs::storage::distribution::delegation::{
     COPY_CONTEXT_HEADER, CopyContext, DIGEST_HEADERS, PASSED_HEADERS, Payload, bound_header,
     request_digest,
 };
+use aruna_core::structs::storage::distribution::route::{ReadRoute, RouteError};
 use aruna_core::structs::storage::distribution::upload::UploadTag;
-use aruna_core::structs::storage::distribution::{ReadRoute, RouteError};
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
-pub(crate) use aruna_operations::s3::object::member_read::MemberTarget as Forward;
-pub(super) use aruna_operations::s3::object::member_read::{
+use aruna_operations::s3::object::member::read::MemberTarget as Forward;
+use aruna_operations::s3::object::member::read::{
     MemberPayload as ForwardBody, MemberRequest as ForwardRequest, TrailerChecksum,
 };
-use aruna_operations::s3::object::member_write::{ForwardDeletesOperation, WriteTargetOperation};
+use aruna_operations::s3::object::member::write::{ForwardDeletesOperation, WriteTargetOperation};
 use http::{HeaderMap, Method};
 use s3s::dto::{
     DeleteObjectOutput, DeletedObject, ETag, Error as S3DeleteError, PutObjectOutput, StreamingBlob,

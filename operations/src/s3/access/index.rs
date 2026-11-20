@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, ABE_REQUEST_KEYSPACE, TOKEN_GRANT_KEYSPACE};
 use aruna_core::rows::PrefixPages;
 use aruna_core::structs::storage::abe_access::token_prefix;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::BTreeSet;
 

@@ -5,13 +5,13 @@
 use super::BlobHandler;
 use super::io::backend_version;
 use crate::s3::RESERVATION;
-use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::backend_import::ExternalObject;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::user::id::UserId;
 use futures::StreamExt;
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};

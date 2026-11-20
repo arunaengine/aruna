@@ -5,16 +5,15 @@
 use super::hidden_token;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{
     AuthToken, MergeError, MergeJob, MergeOutput, MetadataEffect, MetadataError, MetadataEvent,
     MetadataQueryResults, QUERY_MAX_ROWS, SolutionRow,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::Span;
@@ -31,11 +30,12 @@ use super::fanout_types::{
 use super::node_fanout::{FanoutParts, NodeCalls, NodeFanoutOperation};
 use super::read_types::MetadataQueryExecution;
 use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::local_query::LocalQueryOperation;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 use crate::metadata::query_cache::{RemoteKeyInput, credential_digest, remote_key};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, metadata_read_error, peer_call, peer_reply,
+};
 
 /// Where one partition query runs.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,7 +56,10 @@ fn merge_call(job: MergeJob, budget: Duration) -> IoCall {
 
 /// The merged rows or tie count of a [`merge_call`].
 fn merged(result: IoResult) -> Result<MergeOutput, MergeError> {
-    match event(result).map_err(|error| MergeError::Failed(error.to_string()))? {
+    match result
+        .event()
+        .map_err(|error| MergeError::Failed(error.to_string()))?
+    {
         Event::Metadata(MetadataEvent::RowsMerged { result }) => result,
         Event::Metadata(MetadataEvent::Error { error, .. }) => {
             Err(MergeError::Failed(error.to_string()))
@@ -593,7 +596,7 @@ impl DistributedQueryOperation {
     }
 
     fn cache_read(&mut self, result: IoResult) -> Result<Next<QueryAnswer>, MetadataApiError> {
-        if let Ok(Event::Metadata(MetadataEvent::QueryCacheEntry { stamp, entry })) = event(result)
+        if let Ok(Event::Metadata(MetadataEvent::QueryCacheEntry { stamp, entry })) = result.event()
         {
             if let Some((results, nodes_queried)) = entry {
                 let stats = MetadataFanoutStats {

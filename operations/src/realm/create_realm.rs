@@ -12,7 +12,6 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
@@ -26,7 +25,7 @@ use aruna_core::structured_id::{FieldError, PlacementHandle};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -373,7 +372,7 @@ impl Operation for CreateRealmOperation {
 
     /// A failed drain timer leaves the durable outbox retryable.
     fn next(&mut self, result: IoResult) -> Result<Next<CreatedRealm>, CreateRealmError> {
-        done(result)?;
+        result.done()?;
         let (Some(config), Some(auth)) = (self.config_doc.clone(), self.auth_doc.clone()) else {
             return Err(CreateRealmError::ConfigDocMissing);
         };
@@ -448,7 +447,6 @@ pub(crate) fn seed_placement_events(
 mod test {
     use aruna_core::keys::generate_signing_key;
 
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
@@ -467,7 +465,9 @@ mod test {
         BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
     };
     use aruna_core::types::{Key, KeySpace, Value};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_core::user::id::UserId;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
@@ -978,7 +978,7 @@ mod test {
     pub async fn test_realm_creation() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

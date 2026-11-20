@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 
 use super::*;
 
@@ -129,18 +129,18 @@ where
                 self.write()
             }
             Step::Write => {
-                done(result)?;
+                result.done()?;
                 let (_, mut deletes) = self.deltas()?;
                 self.step = Step::Delete;
                 deletes.extend(std::mem::take(&mut self.terminal_deletes));
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Step::Delete => {
-                done(result)?;
+                result.done()?;
                 self.obligations()
             }
             Step::Obligations => {
-                done(result)?;
+                result.done()?;
                 self.crate_read()
             }
             Step::CrateRead => {
@@ -148,7 +148,7 @@ where
                 self.crate_write(value.as_deref())
             }
             Step::CrateWrite => {
-                done(result)?;
+                result.done()?;
                 self.dedup_read()
             }
             Step::DedupRead => {
@@ -156,7 +156,7 @@ where
                 self.dedup_delete(value.as_deref())
             }
             Step::DedupDelete => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }

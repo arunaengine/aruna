@@ -248,7 +248,7 @@ async fn wait_for_opens(opens: &AtomicUsize, expected: usize) {
 
 /// Waits until the pump noticed the lost channel. The reopen is paced, so the
 /// test waits for the announced state rather than spinning.
-async fn wait_for_starting(session: &Arc<aruna_compute::Session>) {
+async fn wait_for_starting(session: &Arc<aruna_compute::session::Session>) {
     let (_, mut receiver) = session.subscribe_all();
     while session.snapshot().state != SessionPhase::Starting {
         tokio::time::timeout(Duration::from_secs(60), receiver.recv())
@@ -259,7 +259,7 @@ async fn wait_for_starting(session: &Arc<aruna_compute::Session>) {
 }
 
 /// Reports the kernel ready over one channel and waits for the manager.
-async fn announce_idle(session: &Arc<aruna_compute::Session>, stream: &mut DuplexStream) {
+async fn announce_idle(session: &Arc<aruna_compute::session::Session>, stream: &mut DuplexStream) {
     stream
         .write_all(b"{\"kind\":\"kernel\",\"state\":\"idle\"}\n")
         .await
@@ -269,7 +269,7 @@ async fn announce_idle(session: &Arc<aruna_compute::Session>, stream: &mut Duple
 
 /// Waits for the manager to observe the helper's readiness. The pump runs in
 /// its own task, so the test waits for the state instead of sleeping.
-async fn wait_for_ready(session: &Arc<aruna_compute::Session>) {
+async fn wait_for_ready(session: &Arc<aruna_compute::session::Session>) {
     let (_, mut receiver) = session.subscribe_all();
     for _ in 0..64 {
         if session.snapshot().state != SessionPhase::Starting {
@@ -280,7 +280,7 @@ async fn wait_for_ready(session: &Arc<aruna_compute::Session>) {
     panic!("the session never became ready");
 }
 
-async fn wait_for_output(session: &Arc<aruna_compute::Session>) -> String {
+async fn wait_for_output(session: &Arc<aruna_compute::session::Session>) -> String {
     let (_, mut receiver) = session.subscribe_all();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(60), receiver.recv())

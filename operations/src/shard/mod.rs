@@ -4,12 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod client;
+pub(crate) mod genesis;
 pub mod incoming;
 pub(crate) mod manifest;
 pub(crate) mod pull;
 pub mod recovery;
 pub mod restore;
-pub mod restore_plan;
 pub mod verify;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -17,7 +17,6 @@ use aruna_core::document::{ShardManifest, ShardManifestEntry, shard_topic_id};
 use aruna_core::effects::{Effect, NetEffect, ShardNetEffect};
 use aruna_core::events::{Event, NetEvent, ShardNetEvent};
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use thiserror::Error;
@@ -41,7 +40,7 @@ pub(crate) fn shard_call(effect: ShardNetEffect) -> IoCall {
 }
 
 pub(crate) fn shard_answer(result: IoResult) -> Result<ShardNetEvent, IoError> {
-    match event(result)? {
+    match result.event()? {
         Event::Net(NetEvent::Shard(answer)) => Ok(*answer),
         other => Err(IoError::Unexpected {
             expected: "a shard answer",
@@ -122,8 +121,9 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::shard_manifest_entry;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::FjallStorage;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_storage::storage::worker::FjallStorage;
     use std::sync::Arc;
     use tempfile::TempDir;
     use ulid::Ulid;
@@ -149,7 +149,11 @@ mod tests {
         }
     }
 
-    async fn write_manifest_row(storage: &aruna_storage::StorageHandle, shard: u32, doc: u8) {
+    async fn write_manifest_row(
+        storage: &aruna_storage::storage::handle::StorageHandle,
+        shard: u32,
+        doc: u8,
+    ) {
         let target = aruna_core::document::DocumentTarget::MetadataDocumentLifecycle {
             document_id: Ulid::from_bytes([doc; 16]),
         };

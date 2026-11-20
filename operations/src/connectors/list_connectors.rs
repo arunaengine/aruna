@@ -6,14 +6,12 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
-use crate::connectors::repository::{
-    LIST_CONNECTOR_SIZE, StorageReadError, source_connector_prefix,
-};
+use crate::connectors::repository::{LIST_CONNECTOR_SIZE, source_connector_prefix};
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListSourceInput {
@@ -81,7 +79,7 @@ impl Operation for ListSourceOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ListSourceError> {
-        let (values, next) = rows::page(result)?;
+        let (values, next) = result.page()?;
         for (_, value) in values {
             self.connectors.push(SourceConnector::from_bytes(&value)?);
         }
@@ -107,7 +105,8 @@ mod tests {
     #[tokio::test]
     async fn lists_created_connectors() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

@@ -2,6 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::family::{JobFamilyId, JobRecordError, JobRecordKind};
+use super::identity::{
+    DUE_INDEX_PREFIX, JobExecutionClass, JobId, JobState, LEASE_INDEX_PREFIX, PRUNE_INDEX_PREFIX,
+    RECORD_KEY_PREFIX, RETENTION_MS,
+};
+use super::input::{CapturedInput, ExportRoCrateResult, ImportRoCrateResult, JobPayload};
 use super::*;
 
 const ATTEMPT_FENCE_DOMAIN: &[u8] = b"aruna-attempt-fence-v1";
@@ -64,13 +70,13 @@ impl AttemptControl {
     /// destination, so a distributed bucket's id carries its set hint. Reports any addition.
     pub fn reserve_outputs<F>(
         &mut self,
-        destinations: &[(crate::NodeId, String, String)],
+        destinations: &[(crate::id::NodeId, String, String)],
         mut mint: F,
     ) -> bool
     where
-        F: FnMut(&(crate::NodeId, String, String)) -> Ulid,
+        F: FnMut(&(crate::id::NodeId, String, String)) -> Ulid,
     {
-        let mut reserved: BTreeSet<(crate::NodeId, String, String)> = self
+        let mut reserved: BTreeSet<(crate::id::NodeId, String, String)> = self
             .output_commits
             .iter()
             .map(|commit| (commit.node_id, commit.bucket.clone(), commit.key.clone()))
@@ -96,7 +102,7 @@ impl AttemptControl {
 /// replayed capture reuses this VersionId instead of creating a second version.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputCommitIntent {
-    pub node_id: crate::NodeId,
+    pub node_id: crate::id::NodeId,
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
@@ -140,7 +146,7 @@ pub fn parse_dedup_value(bytes: &[u8]) -> Result<(JobId, [u8; 32]), ConversionEr
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputObject {
     /// Node-local endpoint that owns this exact version.
-    pub node_id: crate::NodeId,
+    pub node_id: crate::id::NodeId,
     pub bucket: String,
     pub key: String,
     /// Exact version this write created. Two executions writing one key keep two
@@ -287,7 +293,7 @@ impl JobResultPayload {
             return Err(JobRecordError::OutputIdentity);
         };
         self.check_outputs(control.execution_id)?;
-        let reserved: BTreeSet<(crate::NodeId, &str, &str, Ulid)> = control
+        let reserved: BTreeSet<(crate::id::NodeId, &str, &str, Ulid)> = control
             .output_commits
             .iter()
             .map(|commit| {
@@ -755,7 +761,7 @@ pub fn validate_transition(
 }
 
 fn in_process_transition(from: JobState, to: JobState) -> bool {
-    use JobState::*;
+    use super::identity::JobState::*;
     matches!(
         (from, to),
         (Queued, Claimed)
@@ -783,7 +789,7 @@ fn in_process_transition(from: JobState, to: JobState) -> bool {
 /// Fenced execution permits requeue only before attempt submission. `Indeterminate` requires evidence;
 /// permanent pre-attempt failures terminalize from Preparing or Ready.
 fn external_attempt_transition(from: JobState, to: JobState) -> bool {
-    use JobState::*;
+    use super::identity::JobState::*;
     matches!(
         (from, to),
         (Queued, Claimed)
@@ -836,6 +842,17 @@ pub fn job_record_key(job_id: JobId) -> Key {
     bytes.extend_from_slice(RECORD_KEY_PREFIX);
     bytes.extend_from_slice(&job_id.to_bytes());
     ByteView::from(bytes)
+}
+
+/// The job record a row holds; a malformed row is retained for recovery and reads as absent.
+pub fn decode_job_record(job_id: JobId, row: Option<crate::types::Value>) -> Option<JobRecord> {
+    row.and_then(|row| match JobRecord::from_bytes(&row) {
+        Ok(record) => Some(record),
+        Err(error) => {
+            tracing::warn!(job_id = %job_id, error = %error, "Malformed job record retained");
+            None
+        }
+    })
 }
 
 /// Side-row key holding the run-crate obligation status for an execution job.

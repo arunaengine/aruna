@@ -15,7 +15,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -29,7 +29,7 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::fence::WriteFence;
@@ -401,14 +401,14 @@ impl Operation for RoleRemoval {
                 self.emit_document_write(group, auth_doc, reducer, realm_config)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(self.after_writes())
             }
             Stage::Fence => {
@@ -465,16 +465,15 @@ fn materialize_role_removal(
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use aruna_core::SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;
     use tempfile::TempDir;
     use ulid::Ulid;

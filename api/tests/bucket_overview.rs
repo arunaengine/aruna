@@ -12,12 +12,11 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::shared::write_value;
 use aruna_api::auth::RealmAuth;
 use aruna_api::error::ServerError;
-use aruna_api::routes::bucket_usage::{UsageQuery, get_bucket_usage};
+use aruna_api::routes::storage::bucket::usage::{UsageQuery, get_bucket_usage};
 use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };
 use aruna_api::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
@@ -32,10 +31,11 @@ use aruna_core::structs::storage::blob::{
     CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};

@@ -4,9 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{EVENT_SIZE_KEYSPACE, METADATA_CHECKPOINT_KEYSPACE};
 use aruna_core::metadata::{EVENT_LIMIT, EventSize};
 use aruna_core::operation::Operation;
@@ -14,8 +14,6 @@ use aruna_core::rows::decode;
 use aruna_core::storage_entries::event_log_prefix;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
-
-use crate::metadata::call_results::page_rows;
 
 /// Whether this holder should checkpoint once one origin has used `used` of its `share`:
 /// the first origin at half, any other origin at three quarters, so a missing first origin
@@ -77,7 +75,7 @@ impl Operation for CheckpointWindowOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<(u64, u64)>, IoError> {
-        let (values, _) = page_rows(result)?;
+        let (values, _) = result.page()?;
         if self.sizes {
             return Ok(Next::Done(busiest_origin(&values)?));
         }

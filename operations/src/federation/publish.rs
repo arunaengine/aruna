@@ -5,16 +5,16 @@
 
 use std::str::FromStr;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
 use aruna_core::federation::{PUBLISH_SOON, RealmDescriptor, RegistrationMode, Signed};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, encoded_row, read_row, values};
+use aruna_core::rows::{encoded_row, read_row, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
@@ -215,7 +215,7 @@ impl Operation for PublishOperation {
                 self.on_read(config.as_deref(), stored.as_deref())
             }
             Some(publication) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(publication))
             }
         }
@@ -298,11 +298,11 @@ impl Operation for PublishSoonOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings};
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::time::unix_timestamp_secs;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::task_timers::read_timer;
     use ed25519_dalek::SigningKey;
@@ -475,8 +475,10 @@ mod tests {
         // Replicated settings arriving at the reporter persist a due time a few seconds away.
         let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -508,13 +510,25 @@ mod tests {
         let skipped = drive(PublishSoonOperation::new(config.realm_id, other), &context).await;
         assert_eq!(skipped, Ok(false));
         assert_eq!(read_timer(storage, &key).await.unwrap(), None);
-        // Without a task handle the runner still persists the due time before it refuses.
-        let armed = drive(
+        // Without a task handle no admission arms the wake, so the run errs and writes no row.
+        let refused = drive(
             PublishSoonOperation::new(config.realm_id, reporter()),
             &context,
         )
         .await;
-        assert!(matches!(armed, Err(PublishError::Timer(_))));
+        assert!(matches!(refused, Err(PublishError::Timer(_))));
+        assert_eq!(read_timer(storage, &key).await.unwrap(), None);
+        // With one, the shorten arms a new wake and persists its due time.
+        let scheduled = DriverContext {
+            task_handle: Some(aruna_tasks::TaskHandle::new()),
+            ..context.clone()
+        };
+        let armed = drive(
+            PublishSoonOperation::new(config.realm_id, reporter()),
+            &scheduled,
+        )
+        .await;
+        assert_eq!(armed, Ok(true));
         let due = read_timer(storage, &key).await.unwrap().unwrap();
         let limit = (unix_timestamp_secs() + PUBLISH_SOON.as_secs() + 1) * 1000;
         assert!(due.due_unix_millis <= limit);
@@ -525,8 +539,10 @@ mod tests {
         // The attempt count is stored, so a restarted node does not withdraw again.
         let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

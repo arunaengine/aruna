@@ -4,9 +4,9 @@
 
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_state, test_storage};
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::testing::test_context;
 use axum::Router;
 use std::sync::Arc;

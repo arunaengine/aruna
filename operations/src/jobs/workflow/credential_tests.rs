@@ -5,8 +5,9 @@
 use aruna_core::calls::ChildOutcome;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, JobErrorKind, JobPayload, workspace_credential_id,
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobErrorKind, workspace_credential_id,
 };
 use ulid::Ulid;
 
@@ -71,7 +72,7 @@ fn is_child<T>(next: &Result<Next<T>, JobError>) -> bool {
 }
 
 fn bucket(group_id: GroupId) -> BucketInfo {
-    crate::tests::s3::bucket_info(group_id, Default::default())
+    aruna_test_support::s3::bucket_info(group_id, Default::default())
 }
 
 /// The stored credential the mint of `spec` and `record` would accept.

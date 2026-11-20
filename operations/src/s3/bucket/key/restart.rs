@@ -5,7 +5,6 @@
 
 use crate::s3::bucket::key::rows::{SettingsError, authority_keys, keyless, parse_authority};
 use crate::s3::restart_notice::RestartedBucket;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{
@@ -22,6 +21,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::holders::resolve_holders;
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;

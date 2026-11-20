@@ -20,7 +20,6 @@ use tracing::{debug_span, field};
 
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::access::{ReadAccess, ReadAccessOperation};
-use crate::metadata::call_results::page_rows;
 use crate::metadata::registry_cache::cache_answer;
 use crate::metadata::span_timing::ReadTiming;
 
@@ -60,7 +59,7 @@ impl Operation for DeletedGraphsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn<DeletedGraphs> {
-        let (rows, next) = page_rows(result)?;
+        let (rows, next) = result.page()?;
         self.pages += 1;
         if self.deleted.len().saturating_add(rows.len()) > REGISTRY_CANDIDATE_LIMIT {
             return Err(MetadataError::Backend(

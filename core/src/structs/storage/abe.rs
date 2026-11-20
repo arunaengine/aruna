@@ -4,11 +4,13 @@
 
 use super::blob::ArchiveKey;
 use super::encryption::{BucketKeyRef, generate_key, public_key_of};
-use crate::NodeId;
 use crate::compute::{SecretBytes, SharedSecret};
+use crate::id::NodeId;
 use crate::key_seal::{SealedSecret, SeedRng, open_sealed, seal_to};
 use crate::structs::identity::realm::RealmId;
-use aruna_kpabe::{Attribute, MasterSecret, PublicParameters, frame_context, setup_from_seed};
+use aruna_kpabe::frame_context;
+use aruna_kpabe::policy::Attribute;
+use aruna_kpabe::scheme::{MasterSecret, PublicParameters, setup_from_seed};
 use hpke::rand_core::CryptoRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -244,7 +246,10 @@ impl ObjectEnvelope {
         }
         let value: Self = postcard::from_bytes(bytes).map_err(|_| AbeError::Context)?;
         value.context.bytes()?;
-        aruna_kpabe::Envelope::from_bytes(&value.context.parameters.public()?, &value.abe)?;
+        aruna_kpabe::envelope::Envelope::from_bytes(
+            &value.context.parameters.public()?,
+            &value.abe,
+        )?;
         if value.recovery_ciphertext.len() != 48 {
             return Err(AbeError::Context);
         }
@@ -331,7 +336,7 @@ fn seal_envelope(
         .expose()
         .try_into()
         .map_err(|_| AbeError::Crypto)?;
-    let abe = aruna_kpabe::seal(
+    let abe = aruna_kpabe::envelope::seal(
         &context.parameters.public()?,
         &context.attributes()?,
         scalar,
@@ -411,9 +416,6 @@ impl EnvelopeArchive {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub use getrandom::SysRng;
-
 #[derive(Debug, PartialEq)]
 pub enum AbeEffect {
     Issue(super::abe_access::GrantContext),
@@ -428,7 +430,7 @@ pub enum AbeEffect {
         resolved: super::blob::ResolvedBackend,
         bucket: String,
         key: String,
-        created_by: crate::UserId,
+        created_by: crate::user::id::UserId,
         blob: crate::stream::BackendStream<Result<bytes::Bytes, crate::stream::StreamError>>,
         size: Option<u64>,
     },

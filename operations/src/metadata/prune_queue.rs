@@ -16,10 +16,13 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, GraphPruneRecord, MetadataEffect, MetadataError, MetadataEvent,
 };
 use aruna_core::operation::Operation;
+use aruna_core::repository::link::{link_change_entry, schedule_drain};
 use aruna_core::repository::remote::NodeScope;
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::{PrefixPages, outside_answer, outside_call};
 use aruna_core::storage_entries::graph_prune_entry;
 use aruna_core::structs::storage::data::link::document_key;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use thiserror::Error;
@@ -27,9 +30,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::prune_jobs::{DuePrune, DuePruneOperation, RescheduleOperation};
-use crate::jobs::repository::link_queue::QueueDeletedOperation;
-use crate::jobs::repository::links::LinkError;
-use crate::metadata::call_results::effect_event;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::schedule_prune_drain;
@@ -94,7 +94,7 @@ fn graph_effect(effect: MetadataEffect) -> IoCall {
 
 /// A graph answer, or the error it carries.
 fn graph_answer(result: IoResult) -> Result<MetadataEvent, MetadataError> {
-    match effect_event(result)? {
+    match result.event()? {
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
         Event::Metadata(event) => Ok(event),
         other => Err(MetadataError::Backend(format!(
@@ -287,7 +287,7 @@ impl Operation for DeletedIndexOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataError> {
         match self.stage {
             IndexStage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.delete_next()
             }
             _ => self.page_read(result),
@@ -331,12 +331,11 @@ impl Operation for EnqueuePruneOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, MetadataGraphError> {
         if !self.written {
-            done(result)?;
+            result.done()?;
             self.written = true;
             return Ok(Next::Call(IoCall::Effect(Box::new(schedule_prune_drain()))));
         }
-        if let Ok(Event::Task(aruna_core::task::TaskEvent::Error { message, .. })) =
-            effect_event(result)
+        if let Ok(Event::Task(aruna_core::task::TaskEvent::Error { message, .. })) = result.event()
         {
             warn!(%message, graph_iri = %self.graph_iri, "Failed to wake the metadata graph prune drain");
         }
@@ -352,9 +351,9 @@ enum TombstoneStage {
     Index,
 }
 
-/// Queues and runs the prunes for graphs a document sync deleted: each registry row leaves the
-/// cache, its prune job is queued and a kept local copy is removed; index rows go last. A graph
-/// that fails is logged and the others continue.
+/// Queues and runs the prunes for graphs a sync deleted: each row leaves the cache, its prune job
+/// is queued and a local copy removed; index rows go last. A failed prune is logged, as its job
+/// retries it; an unqueued job or kept index rows fail the run after the other graphs.
 #[derive(Debug, PartialEq)]
 pub struct TombstonesOperation {
     tombstones: VecDeque<GraphLifecycleRecord>,
@@ -362,6 +361,8 @@ pub struct TombstonesOperation {
     deleted_documents: BTreeSet<Ulid>,
     stage: TombstoneStage,
     result: TombstoneProcessingResult,
+    /// The first failure without a durable retry, reported when the run ends.
+    failure: Option<MetadataGraphError>,
 }
 
 impl TombstonesOperation {
@@ -377,6 +378,7 @@ impl TombstonesOperation {
             deleted_documents: BTreeSet::new(),
             stage: TombstoneStage::Uncache,
             result: TombstoneProcessingResult::default(),
+            failure: None,
         }
     }
 
@@ -422,7 +424,7 @@ impl Operation for TombstonesOperation {
         match self.stage {
             TombstoneStage::Uncache => {
                 // A node without the cache has nothing to drop.
-                let _ = effect_event(result);
+                let _ = result.event();
                 self.stage = TombstoneStage::Enqueue;
                 Ok(Next::Call(IoCall::child(EnqueuePruneOperation::new(
                     &graph_iri,
@@ -431,6 +433,7 @@ impl Operation for TombstonesOperation {
             TombstoneStage::Enqueue => {
                 if let Err(error) = result.child::<(), MetadataGraphError>()? {
                     warn!(%graph_iri, error = ?error, "Failed to enqueue metadata graph prune job");
+                    self.failure.get_or_insert(error);
                     return self.next_tombstone();
                 }
                 self.result.enqueued = self.result.enqueued.saturating_add(1);
@@ -452,8 +455,12 @@ impl Operation for TombstonesOperation {
             TombstoneStage::Index => {
                 if let Err(error) = result.child::<(), MetadataError>()? {
                     warn!(error = ?error, "Failed to prune IRI index rows for deleted documents");
+                    self.failure.get_or_insert(error.into());
                 }
-                Ok(Next::Done(std::mem::take(&mut self.result)))
+                match self.failure.take() {
+                    Some(error) => Err(error),
+                    None => Ok(Next::Done(std::mem::take(&mut self.result))),
+                }
             }
         }
     }
@@ -466,6 +473,7 @@ enum BatchStage {
     Lifecycle,
     Prune,
     Links,
+    Armed,
     Reschedule,
     Finish,
 }
@@ -556,6 +564,21 @@ impl PruneBatchOperation {
         self.next_group()
     }
 
+    /// Queues a change for the deleted document behind the graph, so the link drain queues the
+    /// checks that remove its links and tokens.
+    fn links(&mut self) -> BatchTurn {
+        let graph_iri = self.graph_iri();
+        let document_id = (graph_iri.rsplit('/').next())
+            .and_then(|id| Ulid::from_string(id).ok())
+            .filter(|id| MetadataRegistryRecord::graph_iri_for(*id) == graph_iri);
+        let Some(document_id) = document_id else {
+            return self.complete();
+        };
+        self.stage = BatchStage::Links;
+        let change = link_change_entry(document_id, self.now_ms);
+        Ok(Next::Call(outside_call(IoCall::Write(vec![change]))))
+    }
+
     fn reschedule(&mut self, error: String) -> BatchTurn {
         let Some((graph_iri, jobs)) = self.current.as_ref() else {
             return self.next_group();
@@ -636,32 +659,40 @@ impl Operation for PruneBatchOperation {
                 ))))
             }
             BatchStage::Prune => match result.child::<bool, MetadataError>()? {
-                Ok(_) => {
-                    // A retry after a failed link queueing finds the graph already pruned, so it
-                    // queues again.
-                    self.stage = BatchStage::Links;
-                    Ok(Next::Call(IoCall::child(QueueDeletedOperation::new(
-                        self.scope.clone(),
-                        self.graph_iri(),
-                    ))))
-                }
+                // A retry after a failed link queueing finds the graph already pruned, so it
+                // queues again.
+                Ok(_) => self.links(),
                 Err(MetadataError::HandleMissing) => {
                     self.reschedule("metadata handle missing".to_string())
                 }
                 Err(error) => self.reschedule(error.to_string()),
             },
-            BatchStage::Links => match result.child::<(), LinkError>()? {
+            BatchStage::Links => match outside_answer(result).and_then(IoResult::done) {
+                Ok(()) if self.scope.has_tasks => {
+                    self.stage = BatchStage::Armed;
+                    Ok(Next::Call(IoCall::from(schedule_drain(Duration::ZERO))))
+                }
                 Ok(()) => self.complete(),
                 Err(error) => {
                     self.reschedule(format!("queueing the repository links failed: {error}"))
                 }
             },
+            BatchStage::Armed => {
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the repository link queue")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Failed to arm the repository link queue"),
+                }
+                self.complete()
+            }
             BatchStage::Reschedule => {
                 result.child::<(), IoError>()??;
                 self.next_group()
             }
             BatchStage::Finish => {
-                done(result)?;
+                result.done()?;
                 Ok(self.result())
             }
         }
@@ -729,21 +760,22 @@ pub fn jobs_queued() -> DuePruneOperation {
 mod tests {
     use super::*;
     use crate::metadata::registry_cache::{Registry, RegistryReadOperation};
-    use crate::testing::{process_graph_tombstones, process_prune_batch, prune_jobs_exist};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::storage_entries::{graph_lifecycle_entry, registry_write_entries};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
+    use aruna_test_support::metadata::{
+        process_graph_tombstones, process_prune_batch, prune_jobs_exist, refusing,
+    };
     use tempfile::tempdir;
 
-    use crate::testing::write_entries;
     use crate::tests::metadata::storage_key_exists;
+    use aruna_drivers::testing::write_entries;
 
     fn lifecycle(graph_iri: &str) -> GraphLifecycleRecord {
         GraphLifecycleRecord::deleted(
@@ -815,6 +847,51 @@ mod tests {
 
     fn storage_context(storage: &StorageHandle) -> DriverContext {
         aruna_drivers::testing::test_context(storage.clone())
+    }
+
+    fn pruned_batch(graph_iri: String) -> PruneBatchOperation {
+        let mut batch = PruneBatchOperation::new(NodeScope {
+            node: None,
+            credential_key: None,
+            has_blob: false,
+            has_tasks: true,
+        });
+        let job = GraphPruneRecord::new(graph_iri.clone(), 5);
+        batch.current = Some((graph_iri, vec![(vec![1], job)]));
+        batch.now_ms = 5;
+        batch.stage = BatchStage::Prune;
+        batch
+    }
+
+    fn pruned() -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(
+            Ok::<_, MetadataError>(true),
+        ))
+    }
+
+    // A pruned dataset queues a change for its links, then arms the link drain.
+    #[test]
+    fn deletion_queues_links() {
+        let document_id = Ulid::from_parts(9, 9);
+        let mut batch = pruned_batch(MetadataRegistryRecord::graph_iri_for(document_id));
+        let change = link_change_entry(document_id, 5);
+        let write = outside_call(IoCall::Write(vec![change]));
+        assert_eq!(batch.next(pruned()), Ok(Next::Call(write)));
+        let written = Ok::<_, IoError>(IoResult::Done);
+        let written = IoResult::Child(aruna_core::calls::ChildOutcome::new(written));
+        let drain = IoCall::from(schedule_drain(Duration::ZERO));
+        assert_eq!(batch.next(written), Ok(Next::Call(drain)));
+    }
+
+    // A graph that names no dataset queues no change.
+    #[test]
+    fn foreign_graph_ignored() {
+        let mut batch = pruned_batch("urn:other".to_string());
+        let job = (PRUNE_JOB_KEYSPACE.to_string(), ByteView::from(vec![1]));
+        assert_eq!(
+            batch.next(pruned()),
+            Ok(Next::Call(IoCall::Delete(vec![job])))
+        );
     }
 
     #[tokio::test]
@@ -945,6 +1022,105 @@ mod tests {
         process_graph_tombstones(&context, vec![tombstone]).await;
 
         assert!(!index_row_exists(&storage, index_key).await);
+    }
+
+    /// A store with the IRI index rows of one document and the tombstone that deletes it, on a
+    /// node with a graph handle, as `prunes_index_rows` sets it up.
+    async fn indexed_tombstone(
+        storage: &StorageHandle,
+        metadata_dir: &std::path::Path,
+    ) -> (aruna_graph::GraphHandle, ByteView, GraphLifecycleRecord) {
+        let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let graph_handle = aruna_graph::GraphHandle::open(
+            metadata_dir,
+            node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        )
+        .expect("metadata handle opens");
+        storage.install_metadata_indexes(metadata_dir);
+        let record = registry_record(Ulid::from_parts(9, 2), "docs/refused");
+        let index_key = aruna_core::storage_entries::iri_reference_key(
+            "https://schema.org/conformsTo",
+            "https://example.test/profile",
+            record.document_id,
+        );
+        let document_row =
+            aruna_core::structs::storage::data::link::document_key(record.document_id, &index_key);
+        let index = aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string();
+        let document = aruna_core::keyspaces::DOCUMENT_IRI_KEYSPACE.to_string();
+        let rows = vec![
+            (index, index_key.clone(), ByteView::from(vec![1u8])),
+            (
+                document,
+                ByteView::from(document_row),
+                ByteView::from(Vec::new()),
+            ),
+        ];
+        write_entries(storage, rows).await;
+        let tombstone = GraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        (graph_handle, index_key, tombstone)
+    }
+
+    fn graph_context(
+        storage: StorageHandle,
+        graph_handle: aruna_graph::GraphHandle,
+    ) -> DriverContext {
+        DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: Some(graph_handle),
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+            outbound_handle: None,
+        }
+    }
+
+    // A prune job that was not queued fails the run, after the index rows were still pruned, so
+    // a caller with a durable row runs it again.
+    #[tokio::test]
+    async fn failed_enqueue_errs() {
+        let (dir, metadata_dir) = (
+            tempdir().expect("temp dir"),
+            tempdir().expect("metadata dir"),
+        );
+        let storage = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("opens");
+        let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
+        let store = refusing(storage.clone(), PRUNE_JOB_KEYSPACE);
+
+        let context = graph_context(store, graph);
+        let run = drive(TombstonesOperation::new([tombstone]), &context);
+
+        assert!(matches!(run.await, Err(MetadataGraphError::Storage(_))));
+        assert!(read_jobs(&storage).await.is_empty());
+        assert!(!index_row_exists(&storage, index_key).await);
+    }
+
+    // Index rows that could not be deleted fail the run; the queued prune job is kept.
+    #[tokio::test]
+    async fn failed_index_errs() {
+        let (dir, metadata_dir) = (
+            tempdir().expect("temp dir"),
+            tempdir().expect("metadata dir"),
+        );
+        let storage = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("opens");
+        let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
+        let store = refusing(storage.clone(), aruna_core::keyspaces::IRI_INDEX_KEYSPACE);
+
+        let context = graph_context(store, graph);
+        let run = drive(TombstonesOperation::new([tombstone]), &context);
+
+        assert!(matches!(run.await, Err(MetadataGraphError::Metadata(_))));
+        assert_eq!(read_jobs(&storage).await.len(), 1);
+        assert!(index_row_exists(&storage, index_key).await);
     }
 
     #[tokio::test]

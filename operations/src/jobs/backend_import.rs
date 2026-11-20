@@ -2,27 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod job;
+pub mod job;
 mod object;
 mod prepare;
 mod reads;
 mod recover;
+pub mod schedule;
 mod twin;
-
-pub use job::BackendImportOperation;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError};
 use aruna_core::errors::BlobError;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, DELETE_CLAIM_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE, RENAMED_ROW_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{JobError, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::JobError;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, BackendImportCheckpoint, BackendImportSpec, ExternalObject, ImportedObject,
     PathIdentity, WriteIntent, object_key, version_key,
@@ -38,16 +37,17 @@ use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use ulid::Ulid;
 
 use super::page_intents::PathIntents;
-use crate::placement::policy::{GateContext, PolicyGateError};
+use crate::placement::policy::gate::{GateContext, PolicyGateError};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::s3::imports::shared::{self, SharedRule, claim_file};
-use crate::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, RuleScan, intent_keys,
-};
+use crate::s3::object::put::plain::intent_keys;
+use crate::s3::object::put::sharing::RuleScan;
+use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::jobs::JobRunOutcome;
 

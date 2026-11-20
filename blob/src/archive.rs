@@ -21,7 +21,7 @@ use aruna_core::rocrate_archive::{
     reject_special_entry,
 };
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::storage::blob::BackendLocation;
 use async_zip::base::read::seek::ZipFileReader as BaseZipReader;
 use async_zip::base::write::ZipFileWriter;

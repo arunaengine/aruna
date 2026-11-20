@@ -4,9 +4,8 @@
 
 use super::{probe_targets, range_holders};
 use crate::distribution::test_record::{member, replicated, secret};
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionSnapshot, MemberState, MetadataCoverage,
-};
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
+use aruna_core::structs::storage::distribution::{DataStrategy, MemberState, MetadataCoverage};
 use aruna_drivers::driver::drive;
 
 /// The two shards split at "m", each replicated on the other member, every member ready.
@@ -109,7 +108,7 @@ async fn content_page_bounded() {
 fn spent_deadline_stops() {
     // Members are asked only while the runner clock is before the deadline.
     use super::{AskSetOperation, SetAnswer};
-    use crate::s3::bucket::get::GetBucketError;
+    use aruna_core::bucket_read::GetBucketError;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;

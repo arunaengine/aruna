@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::data::link::{set_versions_key, truncated_key};
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::tempdir;
 
 use crate::tests::calls::{child, runs_child};
@@ -160,7 +160,8 @@ async fn stored(rows: LinkRows, storage: &StorageHandle) {
 #[tokio::test]
 async fn replaces_own_postings() {
     let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document = Ulid::from_bytes([9; 16]);
     let first = project_links(
         GRAPH,
@@ -206,7 +207,8 @@ async fn truncation_is_marked() {
     assert_eq!(links.len(), MAX_DOCUMENT_LINKS + 1);
 
     let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document = Ulid::from_bytes([1; 16]);
     let marked = BTreeMap::from([(DataLink::Truncated, LinkPosting::default())]);
     stored(
@@ -227,7 +229,8 @@ async fn truncation_is_marked() {
 #[tokio::test]
 async fn retry_settles_unverified() {
     let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let (document, version_id, set_id) = (
         Ulid::from_bytes([1; 16]),
         Ulid::from_bytes([6; 16]),

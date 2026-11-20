@@ -9,9 +9,9 @@ use aruna_core::keyspaces::JOB_ENTRY_KEYSPACE;
 use aruna_core::metadata::MetadataValidationViolation;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{
-    ImportReportDetail, ImportReportRow, ReasonCode, SYSTEM_ENTRY_PREFIX, job_entry_key,
-};
+use aruna_core::structs::execution::job::identity::SYSTEM_ENTRY_PREFIX;
+use aruna_core::structs::execution::job::input::{ImportReportDetail, ImportReportRow, ReasonCode};
+use aruna_core::structs::execution::job::local::job_entry_key;
 use byteview::ByteView;
 
 use super::{

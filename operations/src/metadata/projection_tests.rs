@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::testing::write_entries;
-use aruna_core::UserId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
@@ -15,8 +13,11 @@ use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
 use aruna_core::task::TaskKey;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_drivers::testing::write_entries;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -107,7 +108,7 @@ fn create_event() -> MetadataEventRecord {
     MetadataEventRecord {
         event_id,
         record,
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         node_id: node(1),
         payload: MetadataEventPayload::Scaffold {
             name: "Lifecycle Outbox".to_string(),
@@ -125,17 +126,18 @@ fn stamped(mut event: MetadataEventRecord, config: &RealmConfigDocument) -> Meta
     let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: event.record.document_id,
     };
-    let context = aruna_core::placement::PlacementResolutionContext {
+    let context = aruna_core::placement::resolver::PlacementResolutionContext {
         group_id: Some(event.record.group_id),
         metadata_path: Some(event.record.document_path.as_str()),
     };
-    let (strategy, _) = aruna_core::placement::strategy_for_target(config, &target, context)
-        .expect("strategy resolves");
+    let (strategy, _) =
+        aruna_core::placement::resolver::strategy_for_target(config, &target, context)
+            .expect("strategy resolves");
     event.record.placement = aruna_core::placement::choose_origin_bucket(
         config,
         strategy,
         event.node_id,
-        &aruna_core::placement::subject_bytes(&target),
+        &aruna_core::placement::resolver::subject_bytes(&target),
     )
     .expect("origin holds a bucket");
     event
@@ -1215,6 +1217,32 @@ fn skew_guard_rejects() {
     ));
 }
 
+// An empty queue falls back to replaying the event log page by page; a failed page retries soon.
+#[test]
+fn empty_queue_replays() {
+    let mut run = ProjectionRunOperation::new(None);
+    assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let empty = PendingProjectionResult {
+        markers_examined: 0,
+        projected: 0,
+        has_more: false,
+    };
+    let drained = child(Ok::<_, MetadataProjectionError>(empty));
+    assert!(matches!(
+        run.next(drained),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let page = (3usize, Some(Key::from(b"next".to_vec())));
+    let page = child(Ok::<_, MetadataProjectionError>(page));
+    assert!(matches!(run.next(page), Ok(Next::Call(IoCall::Child(_)))));
+    let error = MetadataProjectionError::Conversion("broken".to_string());
+    let failed = child(Err::<(usize, Option<Key>), _>(error));
+    assert_eq!(
+        run.next(failed),
+        Ok(Next::Done(Some(PROJECTION_RETRY_AFTER)))
+    );
+}
+
 fn child<T, E>(result: Result<T, E>) -> IoResult
 where
     T: Send + std::fmt::Debug + PartialEq + 'static,
@@ -1428,4 +1456,86 @@ fn timer_needs_marker() {
         pending.next(IoResult::Page { rows, next: None }),
         Ok(Next::Call(effect_call(schedule_projection(Duration::ZERO))))
     );
+}
+
+// A pending marker and the event log both hold a create event that a queued applied batch still
+// owns. The marker drain and the log replay leave it to the applied drain, which projects the
+// document's batches in acceptance order; once the batch is gone the drain projects it.
+#[tokio::test]
+async fn owned_recovery_waits() {
+    use aruna_core::document::{
+        AppliedStep, AppliedSync, DocumentReconcileResult, applied_sync_entry, order_entry_key,
+    };
+    use aruna_core::keyspaces::{APPLIED_ORDER_KEYSPACE, APPLIED_SYNC_KEYSPACE};
+
+    let dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let event = create_event();
+    let document_id = event.record.document_id;
+    let marker = pending_projection_key(document_id, event.event_id);
+    let batch = AppliedSync {
+        id: Ulid::from_parts(31, 1),
+        node_id: node(1),
+        realm_id: None,
+        result: DocumentReconcileResult {
+            metadata_create_events: vec![event.clone()],
+            ..DocumentReconcileResult::default()
+        },
+        next: AppliedStep::Metadata,
+    };
+    let entry = order_entry_key(document_id, 0);
+    write_entries(
+        &storage,
+        vec![
+            create_event_entry(&event).expect("event log entry"),
+            (
+                PENDING_PROJECTION_KEYSPACE.to_string(),
+                marker.clone(),
+                ByteView::from(Vec::new()),
+            ),
+            applied_sync_entry(&batch).expect("batch row"),
+            (
+                APPLIED_ORDER_KEYSPACE.to_string(),
+                entry.clone(),
+                ByteView::from(batch.id.to_bytes().to_vec()),
+            ),
+        ],
+    )
+    .await;
+    let context = DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+
+    let result = drain_projection_queue(&context).await.expect("drain runs");
+    assert_eq!((result.markers_examined, result.projected), (1, 0));
+    assert!(pending_marker_exists(&storage, marker.to_vec()).await);
+    let replayed = drive(ReplayPageOperation::new(None, None), &context).await;
+    assert_eq!(replayed.expect("replay runs").0, 0);
+
+    let batch_key = ByteView::from(batch.id.to_bytes().to_vec());
+    for (space, key) in [
+        (APPLIED_SYNC_KEYSPACE, batch_key),
+        (APPLIED_ORDER_KEYSPACE, entry),
+    ] {
+        let deleted = storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: space.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            deleted,
+            Event::Storage(StorageEvent::DeleteResult { .. })
+        ));
+    }
+    let result = drain_projection_queue(&context).await.expect("drain runs");
+    assert_eq!(result.projected, 1);
 }

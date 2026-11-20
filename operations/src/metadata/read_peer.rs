@@ -2,20 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::PeerAuthRefusal;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::protocol::MetadataReadError;
-use crate::metadata::write_peer::WritePeerOperation;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{PeerTrust, ensure_peer_trust};
+use aruna_core::metadata::protocol::MetadataReadError;
 
 type Turn<T> = Result<Next<T>, MetadataReadError>;
 
@@ -143,7 +142,7 @@ impl Operation for ReadPeerOperation {
             }
             ReadStage::Contact => {
                 // The read is accepted; a missed contact refresh only dates the peer's liveness.
-                let _ = event(result);
+                let _ = result.event();
                 Ok(Next::Done(self.auth.take()))
             }
         }

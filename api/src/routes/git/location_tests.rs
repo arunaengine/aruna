@@ -5,7 +5,7 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::error::ServerError;
-use crate::metadata::{CreateMetadataRequest, CreateScaffoldRequest};
+use crate::metadata::model::{CreateMetadataRequest, CreateScaffoldRequest};
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::tests::{TestState, setup_network_state};
 use crate::tests::metadata_fixtures::drain_metadata_background;
@@ -111,7 +111,7 @@ async fn location_routes() {
     assert!(matches!(missing, Err(ServerError::NotFound)));
     let realm_id = test.state.get_realm_id();
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,

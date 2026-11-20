@@ -61,6 +61,29 @@ pub(crate) async fn flush_evicted_documents(
     flushed
 }
 
+/// Takes a read of the eviction journal into `pending`, adding the entries it lacks by eviction
+/// key, and answers whether the journal is loaded. A failed read loads nothing, so maintenance
+/// reads again on its next retry instead of leaving the old entries undelivered.
+pub(crate) fn absorb_journal<E: std::fmt::Display>(
+    read: Result<Vec<PendingEviction>, E>,
+    pending: &mut Vec<PendingEviction>,
+) -> bool {
+    match read {
+        Ok(loaded) => {
+            for entry in loaded {
+                if !pending.iter().any(|known| known.key == entry.key) {
+                    pending.push(entry);
+                }
+            }
+            true
+        }
+        Err(error) => {
+            warn!(%error, "Failed to read the eviction journal; maintenance reads it again");
+            false
+        }
+    }
+}
+
 /// Runs the eviction journal conversion until `shutdown` is cancelled, then
 /// flushes once more and leaves anything uncommitted journalled for restart.
 pub(crate) fn spawn_eviction_maintenance(
@@ -73,13 +96,8 @@ pub(crate) fn spawn_eviction_maintenance(
         let Some(mut eviction_rx) = document_sync.take_eviction_receiver() else {
             return;
         };
-        let mut pending = match document_sync.pending_evictions().await {
-            Ok(pending) => pending,
-            Err(error) => {
-                warn!(%error, "Failed to read the eviction journal on startup");
-                Vec::new()
-            }
-        };
+        let mut pending = Vec::new();
+        let mut loaded = absorb_journal(document_sync.pending_evictions().await, &mut pending);
         let mut retry = tokio::time::interval(EVICTION_RETRY_INTERVAL);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -111,7 +129,11 @@ pub(crate) fn spawn_eviction_maintenance(
                     )
                     .await;
                 },
-                _ = retry.tick(), if !pending.is_empty() => {
+                _ = retry.tick(), if !pending.is_empty() || !loaded => {
+                    if !loaded {
+                        let read = document_sync.pending_evictions().await;
+                        loaded = absorb_journal(read, &mut pending);
+                    }
                     let _ = flush_evicted_documents(
                         &inbound_handler,
                         &document_sync,

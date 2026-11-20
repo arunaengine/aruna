@@ -285,17 +285,18 @@ fn env_key(id: &str) -> String {
 mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
     use crate::tests::fixtures::env_lock;
-    use aruna::config::load;
     use aruna::inbound::initialize_net_holder;
-    use aruna::tasks::incoming::start_task_queues;
+    use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
+    use aruna_config::load;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
@@ -368,7 +369,7 @@ mod tests {
         let shutdown = aruna_tasks::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
-            aruna_core::structs::execution::job::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
             jobs_runtime.clone(),
             &shutdown,
         );
@@ -377,7 +378,7 @@ mod tests {
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
-        let bootstrap_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let bootstrap_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: aruna_core::structs::identity::auth::Actor {
@@ -425,7 +426,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_body_size: aruna_api::server::MAX_BODY_SIZE,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         );
@@ -484,7 +485,7 @@ mod tests {
         let _unset = EnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
-        let settings = aruna::settings::read_settings().unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
 
         assert_eq!(view.blob_bucket_size, Some(100_000));
         assert_eq!(
@@ -516,7 +517,7 @@ mod tests {
         let _unset = EnvGuard::remove(&["CONTENT_DIR"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
-        let settings = aruna::settings::read_settings().unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
 
         assert_eq!(view.blob_root, "/tmp/aruna-doctor-content/blobstore");
         assert_eq!(view.blob_root, settings.blob_root);

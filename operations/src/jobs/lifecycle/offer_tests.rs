@@ -8,13 +8,12 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, NetEffect, ReceiptFrame};
 use aruna_core::events::{Event, LaunchDecline, MetadataAnswer, NetEvent, PeerRequestError};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
 
 use super::{OfferLaunchOperation, OfferOutcome};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
 use crate::tests::records::{Family, node};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 
 fn launch(family: &Family) -> LaunchFrame {
     let intent = family.launch(&family.spec(), family.holder.public(), 0);

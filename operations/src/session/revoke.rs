@@ -5,16 +5,16 @@
 use crate::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation, owner_cutoff,
 };
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::USER_SESSION_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -236,7 +236,7 @@ impl Operation for SessionWrite {
 
     fn next(&mut self, result: IoResult) -> RevokeTurn {
         if let Some(session) = self.session.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(Some(session)));
         }
         let [value] = values::<1>(result)?;
@@ -256,11 +256,11 @@ impl Operation for SessionWrite {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::auth::SessionKind;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
 
     #[test]
     fn revoke_is_idempotent() {

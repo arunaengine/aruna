@@ -10,18 +10,16 @@ use std::time::Duration;
 
 use crate::metadata_calls::get_metadata_routed;
 use crate::metadata_calls::route_metadata_update;
-use aruna_core::StructuredId;
-use aruna_operations::device::drain::drain_publish_queue;
-use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_core::metadata::api::{RoCrateExportView, UpdateDocumentMutation};
+use aruna_core::structured_id::StructuredId;
 use aruna_operations::device::replica_store::read_replica;
-use aruna_operations::device::selection::select_document;
-use aruna_operations::metadata::api::export_types::{
-    ExportMetadataRequest, GetVisibleRequest, RoCrateExportView,
-};
+use aruna_operations::device_node::realm_documents::fetch_realm_documents;
+use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, GetVisibleRequest};
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::metadata::update_document::UpdateDocumentMutation;
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
+use aruna_operations::metadata::device::drain::drain_publish_queue;
+use aruna_operations::metadata::device::selection::select_document;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::replay_event_log;
 use topology::{TestNode, TestResult, Topology, wait_until};
 use ulid::Ulid;
 
@@ -40,7 +38,7 @@ async fn usable(device: &TestNode, document_id: Ulid) -> bool {
     else {
         return false;
     };
-    let Ok(installed) = aruna_operations::testing::export_rocrate_jsonld(
+    let Ok(installed) = aruna_test_support::metadata::export_rocrate_jsonld(
         &device.context,
         replica.graph_iri.clone(),
     )
@@ -294,11 +292,12 @@ async fn replacement_removes_scaffold() -> TestResult<()> {
         .expect("the drain runs");
         let _ = replay_event_log(holder.context.as_ref()).await;
         let _ = process_materialization_batch(holder.context.as_ref()).await;
-        aruna_operations::testing::export_rocrate_jsonld(&holder.context, replica.graph_iri.clone())
-            .await
-            .is_ok_and(|jsonld| {
-                jsonld.contains("owner-replaced") && !jsonld.contains("scaffold-notes")
-            })
+        aruna_test_support::metadata::export_rocrate_jsonld(
+            &holder.context,
+            replica.graph_iri.clone(),
+        )
+        .await
+        .is_ok_and(|jsonld| jsonld.contains("owner-replaced") && !jsonld.contains("scaffold-notes"))
     };
     wait_until(
         "the holder drops the replaced value",

@@ -3,12 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::shared::oidc::spawn_oidc_provider;
-use aruna::inbound::initialize_incoming_fixture;
-use aruna::tasks::incoming::start_task_queues;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::auth::OidcValidator;
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -17,14 +16,16 @@ use aruna_core::keyspaces::SUBJECT_INDEX_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, oidc_subject_key};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_wire::users::RegisterUserResponse;
 use axum::http::StatusCode;
@@ -55,6 +56,8 @@ struct TestNode {
     base_url: String,
     net: NetHandle,
     server_task: JoinHandle<()>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 fn sign_oidc_token(
@@ -85,7 +88,7 @@ fn sign_oidc_token(
 }
 
 async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-    aruna_operations::testing::read_user(context, user_id).await
+    aruna_drivers::testing::read_user(context, user_id).await
 }
 
 async fn read_subject_index(context: &DriverContext, subject_key: &str) -> UserId {
@@ -129,7 +132,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
@@ -203,7 +206,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         state,
         ServerConfig {
             http_addr: addr,
-            max_body_size: aruna_api::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors: aruna_api::cors::CorsConfig::default(),
         },
     )
@@ -223,6 +226,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         base_url: format!("http://{addr}"),
         net,
         server_task,
+        _incoming: incoming,
     }
 }
 

@@ -22,6 +22,7 @@ struct Script {
     mode: TransactionMode,
     then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
+    rolled_back: bool,
 }
 
 impl Script {
@@ -65,6 +66,10 @@ impl Operation for Script {
     fn abort(&mut self) -> Vec<IoCall> {
         std::mem::take(&mut self.cleanup)
     }
+
+    fn rolled_back(&mut self) {
+        self.rolled_back = true;
+    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -76,6 +81,7 @@ fn script(calls: Vec<IoCall>) -> Script {
         mode: TransactionMode::None,
         then: Vec::new(),
         cleanup: Vec::new(),
+        rolled_back: false,
     }
 }
 
@@ -110,8 +116,8 @@ fn read_a() -> IoCall {
 #[test]
 fn effects_join_transaction() {
     // A passed-through storage effect without a transaction id runs in the operation's one.
-    let entry = crate::node_vault::VaultEntry::new(
-        crate::node_vault::VaultPurpose::NamedSecret,
+    let entry = crate::node::vault::VaultEntry::new(
+        crate::node::vault::VaultPurpose::NamedSecret,
         ulid::Ulid::from_parts(1, 1),
     );
     let delete = StorageEffect::VaultDelete {
@@ -160,6 +166,23 @@ fn snapshot_joins_reads() {
 }
 
 #[test]
+fn rebuild_opens_snapshot() {
+    // A usage rebuild's snapshot is the one beginning the rebuild answers; reads then join it.
+    let mut procedure = script(vec![read_a()]);
+    procedure.mode = TransactionMode::UsageRebuild;
+    let mut operation = CallRun::new(procedure);
+    let begin = StorageEffect::BeginUsageRebuild {
+        key_space: crate::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
+    };
+    assert_eq!(operation.start().as_slice(), &[storage(begin)]);
+    let read = StorageEffect::BatchRead {
+        reads: vec![("rows".to_string(), key("a"))],
+        txn_id: Some(txn()),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(read)]);
+}
+
+#[test]
 fn storage_refusal_fails() {
     // A storage effect answered with a storage error fails the operation like a storage call.
     let read = StorageEffect::Read {
@@ -204,7 +227,10 @@ fn transaction_commits_outcome() {
         &[storage(commit)]
     );
     assert!(!operation.is_complete());
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    let committed = StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+        sequence: 1,
+    };
     assert!(operation.step(Event::Storage(committed)).is_empty());
     assert_eq!(
         operation.finalize(),
@@ -265,7 +291,10 @@ fn snapshot_reads_only() {
         operation.step(Event::Storage(page)).as_slice(),
         &[storage(commit)]
     );
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    let committed = StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+        sequence: 1,
+    };
     assert!(operation.step(Event::Storage(committed)).is_empty());
     assert!(matches!(operation.finalize(), Ok(seen) if seen.len() == 3));
 
@@ -493,6 +522,30 @@ fn abort_ends_transaction() {
     assert!(!operation.is_complete());
 }
 
+// A commit storage rolled back for another cause is told like a conflict, and fails with it.
+#[test]
+fn rollback_told_distinctly() {
+    let write = vec![("rows".to_string(), key("a"), key("1"))];
+    let mut operation = run(script(vec![IoCall::Write(write)]), true);
+    operation.start();
+    operation.step(started());
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    operation.step(Event::Storage(written));
+    let cause = Box::new(StorageError::ReadError("counter".to_string()));
+    let rolled = StorageEvent::Error {
+        error: StorageError::RolledBack(cause.clone()),
+    };
+    assert!(operation.step(Event::Storage(rolled)).is_empty());
+    assert!(
+        operation.operation.rolled_back,
+        "a rolled back commit is told"
+    );
+    let rolled = IoError::Storage(StorageError::RolledBack(cause));
+    assert_eq!(operation.finalize(), Err(rolled));
+}
+
 #[test]
 fn conflict_marks_retry() {
     let write = vec![("rows".to_string(), key("a"), key("1"))];
@@ -507,6 +560,7 @@ fn conflict_marks_retry() {
         error: StorageError::TransactionConflict,
     };
     assert!(operation.step(Event::Storage(conflict)).is_empty());
+    assert!(operation.operation.rolled_back, "a refused commit is told");
     let Err(error) = operation.finalize() else {
         panic!("a lost commit fails");
     };
@@ -514,7 +568,7 @@ fn conflict_marks_retry() {
     assert!(CallRun::<Script>::is_conflict(&error));
     let full = IoError::Storage(StorageError::QueueFull);
     assert!(!CallRun::<Script>::is_conflict(&full));
-    assert_eq!(CallRun::<Script>::conflict_retries(), 3);
+    assert_eq!(Script::conflict_retries(), 3);
     let mut fresh = run(script(Vec::new()), true);
     assert_eq!(fresh.on_conflict(3), AfterConflict::Rerun);
     assert_eq!(fresh.on_conflict(4), AfterConflict::Fail);
@@ -689,7 +743,10 @@ fn calls_after_commit() {
         operation.step(Event::Storage(written)).as_slice(),
         &[storage(commit)]
     );
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    let committed = StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+        sequence: 1,
+    };
     let delete = StorageEffect::BatchDelete {
         deletes: vec![("rows".to_string(), key("old"))],
         txn_id: None,
@@ -710,6 +767,89 @@ fn calls_after_commit() {
     // An abort now keeps the committed outcome.
     assert!(operation.abort().is_empty());
     assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
+}
+
+/// Collects the formatted logs of a test.
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut logs = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn refused_wake_logged() {
+    let (logs, _logged) = capture_logs();
+    let wake = TaskEffect::ShortenTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::ZERO,
+    };
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::Effect(Box::new(Effect::Task(wake)))];
+    let mut operation = run(procedure, false);
+    assert_eq!(operation.start().len(), 1, "the wake is sent");
+    let refused = TaskEvent::Error {
+        key: Some(TaskKey::DrainAppliedSync),
+        message: "queue full".to_string(),
+    };
+    assert!(operation.step(Event::Task(refused)).is_empty());
+    assert_eq!(operation.finalize(), Ok(Vec::new()), "the outcome stays");
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("A call after the commit failed"), "{logs}");
+    assert!(logs.contains("queue full"), "{logs}");
+}
+
+/// The logs of this thread, until the returned guard drops.
+fn capture_logs() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Captured(sink.clone()))
+        .with_ansi(false)
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+// A child after the commit that ends with its error is logged without its private details.
+#[test]
+fn failed_child_logged() {
+    let (logs, _logged) = capture_logs();
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::child(script(Vec::new()))];
+    let mut operation = run(procedure, false);
+    assert_eq!(operation.start().len(), 1, "the child is started");
+    let failed = ChildOutcome::new::<u8, IoError>(Err(IoError::Codec("secret".to_string())));
+    assert!(operation.step(Event::Child(failed)).is_empty());
+    assert_eq!(operation.finalize(), Ok(Vec::new()), "the outcome stays");
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("A call after the commit failed"), "{logs}");
+    assert!(!logs.contains("secret"), "{logs}");
+}
+
+#[test]
+fn early_finalize_unfinished() {
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::Delay(Duration::from_secs(1))];
+    let mut operation = run(procedure, false);
+    assert_eq!(
+        operation.start().as_slice(),
+        &[Effect::Delay(Duration::from_secs(1))]
+    );
+    assert!(!operation.is_complete());
+    assert_eq!(operation.finalize(), Err(IoError::Unfinished));
 }
 
 #[test]
@@ -754,5 +894,48 @@ fn names_other_answers() {
             expected: "IoResult::Values",
             ..
         })
+    ));
+}
+
+fn stored(event: StorageEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(event)))
+}
+
+// A batch read or iteration effect, used inside a caller's transaction, answers like its call.
+#[test]
+fn reads_effect_answers() {
+    let key = Key::from(vec![1]);
+    let value = Value::from(vec![2]);
+    let batch = StorageEvent::BatchReadResult {
+        values: vec![(key.clone(), Some(value.clone()))],
+    };
+    assert_eq!(stored(batch).value(), Ok(Some(value.clone())));
+    let iter = StorageEvent::IterResult {
+        values: vec![(key.clone(), value.clone())],
+        next_start_after: Some(key.clone()),
+    };
+    assert_eq!(
+        stored(iter).page(),
+        Ok((vec![(key.clone(), value)], Some(key)))
+    );
+}
+
+// A storage failure an effect answers with reads as the runner reports its own calls' failures.
+#[test]
+fn maps_storage_errors() {
+    let conflict = StorageEvent::Error {
+        error: StorageError::TransactionConflict,
+    };
+    assert_eq!(stored(conflict).page(), Err(IoError::Conflict));
+    let timeout = StorageEvent::Error {
+        error: StorageError::Timeout,
+    };
+    assert_eq!(
+        stored(timeout).values(),
+        Err(IoError::Storage(StorageError::Timeout))
+    );
+    assert!(matches!(
+        stored(StorageEvent::SyncAllFinished).page(),
+        Err(IoError::Unexpected { .. })
     ));
 }

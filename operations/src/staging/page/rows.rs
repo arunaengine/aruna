@@ -11,7 +11,6 @@ use crate::distribution::inventory::{
 };
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::StorageReadError;
@@ -22,10 +21,11 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_CLAIM_KEYSPACE, PURGE_FENCE_KEYSPACE,
     S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
-use aruna_core::structs::execution::job::ClaimGuard;
-use aruna_core::structs::execution::job::{
-    JobId, StagingJobCheckpoint, StagingJobError, job_record_key,
-};
+use aruna_core::staging_checkpoint::MAX_ERROR_SAMPLE;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{StagingJobCheckpoint, StagingJobError};
+use aruna_core::structs::execution::job::local::job_record_key;
+use aruna_core::structs::execution::job::rows::ClaimGuard;
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{
@@ -47,6 +47,7 @@ use aruna_core::structs::storage::replication_queue::{
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -57,8 +58,6 @@ use ulid::Ulid;
 pub const MAX_PAGE_ENTRIES: usize = 10_000;
 /// Most bytes one page writes, keys and values together.
 pub const MAX_PAGE_BYTES: usize = 32 * 1024 * 1024;
-/// Most per-entry errors a staging checkpoint keeps; the failed counter counts all of them.
-pub const MAX_ERROR_SAMPLE: usize = 100;
 /// Rows read ahead of the heads: purge fence, bucket, connector and job claim.
 pub(crate) const GUARD_READS: usize = 4;
 /// Rows of other keys the head read may meet between the page's keys before the page reads its

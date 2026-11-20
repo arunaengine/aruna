@@ -5,14 +5,13 @@
 use byteview::ByteView;
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision, DocumentTarget,
     ShardManifestEntry,
 };
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{
     COMMIT_MESSAGE_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DEAD_LETTER_KEYSPACE,
     DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
@@ -40,6 +39,7 @@ use crate::structs::identity::user::User;
 use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
 
 pub fn subject_index_key(subject_id: &str) -> Key {
     ByteView::from(subject_id.as_bytes().to_vec())
@@ -245,6 +245,14 @@ pub fn document_job_key(document_id: Ulid, event_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(32);
     bytes.extend_from_slice(&document_id.to_bytes());
     bytes.extend_from_slice(&event_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+/// The key of a document's ready Git capture mark: the document, then its capture sequence.
+pub fn capture_key(document_id: Ulid, sequence: u64) -> Key {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
     ByteView::from(bytes)
 }
 
@@ -935,6 +943,7 @@ mod tests {
         DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision,
         DocumentTarget,
     };
+    use crate::id::NodeId;
     use crate::keyspaces::{
         DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
         IRI_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -946,7 +955,7 @@ mod tests {
     use crate::structs::identity::realm::RealmId;
     use crate::structs::placement::record::PlacementRef;
     use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use crate::{NodeId, UserId};
+    use crate::user::id::UserId;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

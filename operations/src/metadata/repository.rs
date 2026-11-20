@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     DocumentSyncRevision, DocumentTarget,
@@ -10,6 +9,7 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_AUDIT_KEYSPACE,
 };
@@ -18,12 +18,10 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataEventRecord,
     MetadataMaterializationRecord,
 };
-pub use aruna_core::storage_entries::{
-    create_event_entry, create_projection_entries, document_job_entry, document_lifecycle_entry,
-    graph_lifecycle_entry, graph_lifecycle_key, lifecycle_manifest_entry, lifecycle_revision_entry,
-    materialization_job_entry, materialization_job_key, materialization_status_entry,
-    materialization_status_key, metadata_document_key, metadata_registry_key,
-    metadata_registry_prefix, registry_write_entries, shard_manifest_entry,
+use aruna_core::storage_entries::{
+    document_job_entry, document_lifecycle_entry, graph_lifecycle_key, lifecycle_manifest_entry,
+    lifecycle_revision_entry, materialization_job_entry, materialization_status_entry,
+    metadata_document_key, registry_write_entries, shard_manifest_entry,
 };
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
@@ -34,13 +32,13 @@ use byteview::ByteView;
 use std::time::Duration;
 use ulid::Ulid;
 
-use crate::storage_read::parse_storage_read;
 use aruna_core::placement::{registry_placement, resolve_shard_holders};
 use aruna_core::storage_entries::lifecycle_revision_change;
+use aruna_core::storage_read::parse_storage_read;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 
-pub use aruna_core::errors::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 pub const LIST_METADATA_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage
@@ -126,7 +124,7 @@ pub fn create_outbox_entries(
         postcard::to_allocvec(audit)?.into(),
     ));
     if let Some(outbox) = outbox {
-        writes.push(crate::sync::outbox_record::outbox_write_entry(outbox)?);
+        writes.push(crate::sync::outbox::record::outbox_write_entry(outbox)?);
         if let Some((lifecycle, change)) = outbox_lifecycle_upsert(outbox)? {
             writes.push(lifecycle_revision_entry(
                 &lifecycle,
@@ -325,7 +323,7 @@ pub(crate) fn schedule_prune_drain() -> Effect {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::sync::outbox_record::outbox_key;
+    use crate::sync::outbox::record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE;
     use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;
@@ -335,7 +333,9 @@ mod pure_tests {
         UPDATED_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataEventPayload;
-    use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
+    use aruna_core::storage_entries::{
+        metadata_registry_key, shard_manifest_key, sync_revision_key, updated_index_key,
+    };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;

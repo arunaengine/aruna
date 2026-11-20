@@ -3,16 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::device::retry::RetryView;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -322,7 +322,7 @@ impl Operation for ClaimStateOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ClaimError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(true));
         }
         let [stored] = values::<1>(result)?;
@@ -335,6 +335,17 @@ impl Operation for ClaimStateOperation {
     }
 }
 
+/// What one drain pass achieved, so the caller knows how soon to look again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The pass could not complete; earlier pages may already be forwarded.
+    Deferred,
+    /// At least one entry asked for another pass; it does not prove entries remain.
+    Recheck,
+    /// No entry asked for another pass.
+    Idle,
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::{
@@ -342,11 +353,11 @@ mod pure_tests {
         publish_entry, publish_key,
     };
     use crate::tests::device::record;
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use craqle::VectorClock;
     use ulid::Ulid;
 

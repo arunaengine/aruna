@@ -4,17 +4,17 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::execution::job::{
-    CLOCK_MARGIN_MS, ExecutionStop, FamilyTombstone, JobFamilyRecord, JobRecordBody,
-    JobRecordEnvelope, JobRecordError, JobRecordKey, JobRecordKind, LocalExecution,
-    PhysicalExecutionState, StopEvidence, TOMBSTONE_RETENTION_MS,
-};
-
 use crate::jobs::records::admit::{
     Admission, AppendPlan, FamilyState, plan_append, plan_bundle, relayable,
 };
 use crate::jobs::records::verify::FamilyView;
 use crate::tests::records::{Family, node, secret};
+use aruna_core::structs::execution::job::family::{
+    CLOCK_MARGIN_MS, ExecutionStop, JobFamilyRecord, JobRecordBody, JobRecordEnvelope,
+    JobRecordError, JobRecordKey, JobRecordKind, LocalExecution, PhysicalExecutionState,
+    StopEvidence,
+};
+use aruna_core::structs::execution::job::prune::{FamilyTombstone, TOMBSTONE_RETENTION_MS};
 use aruna_core::structs::execution::job::record_rows::{PendingNeed, PendingRecord};
 
 type Stored = BTreeMap<JobRecordKey, JobRecordEnvelope>;
@@ -271,7 +271,7 @@ fn waits_for_predecessor() {
         &receipt,
         1,
         [9u8; 32],
-        aruna_core::structs::execution::job::PhysicalExecutionState::Running,
+        aruna_core::structs::execution::job::family::PhysicalExecutionState::Running,
         None,
     );
     let candidate = family.sign(&family.target, JobFamilyRecord::Update(Box::new(update)));
@@ -525,11 +525,12 @@ fn refuses_broken_bundle() {
     let JobFamilyRecord::Receipt(bound) = &receipt.record else {
         panic!("receipt fixture")
     };
-    let rebudget = |change: fn(&mut aruna_core::structs::execution::job::WitnessBudgetRecord)| {
-        let mut fields = *fields;
-        change(&mut fields);
-        family.sign(&secret(9), JobFamilyRecord::Budget(fields))
-    };
+    let rebudget =
+        |change: fn(&mut aruna_core::structs::execution::job::family::WitnessBudgetRecord)| {
+            let mut fields = *fields;
+            change(&mut fields);
+            family.sign(&secret(9), JobFamilyRecord::Budget(fields))
+        };
     // The budget allows sequences 0 and 1 only.
     let late = family.launch(&family.spec(), secret(9).public(), 2);
     let late_receipt = family.receipt(&late, 2);

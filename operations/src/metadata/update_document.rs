@@ -12,6 +12,7 @@ use aruna_core::keyspaces::{
     METADATA_CHECKPOINT_KEYSPACE, METADATA_INDEX_KEYSPACE, RAW_BUDGET_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
 };
+use aruna_core::metadata::api::UpdateDocumentMutation;
 use aruna_core::metadata::{
     EVENT_LIMIT, MaterializationStatusRecord, MetadataActor, MetadataBatch, MetadataBatchSource,
     MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload, MetadataEventRecord,
@@ -33,11 +34,9 @@ use aruna_core::structs::storage::metadata_registry::{
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use craqle::GraphReplicaSnapshot;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{effect_event, page_rows, read_values};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::profile::rules::{
     batch_adds_profile, not_profiled_status, profile_path_rule, stale_status, stamp_unprofiled,
@@ -47,7 +46,7 @@ use crate::metadata::repository::{
     create_outbox_record, event_projection_entries, registry_outbox_record,
     schedule_materialization,
 };
-use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox::record::{outbox_write_entry, schedule_drain_effect};
 use crate::sync::shard_placement::sort_node_ids;
 
 const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;
@@ -61,35 +60,6 @@ pub struct UpdateDocumentConfig {
     pub mutation: UpdateDocumentMutation,
     /// The newest event the caller based the change on; any later event fails the update.
     pub expected_revision: Option<Ulid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateDocumentMutation {
-    ReplaceRoCrate {
-        jsonld: String,
-    },
-    UpsertDataEntity {
-        jsonld: String,
-    },
-    UpsertContextualEntity {
-        jsonld: String,
-    },
-    /// Replaces one data entity by `@id`, so the properties it omits go.
-    ReplaceDataEntity {
-        jsonld: String,
-    },
-    /// Removes one root-linked `File` entity by `@id` and the root's link to it.
-    RemoveDataEntity {
-        id: String,
-    },
-    /// A batch a device planned against its own replica. It is appended
-    /// verbatim, under the device's actor, so both replicas converge on it.
-    ApplyBatch {
-        batch: Box<MetadataBatch>,
-        authored: MetadataBatchSource,
-    },
-    /// Opens a new history window with this holder's current graph state.
-    Checkpoint,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -394,7 +364,7 @@ impl UpdateDocumentOperation {
 
     /// Keeps graph state small enough that the checkpoint fits a fresh window.
     fn snapshot_taken(&mut self, result: IoResult) -> UpdateTurn {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => {
                 let fits = postcard::experimental::serialized_size(&snapshot)
                     .is_ok_and(|size| size as u64 <= RAW_BYTES_LIMIT / 4);
@@ -407,7 +377,7 @@ impl UpdateDocumentOperation {
     }
 
     fn batch_planned(&mut self, result: IoResult) -> UpdateTurn {
-        match effect_event(result)? {
+        match result.event()? {
             Event::Metadata(MetadataEvent::BatchPlanned { batch, .. }) => {
                 if let Some(expected) = &self.expected_graph
                     && aruna_core::metadata::graph_version(&batch.base_clock) != *expected
@@ -929,7 +899,7 @@ impl UpdateCommitOperation {
     }
 
     fn window_read(&mut self, result: IoResult) -> CommitTurn {
-        let (values, _) = page_rows(result)?;
+        let (values, _) = result.page()?;
         self.window = match values.first() {
             Some((key, _)) => Some(
                 key.get(16..32)
@@ -969,7 +939,7 @@ impl UpdateCommitOperation {
 
     /// Checks the fences, the accepted create and this node's budget row.
     fn sidecars_read(&mut self, result: IoResult) -> CommitTurn {
-        let values = read_values(result)?;
+        let values = result.values()?;
         let [raw_budget, accepted_create, rest @ ..] = values.as_slice() else {
             return Err(UpdateDocumentError::Io(IoError::Unexpected {
                 expected: "the raw sidecar values",
@@ -1046,7 +1016,7 @@ impl UpdateCommitOperation {
 
     /// Counts the window's history against the budget and writes the update.
     fn history_read(&mut self, result: IoResult) -> CommitTurn {
-        let (values, next_start_after) = page_rows(result)?;
+        let (values, next_start_after) = result.page()?;
         let (reconstructed, history_events, history_bytes) =
             self.history_budget(&values, next_start_after.as_ref())?;
         // Log keys end in the event id, so the last one is the newest event.
@@ -1213,7 +1183,7 @@ mod call_tests {
         let realm_id = RealmId::from_bytes([9u8; 32]);
         Actor {
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         }
     }
@@ -1308,7 +1278,7 @@ mod call_tests {
         MetadataEventRecord {
             event_id: record.establishing_event_id,
             record: record.clone(),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(2, 2), record.realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(2, 2), record.realm_id),
             node_id,
             payload: MetadataEventPayload::Scaffold {
                 name: "name".to_string(),

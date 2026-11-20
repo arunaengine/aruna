@@ -6,16 +6,17 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
+use aruna_core::job_request::{SubmissionScope, submission_of};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::PublishedPlugin;
-use aruna_core::structs::execution::job::{ExecutionSpec, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::family_reads::FamilyProjectionOperation;
-use aruna_operations::jobs::lifecycle::ids::{SubmissionScope, submission_of};
 use aruna_operations::jobs::lifecycle::submit_external::IngressNode;
 use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::plugins::calls::install_plugin;
@@ -25,15 +26,15 @@ use aruna_operations::plugins::publish::{PublishEntryConfig, PublishEntryOperati
 use aruna_operations::plugins::rows::{decode, encode};
 use aruna_operations::plugins::screen::ScreenTask;
 use aruna_operations::plugins::store::Txn;
-use aruna_operations::plugins::task_cancel::CancelTask;
-use aruna_operations::plugins::task_pass::SettleTasks;
-use aruna_operations::plugins::task_row::{TaskRow, task_key};
-use aruna_operations::plugins::task_send::SendTask;
-use aruna_operations::plugins::tasks::{TaskIo, task_spec};
+use aruna_operations::plugins::task::cancel::CancelTask;
+use aruna_operations::plugins::task::pass::SettleTasks;
+use aruna_operations::plugins::task::row::{TaskRow, task_key};
+use aruna_operations::plugins::task::send::SendTask;
+use aruna_operations::plugins::task::spec::{TaskIo, task_spec};
+use aruna_operations::plugins::work::calls::JobRow;
 use aruna_operations::plugins::work::{
     FinalState, Identity, SendBoundary, WORK_ROW, WorkKind, WorkRow, WorkState, reserve,
 };
-use aruna_operations::plugins::work_calls::JobRow;
 use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_operations::testing_objects::{put_config, seed_bucket};
 use aruna_plugin_types::recipe::Recipe;

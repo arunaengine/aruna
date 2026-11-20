@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmNodeKind;
@@ -20,7 +20,7 @@ use aruna_drivers::driver::node_facts;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_operations::device::realm_documents::{fetch_realm_documents, realm_removed};
+use aruna_operations::device_node::realm_documents::{fetch_realm_documents, realm_removed};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::sync::replicate_documents::{
@@ -29,10 +29,11 @@ use aruna_operations::sync::replicate_documents::{
 use aruna_operations::users::read_document::ReadUserOperation;
 use ulid::Ulid;
 
+use crate::convergence::wait_for_convergence;
 use aruna_operations::auth::bearer_token::TokenRevokedOperation;
 use topology::{
     TestNode, TestResult, Topology, read_group_auth, read_group_record, read_realm_auth,
-    read_realm_config, replicate_config, spawn_node, wait_for_convergence, write,
+    read_realm_config, replicate_config, spawn_node, write,
 };
 
 const MANAGEMENT_NODES: usize = 2;
@@ -60,13 +61,21 @@ async fn device_fetches_revocation() -> TestResult<()> {
         realm.node(0).context.as_ref(),
     )
     .await?;
-    replicate_config(&realm.nodes, realm_id).await;
-    assert!(
-        read_realm_config(realm.node(0), realm_id)
-            .await?
-            .token_revoked(&token_hash, unix_timestamp_secs()),
-        "the realm must hold its own revocation"
-    );
+    // The device takes the first realm node's answer, in a shuffled order, so every realm node
+    // must hold the revocation before it asks; one replication pass may leave one behind.
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "the revocation did not reach every realm node",
+        || async {
+            replicate_config(&realm.nodes, realm_id).await;
+            let mut missing = 0;
+            for node in &realm.nodes {
+                let config = read_realm_config(node, realm_id).await?;
+                missing += usize::from(!config.token_revoked(&token_hash, unix_timestamp_secs()));
+            }
+            Ok(missing)
+        },
+    )
+    .await?;
 
     // The device joins afterwards, with the configuration as it was before the
     // revocation: exactly what a device that was closed comes back to.

@@ -10,9 +10,9 @@ use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::rows::PrefixPages;
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::PersistentIdMapping;
 use aruna_core::structs::secondary_id::{SecondaryIdKind, index_document, secondary_id_prefix};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
@@ -22,8 +22,8 @@ use crate::metadata::api::readable::RecordReadableOperation;
 use crate::metadata::id_mapping::PersistentIdError;
 use crate::metadata::persistent_id::MappingReadOperation;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::StorageReadError;
-use crate::metadata::secondary_ids::IdentifierMatch;
+use aruna_core::errors::StorageReadError;
+use aruna_core::metadata::api::IdentifierMatch;
 
 /// Index rows one page of the reverse index holds.
 const INDEX_PAGE: usize = 256;

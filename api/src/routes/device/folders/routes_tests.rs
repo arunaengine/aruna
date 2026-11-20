@@ -8,20 +8,20 @@ use crate::auth::OwnerAuth;
 use crate::auth::extract;
 use crate::routes::device::buckets::{CreateBucketRequest, create_device_bucket};
 use crate::routes::device::dto::FolderStateName;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
@@ -136,12 +136,12 @@ async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey
     let path = dir.path().to_str().unwrap().to_string();
     let storage = FjallStorage::open(&path).unwrap();
     let net = aruna_net::NetHandle::new(
-        aruna_net::NetConfig {
+        aruna_net::config::NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             realm_id: realm_id(),
-            discovery_method: aruna_net::DiscoveryMethod::None,
-            relay_method: aruna_net::RelayMethod::None,
-            ..aruna_net::NetConfig::default()
+            discovery_method: aruna_net::config::DiscoveryMethod::None,
+            relay_method: aruna_net::config::RelayMethod::None,
+            ..aruna_net::config::NetConfig::default()
         },
         storage.clone(),
     )

@@ -8,9 +8,8 @@ use aruna_core::effects::{Effect, LocalFileEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionOutcome, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord, SyncBase,
     SyncedBytes, SyncedFolder, WriteGuard,
 };
@@ -268,10 +267,7 @@ impl Operation for MaterializeEntryOperation {
     fn first(&mut self) -> Result<Next<MaterializeOutcome>, MaterializeError> {
         let root = self.input.folder.root.clone();
         let relative = self.input.relative.clone();
-        let blob = std::mem::replace(
-            &mut self.input.blob,
-            BackendStream(Box::pin(futures_util::stream::empty())),
-        );
+        let blob = std::mem::replace(&mut self.input.blob, BackendStream::empty());
         let effect = match self.input.conflicted {
             true => LocalFileEffect::WriteConflicted {
                 root,
@@ -295,7 +291,7 @@ impl Operation for MaterializeEntryOperation {
         match self.outcome.take() {
             None => Ok(Next::Call(self.written(result.event()?)?)),
             Some(outcome) => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(outcome))
             }
         }
@@ -323,7 +319,7 @@ mod tests {
             remote: None,
             synced: None,
             audit: None,
-            blob: BackendStream(Box::pin(futures_util::stream::empty())),
+            blob: BackendStream::empty(),
         })
     }
 

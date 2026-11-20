@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::{
@@ -61,7 +61,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::tests::staging::sample_metadata;
+    use aruna_test_support::staging::sample_metadata;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;

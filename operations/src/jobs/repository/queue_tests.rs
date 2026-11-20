@@ -8,7 +8,7 @@ use crate::jobs::repository::test_support::{
 };
 use crate::jobs::store::mutation::{Rows, run_in_memory};
 use aruna_core::events::StorageEvent;
-use aruna_core::repository::{LinkFailure, LinkPush};
+use aruna_core::repository::link::{LinkFailure, LinkPush, link_change_entry};
 
 fn entry(due_at_ms: u64) -> LinkQueueEntry {
     LinkQueueEntry {
@@ -102,7 +102,46 @@ fn drain() -> DrainLinksOperation {
     let mut operation = DrainLinksOperation::new(local_scope());
     operation.stamp(NOW_MS);
     operation.first().unwrap();
+    operation.next(child::<(), LinkError>(Ok(()))).unwrap();
     operation
+}
+
+// A changed document gets its checks queued, then its change row goes.
+#[test]
+fn changes_queue_checks() {
+    let mut operation = QueueChangesOperation::new();
+    assert_eq!(operation.first(), Ok(Next::Call(change_pages().call())));
+    let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
+    let queue = operation.next(queue_page(vec![(key.clone(), value)]));
+    let documents = QueueRowsOperation::new([link().document_id]);
+    assert_eq!(queue, Ok(Next::Call(IoCall::child(documents))));
+    let row = queue_row(link().link_id, &entry(1)).unwrap();
+    let write = operation.next(child::<_, LinkError>(Ok(vec![row.clone()])));
+    assert_eq!(write, Ok(Next::Call(IoCall::Write(vec![row]))));
+    let change = (LINK_CHANGE_KEYSPACE.to_string(), key);
+    let clear = operation.next(IoResult::Done);
+    assert_eq!(clear, Ok(Next::Call(IoCall::Delete(vec![change]))));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+}
+
+// Changes whose checks cannot be queued stay, the due checks still run, and the run ends with
+// the error so the shell runs it again.
+#[test]
+fn failed_changes_stay() {
+    let mut changes = QueueChangesOperation::new();
+    changes.first().unwrap();
+    let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
+    changes.next(queue_page(vec![(key, value)])).unwrap();
+    let failed = child::<Vec<(String, Key, Value)>, _>(Err(LinkError::NoRevision));
+    assert_eq!(changes.next(failed), Err(LinkError::NoRevision));
+    let mut operation = DrainLinksOperation::new(local_scope());
+    let queue = IoCall::child(QueueChangesOperation::new());
+    assert_eq!(operation.first(), Ok(Next::Call(queue)));
+    let failed = child::<(), _>(Err(LinkError::NoRevision));
+    let page = operation.next(failed);
+    assert_eq!(page, Ok(Next::Call(queue_pages().call())));
+    let ended = operation.next(queue_page(Vec::new()));
+    assert_eq!(ended, Err(LinkError::NoRevision));
 }
 
 #[test]
@@ -271,7 +310,7 @@ fn limited_push_retries() {
 fn queued_job(job_id: JobId) -> JobRecord {
     JobRecord::new(
         job_id,
-        aruna_core::structs::execution::job::JobPayload::Probe {
+        aruna_core::structs::execution::job::input::JobPayload::Probe {
             steps: 1,
             step_sleep_ms: 0,
             fail_at: None,
@@ -472,38 +511,6 @@ fn scaffold_uses_registry() {
 }
 
 #[test]
-fn foreign_iri_ignored() {
-    let mut operation = QueueDeletedOperation::new(scope(), "urn:other".into());
-    assert_eq!(operation.first(), Ok(Next::Done(())));
-}
-
-#[test]
-fn deletion_arms_timer() {
-    let document = link().document_id;
-    let iri = MetadataRegistryRecord::graph_iri_for(document);
-    let mut operation = QueueDeletedOperation::new(scope(), iri);
-    assert_eq!(
-        operation.first(),
-        Ok(Next::Call(IoCall::child(QueueRowsOperation::new([
-            document
-        ]))))
-    );
-    let row = queue_row(link().link_id, &entry(1)).unwrap();
-    let write = operation
-        .next(child::<_, LinkError>(Ok(vec![row.clone()])))
-        .unwrap();
-    assert_eq!(write, Next::Call(IoCall::Write(vec![row])));
-    assert_eq!(
-        operation.next(IoResult::Done),
-        Ok(Next::Call(IoCall::child(LinkTimerOperation::new())))
-    );
-    assert_eq!(
-        operation.next(child::<(), LinkError>(Ok(()))),
-        Ok(Next::Done(()))
-    );
-}
-
-#[test]
 fn timer_arms_earliest() {
     let mut operation = LinkTimerOperation::new();
     operation.stamp(NOW_MS);
@@ -512,8 +519,15 @@ fn timer_arms_earliest() {
         (id_key(link().link_id), queued(NOW_MS + 9_000)),
         (id_key(Ulid::nil()), queued(NOW_MS + 2_000)),
     ];
+    assert_eq!(
+        operation.next(queue_page(rows)),
+        Ok(Next::Call(change_probe()))
+    );
     let expected: IoCall = schedule_drain(Duration::from_millis(2_000)).into();
-    assert_eq!(operation.next(queue_page(rows)), Ok(Next::Call(expected)));
+    assert_eq!(
+        operation.next(queue_page(Vec::new())),
+        Ok(Next::Call(expected))
+    );
     let armed = crate::jobs::repository::test_support::event(Event::Task(TaskEvent::Error {
         key: None,
         message: "late".into(),
@@ -521,11 +535,37 @@ fn timer_arms_earliest() {
     assert_eq!(operation.next(armed), Ok(Next::Done(())));
 }
 
+fn change_probe() -> IoCall {
+    IoCall::Page {
+        space: LINK_CHANGE_KEYSPACE.to_string(),
+        prefix: ByteView::from(Vec::new()),
+        after: None,
+        limit: 1,
+    }
+}
+
 #[test]
 fn empty_queue_idle() {
     let mut operation = LinkTimerOperation::new();
     operation.first().unwrap();
+    assert_eq!(
+        operation.next(queue_page(Vec::new())),
+        Ok(Next::Call(change_probe()))
+    );
     assert_eq!(operation.next(queue_page(Vec::new())), Ok(Next::Done(())));
+}
+
+// Change rows left behind, as after a failed queueing or a restart, arm the drain at once.
+#[test]
+fn changes_arm_drain() {
+    let mut operation = LinkTimerOperation::new();
+    operation.stamp(NOW_MS);
+    operation.first().unwrap();
+    operation.next(queue_page(Vec::new())).unwrap();
+    let (_, key, value) = link_change_entry(link().document_id, NOW_MS);
+    let armed = operation.next(queue_page(vec![(key, value)]));
+    let expected: IoCall = schedule_drain(Duration::ZERO).into();
+    assert_eq!(armed, Ok(Next::Call(expected)));
 }
 
 // A retry moves an unchanged check; a change queued while the check ran keeps its earlier due

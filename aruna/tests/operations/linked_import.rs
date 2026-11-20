@@ -6,9 +6,9 @@ use crate::job_calls::insert_job;
 use crate::job_calls::{claim_job, complete_job, transition_to_running};
 use aruna::tasks::job_host::run_backend_import;
 use aruna::tasks::job_host::run_storage_purge;
-use aruna_blob::blob::{BackendRegistry, BlobHandler, NodeBackend};
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::{BackendRegistry, NodeBackend};
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -19,7 +19,9 @@ use aruna_core::keyspaces::{
     GROUP_KEYSPACE, IMPORT_INTENT_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -40,14 +42,16 @@ use aruna_core::structs::storage::group_backend::{
 };
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_net::NetHandle;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use aruna_operations::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
+use aruna_operations::blob::merge_copies::{Unified, UnifyOperation};
 use aruna_operations::blob::migration::misplaced::AnyKey;
 use aruna_operations::blob::purge::{ScopeTotalsOperation, StorageFilesOperation};
-use aruna_operations::blob::unify::{PreviewPageOperation, PreviewQuery, Unified, UnifyOperation};
+use aruna_operations::blob::unify::{PreviewPageOperation, PreviewQuery};
 use aruna_operations::groups::backends::record_writes;
 use aruna_operations::groups::fence::GroupWriteOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
@@ -55,10 +59,10 @@ use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_operations::s3::imports::discovery::{
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::transfer::discovery::{
     AuthorizedPreviewOperation, FileOutcome, SetDiscoveryOperation,
 };
-use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_storage::scan::iter_prefix_page;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
@@ -154,8 +158,8 @@ async fn setup_context() -> TestContext {
 async fn setup_pattern(pattern: &str) -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::FjallStorage::open(&root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let storage_handle = storage::worker::FjallStorage::open(&root).unwrap();
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -358,7 +362,6 @@ async fn claimed(context: &TestContext, tag: u8, payload: JobPayload) -> JobCont
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     }
 }
 

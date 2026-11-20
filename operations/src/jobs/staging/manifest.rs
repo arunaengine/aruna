@@ -10,14 +10,15 @@ use aruna_core::jobs::{JobEffect, JobEvent};
 use aruna_core::keyspaces::STAGING_MANIFEST_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, parse_manifest_line};
-use aruna_core::structs::execution::job::{JobId, ManifestRead, StagingJobCheckpoint};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ManifestRead, StagingJobCheckpoint};
 use aruna_core::structs::execution::source_access::{ObservationMatch, SourceMetadata};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 
 use super::walk::{canonical_walker_path, read_check_call, record_failure, source_permission_path};
 use super::{ClearRowsOperation, PageFailure, StagingRun, committed};
-use crate::staging::head_source::{
+use crate::s3::object::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
 use crate::staging::read_source::{

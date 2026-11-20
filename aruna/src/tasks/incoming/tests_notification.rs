@@ -2,11 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::harness::*;
+use super::support::*;
 use super::*;
 
 /// The outbox rows still waiting.
-async fn outbox_rows(storage: &aruna_storage::StorageHandle) -> Vec<(Key, ByteView)> {
+async fn outbox_rows(
+    storage: &aruna_storage::storage::handle::StorageHandle,
+) -> Vec<(Key, ByteView)> {
     let read = StorageEffect::Iter {
         key_space: aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
         prefix: None,
@@ -150,7 +152,7 @@ async fn notification_delivers_holder() {
         compute_handle: None,
         outbound_handle: None,
     });
-    crate::inbound::initialize_incoming_fixture(context_b.clone());
+    let _incoming = crate::inbound::initialize_incoming_fixture(context_b.clone());
 
     let context_a = Arc::new(DriverContext {
         storage_handle: storage_a.clone(),
@@ -212,7 +214,7 @@ async fn drain_retries_queueing() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = make_net_handle(realm_id, &storage, [26u8; 32]).await;
     let node_id = net_handle.node_id();
 
@@ -266,8 +268,8 @@ async fn drain_retries_queueing() {
     let remaining = outbox_rows(&storage).await;
     assert!(remaining.is_empty());
     let key = format!("webhook/{}", record.notification_id);
-    let key = aruna_core::structs::execution::job::user_dedup_key(recipient, &key);
-    let queued = aruna_operations::jobs::store::test_calls::find_dedup_plan(
+    let key = aruna_core::structs::execution::job::local::user_dedup_key(recipient, &key);
+    let queued = aruna_test_support::jobs::find_dedup_plan(
         &aruna_drivers::testing::test_context(storage.clone()),
         recipient,
         &key,
@@ -279,7 +281,7 @@ async fn drain_retries_queueing() {
 }
 
 async fn write_notification_outbox(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     record: &NotificationOutboxRecord,
 ) {
     let (key_space, key, value) = outbox_write_entry(record).expect("outbox entry");
@@ -297,7 +299,9 @@ async fn write_notification_outbox(
     }
 }
 
-async fn read_inbox_records(storage: &aruna_storage::StorageHandle) -> Vec<NotificationRecord> {
+async fn read_inbox_records(
+    storage: &aruna_storage::storage::handle::StorageHandle,
+) -> Vec<NotificationRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
@@ -391,7 +395,7 @@ async fn device_skips_holders() {
     }
 
     OperationsTaskHandler::new(context, JobsRuntime::new())
-        .refresh_blob_holders()
+        .run_trigger(TaskKey::RefreshBlobHolders)
         .await;
 
     let timer = storage

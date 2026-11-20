@@ -6,9 +6,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_api::https::HostCheck;
 use aruna_api::https::certificate::CertificateStore;
 use aruna_api::https::listener::{HttpsHandle, RoutedListener};
-use aruna_api::https::{HostCheck, HostRoute};
+use aruna_core::listener::HostRoute;
 use aruna_tasks::shutdown::Shutdown;
 use rustls::pki_types::UnixTime;
 use tokio::net::{TcpListener, TcpStream};
@@ -17,7 +18,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use crate::settings::HttpsSettings;
+use aruna_config::settings::HttpsSettings;
 
 /// How often the certificate files are checked for a renewal; `SIGHUP` checks at once.
 const RELOAD_INTERVAL: Duration = Duration::from_secs(60 * 60);

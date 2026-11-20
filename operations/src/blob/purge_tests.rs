@@ -173,7 +173,8 @@ async fn finds_pinned_files() {
 #[tokio::test]
 async fn plans_until_ended() {
     let (_directory, context) = setup().await;
-    let job = aruna_core::structs::execution::job::JobId::from_bytes([0xE5; 16]).as_ulid();
+    let job =
+        aruna_core::structs::execution::job::identity::JobId::from_bytes([0xE5; 16]).as_ulid();
     let id = Ulid::from_parts(10, 1);
     let unversioned = file("raw/gone/x", Ulid::from_parts(21, 1));
     let versioned = file("raw/gone/a", Ulid::from_parts(20, 1));
@@ -230,9 +231,9 @@ async fn plans_until_ended() {
             if job_id == job && location == versioned && version == "p1"
     ));
     // While the purge job runs, its planned files wait; a job that is gone has ended.
-    let record = aruna_core::structs::execution::job::JobRecord::new(
-        aruna_core::structs::execution::job::JobId::from_bytes(job.to_bytes()),
-        aruna_core::structs::execution::job::JobPayload::Probe {
+    let record = aruna_core::structs::execution::job::local::JobRecord::new(
+        aruna_core::structs::execution::job::identity::JobId::from_bytes(job.to_bytes()),
+        aruna_core::structs::execution::job::input::JobPayload::Probe {
             steps: 1,
             step_sleep_ms: 0,
             fail_at: None,
@@ -245,13 +246,13 @@ async fn plans_until_ended() {
         1,
         None,
     );
-    crate::jobs::store::test_calls::insert_job(&context, &record)
+    aruna_test_support::jobs::insert_job(&context, &record)
         .await
         .unwrap();
     aruna_drivers::driver::drive(
         crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
             routing: aruna_drivers::driver::node_routing(&context),
-            has_blob: (&context).blob_handle.is_some(),
+            has_blob: context.blob_handle.is_some(),
         }),
         &context,
     )
@@ -283,14 +284,14 @@ async fn plans_until_ended() {
     assert!(!claimed(&context).await);
     let delete = aruna_core::effects::StorageEffect::Delete {
         key_space: aruna_core::keyspaces::JOB_KEYSPACE.to_string(),
-        key: aruna_core::structs::execution::job::job_record_key(record.job_id),
+        key: aruna_core::structs::execution::job::local::job_record_key(record.job_id),
         txn_id: None,
     };
     context.storage_handle.send_storage_effect(delete).await;
     aruna_drivers::driver::drive(
         crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
             routing: aruna_drivers::driver::node_routing(&context),
-            has_blob: (&context).blob_handle.is_some(),
+            has_blob: context.blob_handle.is_some(),
         }),
         &context,
     )

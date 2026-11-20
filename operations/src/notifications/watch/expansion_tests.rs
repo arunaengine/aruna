@@ -127,8 +127,8 @@ fn drained_row_deleted() {
     );
 }
 
-/// A stored retry row further along stays; a new row past the row cap is refused, while an
-/// existing row still advances.
+/// A stored retry row further along stays; a new row past the row cap is refused for now, as the
+/// queue clears, while an existing row still advances.
 #[test]
 fn retry_row_bounded() {
     let behind = watch_subscription_key(user(4, 2), Ulid::nil()).to_vec();
@@ -146,7 +146,7 @@ fn retry_row_bounded() {
     let mut refused = retrying(&behind);
     assert!(matches!(
         refused.write_retry(full.clone()),
-        Err(ExpandError::Fatal(error)) if error.contains("row cap")
+        Err(ExpandError::Unavailable(error)) if error.contains("row cap")
     ));
     let mut advancing = retrying(&ahead);
     let mut queued = full;
@@ -221,4 +221,77 @@ fn drain_defers_failures() {
         next_start_after: None,
     })));
     assert_eq!(empty.next(none), Ok(Next::Done(())));
+}
+
+// A full storage queue or a timeout passes later, so the delivery is retried; a lasting fault
+// such as a missing key is fatal.
+#[test]
+fn storage_faults_retry() {
+    let full = IoError::Storage(StorageError::QueueFull);
+    assert_eq!(ExpandError::from(full.clone()), ExpandError::Io(full));
+    let missing = ExpandError::from(IoError::Storage(StorageError::KeyNotFound));
+    assert!(matches!(missing, ExpandError::Fatal(_)));
+}
+
+// A watch listing or an inbox upsert that failed on storage, and a full inbox, pass on a later
+// delivery; only a record that does not decode is final.
+#[test]
+fn failed_children_retry() {
+    let mut listing = expanding(None);
+    listing.first().unwrap();
+    let failed = WatchSubscriptionError::Storage("timeout".to_string());
+    let failed = IoResult::Child(ChildOutcome::new(Err::<WatchPage, _>(failed)));
+    let unavailable = ExpandError::Unavailable("timeout".to_string());
+    assert_eq!(listing.next(failed), Err(unavailable));
+
+    let upsert = || Box::new(UpsertInboxOperation::new(Vec::new()));
+    let mut operation = expanding(None);
+    let timeout = Err(InboxError::Storage(StorageError::Timeout));
+    let retried = ExpandError::Io(IoError::Storage(StorageError::Timeout));
+    assert_eq!(operation.upserted(upsert(), timeout), Err(retried));
+    let full = Err(InboxError::TransientCap(user(4, 2)));
+    let full = operation.upserted(upsert(), full);
+    assert!(matches!(full, Err(ExpandError::Unavailable(_))));
+    let broken = Err(InboxError::Decode("bad".to_string()));
+    let broken = operation.upserted(upsert(), broken);
+    assert!(matches!(broken, Err(ExpandError::Fatal(_))));
+}
+
+/// A stored row whose value does not decode, and a healthy watch of the same realm.
+fn mixed_rows() -> (WatchSubscription, Vec<(Key, Value)>) {
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let mut healthy = WatchSubscription::new(Ulid::generate(), user(4, 3), "data/".into(), mask, 1);
+    healthy.watch_id = Ulid::from_bytes([7; 16]);
+    let broken = watch_subscription_key(user(4, 2), Ulid::from_bytes([6; 16]));
+    let kept = watch_subscription_key(healthy.owner, healthy.watch_id);
+    let value = Value::from(healthy.to_bytes().unwrap());
+    let rows = vec![(broken, Value::from(vec![0xff])), (kept, value)];
+    (healthy, rows)
+}
+
+// A holder's delivery scan skips one malformed row and keeps the healthy watch on its page, so
+// the expansion goes on with it instead of refusing the events.
+#[test]
+fn malformed_row_skipped() {
+    let scope = WatchScope::Page {
+        realm_id: REALM,
+        start: None,
+        limit: 4,
+    };
+    let mut listing = ListWatchesOperation::new(scope);
+    listing.first().unwrap();
+    let (healthy, rows) = mixed_rows();
+    let listed = listing.next(IoResult::Page { rows, next: None });
+    let page = WatchPage {
+        subscriptions: vec![healthy],
+        next: None,
+    };
+    assert_eq!(listed, Ok(Next::Done(page)));
+    let Ok(Next::Done(page)) = listed else {
+        unreachable!("the page was just checked");
+    };
+    let mut expansion = expanding(None);
+    expansion.first().unwrap();
+    let listed = IoResult::Child(ChildOutcome::new(Ok::<_, WatchSubscriptionError>(page)));
+    assert!(expansion.next(listed).is_ok());
 }

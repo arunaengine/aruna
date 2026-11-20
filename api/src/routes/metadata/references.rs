@@ -5,19 +5,21 @@
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerResult};
-use crate::metadata::{
+use crate::metadata::model::{
     ExcludedFormResponse, MetadataReferencesParams, MetadataReferencesResponse, PreflightBody,
     PreflightCoverageResponse, PreflightFreshnessResponse, PreflightLocationResponse,
     PreflightResponse, PreflightStorageBody, PreflightTargetBody, PreflightTargetResponse,
-    PreflightVisibleResponse, bearer_token_string, map_api_error, map_query_mode,
-    map_references_response,
+    PreflightVisibleResponse,
+};
+use crate::metadata::{
+    bearer_token_string, map_api_error, map_query_mode, map_references_response,
 };
 use crate::server::state::ServerState;
+use aruna_core::metadata::api::MetadataIndexState;
 use aruna_drivers::driver::drive;
 use aruna_operations::metadata::api::preflight::fanout::references_preflight as run_references_preflight;
 use aruna_operations::metadata::api::preflight_types::{
-    MetadataIndexState, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
-    ReferenceTarget,
+    MetadataStorageOperation, ReferenceExecution, ReferenceRequest, ReferenceTarget,
 };
 use aruna_operations::metadata::api::read_types::MetadataReferencesRequest;
 use aruna_operations::metadata::api::references::ReferencesOperation;

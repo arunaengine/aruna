@@ -9,8 +9,9 @@ use aruna_core::events::GroupEvent;
 use aruna_core::jobs::{JobEffect, JobReport};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobId, StagingJobCheckpoint, StagingJobPhase, StagingJobSpec, StagingWalk,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    StagingJobCheckpoint, StagingJobPhase, StagingJobSpec, StagingWalk,
 };
 use aruna_core::structs::execution::source_access::ListRequest;
 use aruna_core::structs::execution::staging::StagingStrategy;
@@ -22,26 +23,18 @@ use super::walk::{
     Ahead, WalkPageOperation, WalkPlace, WalkedPage, directory_list_path, member, member_outcome,
     target_of,
 };
-use super::{PageFailure, StagingRun, checkpoint_key, committed};
+use super::{PageFailure, StagingRun, committed};
 use crate::jobs::run_rows::SettledRowsOperation;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
-use crate::staging::page::rows::MAX_ERROR_SAMPLE;
+use aruna_core::staging_checkpoint::{
+    LANE_LIMIT, Lane, PARTS, checkpoint_key, fold, lanes_page, parse_lanes,
+};
 
-/// Lanes one job walks at the same time. Each lane holds at most one listed page ahead, so a
-/// job holds a bounded number of pages whatever the source holds.
-const LANE_LIMIT: usize = 4;
-/// Checkpoint rows of one job a reader looks at: its own, and two per lane.
-pub const LANE_ROWS: usize = 2 * LANE_LIMIT + 1;
-/// Slots per spec prefix: lane `slot` walks part `slot % PARTS` of prefix `slot / PARTS`.
-const PARTS: u64 = LANE_LIMIT as u64;
 /// One-key listings that split one prefix, whatever its key space looks like.
 const MAX_PROBES: usize = 64;
-
-/// One open lane: its checkpoint and the exclusive target key it stops before.
-pub(super) type Lane = (u64, StagingJobCheckpoint, Option<String>);
 
 /// Whether the job's remaining prefixes go to lanes: reference imports of flat listings without
 /// a checksum manifest, whose prefixes write disjoint key ranges.
@@ -77,63 +70,6 @@ fn bound_key(job_id: JobId, slot: u64) -> ByteView {
     let mut key = checkpoint_key(job_id, Some(slot)).to_vec();
     key.push(b'u');
     ByteView::from(key)
-}
-
-/// The page of a job's state rows that holds its open lanes.
-pub(super) fn lanes_page(job_id: JobId) -> IoCall {
-    IoCall::Page {
-        space: STAGING_STATE_KEYSPACE.to_string(),
-        prefix: ByteView::from(job_id.to_bytes().to_vec()),
-        after: None,
-        limit: LANE_ROWS,
-    }
-}
-
-/// The open lanes among a job's state rows, each with its checkpoint and where it stops.
-pub fn parse_lanes(rows: Vec<(Key, Value)>) -> Result<Vec<Lane>, String> {
-    let mut lanes: Vec<Lane> = Vec::new();
-    for (key, value) in rows {
-        let Some(slot) = (key.get(16..24)).and_then(|slot| <[u8; 8]>::try_from(slot).ok()) else {
-            continue;
-        };
-        let slot = u64::from_be_bytes(slot);
-        match key.len() {
-            24 => lanes.push((slot, decode(&value)?, None)),
-            // The bound row sorts right after its checkpoint row.
-            _ => match lanes.last_mut() {
-                Some(lane) if lane.0 == slot => lane.2 = decode(&value)?,
-                _ => {}
-            },
-        }
-    }
-    Ok(lanes)
-}
-
-/// The job's checkpoint with its open lanes counted in. The first open lane's prefix reads as
-/// the next to start, so a job handed over walks the open prefixes again.
-pub(super) fn merged(mut main: StagingJobCheckpoint, lanes: Vec<Lane>) -> StagingJobCheckpoint {
-    if let Some(first) = lanes.iter().map(|(slot, ..)| *slot).min() {
-        main.prefixes_done = first / PARTS;
-        main.phase = StagingJobPhase::Registering;
-    }
-    for (_, lane, _) in lanes {
-        if main.current_path.is_none() {
-            main.current_path = lane.current_path.clone();
-        }
-        fold(&mut main, lane);
-    }
-    main
-}
-
-/// Adds a lane's counters and errors to the job's.
-fn fold(main: &mut StagingJobCheckpoint, lane: StagingJobCheckpoint) {
-    main.items_current = main.items_current.saturating_add(lane.items_current);
-    main.items_succeeded = main.items_succeeded.saturating_add(lane.items_succeeded);
-    main.items_failed = main.items_failed.saturating_add(lane.items_failed);
-    main.bytes_current = main.bytes_current.saturating_add(lane.bytes_current);
-    main.bytes_discovered = main.bytes_discovered.saturating_add(lane.bytes_discovered);
-    let room = MAX_ERROR_SAMPLE.saturating_sub(main.errors.len());
-    main.errors.extend(lane.errors.into_iter().take(room));
 }
 
 /// What a window member of the lanes run does.
@@ -808,10 +744,6 @@ impl Operation for OpenPrefixOperation {
             }
         }
     }
-}
-
-fn decode<T: serde::de::DeserializeOwned>(value: &[u8]) -> Result<T, String> {
-    postcard::from_bytes(value).map_err(|error| error.to_string())
 }
 
 fn encode<T: serde::Serialize>(value: &T) -> Result<ByteView, PageFailure> {

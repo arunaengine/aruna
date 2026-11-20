@@ -88,7 +88,7 @@ fn input(mode: EncryptionMode, lookups: BTreeMap<UserId, KeyLookup>) -> EnableIn
 }
 
 fn bucket() -> BucketInfo {
-    crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
+    aruna_test_support::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
 }
 
 /// Runs the operation up to the generated key, with no uploads and no stored settings.
@@ -120,7 +120,7 @@ fn no_versions(operation: &mut EnableEncryptionOperation) -> Turn {
 }
 
 fn sealed(effects: &Turn) -> Vec<SealedCopy> {
-    let Effect::Blob(BlobEffect::SealHolderCopies { key, holders, .. }) = asked(&effects) else {
+    let Effect::Blob(BlobEffect::SealHolderCopies { key, holders, .. }) = asked(effects) else {
         panic!("expected sealing, got {effects:?}");
     };
     holders

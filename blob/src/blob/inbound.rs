@@ -4,10 +4,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_net::streams::BiStream;
 use thiserror::Error;
 use tokio::time::timeout;

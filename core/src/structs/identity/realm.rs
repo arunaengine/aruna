@@ -2,16 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
-use crate::UserId;
 use crate::auth::{
     MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS, revocation_live, revocation_retained,
     user_cutoff_hash,
 };
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::id_mint::named_id;
 use crate::reducer::{AdminDocumentState, RevocationIndex};
-use crate::structs::execution::job::{JobId, SubmissionId};
+use crate::structs::execution::job::family::SubmissionId;
+use crate::structs::execution::job::identity::JobId;
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::auth::{Permission, Role};
 use crate::structs::placement::binding_directory::{BindingDirectory, BindingError};
@@ -29,6 +29,7 @@ use crate::structs::placement::transition::{
 use crate::structs::storage::node_info::{KIND_LABEL_KEY, NODE_LABEL_KEY};
 use crate::structured_id::{PlacementHandle, StructuredId};
 use crate::types::{GroupId, RoleId};
+use crate::user::id::UserId;
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -42,7 +43,7 @@ use ulid::Ulid;
 pub const ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
 
 /// This node's id and realm, while it has a realm transport.
-pub type NodeRealm = Option<(crate::NodeId, RealmId)>;
+pub type NodeRealm = Option<(crate::id::NodeId, RealmId)>;
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(pub [u8; 32]);
@@ -1270,13 +1271,12 @@ fn normalize_replication_factor(replication_factor: u32) -> usize {
 
 #[cfg(test)]
 mod test {
-    use crate::NodeId;
-    use crate::UserId;
     use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use crate::auth::REVOCATION_GRACE_SECS;
+    use crate::id::NodeId;
     use crate::reducer::AdminDocumentState;
     use crate::request_policy::{PolicyKind, RequestPolicy};
-    use crate::structs::execution::job::SubmissionId;
+    use crate::structs::execution::job::family::SubmissionId;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::{
         DynamicDiscoveryMethod, MetadataPathOverride, MetadataReplicationOverride,
@@ -1289,6 +1289,7 @@ mod test {
     };
     use crate::structs::placement::transition::CandidatePlacementMap;
     use crate::structs::storage::node_info::{KIND_LABEL_KEY, NODE_LABEL_KEY};
+    use crate::user::id::UserId;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
@@ -1302,7 +1303,7 @@ mod test {
         let auth_doc = RealmAuthorizationDocument::default_realm_doc(RealmId([0u8; 32]));
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
-            user_id: crate::UserId::new(Ulid::generate(), RealmId([0u8; 32])),
+            user_id: crate::user::id::UserId::new(Ulid::generate(), RealmId([0u8; 32])),
             realm_id: RealmId([0u8; 32]),
         };
         let bytes = auth_doc.to_bytes(&actor).unwrap();
@@ -1371,7 +1372,7 @@ mod test {
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
-            user_id: crate::UserId::new(Ulid::generate(), RealmId([4u8; 32])),
+            user_id: crate::user::id::UserId::new(Ulid::generate(), RealmId([4u8; 32])),
             realm_id: RealmId([4u8; 32]),
         };
 
@@ -1523,14 +1524,14 @@ mod test {
             username: None,
             from: "aruna@example.org".to_string(),
             password: None,
-            changed_by: crate::UserId::local(Ulid::from_bytes([4; 16]), config.realm_id),
+            changed_by: crate::user::id::UserId::local(Ulid::from_bytes([4; 16]), config.realm_id),
             changed_at_ms: 5,
         });
         sealed.vault.push(RealmVaultRecord {
             entry: RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_bytes([1; 16])),
             revision: Ulid::from_bytes([2; 16]),
             sealed: vec![3; 40],
-            changed_by: crate::UserId::local(Ulid::from_bytes([4; 16]), config.realm_id),
+            changed_by: crate::user::id::UserId::local(Ulid::from_bytes([4; 16]), config.realm_id),
             changed_at_ms: 5,
         });
 
@@ -1569,8 +1570,8 @@ mod test {
     fn user_cutoff_latest() {
         // The latest live cutoff of a user wins; other users and lapsed cutoffs deny nothing.
         let realm_id = RealmId([9u8; 32]);
-        let user = crate::UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
-        let other = crate::UserId::local(Ulid::from_bytes([10u8; 16]), realm_id);
+        let user = crate::user::id::UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
+        let other = crate::user::id::UserId::local(Ulid::from_bytes([10u8; 16]), realm_id);
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         for cutoff in [1_000, 2_000] {
             config.revoked_tokens.push(TokenRevocation {
@@ -1589,7 +1590,7 @@ mod test {
     fn floor_blocks_rollback() {
         // A compacted hash must stay expired when the wall clock moves back.
         let realm_id = RealmId([8u8; 32]);
-        let owner = crate::UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);
+        let owner = crate::user::id::UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             user_id: owner,
@@ -1640,8 +1641,8 @@ mod test {
     #[test]
     fn owner_overlay_deduplicates() {
         let realm_id = RealmId([7u8; 32]);
-        let owner_a = crate::UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
-        let owner_b = crate::UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
+        let owner_a = crate::user::id::UserId::local(Ulid::from_bytes([1u8; 16]), realm_id);
+        let owner_b = crate::user::id::UserId::local(Ulid::from_bytes([2u8; 16]), realm_id);
         let actor_a = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
             user_id: owner_a,
@@ -2085,7 +2086,7 @@ mod test {
     fn owner_survives_rebalance() {
         // The derived owner is a pure function of band + binding; arbitrary
         // placement-map, strategy, and override changes never move it.
-        use crate::structs::execution::job::JobId;
+        use crate::structs::execution::job::identity::JobId;
         use crate::structs::identity::realm::JobOwnerError;
         use crate::structs::placement::record::{
             DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, HandleRange,
@@ -2382,7 +2383,7 @@ mod test {
         // stop where the predecessor record ended must not decode at all.
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-            user_id: crate::UserId::new(Ulid::generate(), RealmId([7u8; 32])),
+            user_id: crate::user::id::UserId::new(Ulid::generate(), RealmId([7u8; 32])),
             realm_id: RealmId([7u8; 32]),
         };
         let config = RealmConfigDocument::new(RealmId([7u8; 32]), Vec::new(), 2);

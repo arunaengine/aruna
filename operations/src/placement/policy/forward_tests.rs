@@ -5,8 +5,8 @@
 use super::*;
 use crate::tests::calls::{child, node, runs_child};
 use crate::tests::policy::signed_document;
-use aruna_core::UserId;
 use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector, VerifiedPolicy};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 fn realm() -> RealmId {

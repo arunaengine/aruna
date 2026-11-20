@@ -1,5 +1,5 @@
 //! End-to-end compute tests that run jobs on a real Docker daemon and a real S3 endpoint.
-//! Each test skips with a written message when no daemon is reachable.
+//! They are ignored by default; a run on purpose without a daemon fails.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,22 +8,24 @@
 use crate::shared;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use aruna::tasks::runner::{ComputeReconciler, run_execution_job};
+use aruna::tasks::runner::{reconcile_lost_attempt, run_execution_job};
+use aruna_clock::testing::poll_until;
 use aruna_clock::unix_timestamp_millis;
 use aruna_compute::executor::docker::DockerBackend;
-use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId,
-    JobPayload, JobRecord, JobState, OutputDestination, OutputSelection, RunCrateStatus,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource,
+    JobPayload, OutputDestination, OutputSelection,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::job_calls::{self, ClaimOutcome};
 use aruna_operations::jobs::store::{JobMutation, row_calls};
@@ -44,31 +46,6 @@ fn job_id() -> JobId {
         BucketId::new(0).unwrap(),
     )
     .unwrap()
-}
-
-/// A reachable, healthy Docker daemon, or `None` (test skips).
-async fn docker_or_skip() -> Option<DockerBackend> {
-    let config = DockerConfig {
-        keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
-        // Its own state root, so tests that run at once never contend for one owner lock.
-        state_root: std::env::temp_dir()
-            .join("aruna-compute-tests")
-            .join(ulid::Ulid::generate().to_string()),
-        ..DockerConfig::default()
-    };
-    match DockerBackend::with_config(config) {
-        Ok(backend) => match backend.health().await {
-            Ok(()) => Some(backend),
-            Err(error) => {
-                eprintln!("skipping compute test: docker daemon unhealthy: {error}");
-                None
-            }
-        },
-        Err(error) => {
-            eprintln!("skipping compute test: no reachable docker daemon: {error}");
-            None
-        }
-    }
 }
 
 struct Fixture {
@@ -201,9 +178,9 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         None,
     );
     record.captured_inputs = captured_inputs;
-    drive(row_calls::insert_job(&record), &ctx).await.unwrap();
+    drive(row_calls::insert_job(&record), ctx).await.unwrap();
     let claim = job_calls::claim_job(job_id, node_id, unix_timestamp_millis());
-    let ClaimOutcome::Claimed(claimed) = drive(claim, &ctx).await.unwrap() else {
+    let ClaimOutcome::Claimed(claimed) = drive(claim, ctx).await.unwrap() else {
         panic!("claim failed");
     };
     (job_id, claimed)
@@ -239,7 +216,7 @@ async fn capture_inputs(
                 .resolved_version_id
                 .or(head.version_id)
                 .expect("input has a version"),
-            content: aruna_core::structs::execution::job::InputContent::Blake3(
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3(
                 <[u8; 32]>::try_from(
                     location
                         .hashes
@@ -274,28 +251,36 @@ async fn wait_state(
     want: JobState,
     idle: Duration,
 ) -> JobState {
-    let mut progress = None;
-    let mut deadline = Instant::now() + idle;
+    // Each window of `idle` ends early on a changed record, so only a stalled job fails.
+    let progress = &std::sync::Mutex::new(None);
     loop {
-        let record = drive(row_calls::read_job_record(job_id), &ctx)
-            .await
-            .ok()
-            .flatten();
-        if let Some(record) = &record
-            && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
-        {
-            return record.state;
+        let seen = poll_until(idle, move || async move {
+            let record = drive(row_calls::read_job_record(job_id), ctx)
+                .await
+                .ok()
+                .flatten();
+            if let Some(record) = &record
+                && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
+            {
+                return Some(Some(record.state));
+            }
+            let observed = record.map(|record| (record.state, record.updated_at_ms));
+            let mut progress = progress.lock().unwrap();
+            if observed == *progress {
+                return None;
+            }
+            *progress = observed;
+            Some(None)
+        })
+        .await;
+        match seen {
+            Some(Some(state)) => return state,
+            Some(None) => {}
+            None => {
+                let state = progress.lock().unwrap().map(|(state, _)| state);
+                panic!("timed out waiting for {want:?}, last state {state:?}");
+            }
         }
-        let observed = record.map(|record| (record.state, record.updated_at_ms));
-        if observed != progress {
-            progress = observed;
-            deadline = Instant::now() + idle;
-        }
-        if Instant::now() >= deadline {
-            let state = progress.map(|(state, _)| state);
-            panic!("timed out waiting for {want:?}, last state {state:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -322,21 +307,14 @@ async fn wait_run_crate(
     job_id: JobId,
     timeout: Duration,
 ) -> Option<RunCrateStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(Some(status)) = drive(row_calls::read_crate_status(job_id), &ctx).await
-            && !matches!(
-                status,
-                RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
-            )
-        {
-            return Some(status);
+    poll_until(timeout, move || async move {
+        match drive(row_calls::read_crate_status(job_id), ctx).await {
+            Ok(Some(RunCrateStatus::Pending | RunCrateStatus::Minted { .. })) => None,
+            Ok(status) => status,
+            Err(_) => None,
         }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    })
+    .await
 }
 
 /// Runs a container that upper-cases the source into `outputs/result.txt`; it must succeed.
@@ -402,10 +380,9 @@ async fn run_upper(fixture: &Fixture) -> JobId {
 // Covers staged input, container output, terminal success, durable output, and run crate.
 // The run must not create a bucket of its own.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn executes_job() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let job_id = run_upper(&fixture).await;
 
@@ -479,10 +456,9 @@ fn exact_version(run_crate: &Value, location: &str) -> String {
 
 // Follows a run's output back to its input through the provenance routes, and exports it.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn follows_provenance() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let job_id = run_upper(&fixture).await;
     let crate_status = wait_run_crate(&fixture.compute_ctx, job_id, Duration::from_secs(30)).await;
@@ -504,18 +480,12 @@ async fn follows_provenance() -> TestResult<()> {
         .expect("run");
     let document = run["run_crate"].as_str().expect("the run names its crate");
     // The crate graph is read once it is materialized.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let run_crate = loop {
-        let path = format!("/metadata/{document}/rocrate");
-        if let Some(answer) = api_get(&fixture, &path, &[]).await {
-            break answer["rocrate"].clone();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the run crate never materialized"
-        );
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    };
+    let (fixture_ref, path) = (&fixture, &format!("/metadata/{document}/rocrate"));
+    let answer = poll_until(Duration::from_secs(60), move || async move {
+        api_get(fixture_ref, path, &[]).await
+    })
+    .await;
+    let run_crate = answer.expect("the run crate never materialized")["rocrate"].clone();
 
     let input_id = exact_version(&run_crate, &format!("s3://{bucket}/data.txt"));
     let input = api_get(&fixture, "/data/origin", &[("version", &input_id)])
@@ -559,10 +529,9 @@ async fn follows_provenance() -> TestResult<()> {
 
 // A cancel mid-run terminalizes as Cancelled (evidence-correlated).
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn execution_cancel_terminalizes() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let spec = execution_spec(
         &fixture,
@@ -614,10 +583,9 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
 // A node restart mid-run: the reconciler adopts the running container and does
 // NOT start a second one.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn execution_restart_adopts() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let spec = execution_spec(
         &fixture,
@@ -665,10 +633,7 @@ async fn execution_restart_adopts() -> TestResult<()> {
         .unwrap()
         .unwrap();
     let runtime = JobsRuntime::new();
-    let reconciler = ComputeReconciler::new(fixture.compute_ctx.clone(), Arc::downgrade(&runtime));
-    reconciler
-        .reconcile_lost_attempt(&fixture.compute_ctx, lost)
-        .await;
+    reconcile_lost_attempt(&runtime, &fixture.compute_ctx, lost).await;
 
     // Still exactly one container: no double-run.
     assert_eq!(
@@ -751,9 +716,9 @@ fn nextflow_task(bucket: &str) -> Value {
     })
 }
 
-/// Polls one TES task until its state is terminal; the caller bounds the wait.
+/// Polls one TES task until its state is terminal, up to a generous hang cap.
 async fn wait_task(client: &reqwest::Client, url: &str, creds: &S3Credentials) -> Value {
-    loop {
+    let ended = poll_until(Duration::from_secs(600), move || async move {
         let task: Value = client
             .get(format!("{url}?view=FULL"))
             .basic_auth(&creds.access_key_id, Some(&creds.access_secret))
@@ -764,14 +729,14 @@ async fn wait_task(client: &reqwest::Client, url: &str, creds: &S3Credentials) -
             .await
             .unwrap_or_default();
         let state = task["state"].as_str().map(str::to_string);
-        if matches!(
+        let terminal = matches!(
             state.as_deref(),
             Some("COMPLETE" | "EXECUTOR_ERROR" | "SYSTEM_ERROR" | "CANCELED")
-        ) {
-            return task;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+        );
+        terminal.then_some(task)
+    })
+    .await;
+    ended.expect("the task never ended")
 }
 
 async fn read_object(s3: &aws_sdk_s3::Client, bucket: &str, key: String) -> Option<Vec<u8>> {
@@ -782,10 +747,9 @@ async fn read_object(s3: &aws_sdk_s3::Client, bucket: &str, key: String) -> Opti
 // A Nextflow task through the TES route: a glob keeps the staged input it matches out of the
 // results, and a glob that matches a directory captures every file below it.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn runs_nextflow_task() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     // One absolute cap over setup, every request and the polling keeps a hang under five minutes.
     tokio::time::timeout(Duration::from_secs(240), check_nextflow_task(backend))
         .await

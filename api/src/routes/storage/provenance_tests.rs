@@ -5,7 +5,7 @@
 use std::io::Read as _;
 use std::sync::atomic::Ordering::SeqCst;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 

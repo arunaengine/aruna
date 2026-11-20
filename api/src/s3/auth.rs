@@ -4,14 +4,17 @@
 
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
-use super::service::forwarded_digest;
+use super::service::forward::forwarded_digest;
 use super::util::{anonymous_read_allowed, operation_permission, public_read_allowed};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
-use crate::s3::service::InputView;
+use crate::s3::service::view::InputView;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
@@ -23,14 +26,13 @@ use aruna_core::structs::storage::distribution::delegation::{
 };
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::auth::bearer_token::AccountDeactivatedOperation;
 use aruna_operations::auth::bearer_token::UserCutoffOperation;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::distribution::accept_delegation::DelegateError;
 use aruna_operations::distribution::delegate::accept_delegation;
 use aruna_operations::distribution::routing::{delegated_range, delegated_read};
@@ -38,11 +40,10 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::session::{
-    GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
-};
-use aruna_operations::staging::bucket_guard::BucketGuardOperation;
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_operations::s3::session::S3SessionError;
+use aruna_operations::s3::session::get::GetS3Operation;
+use aruna_operations::s3::session::touch::{TouchS3Config, TouchS3Operation};
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};
@@ -1228,7 +1229,7 @@ mod tests {
             &Payload::Framed { checksum: None }
         ));
     }
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
 
     fn provider(path: &str) -> AuthProvider {
         let storage = FjallStorage::open(path).unwrap();

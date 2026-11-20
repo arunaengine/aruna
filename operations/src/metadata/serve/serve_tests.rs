@@ -5,9 +5,9 @@
 use super::*;
 use crate::document_repository::GetConfigError;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::protocol::MetadataPathCandidate;
-use crate::s3::bucket::get::GetBucketError;
 use crate::tests::calls::{caller_of, child, node, runs_child};
+use aruna_core::bucket_read::GetBucketError;
+use aruna_core::metadata::protocol::MetadataPathCandidate;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
@@ -65,7 +65,7 @@ fn promotion_check_answered() {
 fn staging_spec_refused() {
     let request = MetadataTransportMessage::StagingSpec {
         transfer_id: ulid::Ulid::from_bytes([3u8; 16]),
-        job_id: aruna_core::structs::execution::job::JobId::from_bytes([4u8; 16]),
+        job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([4u8; 16]),
     };
     let mut serve = ServeRequestOperation::new(node(2), local(), request);
     assert!(runs_child(serve.first()));
@@ -237,11 +237,11 @@ fn lookup_rechecks_config() {
     );
 }
 
-fn relationship(source_bucket: &str) -> aruna_core::structs::SyncRelationship {
+fn relationship(source_bucket: &str) -> aruna_core::structs::sync_relationship::SyncRelationship {
     use aruna_core::structs::storage::replication::ArunaArn;
-    use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
+    use aruna_core::structs::sync_relationship::{SyncMode, SyncState, SyncStatusSnapshot};
     let realm_id = RealmId([1u8; 32]);
-    aruna_core::structs::SyncRelationship {
+    aruna_core::structs::sync_relationship::SyncRelationship {
         id: ulid::Ulid::from_bytes([7u8; 16]),
         source: ArunaArn::s3_bucket(realm_id, node(1), source_bucket).unwrap(),
         target: ArunaArn::s3_bucket(realm_id, node(2), "target").unwrap(),
@@ -249,7 +249,10 @@ fn relationship(source_bucket: &str) -> aruna_core::structs::SyncRelationship {
         reference_handling: Default::default(),
         reference_serving: false,
         replicate_deletes: true,
-        created_by: aruna_core::UserId::local(ulid::Ulid::from_bytes([8u8; 16]), realm_id),
+        created_by: aruna_core::user::id::UserId::local(
+            ulid::Ulid::from_bytes([8u8; 16]),
+            realm_id,
+        ),
         created_at: std::time::SystemTime::UNIX_EPOCH,
         state: SyncState::Enabled,
         status: SyncStatusSnapshot::default(),
@@ -277,7 +280,7 @@ fn workspace_delete_allowed() {
         stored.created_by,
         false
     ));
-    let other = aruna_core::UserId::local(ulid::Ulid::from_bytes([9u8; 16]), realm_id);
+    let other = aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([9u8; 16]), realm_id);
     assert!(!valid_sync_request(&stored, buckets, realm_id, other, true));
 }
 
@@ -342,7 +345,7 @@ fn mirror_needs_token() {
 fn read_only_refused() {
     // A read-only bucket refuses a mirror like a denied write, before any bucket is made.
     use super::mirror::{MirrorRequest, MirrorServeOperation};
-    use crate::staging::bucket_guard::BucketGuardError;
+    use crate::s3::bucket::write_guard::BucketGuardError;
     let realm_id = RealmId([1u8; 32]);
     let caller = caller_of(realm_id);
     let mut stored = relationship("source");
@@ -454,7 +457,7 @@ fn create_needs_path() {
     // A create whose path is only slashes is refused before any write check.
     use super::writes::WriteServeOperation;
     use crate::forward::authorize::ForwardAuthError;
-    use crate::metadata::create_document::CreateDocumentPayload;
+    use aruna_core::metadata::api::CreateDocumentPayload;
     let request = MetadataTransportMessage::ForwardCreateDocument {
         auth_token: None,
         config_digest: digest(1),

@@ -787,7 +787,8 @@ mod tests {
         use aruna_drivers::driver::{DriverContext, drive};
         let dir = tempfile::tempdir().unwrap();
         let storage_handle =
-            aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
@@ -851,7 +852,8 @@ mod tests {
         use aruna_drivers::driver::{DriverContext, drive};
         let dir = tempfile::tempdir().unwrap();
         let storage_handle =
-            aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

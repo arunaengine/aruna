@@ -10,18 +10,17 @@ use super::sources::{
     learn_probe_hash, merge_candidates,
 };
 use super::*;
-use crate::blob::permission_paths::MAX_HASH_ALIASES;
 use crate::jobs::repository::test_support::{
     artifact, job_id, job_scope as scoped_job, local_scope, other_node, owner_node, realm,
 };
 use crate::tests::export::{
-    FIXTURE_BYTES, crate_document, job_context, probe_sources, recognized_entities, remote_spec,
-    scope_of,
+    crate_document, job_context, probe_sources, recognized_entities, scope_of,
 };
 use aruna_blob::archive::zip_date;
 use aruna_blob::archive::zip_entry;
 use aruna_core::archive_path::safe_zip_path;
 use aruna_core::archive_path::synthesized_path;
+use aruna_core::blob_paths::MAX_HASH_ALIASES;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::BlobEvent;
 use aruna_core::events::Event;
@@ -33,6 +32,7 @@ use aruna_core::structs::storage::format::StoredFormat;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
+use aruna_test_support::export::{FIXTURE_BYTES, remote_spec};
 use bytes::Bytes;
 use futures_util::io::AsyncWriteExt;
 use serde_json::Value as JsonValue;
@@ -40,18 +40,17 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use crate::tests::import::{
-    RewriteTarget, file_id_candidates, inspect_archive, open_archive, payload_entries,
-    read_metadata, rewrite_document, signature_entry, validate_document,
-};
-use crate::tests::staging::setup_driver_context;
+use crate::jobs::import::rewrite::{RewriteTarget, rewrite_document, validate_document};
+use aruna_blob::archive::{inspect_archive, open_archive, read_metadata};
 use aruna_blob::blob::BlobHandle;
-use aruna_core::UserId;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::rocrate_archive::{file_id_candidates, payload_entries, signature_entry};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::data::identity::{ObjectLocation, normalized_id};
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::staging::setup_driver_context;
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
 use std::pin::Pin;
@@ -556,7 +555,7 @@ async fn selection_skips_discovery() {
         iroh::SecretKey::from_bytes(&[152; 32]).public(),
     );
     let mut spec = remote_spec(user.realm_id, user);
-    let selection = aruna_core::structs::execution::job::ExportSelection {
+    let selection = aruna_core::structs::execution::job::input::ExportSelection {
         files: Vec::new(),
         audience: RealmId::from_bytes([153; 32]),
         intent_digest: String::new(),
@@ -1829,11 +1828,13 @@ pub(super) fn op_spec() -> ExportRoCrateSpec {
 
 pub(super) fn selected_spec() -> ExportRoCrateSpec {
     let mut spec = op_spec();
-    spec.selection = Some(aruna_core::structs::execution::job::ExportSelection {
-        files: vec!["a".to_string()],
-        audience: RealmId::from_bytes([9; 32]),
-        intent_digest: String::new(),
-    });
+    spec.selection = Some(
+        aruna_core::structs::execution::job::input::ExportSelection {
+            files: vec!["a".to_string()],
+            audience: RealmId::from_bytes([9; 32]),
+            intent_digest: String::new(),
+        },
+    );
     spec
 }
 

@@ -8,7 +8,7 @@ use ulid::Ulid;
 
 use super::DistributionMember;
 use super::request::TransferRole;
-use crate::NodeId;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
 

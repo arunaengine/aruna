@@ -8,11 +8,13 @@ use std::collections::HashMap;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use aruna_core::structs::execution::job::{JobError, JobResultPayload, PluginWorkSpec, UploadForm};
+use aruna_core::structs::execution::job::input::{PluginWorkSpec, UploadForm};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_core::structs::storage::origin::VersionOrigin;
-use aruna_outbound::{OutboundHandle, TransferError, UploadBody};
+use aruna_outbound::OutboundHandle;
+use aruna_outbound::transfers::{TransferError, UploadBody};
 use ulid::Ulid;
 
 use super::plugin_work::{PROGRESS_TICK, key_wait, permanent, refused};
@@ -20,8 +22,8 @@ use aruna_core::jobs::JobRunOutcome;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_operations::placement::policy::GateOperation;
-use aruna_operations::plugins::copy_steps::read_locked;
+use aruna_operations::placement::policy::gate::GateOperation;
+use aruna_operations::plugins::copy::steps::read_locked;
 use aruna_operations::plugins::transfer_steps::{
     KeepReply, PrepareDownload, PrepareUpload, TransferEnd, TransferWork, UploadReply, account,
     check_answer, send_end, source_gone, write_failure,

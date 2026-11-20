@@ -5,6 +5,7 @@
 use aruna_api::auth::RealmAuth;
 use aruna_api::auth::ValidatedBearer;
 use aruna_api::error::ServerError;
+use aruna_api::metadata::model::*;
 use aruna_api::metadata::*;
 use aruna_api::routes::metadata::documents::*;
 use aruna_api::routes::metadata::rocrate::*;
@@ -12,25 +13,25 @@ use aruna_api::server::state::ServerState;
 use aruna_api::tests::metadata_fixtures::{
     create_test_document, drain_metadata_background, state_realm_nodes, test_realm_id, write_doc,
 };
-use aruna_core::MetaResourceId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_core::structured_id::MetaResourceId;
 use aruna_drivers::driver::drive;
+use aruna_drivers::testing::installed_graph_handle;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
 use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
-use aruna_operations::testing::installed_graph_handle;
-use aruna_operations::testing::sign_token;
+use aruna_test_support::tokens::sign_token;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use std::sync::Arc;
 use ulid::Ulid;
 
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -42,7 +43,8 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -441,7 +443,7 @@ impl SearchPaginationCluster {
 async fn setup_search_cluster(node_count: usize) -> SearchPaginationCluster {
     let realm_signing_key = test_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
 
     let mut nodes = Vec::new();
@@ -722,13 +724,15 @@ struct DistributedMetadataNode {
     _node_dir: TempDir,
     net: NetHandle,
     state: Arc<ServerState>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 struct QueryNamesResult {
     names: Vec<String>,
     nodes_queried: usize,
     nodes_failed: usize,
-    failed_partitions: Vec<aruna_core::NodeId>,
+    failed_partitions: Vec<aruna_core::id::NodeId>,
 }
 
 struct SearchPathsResult {
@@ -740,8 +744,8 @@ struct SearchPathsResult {
 async fn setup_access_state() -> DistributedAccessState {
     let realm_signing_key = test_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
-    let denied_user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
+    let denied_user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     let coordinator = spawn_metadata_node(realm_id).await;
     let remote = spawn_metadata_node(realm_id).await;
@@ -811,7 +815,8 @@ async fn setup_access_state() -> DistributedAccessState {
 
 async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
     let node_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(node_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(node_dir.path().to_str().unwrap()).unwrap();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -842,7 +847,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let state = Arc::new(
         ServerState::new(
             context,
@@ -860,13 +865,14 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         _node_dir: node_dir,
         net,
         state,
+        _incoming: incoming,
     }
 }
 
 async fn install_realm_config(
     nodes: &[&DistributedMetadataNode],
     realm_id: RealmId,
-    user_node: Option<(aruna_core::NodeId, aruna_core::UserId)>,
+    user_node: Option<(aruna_core::id::NodeId, aruna_core::user::id::UserId)>,
 ) {
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.seed_default_placement();
@@ -884,7 +890,7 @@ async fn install_realm_config(
     for node in nodes {
         let actor = Actor {
             node_id: node.net.node_id(),
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             realm_id,
         };
         write_doc(
@@ -901,7 +907,7 @@ async fn install_realm_config(
 async fn install_auth_documents(
     node: &DistributedMetadataNode,
     realm_id: RealmId,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     group_id: Ulid,
 ) {
     let actor = Actor {
@@ -925,7 +931,7 @@ async fn install_auth_documents(
 async fn install_group_documents(
     node: &DistributedMetadataNode,
     realm_id: RealmId,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
     group_id: Ulid,
 ) {
     let actor = Actor {
@@ -1065,6 +1071,6 @@ fn test_signing_key() -> SigningKey {
     generate_signing_key()
 }
 
-fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
-    aruna_operations::testing::token_claims(realm_id, user_id)
+fn test_token_claims(realm_id: RealmId, user_id: aruna_core::user::id::UserId) -> TokenClaims {
+    aruna_test_support::tokens::token_claims(realm_id, user_id)
 }

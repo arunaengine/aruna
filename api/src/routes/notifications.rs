@@ -11,8 +11,8 @@ use crate::routes::notification_calls::{
     unread_for_user,
 };
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
-use aruna_core::UserId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::id::NodeId;
 use aruna_core::metrics::WatchMetricReason;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -22,6 +22,7 @@ use aruna_core::structs::execution::notification_watch::{
     parse_watch_path, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch::NotificationDispatchError;
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
@@ -29,7 +30,6 @@ use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
 use aruna_operations::notifications::user_call::WatchDispatchError;
 use aruna_operations::notifications::watch::check::WatchCheckOperation;
 use aruna_operations::notifications::watch::paths::{WatchAuthorization, watch_permission_path};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -470,9 +470,7 @@ async fn authorize_watch(
         auth,
         permission_path,
         Permission::READ,
-        aruna_operations::auth::request_policy::PolicyRequestExtras::operation(
-            "notifications.create_watch",
-        ),
+        aruna_core::request_policy::PolicyRequestExtras::operation("notifications.create_watch"),
     )
     .await
     {

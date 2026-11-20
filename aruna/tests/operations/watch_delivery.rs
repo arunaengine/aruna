@@ -7,6 +7,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
@@ -25,7 +26,7 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::placement::resolve_inbox_holder;
@@ -37,7 +38,7 @@ use aruna_operations::notifications::watch::origin::EmitEventOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::testing::sync_topic;
+use aruna_test_support::documents::sync_topic;
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;

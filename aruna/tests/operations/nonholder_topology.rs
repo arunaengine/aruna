@@ -6,64 +6,66 @@ use crate::topology;
 use aruna_operations::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
 use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 
-use crate::job_calls::find_dedup_job;
-use crate::job_calls::{JobClassBudget, drain_job_batch};
 use crate::job_calls::{
-    RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, read_record_routed,
-    submit_execution_job, submit_rocrate_import,
+    cancel_job_routed, drain_job_batch, find_dedup_job, read_job_routed, read_owned_job,
+    read_record_routed, submit_rocrate_import,
 };
 use crate::metadata_calls::route_metadata_update;
 use crate::metadata_calls::{create_with_id, route_metadata_delete};
-use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::job_request::{SubmissionScope, SubmitJobError, submission_of};
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_core::placement::resolve_shard_holders;
-use aruna_core::storage_entries::registry_delete_entries;
-use aruna_core::structs::execution::job::{
-    ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobState, LogicalJobState, RoCrateLimits, WorkspaceMode, user_dedup_key,
+use aruna_core::metadata::api::{
+    CreateDocumentPayload, ExportMetadataResult, RoCrateExportView, UpdateDocumentMutation,
 };
+use aruna_core::placement::resolve_shard_holders;
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::storage_entries::registry_delete_entries;
+use aruna_core::structs::execution::job::family::LogicalJobState;
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
+    ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
+    ImportRoCrateTarget, RoCrateLimits,
+};
+use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::forward::routing::origin_holds_document;
-use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
-use aruna_operations::jobs::lifecycle::ids::{SubmissionScope, submission_of};
+use aruna_operations::jobs::drain::JobClassBudget;
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::lifecycle::admit::here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
 use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::route::JobRouteError;
-use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
-use aruna_operations::metadata::api::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
-};
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::api::read_types::{ApiQueryMode, DocumentQueryRequest};
 use aruna_operations::metadata::create_document::{
-    CreateDocumentOperation, CreateDocumentPayload, mint_forward_document, mint_local_document,
-    resolve_metadata_id,
+    CreateDocumentOperation, mint_forward_document, mint_local_document, resolve_metadata_id,
 };
+use aruna_operations::metadata::forward::holders::origin_holds_document;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use aruna_operations::testing::fresh_job_id;
+use aruna_test_support::jobs::submit_execution_job;
 use std::cell::RefCell;
 use ulid::Ulid;
 
+use crate::convergence::wait_for_convergence;
 use crate::topology::{create_document, document_config, document_present};
-use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
+use topology::{TestNode, TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
@@ -99,8 +101,8 @@ const JOB_BUDGET: JobClassBudget = JobClassBudget {
 /// Owner derivation as every node performs it: pure, from the replicated config.
 fn derived_owner(
     realm: &Topology,
-    job_id: aruna_core::structs::execution::job::JobId,
-) -> TestResult<aruna_core::NodeId> {
+    job_id: aruna_core::structs::execution::job::identity::JobId,
+) -> TestResult<aruna_core::id::NodeId> {
     Ok(realm.config.job_owner(job_id)?)
 }
 
@@ -210,8 +212,8 @@ async fn record_routes_owner() -> TestResult<()> {
 #[allow(clippy::too_many_arguments)]
 async fn submit_external_job(
     context: &aruna_drivers::driver::DriverContext,
-    spec: aruna_core::structs::execution::job::ExecutionSpec,
-    created_by: aruna_core::UserId,
+    spec: aruna_core::structs::execution::job::input::ExecutionSpec,
+    created_by: aruna_core::user::id::UserId,
     idempotency_key: Option<String>,
     workspace_mode: WorkspaceMode,
     workspace_bucket: Option<String>,
@@ -392,7 +394,11 @@ async fn origin_scoped_dedup() -> TestResult<()> {
 }
 
 /// Stores upload `[seed; 16]` of `owner` on `node`, which an import submission claims.
-async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> TestResult<()> {
+async fn seed_upload(
+    node: &TestNode,
+    owner: aruna_core::user::id::UserId,
+    seed: u8,
+) -> TestResult<()> {
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     let location = BackendLocation {
         backend: BackendRef::node_default(),
@@ -409,13 +415,13 @@ async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> Te
         blob_size: 1,
         hashes: Default::default(),
     };
-    let record = aruna_core::structs::execution::job::RoCrateUploadRecord {
+    let record = aruna_core::structs::execution::job::input::RoCrateUploadRecord {
         upload_id: Ulid::from_bytes([seed; 16]),
         owner,
         location,
         blake3: [seed; 32],
         size: 1,
-        media_type: aruna_core::structs::execution::job::RoCrateMediaType::Zip,
+        media_type: aruna_core::structs::execution::job::input::RoCrateMediaType::Zip,
         expires_at_ms: u64::MAX,
         claimed_by: None,
     };

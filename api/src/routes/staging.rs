@@ -17,12 +17,17 @@ use crate::routes::storage::connectors::{
 };
 use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
-use aruna_core::structs::execution::job::{
-    JobPayload, JobRecord, JobState, StagingJobCheckpoint, StagingJobItem, StagingJobPhase,
-    StagingJobPrefix, StagingJobSpec,
+use aruna_core::id::NodeId;
+use aruna_core::job_request::SubmitJobError;
+use aruna_core::live_version::LiveVersionInput;
+use aruna_core::staging_checkpoint::ReadCheckpointOperation;
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobCheckpoint, StagingJobItem, StagingJobPhase, StagingJobPrefix,
+    StagingJobSpec,
 };
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, SourceEntryKind};
 use aruna_core::structs::execution::staging::{SourceMapping, StagingStrategy};
 use aruna_core::structs::execution::table::{
@@ -30,27 +35,25 @@ use aruna_core::structs::execution::table::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::structs::storage::distribution::ReadRoute;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::auth::request_authorization::rules_operation;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
 use aruna_operations::distribution::routing::{bound_view, route_read};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::jobs::staging::ReadCheckpointOperation;
-use aruna_operations::jobs::submit::SubmitJobError;
-use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
+use aruna_operations::replication::live_queue::QueueLiveOperation;
+use aruna_operations::s3::object::head_source::HeadSourceError;
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
 use aruna_operations::s3::object::put::PutObjectError;
-use aruna_operations::staging::head_source::HeadSourceError;
+use aruna_operations::s3::object::reference::{
+    MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
+};
 use aruna_operations::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,
 };
 use aruna_operations::staging::read_source::ReadSourceError;
-use aruna_operations::staging::reference::{
-    MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
-};
 use aruna_operations::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
 };
@@ -1111,7 +1114,7 @@ pub async fn get_staging_job(
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     AxumPath(job_id): AxumPath<String>,
 ) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
-    let job_id = aruna_core::structs::execution::job::JobId::from_str(&job_id)
+    let job_id = aruna_core::structs::execution::job::identity::JobId::from_str(&job_id)
         .map_err(|_| ServerError::BadRequest)?;
     // The owner is the sole 404 authority; a non-owner routes or reports 503.
     let (record, checkpoint) = read_staging_routed(
@@ -1959,8 +1962,8 @@ pub(crate) async fn queue_live_replication(
     version_id: ulid::Ulid,
     delete_marker: bool,
 ) {
-    let result = match drive(
-        LiveVersionOperation::new(LiveVersionInput {
+    if let Err(error) = drive(
+        QueueLiveOperation::new(LiveVersionInput {
             local_node_id: state.get_node_id(),
             auth_context,
             bucket: bucket.clone(),
@@ -1972,22 +1975,14 @@ pub(crate) async fn queue_live_replication(
     )
     .await
     {
-        Ok(result) => result,
-        Err(error) => {
-            warn!(
-                error = %error,
-                bucket,
-                key,
-                version_id = %version_id,
-                delete_marker,
-                "Failed to queue live replication after committed staging snapshot; durable obligation remains for repair"
-            );
-            return;
-        }
-    };
-
-    if result.queued > 0 && !result.scheduled {
-        warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+        warn!(
+            error = %error,
+            bucket,
+            key,
+            version_id = %version_id,
+            delete_marker,
+            "Failed to queue live replication after committed staging snapshot; durable obligation remains for repair"
+        );
     }
 }
 

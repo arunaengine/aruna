@@ -16,8 +16,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::page_rows;
-
 pub(crate) const RAW_PAGE_SIZE: usize = 1;
 pub(crate) const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;
 pub(crate) const RAW_ENCODED_LIMIT: usize = RAW_BYTES_LIMIT as usize;
@@ -219,7 +217,7 @@ impl Operation for RawEventsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RawReadError> {
-        let (values, next) = page_rows(result)?;
+        let (values, next) = result.page()?;
         if values.len() > self.page_limit {
             return Err(budget_error("page size limit exceeded"));
         }

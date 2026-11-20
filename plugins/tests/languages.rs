@@ -1,5 +1,5 @@
 //! Builds probes and the starter projects in each language and runs them; the examples run in
-//! `examples.rs`. Opt in with ARUNA_PLUGIN_LANGUAGES=1: toolchains download packages on first use.
+//! `examples.rs`. Ignored by default: the toolchains download packages on first use.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -16,14 +16,14 @@ use aruna_plugin_types::calls::{
     Document, Entry, ErrorKind, HostError, Intent, Listing, ObjectInfo, ObjectPage, Response,
 };
 use aruna_plugin_types::permission::Permission;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{Broker, CallContext, MetadataPatch, SendRequest, StatePut};
+use aruna_plugins::host::wit::aruna::plugin::types::{FailureKind, Trigger};
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
-use aruna_plugins::{
-    CancellationToken, Compiled, FailureKind, Invocation, InvokeError, Runtime, Trigger,
-};
+use aruna_plugins::runtime::{Compiled, Invocation, InvokeError, Runtime};
 
-use common::{available, limits};
+use common::{limits, require};
 
 mod common;
 
@@ -382,29 +382,29 @@ def tick(tick):
 "#;
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn probes_javascript() {
-    if available("javascript", "npx") {
-        let plugin = build(probe("javascript", JAVASCRIPT_PROBE)).await;
-        let tick = r#"{"tick":1762700000000}"#;
-        check_probe("javascript", &plugin, "\"awaited\"", tick).await;
-    }
+    require("javascript", "npx");
+    let plugin = build(probe("javascript", JAVASCRIPT_PROBE)).await;
+    let tick = r#"{"tick":1762700000000}"#;
+    check_probe("javascript", &plugin, "\"awaited\"", tick).await;
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn probes_rust() {
     // A new project builds offline against the library the build writes into it.
-    if available("rust", "cargo") {
-        let plugin = build(probe("rust", RUST_PROBE)).await;
-        check_probe("rust", &plugin, "\"plain\"", r#"{"tick":1762700000000}"#).await;
-    }
+    require("rust", "cargo");
+    let plugin = build(probe("rust", RUST_PROBE)).await;
+    check_probe("rust", &plugin, "\"plain\"", r#"{"tick":1762700000000}"#).await;
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn probes_python() {
-    if available("python", "uv") {
-        let plugin = build(probe("python", PYTHON_PROBE)).await;
-        check_probe("python", &plugin, "\"plain\"", r#"{"tick": 1762700000000}"#).await;
-    }
+    require("python", "uv");
+    let plugin = build(probe("python", PYTHON_PROBE)).await;
+    check_probe("python", &plugin, "\"plain\"", r#"{"tick": 1762700000000}"#).await;
 }
 
 /// Copies the folder `from` to `to`, naming the plugin `starter` as `plugin new` would.
@@ -423,12 +423,11 @@ fn copy_template(from: &Path, to: &Path) {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn builds_templates() {
     // Each language's starter project builds on its library and answers a manual run.
     for (language, program) in [("rust", "cargo"), ("javascript", "npx"), ("python", "uv")] {
-        if !available(language, program) {
-            continue;
-        }
+        require(language, program);
         let project = tempfile::tempdir().unwrap();
         let template = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
         copy_template(&template.join(language), project.path());

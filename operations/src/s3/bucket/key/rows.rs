@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::IoCall;
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
@@ -20,6 +19,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::holders::{HolderReport, HolderState, KeyLookup, admin_users};
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 

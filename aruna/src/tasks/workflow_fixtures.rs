@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{ComputeResources, ExecutionSpec};
+use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec};
 use ulid::Ulid;
 
 pub(crate) fn node_id(seed: u8) -> NodeId {

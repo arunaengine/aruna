@@ -35,7 +35,7 @@ async fn subject_claims_promote() {
 
     for (storage, order) in [(&left, [0, 1]), (&right, [1, 0])] {
         for index in order {
-            apply_user_operation(
+            apply_admin_operation(
                 storage,
                 DocumentTarget::User {
                     user_id: user_ids[index],
@@ -83,7 +83,7 @@ async fn subject_claims_promote() {
     );
     removal.observed.advance(actors[0].node_id, 1);
     for storage in [&left, &right] {
-        apply_user_operation(
+        apply_admin_operation(
             storage,
             DocumentTarget::User {
                 user_id: user_ids[0],

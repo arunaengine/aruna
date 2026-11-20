@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{BlobHandler, NodeBackend};
+use super::BlobHandler;
+use super::registry::NodeBackend;
 use crate::opendal::build_group_service;
 use crate::s3::{self, check_keys};
 use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -673,7 +674,7 @@ mod tests {
                 .collect(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: false,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }

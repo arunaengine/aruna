@@ -5,7 +5,6 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
@@ -13,23 +12,24 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::permission_path::validate_restriction_limits;
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobError, JobId, JobRecord, workspace_credential_id,
-};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::{JobError, JobRecord, workspace_credential_id};
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BucketInfo, UserAccess, bucket_permission_path, group_permission_path,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 
 use super::DEFAULT_WALLTIME;
 use super::workspace::{authorization_error, bucket_lookup_error};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::jobs::lifecycle::ids::session_of;
 use crate::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
 use crate::s3::access::get::{GetAccessError, GetAccessOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::job_request::session_of;
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.
 const CREDENTIAL_SLACK: Duration = Duration::from_secs(6 * 60 * 60);

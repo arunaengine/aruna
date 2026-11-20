@@ -4,7 +4,6 @@
 
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, HARVEST_SOURCE_KEYSPACE};
@@ -15,12 +14,14 @@ use aruna_core::structs::execution::harvest::{
 };
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::connectors::harvest_rows::connector_key;
 use crate::groups::fence::{group_write_result, write_group_new};
 use crate::harvest::oai_pmh::request::{normalize_metadata_prefix, normalize_set};
-use crate::harvest::repository::{connector_key, source_key};
+use crate::harvest::repository::source_key;
 use crate::harvest::target_path::{normalize_target_prefix, prefix_is_blank};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,7 +206,7 @@ impl Operation for CreateSourceOperation {
                 }
                 self.decide(existing, false)
             }
-            Stage::Write => match group_write_result(rows::event(result)?) {
+            Stage::Write => match group_write_result(result.event()?) {
                 Ok(()) => (self.source.take().map(Next::Done)).ok_or(CreateSourceError::Failed),
                 Err(GroupWriteError::Taken) => {
                     self.stage = Stage::Reread;
@@ -213,7 +214,7 @@ impl Operation for CreateSourceOperation {
                 }
                 Err(error) => Err(error.into()),
             },
-            Stage::Reread => self.decide(rows::value(result)?, true),
+            Stage::Reread => self.decide(result.value()?, true),
         }
     }
 }
@@ -356,7 +357,8 @@ mod tests {
     #[tokio::test]
     async fn persists_after_connector() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

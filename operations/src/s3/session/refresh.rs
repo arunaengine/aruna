@@ -4,11 +4,10 @@
 
 use super::{
     S3SessionCredentials, S3SessionError, SESSION_SECRETS_LEN, build_session, decode_index,
-    draw_secret, drawn_secret, expiry_key, owner_key,
+    expiry_key, owner_key,
 };
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::compute::Secret;
+use aruna_core::compute::{Secret, draw_secret, drawn_secret};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
@@ -16,6 +15,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{PreviousCredential, S3Session, SESSION_MAX_TTL};
 use aruna_core::types::{GroupId, Value};
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 
 #[derive(Debug, PartialEq)]

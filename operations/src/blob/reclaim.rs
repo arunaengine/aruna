@@ -24,9 +24,12 @@ use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
-use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::groups::backends::backend_key;
+
+/// Hash aliases read per page; the next page continues after the last one.
+const ALIAS_PAGE: usize = 256;
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
 
 /// What one candidate resolved to. `Dropped` covers every reason the queue row
 /// is stale: retain, a vanished backend, or a location that is already gone.
@@ -211,7 +214,7 @@ impl ReclaimBlobOperation {
             space: PATHS_INDEX_KEYSPACE.to_string(),
             prefix: HashIndex::hash_prefix(&self.key.blake3)?.into(),
             after: start,
-            limit: usize::MAX,
+            limit: ALIAS_PAGE,
         };
         self.call(ReclaimState::ScanAliases, page)
     }
@@ -412,12 +415,11 @@ mod tests {
         BackendStatusOperation, RECLAIM_TICK_LIMIT, ReclaimOutcome, ReclaimSweepError,
         ReclaimSweepOperation,
     };
-    use crate::testing::path_context;
+    use aruna_core::calls::CallRun;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::operation::{EffectOperation, Runnable};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::CopyOwner;
     use aruna_core::structs::storage::format::EncodingClass;
@@ -425,6 +427,7 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_hash_key};
     use aruna_core::types::Value;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use aruna_storage::scan::iter_prefix_page;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -487,7 +490,7 @@ mod tests {
     }
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     async fn read(context: &DriverContext, key_space: &str, key: Vec<u8>) -> Option<Value> {
@@ -673,6 +676,31 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[test]
+    fn alias_scan_bounded() {
+        let mut reclaim = reclaim_op(candidate_key());
+        let Ok(Next::Call(IoCall::Page { limit, .. })) = reclaim.scan_aliases(None) else {
+            panic!("expected an alias page");
+        };
+        assert_eq!(limit, ALIAS_PAGE);
+    }
+
+    #[tokio::test]
+    async fn later_page_pins() {
+        // A live alias past the first page still keeps the copy.
+        let dir = tempdir().unwrap();
+        let context = path_context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        for n in 0..ALIAS_PAGE as u128 {
+            add_alias(&context, Ulid::from_parts(1, n), false).await;
+        }
+        add_alias(&context, Ulid::from_parts(2, 0), true).await;
+
+        let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
+
+        assert_eq!(verdict, ReclaimVerdict::Pinned);
     }
 
     #[tokio::test]
@@ -918,7 +946,7 @@ mod tests {
         let outcome = aruna_drivers::driver::drive(
             crate::blob::cleanup::ProcessCleanupOperation::new(crate::blob::cleanup::CleanupNode {
                 routing: aruna_drivers::driver::node_routing(&after),
-                has_blob: (&after).blob_handle.is_some(),
+                has_blob: after.blob_handle.is_some(),
             }),
             &after,
         )
@@ -945,7 +973,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let context = path_context(dir.path().to_str().unwrap());
         seed(&context, 10).await;
-        let mut operation = reclaim_op(candidate_key()).into_machine();
+        let mut operation = CallRun::new(reclaim_op(candidate_key()));
         let mut effects = std::collections::VecDeque::from_iter(operation.start());
         let mut refreshed = false;
         while !operation.is_complete() {

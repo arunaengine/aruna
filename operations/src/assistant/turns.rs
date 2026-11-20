@@ -3,18 +3,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    BUDGET_CAP, ChatStoreError, TURN_CAP, decode_heads, head_key, heads_page, live_head, read_head,
-    turn_key, turns_page,
+    BUDGET_CAP, ChatStoreError, TURN_CAP, TotalsRead, TotalsStep, head_key, live_head, read_head,
+    totals_entry, turn_key, turns_page,
 };
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows;
-use aruna_core::structs::{
-    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
+use aruna_core::structs::assistant_chat::{
+    AssistantChatHead, AssistantChatTotals, AssistantChatTurn, MAX_ASSISTANT_BYTES,
+    MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 
 /// Reads the live turns of one chat in seq order, optionally only those after
 /// a seq the caller already holds.
@@ -48,14 +48,14 @@ impl Operation for ReadChatOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
         if self.turns {
-            let (rows, _) = rows::page(result)?;
+            let (rows, _) = result.page()?;
             let turns = rows
                 .into_iter()
                 .map(|(_, value)| AssistantChatTurn::from_bytes(value.as_ref()))
                 .collect::<Result<Vec<_>, _>>()?;
             return Ok(Next::Done(turns));
         }
-        let head = live_head(rows::value(result)?)?;
+        let head = live_head(result.value()?)?;
         let from = self.after.map_or(head.first_seq, |after| {
             after.saturating_add(1).max(head.first_seq)
         });
@@ -74,7 +74,7 @@ impl Operation for ReadChatOperation {
 enum WriteTurnStage {
     Head,
     Turns(AssistantChatHead),
-    Sum(AssistantChatHead),
+    Totals(AssistantChatHead, TotalsRead),
     Trimmed(AssistantChatHead),
     Written(AssistantChatHead),
 }
@@ -94,6 +94,8 @@ pub struct WriteTurnOperation {
     freed: u64,
     /// Turn keys dropped to keep the chat within its turn cap.
     trim: Vec<Key>,
+    /// The user's totals once this write is in.
+    totals: AssistantChatTotals,
     stage: WriteTurnStage,
 }
 
@@ -115,6 +117,7 @@ impl WriteTurnOperation {
             now,
             freed: 0,
             trim: Vec::new(),
+            totals: AssistantChatTotals::default(),
             stage: WriteTurnStage::Head,
         }
     }
@@ -136,8 +139,7 @@ impl WriteTurnOperation {
                 .saturating_add(1)
                 .saturating_sub(MAX_ASSISTANT_TURNS);
             if over == 0 {
-                self.stage = WriteTurnStage::Sum(head);
-                return Ok(Next::Call(heads_page(self.user_id)));
+                return self.count(head);
             }
             turns_page(self.user_id, &self.chat_id, head.first_seq, over as usize)
         } else if head.next_seq.checked_sub(1) == Some(self.seq) {
@@ -165,26 +167,35 @@ impl WriteTurnOperation {
         if self.seq == head.next_seq {
             self.trim = keys;
         }
-        self.stage = WriteTurnStage::Sum(head);
-        Ok(Next::Call(heads_page(self.user_id)))
+        self.count(head)
+    }
+
+    /// Reads the user's totals, so the byte budget never reads the user's other chats.
+    fn count(
+        &mut self,
+        head: AssistantChatHead,
+    ) -> Result<Next<AssistantChatHead>, ChatStoreError> {
+        let totals = TotalsRead::new(self.user_id);
+        let call = totals.call();
+        self.stage = WriteTurnStage::Totals(head, totals);
+        Ok(Next::Call(call))
     }
 
     fn sum(
         &mut self,
         head: AssistantChatHead,
-        rows: Vec<(Key, Value)>,
+        totals: AssistantChatTotals,
     ) -> Result<Next<AssistantChatHead>, ChatStoreError> {
-        let held: u64 = decode_heads(rows)?
-            .iter()
-            .filter(|head| head.is_live())
-            .map(|head| head.bytes)
-            .sum();
-        let total = held
+        let total = (totals.bytes)
             .saturating_sub(self.freed)
             .saturating_add(self.payload.len() as u64);
         if total > MAX_ASSISTANT_BYTES {
             return Err(ChatStoreError::TooLarge(BUDGET_CAP));
         }
+        self.totals = AssistantChatTotals {
+            bytes: total,
+            ..totals
+        };
         if self.trim.is_empty() {
             return self.write_all(head);
         }
@@ -224,6 +235,7 @@ impl WriteTurnOperation {
                 head_key(self.user_id, &self.chat_id),
                 head.to_bytes()?.into(),
             ),
+            totals_entry(self.user_id, self.totals)?,
         ];
         self.stage = WriteTurnStage::Written(head);
         Ok(Next::Call(IoCall::Write(writes)))
@@ -244,17 +256,23 @@ impl Operation for WriteTurnOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ChatStoreError> {
         match std::mem::replace(&mut self.stage, WriteTurnStage::Head) {
             WriteTurnStage::Head => {
-                let head = live_head(rows::value(result)?)?;
+                let head = live_head(result.value()?)?;
                 self.head(head)
             }
-            WriteTurnStage::Turns(head) => self.turns(head, rows::page(result)?.0),
-            WriteTurnStage::Sum(head) => self.sum(head, rows::page(result)?.0),
+            WriteTurnStage::Turns(head) => self.turns(head, result.page()?.0),
+            WriteTurnStage::Totals(head, mut totals) => match totals.next(result)? {
+                TotalsStep::Call(call) => {
+                    self.stage = WriteTurnStage::Totals(head, totals);
+                    Ok(Next::Call(call))
+                }
+                TotalsStep::Done(counted) => self.sum(head, counted),
+            },
             WriteTurnStage::Trimmed(head) => {
-                rows::done(result)?;
+                result.done()?;
                 self.write_all(head)
             }
             WriteTurnStage::Written(head) => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(head))
             }
         }

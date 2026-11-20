@@ -10,14 +10,16 @@ use crate::cli::{
     ReclaimCommands, TopicCommands, TopicsCommands,
 };
 use crate::error::CliError;
-use crate::explorer::{
+use crate::explorer::commands::{
     explore_entries, explore_keyspaces, print_node_state, print_topic_placements,
     print_topic_status, print_topics_list, scan_locations,
 };
 use crate::export::export_bucket;
 use crate::info::print_info;
 use crate::iroh_check::print_iroh_check;
-use crate::migrate::{CursorRepair, migrate, purge_topic, repair_cursor};
+use crate::migrate::cursor_repair::{CursorRepair, repair_cursor};
+use crate::migrate::migrate;
+use crate::migrate::topic_purge::purge_topic;
 use crate::portal::update_portal;
 use crate::reclaim::{print_status as reclaim_status, seed_backend};
 use crate::report::print_report;
@@ -43,7 +45,7 @@ mod tokens;
 
 #[tokio::main]
 async fn main() -> Result<(), CliError> {
-    aruna::limits::raise_open_files();
+    aruna_storage::limits::raise_open_files();
     let args = Cli::parse();
 
     match args.command {

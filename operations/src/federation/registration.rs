@@ -4,11 +4,11 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::federation::{RealmKpis, RealmTotals, Registration, Signed, Withdrawal};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{HttpMethod, HttpRequest, OutboundEffect, OutboundEvent};
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -187,7 +187,7 @@ fn accepted(result: IoResult) -> Result<Result<(), String>, IoError> {
         return Err(IoError::Unexpected { expected, got });
     };
     Ok(match result {
-        Ok(status) => match reqwest::StatusCode::from_u16(status) {
+        Ok(status) => match http::StatusCode::from_u16(status) {
             Ok(status) if status.is_success() => Ok(()),
             Ok(status) => Err(format!("registry answered {status}")),
             Err(_) => Err(format!("registry answered {status}")),

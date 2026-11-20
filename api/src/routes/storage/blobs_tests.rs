@@ -11,8 +11,8 @@ use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
 use crate::tests::routes::write_fixture;
-use aruna_core::UserId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::replication_protocol::{CopyCompliance, LocationCopyStorage, LocationSummary};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -22,11 +22,10 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::CopyOrigin;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_operations::replication::locations::LocationSummaryError;
-use aruna_operations::replication::protocol::CopyCompliance;
-use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::Extension;
 use axum::extract::{Query, State};
 use byteview::ByteView;
@@ -35,7 +34,7 @@ use std::time::SystemTime;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-fn node_id() -> aruna_core::NodeId {
+fn node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[3u8; 32]).public()
 }
 

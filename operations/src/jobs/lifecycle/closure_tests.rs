@@ -5,7 +5,7 @@
 
 use aruna_core::calls::ChildOutcome;
 use aruna_core::events::MetadataAnswer;
-use aruna_core::structs::execution::job::LAUNCH_WINDOW_MS;
+use aruna_core::structs::execution::job::family::LAUNCH_WINDOW_MS;
 
 use super::*;
 use crate::tests::records::{Family, REALM, node};
@@ -23,7 +23,7 @@ fn launch(family: &Family) -> (LaunchFrame, Vec<JobRecordEnvelope>) {
     let run = family.run(
         1,
         0,
-        aruna_core::structs::execution::job::PhysicalExecutionState::Failed,
+        aruna_core::structs::execution::job::family::PhysicalExecutionState::Failed,
     );
     let launch = run[3].clone();
     let frame = LaunchFrame::new(launch).expect("bounded launch");

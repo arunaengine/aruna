@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -19,12 +20,10 @@ use aruna_core::structs::storage::share::{
     TicketBody, client_network,
 };
 use aruna_drivers::driver::{drive, drive_retry};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::distribution::nonce::SpendNonceOperation;
-use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
 use aruna_operations::s3::object::get::GetObjectInput;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::read::GetRoutedOperation;
 use aruna_operations::shares::lifecycle::{
     OpenShareConfig, OpenShareOperation, OpenedShare, ShareError,
 };
@@ -33,7 +32,10 @@ use aruna_operations::shares::rules::{
     NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
-use aruna_operations::staging::bucket_guard::BucketGuardOperation;
+use aruna_operations::sync::notification_outbox::{
+    EmitNotificationsInput, EmitNotificationsOperation,
+};
+use aruna_operations::transfer::read::GetRoutedOperation;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
@@ -59,10 +61,11 @@ use crate::lookup::{ObjectOutput, bucket_info};
 use crate::mcp::data::store_stream;
 use crate::rate_limit::LocalKey;
 use crate::routes::storage::objects::{page_error, page_node};
-use crate::s3::service::{ArunaS3Service, delegated_caller};
+use crate::s3::service::ArunaS3Service;
+use crate::s3::service::forward::reads::delegated_caller;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_operations::s3::object::member_read::{MemberKey, MemberRead, MemberReadOperation};
+use aruna_operations::s3::object::member::read::{MemberKey, MemberRead, MemberReadOperation};
 use aruna_operations::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
 use std::sync::atomic::{AtomicU64, Ordering};
 

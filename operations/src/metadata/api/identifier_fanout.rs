@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
@@ -21,8 +21,9 @@ use super::node_fanout::{
 };
 use super::{ApiQueryMode, MetadataApiError, MetadataReadError};
 use crate::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::secondary_ids::{IdentifierMatch, merge_matches};
+use crate::metadata::secondary_ids::merge_matches;
+use aruna_core::metadata::api::IdentifierMatch;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 
 type Matches = Vec<IdentifierMatch>;
 

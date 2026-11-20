@@ -3,23 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::device::replica::ReplicaRecord;
-use crate::forward::replay::create_record_matches;
-use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::MetadataWriteRoute;
 use crate::forward::routing::distinct_holders;
 use crate::forward::routing::holder_intersection;
-use crate::forward::routing::holds_metadata_id;
 use crate::forward::routing::write_route;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::MetadataReadError;
+use crate::metadata::forward::holders::holds_metadata_id;
+use crate::metadata::forward::replay::{create_record_matches, routed_record_matches};
 use crate::realm::peer_trust::peer_acts_for;
-use aruna_core::MetaResourceId;
-use aruna_core::NodeId;
-use aruna_core::StructuredId;
-use aruna_core::UserId;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -27,6 +23,8 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::holder_reads::device_raw_revision;
@@ -302,14 +300,14 @@ fn response_records_checked() {
     let create = CreateDocumentConfig {
         actor: Actor {
             node_id: node(1),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
             realm_id,
         },
         group_id,
         document_id: Ulid::nil(),
         document_path: "/docs/one/".to_string(),
         public: true,
-        payload: crate::metadata::create_document::CreateDocumentPayload::Scaffold {
+        payload: aruna_core::metadata::api::CreateDocumentPayload::Scaffold {
             name: "one".to_string(),
             description: String::new(),
             date_published: "2026-01-01".to_string(),

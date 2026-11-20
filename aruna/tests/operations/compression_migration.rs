@@ -7,7 +7,8 @@ use crate::blob_node::{
     BUCKET, TestContext, blob_files, content, progress, put, read, run, setup_context, version,
     write,
 };
-use aruna::tasks::incoming::start_task_queues;
+use aruna::tasks::incoming::restore::start_task_queues;
+use aruna_clock::testing::poll_until;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -150,14 +151,9 @@ async fn restart_resumes_migration() {
     start_task_queues(restarted, task_handle, JobsRuntime::new(), &shutdown).await;
 
     // A generous cap only detects lost progress; the run itself needs a few seconds.
-    let finished = tokio::time::timeout(std::time::Duration::from_secs(300), async {
-        loop {
-            let record = progress(&context).await;
-            if record.finished_at_ms.is_some() {
-                return record;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+    let finished = poll_until(std::time::Duration::from_secs(300), async || {
+        let record = progress(&context).await;
+        record.finished_at_ms.is_some().then_some(record)
     })
     .await
     .expect("the restart re-arms the migration");

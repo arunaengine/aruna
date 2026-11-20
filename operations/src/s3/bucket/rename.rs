@@ -18,8 +18,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::JobRecord;
-use aruna_core::structs::execution::job::job_record_key;
+use aruna_core::structs::execution::job::local::{JobRecord, job_record_key};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{
@@ -30,7 +29,7 @@ use aruna_core::structs::storage::format::{CompressionMigration, EncodingClass};
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 use aruna_core::structs::storage::multipart::MultipartUpload;
 use aruna_core::structs::storage::replication_queue::queued_prefixes;
-use aruna_core::structs::sync_relationship_prefix;
+use aruna_core::structs::sync_relationship::sync_relationship_prefix;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;

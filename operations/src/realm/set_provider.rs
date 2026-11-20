@@ -11,7 +11,8 @@ use aruna_core::events::Event;
 use aruna_core::federation::valid_federation_url;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, config_oidc_path};
+use aruna_core::reducer::paths::config_oidc_path;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -27,7 +28,7 @@ use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
 use crate::realm::write_stage::{WriteStage, WriteStep};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -382,8 +383,8 @@ fn apply_reducer_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn actor() -> Actor {

@@ -59,7 +59,7 @@ fn pulled() -> IoResult {
     IoResult::Child(ChildOutcome::new(Ok::<bool, IoError>(true)))
 }
 
-fn pull_from(peer: NodeId) -> Result<Next<Option<(NodeId, [u8; 32])>>, IoError> {
+fn pull_from(peer: NodeId) -> ConvergeTurn {
     let pull = crate::shard::pull::PullTopicsOperation::new(vec![topic()], vec![peer]);
     Ok(Next::Call(IoCall::child(pull)))
 }

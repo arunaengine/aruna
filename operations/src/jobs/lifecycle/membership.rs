@@ -8,9 +8,10 @@ use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::storage_entries::reducer_state_key;
-use aruna_core::structs::execution::job::{
-    JobProjection, JobRecordEnvelope, LogicalJobState, NotRun, not_run,
+use aruna_core::structs::execution::job::family::{
+    JobProjection, JobRecordEnvelope, LogicalJobState,
 };
+use aruna_core::structs::execution::job::membership::{NotRun, not_run};
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::warn;
 
@@ -77,7 +78,8 @@ mod tests {
     use super::*;
 
     fn projection(state: LogicalJobState) -> JobProjection {
-        use aruna_core::structs::execution::job::{JobId, OutputSet, SubmissionId};
+        use aruna_core::structs::execution::job::family::{OutputSet, SubmissionId};
+        use aruna_core::structs::execution::job::identity::JobId;
         JobProjection {
             submission_id: SubmissionId([1u8; 32]),
             request_digest: [2u8; 32],

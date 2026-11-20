@@ -4,12 +4,11 @@
 
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
-use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::staging_checkpoint::{LANE_ROWS, parse_lanes};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::StagingJobSpec;
 use aruna_drivers::jobs::context::JobContext;
-use aruna_operations::jobs::staging::lanes::LANE_ROWS;
-use aruna_operations::jobs::staging::lanes::parse_lanes;
-use aruna_operations::tests::staging::spec;
+use aruna_test_support::staging::spec;
 use ulid::Ulid;
 
 /// An S3 endpoint that lists `keys` page by page, as ListObjectsV2 does.
@@ -90,7 +89,7 @@ async fn prefix_split_lanes() {
 #[tokio::test]
 async fn denied_file_counted() {
     use aruna_core::jobs::JobRunOutcome;
-    use aruna_core::structs::execution::job::JobResultPayload;
+    use aruna_core::structs::execution::job::local::JobResultPayload;
     let keys = (0..20).map(|index| format!("a/{index:04}")).collect();
     let (endpoint, server) = s3_listing(keys).await;
     let (ctx, spec, _dir) = job_context(endpoint, &[("a", "ta")], Some("ta/0007")).await;
@@ -125,14 +124,15 @@ async fn job_context(
     denied: Option<&str>,
 ) -> (JobContext, StagingJobSpec, tempfile::TempDir) {
     use aruna_core::jobs::ProgressReporter;
-    use aruna_core::structs::execution::job::{JobClaim, JobPayload, JobProgress, JobRecord};
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::{JobClaim, JobProgress, JobRecord};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::object_permission_path;
     use aruna_drivers::driver::drive;
     use aruna_operations::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_operations::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -167,7 +167,7 @@ async fn job_context(
         object_permission_path(realm, group, node, &spec.bucket, key)
     });
     let denied = denied.as_deref().unwrap_or("/none");
-    spec.auth_context = aruna_operations::testing_access::seed_access(&driver, scope, denied).await;
+    spec.auth_context = aruna_drivers::testing::seed_access(&driver, scope, denied).await;
     let owner = spec.auth_context.user_id;
     let bucket = create_test_bucket(&driver, spec.group_id, owner, &spec.bucket).await;
     spec.bucket_identity = bucket.identity();
@@ -179,7 +179,7 @@ async fn job_context(
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    aruna_operations::jobs::store::test_calls::insert_job(&driver, &record)
+    aruna_test_support::jobs::insert_job(&driver, &record)
         .await
         .unwrap();
     let ctx = JobContext {
@@ -192,7 +192,6 @@ async fn job_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&JobProgress::new("items")),
         range_turns: Default::default(),
-        handlers: Default::default(),
     };
     (ctx, spec, test._tempdir)
 }
@@ -203,7 +202,7 @@ async fn import(keys: Vec<String>, prefixes: &[(&str, &str)]) -> u64 {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::jobs::JobRunOutcome;
     use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
-    use aruna_core::structs::execution::job::JobResultPayload;
+    use aruna_core::structs::execution::job::local::JobResultPayload;
     use aruna_core::structs::storage::blob::BlobHeadKey;
 
     let (endpoint, server) = s3_listing(keys.clone()).await;
@@ -266,6 +265,6 @@ pub(crate) async fn run_staging_job(ctx: &JobContext, spec: &StagingJobSpec) -> 
         routing: aruna_drivers::driver::node_routing(&ctx.driver),
         seed: 7,
     };
-    let job = aruna_operations::jobs::staging::StagingJobOperation::new(run);
+    let job = aruna_operations::jobs::staging::job::StagingJobOperation::new(run);
     aruna::tasks::job_host::run_hosted(ctx, job).await
 }

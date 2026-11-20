@@ -845,7 +845,7 @@ async fn user_operation_materializes() {
             name: "Alice Updated".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("admin operation applies");
 
@@ -914,7 +914,7 @@ async fn stale_user_recorded() {
     };
 
     for event in [newer, older.clone(), older.clone()] {
-        apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+        apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
             .await
             .expect("out-of-order admin operation applies");
     }
@@ -960,7 +960,7 @@ async fn subject_add_indexes() {
         },
     };
 
-    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("subject add applies");
 
@@ -1037,7 +1037,7 @@ async fn subject_remove_cleans() {
             subject_id: "subject-removed".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("subject remove applies");
 
@@ -1228,7 +1228,7 @@ async fn hand_over_subject(
             subject_id: "subject-moved".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id: merged }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id: merged }, event)
         .await
         .expect("subject remove applies");
     let owner = read_storage_value(
@@ -1378,7 +1378,7 @@ async fn apply_with_claims(
         actor,
         op,
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id: target }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id: target }, event)
         .await
         .expect("event applies");
     read_storage_value(

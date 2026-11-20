@@ -8,9 +8,11 @@ use bls12_381_plus::{G1Projective, G2Projective, Gt};
 use zeroize::Zeroizing;
 
 use crate::crypto::{checked_target, fingerprint};
-use crate::policy::canonical_attributes;
-use crate::{Attribute, Ciphertext, Error, MAX_ATTRIBUTE_BYTES, MAX_ATTRIBUTES, MAX_BYTES};
-use crate::{MAX_EPOCHS, MAX_ROWS, Policy, PublicParameters, UserKey, check_context};
+use crate::policy::{Attribute, Policy, canonical_attributes};
+use crate::scheme::{Ciphertext, PublicParameters, UserKey};
+use crate::{
+    Error, MAX_ATTRIBUTE_BYTES, MAX_ATTRIBUTES, MAX_BYTES, MAX_EPOCHS, MAX_ROWS, check_context,
+};
 
 pub(crate) fn header(kind: u8, fingerprint: &[u8; 32]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(37);

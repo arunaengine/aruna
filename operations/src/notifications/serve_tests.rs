@@ -4,10 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::notifications::watch::listing::WatchPage;
 use crate::notifications::watch::paths::WatchAuthorizationDenial;
 use crate::tests::notifications::{peer_input, user};
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
 fn serving(request: InboxRequest) -> ServeInboxOperation {
@@ -201,12 +203,39 @@ fn events_wake_recipients() {
         }))
     );
 
-    let mut failed =
-        WatchEventsOperation::new(peer_input(), vec![watch_event(user(1, 2).realm_id)]);
-    failed.state = EventsState::Expand;
+    // An expansion that may pass later answers unavailable, so the sender keeps the events;
+    // only a fatal one is refused.
+    let expanding = || {
+        let events = vec![watch_event(user(1, 2).realm_id)];
+        let mut operation = WatchEventsOperation::new(peer_input(), events);
+        operation.state = EventsState::Expand;
+        operation
+    };
     let conflict = child::<ExpandOutcome, _>(Err(ExpandError::Conflict));
-    assert_eq!(
-        rejected(failed.next(conflict)),
-        ExpandError::Conflict.to_string()
-    );
+    let reason = ExpandError::Conflict.to_string();
+    let unavailable = NotificationTransportMessage::Unavailable(reason);
+    assert_eq!(expanding().next(conflict), Ok(Next::Done(unavailable)));
+    let fatal = child::<ExpandOutcome, _>(Err(ExpandError::Fatal("cap".to_string())));
+    assert_eq!(rejected(expanding().next(fatal)), "cap");
+}
+
+// A holder whose watch listing failed on storage answers unavailable through the real expansion
+// child, so the sender keeps the events instead of dropping them.
+#[test]
+fn listing_failure_unavailable() {
+    let realm_id = user(1, 2).realm_id;
+    let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let node = crate::tests::locations::node_id(1);
+    let events = vec![watch_event(realm_id)];
+    let mut expand = WatchExpandOperation::new(realm_id, config, node, events.clone(), None);
+    expand.first().unwrap();
+    let failed = WatchSubscriptionError::Storage("timeout".to_string());
+    let Err(error) = expand.next(child::<WatchPage, _>(Err(failed))) else {
+        panic!("the failed listing ends the expansion");
+    };
+    let mut operation = WatchEventsOperation::new(peer_input(), events);
+    operation.state = EventsState::Expand;
+    let answer = operation.next(child::<ExpandOutcome, _>(Err(error)));
+    let unavailable = NotificationTransportMessage::Unavailable("timeout".to_string());
+    assert_eq!(answer, Ok(Next::Done(unavailable)));
 }

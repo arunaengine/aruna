@@ -7,7 +7,6 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation}
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -25,6 +24,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -41,7 +41,7 @@ async fn full_context() -> (TempDir, DriverContext) {
     let temp_root = temp_handle.path().to_str().expect("utf8 path");
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).expect("blob root");
-    let storage_handle = storage::FjallStorage::open(temp_root).expect("storage opens");
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).expect("storage opens");
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .expect("net handle");

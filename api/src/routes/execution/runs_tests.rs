@@ -4,17 +4,18 @@
 
 use std::sync::Mutex;
 
-use crate::job_test_calls::put_crate_outcome;
-use aruna_core::structs::execution::job::{JobId, RunCrateStatus, RunLink};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{RunCrateStatus, RunLink};
+use aruna_test_support::jobs::put_crate_outcome;
 use axum::Router;
 use axum::http::StatusCode;
 use ulid::Ulid;
 
 use super::*;
 use crate::auth::RealmAuth;
-use crate::routes::storage::relay::RELAY_NODE_HEADER;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{LOCAL, Node, PEER, node_id, node_state, publish_api};
+use aruna_operations::s3::object::member::rest::RELAY_NODE_HEADER;
 
 async fn run(
     node: &Node,

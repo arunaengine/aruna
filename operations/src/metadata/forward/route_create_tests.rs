@@ -4,11 +4,10 @@
 
 use super::*;
 use aruna_core::calls::ChildOutcome;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-
-use crate::metadata::create_document::CreateDocumentPayload;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -19,7 +18,7 @@ fn route() -> RouteCreateOperation {
     let create = CreateDocumentOperation::new(CreateDocumentConfig {
         actor: Actor {
             node_id: node(1),
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 1), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
             realm_id,
         },
         group_id: Ulid::from_parts(2, 2),

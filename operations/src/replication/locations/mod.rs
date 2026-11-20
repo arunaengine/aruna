@@ -2,19 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod local;
-mod queued;
-mod relationships;
-mod remote;
+pub mod holders;
+pub mod local;
+pub mod queued;
+pub mod relationships;
+pub mod remote;
 
 use aruna_core::calls::IoError;
 use aruna_core::errors::{BlobError, ConversionError};
 use thiserror::Error;
-
-pub use local::{LocalSummary, LocationSummaryOperation};
-pub use queued::{QueuedNodesOperation, QueuedReplicas};
-pub use relationships::{RelationshipNodesOperation, ReplicaTarget};
-pub use remote::RemoteLocationOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LocationSummaryError {

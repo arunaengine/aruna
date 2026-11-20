@@ -6,26 +6,26 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::job_service::submit_purge_job;
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::listing::ListVersionsItem;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_drivers::driver::drive;
 use aruna_operations::blob::migration::misplaced::AccessRule;
 use aruna_operations::blob::purge::ScopeTotalsOperation;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::metadata::api::links::set_preview_distributed;
-use aruna_operations::s3::bucket::release::BucketScope;
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::replication::sync_relationship::list::ListRelationshipsOperation;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_operations::s3::object::delete::pinned::{PinnedError, RefuseScopeOperation};
 use aruna_operations::s3::object::versions::{
-    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+    ListVersionsError, ListVersionsInput, ListVersionsOperation,
 };
-use aruna_operations::sync::sync_relationship::{
-    ListRelationshipsOperation, SyncRelationshipDirection,
-};
+use aruna_operations::transfer::pinned::{PinnedError, RefuseScopeOperation};
+use aruna_operations::transfer::release::BucketScope;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -943,7 +943,8 @@ pub async fn control_purge(
     RealmAuth(auth): RealmAuth,
     axum::extract::Path((job_id, action)): axum::extract::Path<(String, String)>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
-    use crate::job_service::{CancelJobOutcome, cancel_owned_job};
+    use crate::job_service::cancel_owned_job;
+    use aruna_operations::jobs::job::cancel::CancelJobOutcome;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
     let record = crate::job_service::read_job_record(&context, job_id)
@@ -1008,7 +1009,7 @@ pub struct PurgeJobResponse {
 
 async fn purge_job(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let context = state.get_ctx();
     let record = crate::job_service::read_job_record(&context, job_id)
@@ -1073,7 +1074,7 @@ pub async fn get_purge(
 
 async fn purge_ended(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<bool> {
     let record = crate::job_service::read_job_record(&state.get_ctx(), job_id)
         .await
@@ -1098,7 +1099,7 @@ fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePur
 
 fn scoped_version_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::object::versions::ListVersionsResult,
+    result: aruna_core::structs::storage::listing::ListVersionsResult,
 ) -> (Vec<ListVersionsItem>, bool, Option<String>, Option<Ulid>) {
     let mut items = result.items;
     let mut truncated = result.is_truncated;
@@ -1120,7 +1121,7 @@ fn scoped_version_page(
 
 fn scoped_multipart_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::multipart::uploads::ListUploadsResult,
+    result: aruna_core::structs::storage::listing::ListUploadsResult,
 ) -> (
     Vec<aruna_core::structs::storage::multipart::MultipartUpload>,
     bool,

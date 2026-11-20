@@ -6,9 +6,11 @@ use super::*;
 use crate::jobs::staging::pure_tests::{child_answer, test_run};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::execution::job::{
-    JobClaim, JobId, JobPayload, JobRecord, StagingJobPhase, StagingJobPrefix, StagingJobSpec,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobPhase, StagingJobPrefix, StagingJobSpec,
 };
+use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -20,7 +22,7 @@ fn spec() -> StagingJobSpec {
     let realm_id = RealmId::from_bytes([1; 32]);
     StagingJobSpec {
         auth_context: AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([2; 16]), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -110,7 +112,8 @@ fn transient_errors_retry() {
 async fn manifest_read_authorized() {
     let tempdir = tempfile::tempdir().unwrap();
     let storage_handle =
-        aruna_storage::storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        aruna_storage::storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap())
+            .unwrap();
     let context = aruna_drivers::testing::test_context(storage_handle.clone());
     let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let claim_token = Ulid::from_bytes([6; 16]);
@@ -129,7 +132,7 @@ async fn manifest_read_authorized() {
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    crate::jobs::store::test_calls::insert_job(&context, &record)
+    aruna_test_support::jobs::insert_job(&context, &record)
         .await
         .unwrap();
     let driver = DriverContext {
@@ -145,7 +148,7 @@ async fn manifest_read_authorized() {
     let mut spec = spec();
     let denied = source_permission_path(&spec, "data/MD5SUMS");
     let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
-    spec.auth_context = crate::testing_access::seed_access(&driver, scope, &denied).await;
+    spec.auth_context = aruna_drivers::testing::seed_access(&driver, scope, &denied).await;
     let checkpoint = checkpoint();
     // Digests an earlier chunk stored, and one of another folder's manifest.
     let digest = postcard::to_allocvec(&(ChecksumAlgorithm::Md5, vec![1u8; 16])).unwrap();

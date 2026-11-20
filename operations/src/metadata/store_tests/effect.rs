@@ -4,12 +4,12 @@
 
 use super::auth::{auth_storage, node_id_seed};
 use super::*;
-use crate::metadata::protocol::{MetadataReadError, metadata_read_error};
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
+use aruna_core::metadata::protocol::{MetadataReadError, metadata_read_error};
 pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) {
     let metadata_dir = tempdir().expect("metadata dir");
     let graph_handle = aruna_graph::GraphHandle::open(
@@ -32,7 +32,7 @@ async fn plan_entity(
     name: &str,
 ) -> MetadataBatch {
     let event = send_metadata_effect(
-        &handle,
+        handle,
         MetadataEffect::PlanBatch {
             graph_iri: graph_iri.to_string(),
             actor: [actor; 32],
@@ -51,7 +51,7 @@ async fn plan_entity(
 
 async fn merge_into(handle: &DriverContext, graph_iri: &str, batch: &MetadataBatch) -> bool {
     let event = send_metadata_effect(
-        &handle,
+        handle,
         MetadataEffect::MergeBatch {
             graph_iri: graph_iri.to_string(),
             batch: batch.clone(),
@@ -66,7 +66,7 @@ async fn merge_into(handle: &DriverContext, graph_iri: &str, batch: &MetadataBat
 
 async fn graph_state(handle: &DriverContext, graph_iri: &str) -> Vec<(String, String, String)> {
     let event = send_metadata_effect(
-        &handle,
+        handle,
         MetadataEffect::GraphSnapshot {
             graph_iri: graph_iri.to_string(),
         },
@@ -148,7 +148,7 @@ async fn merges_converge() {
     for handle in [&left, &right] {
         assert!(matches!(
             send_metadata_effect(
-                &handle,
+                handle,
                 MetadataEffect::CreateCrate {
                     request: request.clone(),
                 }

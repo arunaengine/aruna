@@ -5,20 +5,18 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
-use aruna_core::rows;
-use aruna_core::structs::execution::harvest::{
-    RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
-};
+use aruna_core::structs::execution::harvest::{RepositoryConnector, RepositoryConnectorKind};
+use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
+use crate::connectors::harvest_rows::{INVENIO_TOKEN, connector_writes};
 use crate::endpoint_screening;
-use crate::harvest::repository::connector_writes;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CreateConnectorInput {
@@ -184,8 +182,6 @@ fn validate_invenio(
 
 /// Public config key naming the Invenio community new records are submitted to.
 pub const INVENIO_COMMUNITY: &str = "community";
-/// Secret config key of the optional read token an Invenio connector keeps.
-pub const INVENIO_TOKEN: &str = "token";
 
 impl Operation for CreateConnectorOperation {
     type Output = CreateConnectorResult;
@@ -219,7 +215,7 @@ impl Operation for CreateConnectorOperation {
             now,
             self.input.created_by,
         );
-        let secret = RepositoryConnectorSecret::new(
+        let secret = SourceConnectorSecret::new(
             connector.connector_id,
             self.input.secret_config.clone(),
             now,
@@ -234,7 +230,7 @@ impl Operation for CreateConnectorOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CreateConnectorError> {
-        crate::groups::fence::group_write_result(rows::event(result)?)?;
+        crate::groups::fence::group_write_result(result.event()?)?;
         let result = self.result.take().ok_or(CreateConnectorError::Failed)?;
         Ok(Next::Done(result))
     }
@@ -243,7 +239,7 @@ impl Operation for CreateConnectorOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harvest::repository::{parse_connector_read, read_connector_effect};
+    use crate::connectors::harvest_rows::{parse_connector_read, read_connector_effect};
     use aruna_core::calls::IoCall;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -412,7 +408,8 @@ mod tests {
     #[tokio::test]
     async fn persists_connector_record() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

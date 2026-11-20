@@ -21,17 +21,20 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::errors::StagingSourceError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding,
 };
 use aruna_core::types::Key;
 use aruna_operations::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
+use aruna_operations::device::sync::folders::bind::{bind_folder, finish_binding, request_sync};
+use aruna_operations::device::sync::folders::reads::{
+    folder_counters, list_actions, list_entries, list_folders, read_bound, read_entry,
+};
+use aruna_operations::device::sync::folders::unbind::unbind_folder;
 use aruna_operations::device::sync::folders::{
-    BindFolderInput, FolderError, bind_folder, finish_binding, folder_counters, list_actions,
-    list_entries, list_folders, read_bound, read_entry, request_sync, set_folder_state,
-    set_propagate_deletes, unbind_folder,
+    BindFolderInput, FolderError, set_folder_state, set_propagate_deletes,
 };
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 
@@ -247,7 +250,7 @@ fn map_action_error(error: ActionError) -> ServerError {
 /// One folder with the counters its entries currently add up to.
 async fn folder_detail(
     state: &ServerState,
-    folder: aruna_core::structs::SyncedFolder,
+    folder: aruna_core::structs::synced_folder::SyncedFolder,
 ) -> ServerResult<SyncedFolderView> {
     let counters = drive(folder_counters(folder.folder_id), &state.get_ctx())
         .await

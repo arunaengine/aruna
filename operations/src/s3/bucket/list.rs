@@ -194,7 +194,7 @@ mod test {
     async fn test_list_buckets() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,

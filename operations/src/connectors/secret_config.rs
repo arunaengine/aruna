@@ -4,11 +4,11 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::rows;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::repository::{StorageReadError, parse_secret_read, read_secret_effect};
+use crate::connectors::repository::{parse_secret_read, read_secret_effect};
+use aruna_core::errors::StorageReadError;
 
 #[derive(Debug, PartialEq)]
 pub struct HasConfigOperation {
@@ -43,7 +43,7 @@ impl Operation for HasConfigOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, HasConfigError> {
-        let secret = parse_secret_read(rows::event(result)?, self.connector_id)?;
+        let secret = parse_secret_read(result.event()?, self.connector_id)?;
         Ok(Next::Done(secret.is_some()))
     }
 }

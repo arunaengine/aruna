@@ -5,10 +5,10 @@
 use crate::tasks::runner::{execution_host, resume_attempt as run_resume, run_execution_job};
 use crate::tasks::runner::{run_wiring, under_lease};
 use aruna_clock::unix_timestamp_millis;
-use aruna_compute::ExecutorBackend;
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::executor::ExecutorBackend;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
-use aruna_core::UserId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{
     AdoptableEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence,
@@ -16,23 +16,23 @@ use aruna_core::compute::{
     ResumePoint, StagingMode, TaskOutput, TaskSpec, UserSpec,
 };
 use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
-use aruna_core::structs::execution::job::{
-    AttemptIntent, ExecutionSpec, JobError, JobErrorKind, JobId, JobPayload, JobRecord,
-    JobResultPayload, JobState, MAX_MESSAGE_BYTES, OutputDestination, OutputSelection,
-    SessionReportDetail, SessionReportRow, WorkspaceMode,
+use aruna_core::structs::execution::job::family::MAX_MESSAGE_BYTES;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, JobPayload, OutputDestination, OutputSelection, SessionReportDetail,
+    SessionReportRow,
+};
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobError, JobErrorKind, JobRecord, JobResultPayload, WorkspaceMode,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::effect_adapters::job::with_job_host;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
-use aruna_operations::jobs::store::test_calls::{
-    begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
-    put_crate_status, read_attempt_control, read_job_record, record_attempt_intent,
-    record_attempt_started, set_cancel_requested, transition_to_preparing, transition_to_ready,
-};
 use aruna_operations::jobs::workflow::attempt::{AttemptScope, RunWiring};
 use aruna_operations::jobs::workflow::credential::{
     MintCredentialOperation, RunIdentity, WorkspaceAccessOperation,
@@ -47,9 +47,14 @@ use aruna_operations::jobs::workflow::settle::{ParkAttemptOperation, SettleScope
 use aruna_operations::jobs::workflow::supervise::{SuperviseOperation, WalltimeAnchorOperation};
 use aruna_operations::jobs::workflow::*;
 use aruna_operations::jobs::{JOB_HEARTBEAT_MS, JOB_MAX_ATTEMPTS};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::jobs::{
+    begin_external_running, claim_job, handoff_external_attempt, insert_job, mutate_job,
+    put_crate_status, read_attempt_control, read_job_record, record_attempt_intent,
+    record_attempt_started, set_cancel_requested, transition_to_preparing, transition_to_ready,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -60,7 +65,7 @@ use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use super::workflow_fixtures::{execution_spec, node_id};
-use aruna_operations::testing::task_context;
+use aruna_drivers::testing::task_context;
 
 /// The context of a call about `backend`: one whose registry holds it.
 fn with_backend(context: &DriverContext, backend: &Arc<dyn ExecutorBackend>) -> DriverContext {
@@ -204,8 +209,8 @@ async fn collect_or_park(
     token: ulid::Ulid,
     spec: &ExecutionSpec,
     bucket: &str,
-    control: &aruna_core::structs::execution::job::AttemptControl,
-) -> Option<Vec<aruna_core::structs::execution::job::OutputObject>> {
+    control: &aruna_core::structs::execution::job::local::AttemptControl,
+) -> Option<Vec<aruna_core::structs::execution::job::local::OutputObject>> {
     let node = context.net_handle.as_ref().map(|net| net.node_id());
     let collect = CollectOutputsOperation::new(spec, bucket, control.clone(), node);
     match drive(collect, context).await {
@@ -846,18 +851,19 @@ async fn capture_failure_caps() {
 /// A run that exited 0 and captures one wildcard output.
 fn capture_spec(node: aruna_core::id::NodeId) -> ExecutionSpec {
     let mut spec = execution_spec();
-    spec.file_outputs
-        .push(aruna_core::structs::execution::job::OutputSelection {
+    spec.file_outputs.push(
+        aruna_core::structs::execution::job::input::OutputSelection {
             container_path: "/out/*".to_string(),
             path_prefix: Some("/out".to_string()),
             destination_node_id: Some(node),
-            destination: aruna_core::structs::execution::job::OutputDestination::S3 {
+            destination: aruna_core::structs::execution::job::input::OutputDestination::S3 {
                 bucket: "dest".to_string(),
                 key: "results/".to_string(),
             },
             name: None,
             description: None,
-        });
+        },
+    );
     spec
 }
 
@@ -1063,7 +1069,7 @@ async fn finalize_renews_lease() {
 /// needs this node's key.
 async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::NetHandle) {
     let net = aruna_net::NetHandle::new(
-        aruna_net::NetConfig {
+        aruna_net::config::NetConfig {
             realm_id: aruna_core::structs::identity::realm::RealmId([1; 32]),
             ..aruna_drivers::testing::local_net()
         },
@@ -1176,7 +1182,7 @@ async fn session_end_succeeds() {
     assert!(stored.report_digest.is_some());
     assert_eq!(session.finished().await, EndReason::Ended);
     assert!(registry.sessions().get(&job_id.to_string()).is_none());
-    let query = aruna_operations::jobs::job_reports::ReportQuery {
+    let query = aruna_operations::jobs::job::reports::ReportQuery {
         expected_digest: None,
         last_key: None,
         limit: 10,
@@ -1184,7 +1190,7 @@ async fn session_end_succeeds() {
     let report = read_owned_report(&ctx, stored.created_by, job_id, query)
         .await
         .unwrap();
-    let aruna_operations::jobs::job_reports::JobReportLookup::Ready { rows, .. } = report else {
+    let aruna_operations::jobs::job::reports::JobReportLookup::Ready { rows, .. } = report else {
         panic!("ended session report must be readable");
     };
     assert_eq!(rows.len(), 1);
@@ -1639,7 +1645,7 @@ async fn absent_retries_same() {
 // with that credential, which carries the workspace and the input view together.
 #[tokio::test]
 async fn recovery_reuses_credential() {
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::input::{
         CapturedInput, InputContent, InputMode, InputSelection, InputSource,
     };
     let dir = tempdir().unwrap();
@@ -1690,13 +1696,14 @@ async fn recovery_reuses_credential() {
         served_by: None,
     };
     let scope = (RealmId([1; 32]), spec.group_id, local);
-    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+    let owner = aruna_drivers::testing::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = mutate_job(&context, record.job_id, |record| {
-        record.payload = JobPayload::Execution(spec.clone());
+    let (stored, input) = (spec.clone(), captured.clone());
+    let record = mutate_job(&context, record.job_id, move |record| {
+        record.payload = JobPayload::Execution(stored.clone());
         record.created_by = owner;
-        record.captured_inputs = vec![captured.clone()];
+        record.captured_inputs = vec![input.clone()];
         record.workspace_bucket = Some("ws-test".to_string());
         Ok(aruna_operations::jobs::store::JobMutation::Persist)
     })
@@ -1745,11 +1752,12 @@ async fn workspace_run_credential() {
     let mut spec = execution_spec();
     spec.executor_constraint = Some("docker".to_string());
     let scope = (RealmId([1; 32]), spec.group_id, local);
-    let owner = aruna_operations::testing_access::seed_access(&ctx, scope, "/none")
+    let owner = aruna_drivers::testing::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = mutate_job(&context, record.job_id, |record| {
-        record.payload = JobPayload::Execution(spec.clone());
+    let stored = spec.clone();
+    let record = mutate_job(&context, record.job_id, move |record| {
+        record.payload = JobPayload::Execution(stored.clone());
         record.created_by = owner;
         record.workspace_mode = WorkspaceMode::Existing;
         record.workspace_bucket = Some("ws-test".to_string());
@@ -1785,7 +1793,7 @@ async fn crate_write_idempotent() {
     put_crate_status(
         &driver,
         job_id,
-        &aruna_core::structs::execution::job::RunCrateStatus::Written {
+        &aruna_core::structs::execution::job::local::RunCrateStatus::Written {
             resource: "already-there".to_string(),
         },
     )
@@ -1802,7 +1810,6 @@ async fn crate_write_idempotent() {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     };
     let write = run_crate::WriteCrateOperation::new(job_id, ctx.driver.node_and_realm());
     let outcome = run_crate::crate_outcome(drive(write, &ctx.driver).await);
@@ -1901,7 +1908,7 @@ async fn store_site(
         execution_id: Ulid::from_bytes([0xA1; 16]),
         job_id,
         logical_job_id: job_id,
-        resources: aruna_core::structs::execution::job::EffectiveResources {
+        resources: aruna_core::structs::execution::job::family::EffectiveResources {
             cpu_cores: 1,
             ram_bytes: 1,
             disk_bytes: 0,
@@ -1946,7 +1953,7 @@ async fn store_site(
 }
 
 fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
-    let mut registry = aruna_compute::ExecutorRegistry::new();
+    let mut registry = aruna_compute::registry::ExecutorRegistry::new();
     let workspace = aruna_compute::registry::WorkspaceEndpoint::default();
     registry.register(
         "docker",
@@ -2028,7 +2035,7 @@ async fn drift_requeues_attempt() {
 #[tokio::test]
 async fn stored_site_starts() {
     // The exact stored generation, subject digest and backend config still admit the start.
-    use aruna_compute::ExecutorRegistry;
+    use aruna_compute::registry::ExecutorRegistry;
     use aruna_core::compute::ExecutorCapability;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::placement::policy::PlacementSubject;
@@ -2249,10 +2256,10 @@ async fn read_owned_report(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    query: aruna_operations::jobs::job_reports::ReportQuery,
-) -> Result<aruna_operations::jobs::job_reports::JobReportLookup, String> {
+    query: aruna_operations::jobs::job::reports::ReportQuery,
+) -> Result<aruna_operations::jobs::job::reports::JobReportLookup, String> {
     let now_ms = unix_timestamp_millis();
-    let read = aruna_operations::jobs::job_reports::JobReportOperation::owned(
+    let read = aruna_operations::jobs::job::reports::JobReportOperation::owned(
         user_id, job_id, query, now_ms,
     );
     drive(read, context).await.map_err(|error| error.0)

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{InstallGuard, PluginInstall};
@@ -16,7 +17,7 @@ use aruna_core::plugins::{PluginEffect, PluginEvent};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -249,15 +250,18 @@ mod tests {
     use super::*;
     use crate::plugins::calls::*;
     use crate::plugins::fixtures;
-    use crate::plugins::install::tests::Fixture;
     use crate::plugins::rows::tests::{child_result, page_result};
-    use aruna_core::UserId;
+    use crate::plugins::test_support::{install_as, install_request};
+    use aruna_core::user::id::UserId;
+    use aruna_test_support::plugins::Fixture;
 
     #[tokio::test]
     async fn unnamed_accounts() {
         let fixture = Fixture::new().await;
         let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
-        let installed = fixture.install(&fixture.request(None)).await.unwrap();
+        let installed = install_as(&fixture, &install_request(&fixture, None))
+            .await
+            .unwrap();
         let config = read_config(ctx, actor.realm_id).await.unwrap();
         let now = 1_000;
         assert_eq!(

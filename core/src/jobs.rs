@@ -17,23 +17,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::events::Event;
 use crate::metadata::AuthToken;
 use crate::operation::SubOperation;
 use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::execution::job::RoCrateLimits;
-use crate::structs::execution::job::{
-    ExpiryReason, InputSelection, JobError, JobId, JobPayload, JobProgress, JobRecord,
-    JobResultPayload, JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId,
-    WorkspaceMode,
+use crate::structs::execution::job::family::{ExpiryReason, LogicalJobState, SubmissionId};
+use crate::structs::execution::job::identity::{JobId, JobState};
+use crate::structs::execution::job::input::{
+    InputSelection, JobPayload, RoCrateLimits, StagingJobCheckpoint,
+};
+use crate::structs::execution::job::key_wait::KeyWait;
+use crate::structs::execution::job::local::{
+    JobError, JobProgress, JobRecord, JobResultPayload, WorkspaceMode,
 };
 use crate::structs::execution::table::GzipCursor;
 use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
@@ -454,7 +457,7 @@ pub enum SubmissionRefusal {
 pub enum ClosureAnswer {
     /// The node stores a claim of the submission: its request family and alias.
     Claimed {
-        family: crate::structs::execution::job::JobFamilyId,
+        family: crate::structs::execution::job::family::JobFamilyId,
         job_id: JobId,
     },
     /// No claim, and a committed closure row refuses every later admission there.

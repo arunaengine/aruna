@@ -2,20 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::job_request::UploadClaimError;
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
 };
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
 use std::time::{Duration, Instant};
@@ -213,28 +215,6 @@ impl Operation for CreateRoCrateOperation {
     }
 }
 
-#[derive(Debug, Error, PartialEq)]
-pub enum UploadClaimError {
-    #[error("upload not found")]
-    NotFound,
-    #[error("upload is owned by another user")]
-    WrongOwner,
-    #[error("upload expired")]
-    Expired,
-    #[error("upload is already claimed")]
-    AlreadyClaimed,
-    #[error("upload record is invalid: {0}")]
-    Invalid(String),
-    #[error("upload storage failed: {0}")]
-    Storage(String),
-}
-
-impl From<IoError> for UploadClaimError {
-    fn from(error: IoError) -> Self {
-        Self::Storage(error.to_string())
-    }
-}
-
 /// Claims a stored upload for job `job_id` of `owner` in one write transaction; see
 /// [`claim_upload`]. A record the claim leaves unchanged is not written again.
 #[derive(Debug, PartialEq)]
@@ -280,7 +260,7 @@ impl Operation for ClaimUploadOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<RoCrateUploadRecord>, UploadClaimError> {
         if let Some(record) = self.claimed.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(record));
         }
         let [value] = values::<1>(result)?;
@@ -326,11 +306,11 @@ pub(crate) fn claim_upload(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use aruna_core::structs::execution::job::RoCrateMediaType;
+    use aruna_core::structs::execution::job::input::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;

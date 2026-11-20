@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::jobs::{JobEffect, JobReport, JobStops};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobError, rocrate_plan_key};
+use aruna_core::structs::execution::job::local::{JobError, rocrate_plan_key};
 
 use super::acquire::{AcquireSourceOperation, AcquiredSource};
 use super::finish::{

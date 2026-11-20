@@ -373,7 +373,9 @@ async fn lists_bucket_jobs() {
 async fn lists_unrouted_import() {
     // A running import shows also for a rule whose write storage is gone from routing.
     use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, S3_BUCKET_KEYSPACE};
-    use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use aruna_core::structs::storage::backend_import::{BackendImport, BackendImportSpec};
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
@@ -422,7 +424,7 @@ async fn lists_unrouted_import() {
     let payload = JobPayload::BackendImport(spec);
     let (user, node) = (test.auth.user_id, test.state.get_node_id());
     let record = JobRecord::new(job_id, payload, user, node, 1, 1, None);
-    crate::job_test_calls::insert_job(&context, &record)
+    aruna_test_support::jobs::insert_job(&context, &record)
         .await
         .unwrap();
     let query = BucketPageQuery {

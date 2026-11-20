@@ -25,10 +25,11 @@ use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
-    AssistantProviderStatus, CENTRAL_PROVIDER_ID,
+    AssistantProviderStatus,
 };
+use aruna_core::structs::central_assistant::CENTRAL_PROVIDER_ID;
 use aruna_drivers::driver::drive;
 use aruna_operations::assistant::provider::{
     CreateProviderOperation, DeleteProviderOperation, GetProviderOperation, ListProviderOperation,
@@ -315,7 +316,7 @@ pub(super) fn provider_summary(provider: &AssistantProvider) -> ProviderSummary 
 
 pub(super) async fn load_provider(
     state: &ServerState,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     provider_id: String,
 ) -> ServerResult<AssistantProvider> {
     drive(
@@ -329,7 +330,7 @@ pub(super) async fn load_provider(
 
 pub(super) async fn save_provider(
     state: &ServerState,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     expected: AssistantProvider,
     provider: AssistantProvider,
 ) -> ServerResult<AssistantProvider> {

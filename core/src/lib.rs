@@ -11,6 +11,9 @@ pub mod archive_path;
 pub mod audit;
 pub mod auth;
 pub mod backoff;
+pub mod blob_paths;
+pub mod blob_records;
+pub mod bucket_read;
 pub mod calls;
 pub mod compute;
 pub mod config_authority;
@@ -25,6 +28,7 @@ pub mod download_slots;
 pub mod effects;
 pub mod egress;
 pub mod entity_patch;
+pub mod entropy;
 pub mod errors;
 pub mod events;
 pub mod federation;
@@ -33,10 +37,10 @@ pub mod git_state;
 pub mod handle;
 pub mod handoff;
 pub mod heartbeat;
-pub mod holder_choice;
 pub mod id;
 pub mod id_mint;
 pub mod injection;
+pub mod job_request;
 pub mod jobs;
 pub mod join_request;
 pub mod key_index;
@@ -44,14 +48,15 @@ pub mod key_seal;
 pub mod keys;
 pub mod keyspaces;
 pub mod link;
+pub mod listener;
+pub mod live_version;
 pub mod managed_copy;
 pub mod member_read;
 pub mod metadata;
 pub mod metrics;
 pub mod native_reference;
-pub mod node_facts;
-pub mod node_state;
-pub mod node_vault;
+pub mod node;
+pub mod notification_routing;
 pub mod onboarding;
 pub mod operation;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -68,6 +73,7 @@ pub mod realm_vault;
 pub mod recovery_code;
 pub mod reducer;
 pub mod register;
+pub mod replication_protocol;
 pub mod repo_layout;
 pub mod repository;
 pub mod request_policy;
@@ -75,10 +81,13 @@ pub mod rocrate_archive;
 pub mod row_plan;
 pub mod rows;
 pub mod scheduling;
+pub mod search;
 pub mod search_enrichment;
 pub mod secret_registers;
 pub mod secrets;
+pub mod staging_checkpoint;
 pub mod storage_entries;
+pub mod storage_read;
 pub mod stream;
 pub mod structs;
 pub mod structured_id;
@@ -87,6 +96,7 @@ pub mod task;
 pub mod telemetry;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod testing;
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod time;
 pub mod trace_context;
 pub mod transfer;
@@ -96,18 +106,3 @@ pub mod vault_format;
 
 #[cfg(test)]
 mod tests;
-
-pub use document::{
-    DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent,
-    DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
-};
-pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
-pub use keyspaces::*;
-pub use metadata::*;
-pub use onboarding::*;
-pub use structured_id::{
-    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle, StructuredId,
-};
-pub use task::{TaskEffect, TaskEvent, TaskKey};
-pub use trace_context::DistributedTraceContext;
-pub use user::id::UserId;

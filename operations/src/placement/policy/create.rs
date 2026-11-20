@@ -2,15 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicySignEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -28,7 +27,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox::record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -329,7 +330,8 @@ impl PolicyWrite {
         if let Some(entry) = shard_manifest_entry(&target, &change)? {
             writes.push(entry);
         }
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            self.ids.mint(self.config.created_at_ms),
             self.config.actor.node_id,
             target,
             holders,
@@ -456,7 +458,7 @@ impl Operation for PolicyWrite {
                 }
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 let document = self.document.take().ok_or(CreatePolicyError::NotFinished)?;
                 Ok(Self::committed(document))
             }
@@ -470,16 +472,17 @@ mod tests {
     use crate::placement::policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementSelector;
     use aruna_core::structs::placement::policy::document::verify_policy_authority;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 

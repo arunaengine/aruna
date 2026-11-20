@@ -2,10 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::AttemptControl;
-use aruna_core::structs::execution::job::JobError;
-use aruna_core::structs::execution::job::JobProgress;
-use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, JobError, JobProgress, JobResultPayload,
+};
 use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
 use aruna_core::types::TxnId;
@@ -21,30 +20,29 @@ use std::ops::Range;
 use ulid::Ulid;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, JobId, JobRecord};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ArtifactRef, ImportRoCrateSpec};
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;
-pub use aruna_operations::jobs::drain::JobClassBudget;
+use aruna_operations::jobs::drain::JobClassBudget;
 use aruna_operations::jobs::drain::{DrainError, DrainJobsOperation, JobDrainResult};
-use aruna_operations::jobs::job_artifacts::{ArtifactRangeOperation, ArtifactRead};
-pub use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
-use aruna_operations::jobs::job_cancel::{CancelOwnedOperation, RoutedCancelOperation};
-use aruna_operations::jobs::job_reads::OwnedJobOperation;
-pub use aruna_operations::jobs::job_reports::JobReportLookup;
-use aruna_operations::jobs::job_reports::{ReportQuery, ReportRouteOperation};
-use aruna_operations::jobs::job_routes::{RecordRouteOperation, StatusRouteOperation};
+use aruna_operations::jobs::job::artifacts::{ArtifactRangeOperation, ArtifactRead};
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::job::cancel::{CancelOwnedOperation, RoutedCancelOperation};
+use aruna_operations::jobs::job::reads::OwnedJobOperation;
+use aruna_operations::jobs::job::reports::JobReportLookup;
+use aruna_operations::jobs::job::reports::{ReportQuery, ReportRouteOperation};
+use aruna_operations::jobs::job::routes::{RecordRouteOperation, StatusRouteOperation};
 use aruna_operations::jobs::prune::{JobPruneOutcome, PruneJobsOperation};
 use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
-pub use aruna_operations::jobs::store::test_calls::{
-    list_job_entries, record_attempt_intent, submit_execution_job,
-};
-use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
-use aruna_operations::jobs::submit_local::SubmitLocalOperation;
+use aruna_operations::jobs::submit::local::SubmitLocalOperation;
 
 pub async fn read_owned_job(
     context: &DriverContext,
@@ -243,7 +241,7 @@ pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(
 pub async fn put_crate_status(
     context: &DriverContext,
     job_id: JobId,
-    status: &aruna_core::structs::execution::job::RunCrateStatus,
+    status: &aruna_core::structs::execution::job::local::RunCrateStatus,
 ) -> Result<(), String> {
     drive(row_calls::put_crate_status(job_id, status), context)
         .await
@@ -266,7 +264,7 @@ pub async fn put_purge_checkpoint(
 pub async fn read_crate_status(
     context: &DriverContext,
     job_id: JobId,
-) -> Result<Option<aruna_core::structs::execution::job::RunCrateStatus>, String> {
+) -> Result<Option<aruna_core::structs::execution::job::local::RunCrateStatus>, String> {
     drive(row_calls::read_crate_status(job_id), context)
         .await
         .map_err(|error| error.to_string())
@@ -285,7 +283,7 @@ pub async fn read_job_record(
 pub async fn read_run_link(
     context: &DriverContext,
     job_id: JobId,
-) -> Result<Option<aruna_core::structs::execution::job::RunLink>, String> {
+) -> Result<Option<aruna_core::structs::execution::job::local::RunLink>, String> {
     drive(row_calls::read_run_link(job_id), context)
         .await
         .map_err(|error| error.to_string())

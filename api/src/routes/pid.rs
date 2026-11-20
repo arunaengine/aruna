@@ -17,24 +17,27 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
-use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::IdentifierMatch;
+use aruna_core::metadata::protocol::{
+    PersistentIdOutcome, PersistentIdRequest, PersistentIdResolution,
+};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::{
+    PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
+    PersistentIdStatus,
+};
 use aruna_core::structs::secondary_id::{
     IdentifierOrigin, SecondaryIdKind, normalize_endpoint, normalize_value,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
-use aruna_core::structs::{
-    PersistentIdFailure, PersistentIdKind, PersistentIdMapping, PersistentIdProvider,
-    PersistentIdStatus,
-};
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::metadata::PersistentIdResolution;
+use aruna_operations::holder_choice::{HolderCandidate, PickHolderOperation};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::identifier_fanout::lookup_identifier_distributed;
 use aruna_operations::metadata::identifier_lookup::IdentifierQuery;
@@ -42,8 +45,6 @@ use aruna_operations::metadata::persistent_id::forward::{
     PidRouteOperation, outcome_mapping, outcome_resolution, outcome_status,
 };
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
-use aruna_operations::metadata::secondary_ids::IdentifierMatch;
-use aruna_operations::metadata::{PersistentIdOutcome, PersistentIdRequest};
 
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};
@@ -915,10 +916,10 @@ async fn choose_holder(
     let record = drive(DocumentRecordOperation::new(document_id), context)
         .await
         .ok()??;
-    let choice = HolderChoiceOperation::new(&record.holder_node_ids, now_ms);
-    let candidates = drive(choice, context).await.unwrap_or_default();
-    pick(candidates, Ulid::generate().random())
-        .filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
+    let choice = PickHolderOperation::new(&record.holder_node_ids, now_ms);
+    // Unlike DRS, a PID never serves from a holder without a published API.
+    let chosen = drive(choice, context).await.ok().flatten();
+    chosen.filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
 }
 
 #[cfg(test)]
@@ -994,14 +995,14 @@ mod tests {
         let mapping = PersistentIdMapping::requested(
             id,
             false,
-            aruna_core::UserId::local(
+            aruna_core::user::id::UserId::local(
                 Ulid::from_bytes([4; 16]),
                 aruna_core::structs::identity::realm::RealmId([5; 32]),
             ),
-            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
+            aruna_core::structs::execution::job::identity::JobId::from_bytes([6; 16]),
             false,
             "/private/document".to_string(),
-            aruna_core::structs::PersistentIdRevision {
+            aruna_core::structs::persistent_id::PersistentIdRevision {
                 event_id: Ulid::from_bytes([7; 16]),
                 actor: iroh::SecretKey::from_bytes(&[8; 32]).public(),
                 occurred_at_ms: 9,
@@ -1067,7 +1068,7 @@ mod tests {
         use aruna_core::storage_entries::metadata_document_key;
         use aruna_core::structs::identity::auth::NodeCapabilities;
         use aruna_core::structs::identity::realm::RealmId;
-        use aruna_core::structs::persistent_id_key;
+        use aruna_core::structs::persistent_id::persistent_id_key;
         use aruna_core::structs::placement::record::PlacementRef;
         use aruna_drivers::testing::test_context;
 
@@ -1078,7 +1079,7 @@ mod tests {
                 .to_bytes(),
         );
         let node_id = iroh::SecretKey::from_bytes(&[8; 32]).public();
-        let user_id = aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -1090,7 +1091,7 @@ mod tests {
         let document_id = Ulid::from_bytes([10; 16]);
         let group_id = Ulid::from_bytes([11; 16]);
         seed_group_docs(&context, realm_id, &actor, group_id, "public", user_id).await;
-        let revision = aruna_core::structs::PersistentIdRevision {
+        let revision = aruna_core::structs::persistent_id::PersistentIdRevision {
             event_id: Ulid::from_bytes([7; 16]),
             actor: node_id,
             occurred_at_ms: 9,
@@ -1100,7 +1101,7 @@ mod tests {
             document_id,
             false,
             user_id,
-            aruna_core::structs::execution::job::JobId::from_bytes([6; 16]),
+            aruna_core::structs::execution::job::identity::JobId::from_bytes([6; 16]),
             frozen,
             path.clone(),
             revision,

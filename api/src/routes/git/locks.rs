@@ -139,7 +139,7 @@ pub async fn verify(
 ) -> ServerResult<Response> {
     let id = repository_id(&repository)?;
     drive(
-        git::repository(
+        git::access::repository(
             state.get_ctx().node_id(),
             &auth,
             id,

@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
@@ -304,7 +304,7 @@ impl Operation for ReserveSecretOperation {
             }
             Stage::Count { .. } => self.handle_page(result),
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 self.record
                     .take()
                     .map(Next::Done)
@@ -318,13 +318,13 @@ impl Operation for ReserveSecretOperation {
 mod tests {
     use super::{ReserveSecretError, ReserveSecretInput, ReserveSecretOperation};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
@@ -343,7 +343,8 @@ mod tests {
 
     fn open_context(tempdir: &tempfile::TempDir) -> DriverContext {
         DriverContext {
-            storage_handle: storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap(),
+            storage_handle: storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap())
+                .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -457,7 +458,8 @@ mod tests {
     #[tokio::test]
     async fn reserves_same_node() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -532,7 +534,8 @@ mod tests {
     #[tokio::test]
     async fn expired_reservation_reclaimed() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

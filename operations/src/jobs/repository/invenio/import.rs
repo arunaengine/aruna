@@ -12,7 +12,7 @@ use aruna_core::repository::invenio::{
 use aruna_core::repository::remote::{ArchiveSpool, NodeScope, RemoteAnswer, RemoteCall};
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryPull};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
+use aruna_core::structs::execution::job::input::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
 use serde_json::{Value, json};

@@ -7,13 +7,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::job_calls::insert_job;
-use crate::job_calls::record_attempt_intent;
 use crate::job_calls::reserve_output_commits;
 use aruna::tasks::runner::under_lease;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
-use aruna_compute::{ExecutorBackend, ExecutorRegistry};
-use aruna_core::UserId;
+use aruna_compute::executor::ExecutorBackend;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
     LogTails, NOBODY, OutputChunks, ReconcileEvidence, TaskInput, TaskOutput, TaskSpec, UserSpec,
@@ -26,10 +25,13 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, CapturedInput, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobClaim, JobError, JobId, JobPayload, JobRecord, JobState, OutputDestination,
-    OutputObject, OutputSelection, WorkspaceMode,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputMode, InputSelection, InputSource, JobPayload,
+    OutputDestination, OutputSelection,
+};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobClaim, JobError, JobRecord, OutputObject, WorkspaceMode,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -38,12 +40,15 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+use aruna_core::structs::storage::listing::ListVersionsItem;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskKey;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::NetHandle;
+use aruna_net::config::NetConfig;
 use aruna_operations::jobs::workflow::credential::RunIdentity;
 use aruna_operations::jobs::workflow::inputs::LoadInputsOperation;
 use aruna_operations::jobs::workflow::outputs::{CaptureOutputsOperation, CaptureScope};
@@ -53,12 +58,11 @@ use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation, H
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::s3::object::versions::{
-    ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-};
+use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::testing::fresh_job_id;
 use aruna_storage::storage;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
+use aruna_test_support::jobs::record_attempt_intent;
 use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -90,7 +94,7 @@ async fn setup() -> Harness {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let config = NetConfig {
         realm_id,
@@ -250,7 +254,7 @@ async fn capture_inputs(harness: &Harness, spec: &ExecutionSpec) -> Vec<Captured
                 .resolved_version_id
                 .or(head.version_id)
                 .expect("input has a version"),
-            content: aruna_core::structs::execution::job::InputContent::Blake3(
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3(
                 <[u8; 32]>::try_from(
                     location
                         .hashes
@@ -789,7 +793,7 @@ async fn run_capture(
     mode: InputMode,
     key: &str,
     workspace: Option<&str>,
-) -> Vec<aruna_core::structs::execution::job::OutputObject> {
+) -> Vec<aruna_core::structs::execution::job::local::OutputObject> {
     let pinned = put_version(harness, b"input-bytes", None).await;
     let mut spec = pinned_spec(harness, pinned.version_id, mode);
     spec.file_outputs.push(OutputSelection {

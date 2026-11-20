@@ -13,17 +13,18 @@ use aruna_core::outbound::{ConnectionAnswer, ConnectionCall, ConnectionError};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_core::secrets::ResponseExposure;
-use aruna_outbound::{ConnectionSender, OutboundHandle};
+use aruna_outbound::OutboundHandle;
+use aruna_outbound::connection::ConnectionSender;
 use async_trait::async_trait;
 use ulid::Ulid;
 
 use crate::plugin_host::worker::tests::worker_on;
 use aruna_drivers::driver::DriverContext;
 use aruna_operations::plugins::runs::{admit, read_run};
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::leaks;
-use aruna_operations::plugins::test_support::queued;
-use aruna_operations::plugins::test_support::{connected, install_artifact};
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::{connected, install_artifact};
+use aruna_test_support::plugins::leaks;
+use aruna_test_support::plugins::queued;
 
 /// Answers every request with `answer` and records what it was asked.
 pub(crate) struct Fake {
@@ -124,7 +125,7 @@ async fn sends_below_connection() {
 
 #[tokio::test]
 async fn sends_to_admitted() {
-    use aruna_operations::plugins::test_support::edit_config;
+    use aruna_test_support::plugins::edit_config;
     let fixture = Fixture::new().await;
     let install = install_artifact(&fixture, connected()).await;
     // The address setting changes after the run was admitted with the old one.
@@ -251,8 +252,8 @@ async fn undeclared_method() {
 /// The secured fixture installed with its slot bound to the group secret `api-key`, whose
 /// one rule lets this install inject it toward the fixture's address.
 async fn secured_install(fixture: &Fixture) -> PluginInstall {
-    use aruna_operations::plugins::test_support::{edit_config, secret_with};
-    use aruna_operations::plugins::test_support::{publish_artifact, secured};
+    use aruna_test_support::plugins::artifacts::{publish_artifact, secured};
+    use aruna_test_support::plugins::{edit_config, secret_with};
     install_artifact(fixture, connected()).await;
     let digest = publish_artifact(fixture, &secured()).await;
     let binding = aruna_core::plugin_installs::SecretBinding::parse("group:api-key").unwrap();
@@ -262,8 +263,7 @@ async fn secured_install(fixture: &Fixture) -> PluginInstall {
         install.secrets = [("api".to_string(), binding)].into();
     })
     .await;
-    let config =
-        aruna_operations::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugin_host::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config.await.unwrap().installs.remove(0);
     secret_with(fixture, &install, ResponseExposure::Full).await;
     install
@@ -272,7 +272,7 @@ async fn secured_install(fixture: &Fixture) -> PluginInstall {
 /// Every stored byte of the run's record and intents, to look for a canary.
 async fn stored(fixture: &Fixture) -> Vec<u8> {
     use aruna_core::keyspaces::{PLUGIN_INTENTS_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
-    let txn = aruna_operations::plugins::store::Txn::direct(&fixture.ctx);
+    let txn = aruna_test_support::plugins::rows::Txn::direct(&fixture.ctx);
     let mut bytes = Vec::new();
     for space in [PLUGIN_RUNS_KEYSPACE, PLUGIN_INTENTS_KEYSPACE] {
         for (_, value) in txn.scan(space, &[]).await.unwrap() {
@@ -284,7 +284,7 @@ async fn stored(fixture: &Fixture) -> Vec<u8> {
 
 #[tokio::test]
 async fn injects_without_showing() {
-    use aruna_operations::plugins::test_support::{TOKEN, hold_keys};
+    use aruna_test_support::plugins::{TOKEN, hold_keys};
     let fixture = Fixture::keyed().await;
     let install = secured_install(&fixture).await;
     // The destination echoes the token back in a field the code may read.
@@ -339,9 +339,7 @@ async fn probe_with(
 
 #[tokio::test]
 async fn narrowed_rules_refuse() {
-    use aruna_operations::plugins::rules::{RuleGuard, consumer};
-    use aruna_operations::plugins::test_support::edit_rules;
-    use aruna_operations::plugins::test_support::hold_keys;
+    use aruna_test_support::plugins::{hold_keys, replace_rules};
     let fixture = Fixture::keyed().await;
     let install = secured_install(&fixture).await;
     let sender = fake(200, r#"{"id":7,"meta":{"name":"n"}}"#);
@@ -354,19 +352,9 @@ async fn narrowed_rules_refuse() {
     assert_eq!(run.state, RunState::Succeeded, "{:?}", run.message);
     // An admin narrows the rule by hand: a retry refuses the settled call instead of filtering
     // its stored reply, and never sends it again.
-    let name = aruna_core::secrets::SecretName::try_from("api-key".to_string()).unwrap();
-    let guard = RuleGuard::Revision {
-        install_id: install.install_id,
-        revision: install.revision,
-    };
-    let mut rule =
-        aruna_operations::plugins::test_support::rule_for(&install, ResponseExposure::Status);
+    let mut rule = aruna_test_support::plugins::rule_for(&install, ResponseExposure::Status);
     rule.paths = vec!["/v1".to_string()];
-    let target = (install.group_id, &name);
-    let rules = (&consumer(&install), vec![rule]);
-    edit_rules(&fixture.ctx, &fixture.actor, target, rules, guard)
-        .await
-        .unwrap();
+    replace_rules(&fixture, &install, vec![rule]).await;
     (run.state, run.output, run.finished_ms) = (RunState::Queued, None, None);
     drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     worker.claim(unix_timestamp_millis()).await.unwrap();
@@ -384,9 +372,9 @@ async fn narrowed_rules_refuse() {
 async fn whole_answers_gated() {
     use crate::plugin_host::broker::RunBroker;
     use aruna_operations::plugins::check::RunScope;
-    use aruna_operations::plugins::test_support::{bound, edit_config, hold_keys, secret_with};
     use aruna_plugin_types::calls::{ErrorKind, Method};
     use aruna_plugins::broker::{Broker, CallContext, SendRequest};
+    use aruna_test_support::plugins::{bound, edit_config, hold_keys, replace_rules, secret_with};
     let fixture = Fixture::keyed().await;
     // A connection that reads whole answers with the bearer slot `api_key`.
     let install = bound(&fixture).await;
@@ -399,8 +387,7 @@ async fn whole_answers_gated() {
         (config.installs[0].digest, config.installs[0].version) = (digest, "0.3.0".to_string());
     })
     .await;
-    let config =
-        aruna_operations::plugins::calls::read_config(&fixture.ctx, fixture.actor.realm_id);
+    let config = crate::plugin_host::read_config(&fixture.ctx, fixture.actor.realm_id);
     let install = config
         .await
         .unwrap()
@@ -440,26 +427,14 @@ async fn whole_answers_gated() {
             broker.connection_send(&cx, request).await
         }
     };
-    use aruna_operations::plugins::rules::{RuleGuard, consumer};
-    use aruna_operations::plugins::test_support::edit_rules;
-    let name = aruna_core::secrets::SecretName::try_from("api-key".to_string()).unwrap();
-    let guard = RuleGuard::Revision {
-        install_id: install.install_id,
-        revision: install.revision,
-    };
     let set_rule = |response| {
-        let mut rule = aruna_operations::plugins::test_support::rule_for(&install, response);
+        let mut rule = aruna_test_support::plugins::rule_for(&install, response);
         (rule.origins, rule.paths) = (
             vec!["https://catalog.example.org".into()],
             vec!["/api".into()],
         );
-        let (ctx, actor, install, name) = (&fixture.ctx, &fixture.actor, &install, &name);
-        async move {
-            let target = (install.group_id, name);
-            edit_rules(ctx, actor, target, (&consumer(install), vec![rule]), guard)
-                .await
-                .unwrap();
-        }
+        let (fixture, install) = (&fixture, &install);
+        async move { replace_rules(fixture, install, vec![rule]).await }
     };
     set_rule(ResponseExposure::Status).await;
     let narrower = send().await.unwrap_err();
@@ -482,7 +457,7 @@ async fn whole_answers_gated() {
 async fn canaries_stay_hidden() {
     use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
     use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
-    use aruna_operations::plugins::test_support::{TOKEN, hold_keys};
+    use aruna_test_support::plugins::{TOKEN, hold_keys};
     let fixture = Fixture::keyed().await;
     let install = secured_install(&fixture).await;
     // The destination echoes the token in a readable field and in a header.
@@ -506,7 +481,7 @@ async fn canaries_stay_hidden() {
     // does find what is stored, such as the plugin's name.
     assert_eq!(leaks(&fixture, TOKEN).await, Vec::<&str>::new());
     assert!(!leaks(&fixture, &install.plugin).await.is_empty());
-    let txn = aruna_operations::plugins::store::Txn::direct(&fixture.ctx);
+    let txn = aruna_test_support::plugins::rows::Txn::direct(&fixture.ctx);
     let audit = txn.scan(ADMIN_AUDIT_KEYSPACE, &[]).await.unwrap();
     let uses = (audit.iter())
         .filter_map(|(_, value)| AdminAuditRecord::from_bytes(value).ok())

@@ -3,15 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::shared::oidc::spawn_oidc_provider;
-use aruna::inbound::initialize_incoming_fixture;
-use aruna::tasks::incoming::start_task_queues;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::auth::{OidcValidator, handle_token};
 use aruna_api::auth::{RealmAuth, TokenAuth};
 use aruna_api::routes::access::sessions::{CreateSessionRequest, CreateSessionResponse};
 use aruna_api::server::Server;
 use aruna_api::server::ServerConfig;
 use aruna_api::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::auth::ADMIN_CLAIMED_KEY;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -27,8 +26,10 @@ use aruna_core::structs::identity::auth::{
 };
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::node::api_state::LoadStateOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
@@ -40,7 +41,7 @@ use aruna_operations::realm::announce_presence::{
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use axum::http::StatusCode;
@@ -84,6 +85,8 @@ struct TestNode {
     realm_admin_id: UserId,
     net: NetHandle,
     server_task: JoinHandle<()>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 fn sign_oidc_token(
@@ -217,7 +220,7 @@ async fn spawn_node(
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(driver_ctx.clone());
+    let incoming = initialize_incoming_fixture(driver_ctx.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         driver_ctx.clone(),
@@ -322,7 +325,7 @@ async fn spawn_node(
         state.clone(),
         ServerConfig {
             http_addr: addr,
-            max_body_size: aruna_api::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors: aruna_api::cors::CorsConfig::default(),
         },
     )
@@ -345,6 +348,7 @@ async fn spawn_node(
         realm_admin_id,
         net: net_handle,
         server_task,
+        _incoming: incoming,
     }
 }
 

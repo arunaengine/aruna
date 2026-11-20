@@ -5,12 +5,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DEAD_LETTER_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE};
 use aruna_core::metadata::IriIndexRecord;
 use aruna_core::operation::Operation;
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::HashIndex;
@@ -20,23 +19,22 @@ use ulid::Ulid;
 
 use super::super::access::{child_results, children};
 use super::super::list::PendingRecordsOperation;
-use super::super::preflight_types::{
-    MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
-    ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
-};
 use super::super::readable::RecordReadableOperation;
 use super::super::title::DocumentTitleOperation;
 use super::super::{MAX_PAGINATION_DEPTH, MetadataApiError, REGISTRY_CANDIDATE_LIMIT};
 use super::{
     MAX_TARGET_VERSIONS, PREFLIGHT_BUDGET, add_location_iris, index_state, visible_prefix,
 };
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
-use crate::metadata::call_results::page_rows;
 use crate::metadata::data_links::LinkBudget;
 use crate::metadata::iri_index::{
     BacklinkError, BacklinkPage, BacklinksOperation, IriFreshness, iri_freshness, status_rows,
 };
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::metadata::api::{
+    MetadataNodeFreshness, MetadataPreflightLocation, MetadataVisibleReference,
+    ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
+};
 
 type Backlinks = (BacklinkPage, LinkBudget);
 type PendingRecords = HashMap<GroupId, Vec<MetadataRegistryRecord>>;
@@ -395,7 +393,7 @@ impl Operation for LocalPreflightOperation {
                 self.classified(walk, page)
             }
             LocalStage::Freshness(returned) => {
-                let values = all_values(result)?;
+                let values = result.values()?;
                 let freshness = iri_freshness(&returned, values).map_err(unavailable)?;
                 self.stage = LocalStage::Pending(freshness);
                 let pending = PendingRecordsOperation::new(None, REGISTRY_CANDIDATE_LIMIT);
@@ -410,12 +408,12 @@ impl Operation for LocalPreflightOperation {
                 Ok(Next::Call(any_row(MATERIALIZATION_JOB_KEYSPACE)))
             }
             LocalStage::Queued(freshness, pending) => {
-                let (queued, _) = page_rows(result).map_err(unavailable)?;
+                let (queued, _) = result.page().map_err(unavailable)?;
                 self.stage = LocalStage::Dead(freshness, pending || !queued.is_empty());
                 Ok(Next::Call(any_row(DEAD_LETTER_KEYSPACE)))
             }
             LocalStage::Dead(freshness, pending) => {
-                let (dead, _) = page_rows(result).map_err(unavailable)?;
+                let (dead, _) = result.page().map_err(unavailable)?;
                 // A queued or failed materialization has no postings yet, so its references
                 // are missing.
                 let freshness = (freshness, pending, !dead.is_empty());

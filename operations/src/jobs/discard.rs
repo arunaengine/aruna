@@ -11,9 +11,10 @@ use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
     WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::node_state::{DISCARD_KEY, LAST_CONTACT_KEY};
+use aruna_core::node::state::{DISCARD_KEY, LAST_CONTACT_KEY};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobError, JobRecord, RETENTION_MS};
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;

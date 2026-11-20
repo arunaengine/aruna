@@ -9,20 +9,20 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{InputResolveRequest, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{CapturedInput, InputSelection, InputSource};
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection, InputSource};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
-use super::admit_here::placement_failure;
+use super::admit::here::placement_failure;
 use super::input_capture::{CaptureCaller, CaptureInputsOperation};
 use super::input_walk::{FollowLinkOperation, InputCaller};
 use super::submission_rules::{fits, peer_refusal, refusal_of, resolver_admits};
 use super::submit_external::IngressNode;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::forward::write_peer::WritePeerOperation;
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::submit::SubmitJobError;
-use crate::metadata::write_peer::WritePeerOperation;
+use aruna_core::job_request::SubmitJobError;
 
 #[derive(Debug, PartialEq)]
 enum ServeStep {
@@ -198,7 +198,8 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, user, user_auth};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, SubmissionId};
+    use aruna_core::structs::execution::job::family::SubmissionId;
+    use aruna_core::structs::execution::job::input::InputMode;
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 
     fn input(key: &str, holder: Option<NodeId>) -> InputSelection {

@@ -5,12 +5,12 @@
 use super::{JobTargetResponse, NodeJobsResponse, visible_jobs};
 use crate::server::state::ServerState;
 use crate::tests::routes::{seed_group_docs, test_storage};
-use aruna_core::UserId;
 use aruna_core::jobs::{JobKind, JobTarget, RunningJobView};
 use aruna_core::keys::generate_signing_key;
-use aruna_core::structs::execution::job::JobProgress;
+use aruna_core::structs::execution::job::local::JobProgress;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_drivers::testing::test_context;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};

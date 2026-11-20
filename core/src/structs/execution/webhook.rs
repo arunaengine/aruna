@@ -8,10 +8,10 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::register::RegisterStamp;
 use crate::structs::execution::notification::{NotificationKind, NotificationRecord};
+use crate::user::id::UserId;
 
 /// The one event a webhook delivers: an upload through one of the subscriber's share links.
 pub const WEBHOOK_EVENT: &str = "share.upload";

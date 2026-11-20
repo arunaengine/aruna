@@ -5,8 +5,6 @@
 
 use std::sync::Arc;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxRecord, ShardManifest, shard_topic_id};
@@ -14,6 +12,7 @@ use aruna_core::document_apply::ApplyError;
 use aruna_core::effects::ShardNetEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::ShardNetEvent;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
@@ -21,7 +20,7 @@ use aruna_core::placement::fence::{fence_read, stored_generation};
 use aruna_core::placement::transition::{
     TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
 };
-use aruna_core::rows::{PrefixPages, done, read_row, value};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -29,6 +28,7 @@ use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits, TransitionStatus,
 };
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -41,7 +41,7 @@ use crate::shard::pull::PullTopicsOperation;
 use crate::shard::verify::ConvergeOperation;
 use crate::shard::{AssembleManifestOperation, ManifestError, shard_answer, shard_call};
 use crate::sync::document_outbox::OutboxTimerOperation;
-use crate::sync::outbox_record::outbox_stream_prefixes;
+use crate::sync::outbox::record::outbox_stream_prefixes;
 
 /// Fence close attempts before a persistent transaction conflict is reported.
 const CLOSE_ATTEMPTS: usize = 4;
@@ -1181,10 +1181,10 @@ impl Operation for FenceAttemptOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
-        let current = stored_generation(value(result)?.as_ref());
+        let current = stored_generation(result.value()?.as_ref());
         if current.is_some_and(|current| current >= self.generation) {
             return Ok(Next::Done(()));
         }
@@ -1258,7 +1258,8 @@ mod tests {
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::placement::fence;
-    use aruna_core::reducer::{AdminDocumentState, overlay_placement};
+    use aruna_core::reducer::AdminDocumentState;
+    use aruna_core::reducer::placement::overlay_placement;
     use std::path::Path;
 
     use aruna_core::document::DocumentTarget;
@@ -1267,7 +1268,8 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::placement::record::PlacementStrategy;
     use aruna_core::structs::placement::transition::BucketCompletion;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -1290,7 +1292,7 @@ mod tests {
 
     fn context(root: &str) -> Arc<DriverContext> {
         Arc::new(DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(root).unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -1303,8 +1305,10 @@ mod tests {
     /// A drain consults the eviction journal through the net handle, so a
     /// context without one never exercises that gate.
     async fn net_context(root: &Path) -> (Arc<DriverContext>, NetHandle) {
-        let storage_handle =
-            aruna_storage::FjallStorage::open(root.join("storage").to_str().unwrap()).unwrap();
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(
+            root.join("storage").to_str().unwrap(),
+        )
+        .unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1420,7 +1424,6 @@ mod tests {
         drive(GetConfigOperation::new(realm_id), context)
             .await
             .inspect_err(config_unavailable)
-            .ok()
             .expect("the realm config is stored")
     }
 
@@ -1700,7 +1703,7 @@ mod tests {
             kind: aruna_core::document::DocumentChangeKind::Delete,
             placement,
         };
-        let record = crate::sync::outbox_record::new_identified_record(
+        let record = crate::sync::outbox::record::new_identified_record(
             Ulid::from_bytes([seed; 16]),
             node(1),
             DocumentTarget::MetadataDocumentLifecycle {
@@ -1713,7 +1716,7 @@ mod tests {
         )
         .fenced_at(generation);
         let (key_space, key, value) =
-            crate::sync::outbox_record::outbox_write_entry(&record).expect("the row encodes");
+            crate::sync::outbox::record::outbox_write_entry(&record).expect("the row encodes");
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
@@ -1931,7 +1934,8 @@ mod tests {
         // after the departing holder closed that generation.
         let directory = tempdir().unwrap();
         let storage =
-            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap();
         let realm_id = RealmId::from_bytes([9; 32]);
         let placement = fenced_bucket();
 
@@ -1990,7 +1994,8 @@ mod tests {
     async fn close_is_monotone() {
         let directory = tempdir().unwrap();
         let storage =
-            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap();
         let realm_id = RealmId::from_bytes([10; 32]);
         let placement = fenced_bucket();
         let stored = || async {
@@ -2063,7 +2068,8 @@ mod tests {
         // success without rewriting it would brick the bucket for good.
         let directory = tempdir().unwrap();
         let storage =
-            aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
+                .unwrap();
         let realm_id = RealmId::from_bytes([12; 32]);
         let placement = fenced_bucket();
         let (key_space, key) = fence_read(&realm_id, &placement);

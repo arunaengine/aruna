@@ -14,7 +14,8 @@ use aruna_core::compute::{AttemptStatus, BackendError};
 use aruna_core::events::Event;
 use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobId, JobRecord};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::JobRecord;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -26,10 +27,10 @@ use super::session::{
     SessionInputs, SessionPlan, SessionPlanOperation, SessionReportOperation, session_call,
 };
 use crate::jobs::fence::{fence_read, fence_up};
-use crate::jobs::lifecycle::ids::session_of;
 use crate::jobs::store::job_calls::record_attempt_started;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
+use aruna_core::job_request::session_of;
 
 #[derive(Debug, PartialEq)]
 enum SuperviseStep {

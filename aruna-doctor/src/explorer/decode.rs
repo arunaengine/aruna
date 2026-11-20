@@ -19,11 +19,11 @@ use aruna_core::keyspaces::{
     UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::execution::job::record_keys::alias_family;
 use aruna_core::structs::execution::job::record_rows::{
     ConflictRecord, OutboxEntry, PendingNeed, PendingRecord, ProjectionCache,
 };
-use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{
@@ -44,8 +44,8 @@ use aruna_core::structs::storage::multipart::{
     MultipartPartKey, MultipartUpload,
 };
 use aruna_net::dht::storage::StoredEntry;
-use aruna_operations::jobs::lifecycle::witness_arm::{WitnessDeadline, WitnessExplain};
-use aruna_operations::placement::policy::PolicyCacheEntry;
+use aruna_operations::jobs::lifecycle::witness::arm::{WitnessDeadline, WitnessExplain};
+use aruna_operations::placement::policy::cache::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -523,7 +523,7 @@ fn decode_explain_key(key: &[u8]) -> DecodedField {
 
 fn family_from_key(key: &[u8]) -> Option<JobFamilyId> {
     Some(JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId(
+        submission_id: aruna_core::structs::execution::job::family::SubmissionId(
             key.get(..32)?.try_into().ok()?,
         ),
         request_digest: key.get(32..64)?.try_into().ok()?,
@@ -975,12 +975,11 @@ mod tests {
         UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION;
+    use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::execution::job::record_rows::{
-        ConflictRecord, PendingNeed, PendingRecord,
+        ConflictRecord, OutboxEntry, PROJECTION_CACHE_VERSION, PendingNeed, PendingRecord,
+        ProjectionCache,
     };
-    use aruna_core::structs::execution::job::record_rows::{OutboxEntry, ProjectionCache};
-    use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::node_state::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1007,8 +1006,8 @@ mod tests {
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_net::dht::storage::StoredEntry;
-    use aruna_operations::jobs::lifecycle::witness_arm::{WitnessDeadline, WitnessExplain};
-    use aruna_operations::placement::policy::PolicyCacheEntry;
+    use aruna_operations::jobs::lifecycle::witness::arm::{WitnessDeadline, WitnessExplain};
+    use aruna_operations::placement::policy::cache::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -1025,7 +1024,7 @@ mod tests {
         let info = BucketInfo {
             group_id: Ulid::from_bytes([7_u8; 16]),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::local(Ulid::from_bytes([8_u8; 16]), realm_id),
+            created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([8_u8; 16]), realm_id),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1053,12 +1052,12 @@ mod tests {
 
     fn test_family() -> JobFamilyId {
         JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([9u8; 32]),
+            submission_id: aruna_core::structs::execution::job::family::SubmissionId([9u8; 32]),
             request_digest: [8u8; 32],
         }
     }
 
-    fn test_node() -> aruna_core::NodeId {
+    fn test_node() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[6u8; 32]).public()
     }
 
@@ -1066,10 +1065,10 @@ mod tests {
         let family = test_family();
         JobRecordEnvelope::sign(
             RealmId::from_bytes([2u8; 32]),
-            aruna_core::structs::execution::job::JobFamilyRecord::Claim(
-                aruna_core::structs::execution::job::SubmissionClaim {
+            aruna_core::structs::execution::job::family::JobFamilyRecord::Claim(
+                aruna_core::structs::execution::job::family::SubmissionClaim {
                     submission_id: family.submission_id,
-                    job_id: aruna_core::structs::execution::job::JobId::from_bytes(
+                    job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
                         Ulid::from_bytes([5u8; 16]).to_bytes(),
                     ),
                     request_digest: family.request_digest,
@@ -1104,7 +1103,9 @@ mod tests {
 
         let pending = PendingRecord {
             envelope: envelope.clone(),
-            need: PendingNeed::Evidence(aruna_core::structs::execution::job::JobRecordKind::Spec),
+            need: PendingNeed::Evidence(
+                aruna_core::structs::execution::job::family::JobRecordKind::Spec,
+            ),
             first_seen_ms: 12,
             attempts: 2,
         };
@@ -1188,11 +1189,13 @@ mod tests {
         let execution_id = Ulid::from_bytes([1u8; 16]);
         let reservation = JobReservationRecord {
             execution_id,
-            job_id: aruna_core::structs::execution::job::JobId::from_bytes(
+            job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
                 Ulid::from_bytes([5u8; 16]).to_bytes(),
             ),
-            logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([5u8; 16]),
-            resources: aruna_core::structs::execution::job::EffectiveResources {
+            logical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes(
+                [5u8; 16],
+            ),
+            resources: aruna_core::structs::execution::job::family::EffectiveResources {
                 cpu_cores: 2,
                 ram_bytes: 1024,
                 disk_bytes: 2048,
@@ -1333,7 +1336,10 @@ mod tests {
             },
             publication: PolicyPublication {
                 publisher: secret.public(),
-                created_by: aruna_core::UserId::local(Ulid::from_bytes([15_u8; 16]), realm_id),
+                created_by: aruna_core::user::id::UserId::local(
+                    Ulid::from_bytes([15_u8; 16]),
+                    realm_id,
+                ),
                 created_at_ms: 42,
                 event_id: Ulid::from_bytes([12_u8; 16]),
                 config_digest: [13_u8; 32],
@@ -1412,7 +1418,7 @@ mod tests {
                 bucket_identity: (
                     Ulid::from_bytes([20_u8; 16]),
                     std::time::SystemTime::UNIX_EPOCH,
-                    aruna_core::UserId::local(Ulid::from_bytes([22_u8; 16]), realm_id),
+                    aruna_core::user::id::UserId::local(Ulid::from_bytes([22_u8; 16]), realm_id),
                 ),
                 target_refs: Vec::new(),
                 mode: PolicyRefMode::Union,
@@ -1450,7 +1456,7 @@ mod tests {
             bucket_identity: (
                 Ulid::from_bytes([24_u8; 16]),
                 std::time::SystemTime::UNIX_EPOCH,
-                aruna_core::UserId::local(Ulid::from_bytes([25_u8; 16]), realm_id),
+                aruna_core::user::id::UserId::local(Ulid::from_bytes([25_u8; 16]), realm_id),
             ),
             generation: 3,
             target_refs: Vec::new(),
@@ -1525,7 +1531,7 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([4_u8; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4_u8; 16]), realm_id),
             realm_id,
         };
         let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -1589,7 +1595,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: Some("ticket".to_string()),
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::UserId::nil(realm_id),
+                owner: aruna_core::user::id::UserId::nil(realm_id),
             },
         };
         let value = postcard::to_allocvec(&state).unwrap();
@@ -1621,6 +1627,7 @@ mod tests {
             placement_ref,
             authoritative_node_id,
             vec![selected_peer],
+            1,
         );
         let value = postcard::to_allocvec(&placement).unwrap();
         let key = aruna_operations::sync::shard_placement::placement_key(realm_id, &placement_ref);
@@ -1690,7 +1697,8 @@ mod tests {
     #[test]
     fn decodes_upload_entry() {
         let realm_id = RealmId::from_bytes([3_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id);
+        let created_by =
+            aruna_core::user::id::UserId::local(Ulid::from_bytes([10_u8; 16]), realm_id);
         let upload = MultipartUpload {
             backend: BackendRef::node_default(),
             storage_class: None,
@@ -1730,7 +1738,8 @@ mod tests {
     #[test]
     fn decodes_upload_part() {
         let realm_id = RealmId::from_bytes([9_u8; 32]);
-        let created_by = aruna_core::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
+        let created_by =
+            aruna_core::user::id::UserId::local(Ulid::from_bytes([11_u8; 16]), realm_id);
         let key = MultipartPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
         let part = MultipartPart {
             part_number: 5,
@@ -2025,7 +2034,8 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let group_id = Ulid::from_bytes([2_u8; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
-        let created_by = aruna_core::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
+        let created_by =
+            aruna_core::user::id::UserId::local(Ulid::from_bytes([6_u8; 16]), realm_id);
         let head_key = BlobHeadKey::new("bucket", "path/file.txt");
         let head_value =
             aruna_core::structs::storage::blob::CurrentVersionPointer::new_with_generation(

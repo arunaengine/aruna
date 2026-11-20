@@ -4,26 +4,25 @@
 
 use super::LocationSummaryError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::realm::peer_trust::ensure_realm_peer;
-use crate::replication::protocol::{
-    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
-    VersionReplicationMessage,
-};
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::managed_copy::{CopyRequest, read_effect, registration_for, serve_reads};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
+use aruna_core::replication_protocol::{
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
+    VersionReplicationMessage,
+};
+use aruna_core::request_policy::{
+    CompiledPolicySet, PolicyDecision, PolicyRequestExtras, policy_request_with,
+};
 use aruna_core::rows::read_row;
-use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -35,7 +34,9 @@ use aruna_core::structs::storage::blob::{
     object_permission_path,
 };
 use aruna_core::structs::storage::group_backend::GroupStorage;
+use aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -644,15 +645,14 @@ impl Operation for LocationSummaryOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::{LocalSummary, LocationSummaryError, LocationSummaryOperation, SummaryState, Turn};
-    use crate::replication::protocol::{
-        CopyCompliance, LocationCopyStorage, VersionReplicationMessage,
-    };
     use crate::tests::locations::{node_id, realm_id, request};
-    use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect};
     use aruna_core::events::{BlobEvent, Event};
     use aruna_core::operation::{Operation, TransactionMode};
+    use aruna_core::replication_protocol::{
+        CopyCompliance, LocationCopyStorage, VersionReplicationMessage,
+    };
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::{Permission, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -667,6 +667,7 @@ mod pure_tests {
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use std::collections::{HashMap, HashSet};
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -870,7 +871,7 @@ mod pure_tests {
         let version_id = Ulid::from_bytes([3u8; 16]);
         let mut version = materialized();
         version.metadata.insert(
-            aruna_core::structs::ORIGIN_DEVICE_TAG.to_string(),
+            aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG.to_string(),
             "device-ada".to_string(),
         );
         let mut operation = authorized(Some(version_id));
@@ -1236,7 +1237,7 @@ mod pure_tests {
         assert!(operation.abort().is_empty());
     }
 
-    fn peer_realm(peer: aruna_core::NodeId) -> Vec<u8> {
+    fn peer_realm(peer: aruna_core::id::NodeId) -> Vec<u8> {
         let mut realm = RealmConfigDocument::default_for_realm(realm_id(), Vec::new());
         realm.ensure_node(peer, RealmNodeKind::Server);
         postcard::to_allocvec(&realm).unwrap()

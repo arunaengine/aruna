@@ -30,8 +30,19 @@ def write_tree(root, files):
             handle.write(text)
 
 
+# The dispatch shells the trigger guard expects, each with one arm that only drives.
+TRIGGER_SITES = {
+    **{
+        rel: f"fn serve(on: Kind) {{\n    match on {{\n        {prefix}One => {{}}\n    }}\n}}\n"
+        for rel, prefix in check_layers.TRIGGER_MATCHES
+    },
+    "aruna/src/plugin_host/broker.rs": "impl Broker for RunBroker {}\n",
+}
+
+
 def base_tree(extra=None):
     files = {
+        **TRIGGER_SITES,
         "Cargo.toml": WORKSPACE,
         "operations/Cargo.toml": MANIFEST,
         "operations/src/lib.rs": "pub mod abe;\npub mod jobs;\n",
@@ -42,12 +53,17 @@ def base_tree(extra=None):
     return files
 
 
-def zero_baseline(clean=()):
+def pure_tree(extra=None):
+    """The base tree without its async module, as production operations must be."""
+    files = base_tree({"operations/src/jobs/mod.rs": "pub fn run() {}\n"})
+    files.update(extra or {})
+    return files
+
+
+def zero_baseline():
     return {
-        "clean_domains": list(clean),
         "crate_allow": {},
         "structural": {key: 0 for key, _ in check_layers.COUNTS},
-        "async_lines": {},
     }
 
 
@@ -111,6 +127,7 @@ class SpansTest(unittest.TestCase):
         self.assertTrue(check_layers.is_test("operations/tests/main.rs"))
         self.assertTrue(check_layers.is_test("operations/src/realm_vault_tests.rs"))
         self.assertTrue(check_layers.is_test("operations/src/jobs/tests_outbox.rs"))
+        self.assertTrue(check_layers.is_test("operations/src/metadata/store_tests/mod.rs"))
         self.assertFalse(check_layers.is_test("operations/src/jobs/testing.rs"))
 
 
@@ -122,6 +139,7 @@ class ClassifyTest(unittest.TestCase):
                     "operations/src/abe/mixed.rs": PURE_OP + "async fn helper() {}\n",
                     "operations/src/abe/plain.rs": "pub fn plain() {}\n// .await in a comment\n",
                     "operations/src/abe/sub.rs": "impl<T: Send> SubOperation for Step<T> {}\n",
+                    "operations/src/abe/tight.rs": "fn f() { let a = async{}; let b = async move{}; }\n",
                 }
             )
         )
@@ -130,8 +148,9 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(kinds["operations/src/abe/mixed.rs"], "mixed")
         self.assertEqual(kinds["operations/src/abe/plain.rs"], "plain")
         self.assertEqual(kinds["operations/src/abe/sub.rs"], "op")
+        self.assertEqual(kinds["operations/src/abe/tight.rs"], "async")
         self.assertEqual(kinds["operations/src/jobs/mod.rs"], "async")
-        self.assertEqual(check_layers.async_lines(ops), {"abe": 3, "jobs": 1})
+        self.assertEqual(check_layers.async_lines(ops), {"abe": 4, "jobs": 1})
 
     def test_use_paths(self):
         paths = check_layers.use_paths("crate::a::{b, c::{d as e, self}, f::*}")
@@ -178,14 +197,6 @@ class ReferencesTest(unittest.TestCase):
         self.assertEqual(details["group_cycle_modules"], ["abe, auth, realm"])
         self.assertEqual(counts["group_mutual_pairs"], 0)
 
-    def test_runner_refs(self):
-        counts, details = self.counts(
-            {"operations/src/driver.rs": "use crate::jobs::run;\nuse crate::storage_read::read;\n",
-             "operations/src/storage_read.rs": "pub fn read() {}\n"}
-        )
-        self.assertEqual(counts["runner_refs"], 1)
-        self.assertEqual(details["runner_refs"], ["driver -> jobs: 1"])
-
 
 class TriggerTest(unittest.TestCase):
     def test_arms(self):
@@ -209,13 +220,79 @@ class TriggerTest(unittest.TestCase):
             [("TaskKey::Drain { id, .. }", True), ("TaskKey::Plain", False), ("TaskKey::Block if ready()", True), ("_", False)],
         )
 
-    def test_broker_impl(self):
-        rel = "operations/src/plugins/broker.rs"
-        text = "impl Broker for RunBroker {\n    async fn get(&self) {}\n    fn sync(&self) {}\n}\nasync fn free() {}\n"
+    def trigger_findings(self, files):
         with tempfile.TemporaryDirectory() as root:
-            write_tree(root, {rel: text})
-            source = check_layers.load_source(root, rel)
-        self.assertEqual(check_layers.trigger_arms({rel: source}), [f"{rel}: Broker::get"])
+            write_tree(root, files)
+            sources = {rel: check_layers.load_source(root, rel) for rel in files}
+        return check_layers.trigger_arms(sources)
+
+    def test_trigger_missing(self):
+        found = self.trigger_findings({})
+        missing = [f"{rel}: no {prefix} dispatch" for rel, prefix in check_layers.TRIGGER_MATCHES]
+        broker = "aruna/src/plugin_host/broker.rs: no Broker impl source"
+        self.assertEqual(found, missing + [broker])
+
+    def test_trigger_helpers(self):
+        # An arm may return only the table helper's future, and that helper must look the
+        # operation up once and drive it; a bespoke helper or a helper without a drive counts.
+        (timers, _), _ = check_layers.TRIGGER_MATCHES
+        timer_text = (
+            "fn work(key: TaskKey) {\n    match key {\n"
+            "        TaskKey::One => Box::pin(self.run_trigger(key)),\n"
+            "        TaskKey::Two => Box::pin(self.drain_two()),\n"
+            "    }\n}\n"
+            "async fn run_trigger(&self, key: TaskKey) {\n"
+            "    let operation = timer_operation(&key, &input);\n    self.later().await;\n}\n"
+        )
+        found = self.trigger_findings({**TRIGGER_SITES, timers: timer_text})
+        self.assertEqual(
+            found,
+            [
+                f"{timers}: TaskKey::Two hands off to drain_two",
+                f"{timers}: run_trigger does not drive one timer_operation operation",
+            ],
+        )
+
+    def test_trigger_shapes(self):
+        (timers, timer_prefix), (peers, peer_prefix) = check_layers.TRIGGER_MATCHES
+        timer_text = (
+            "fn work(key: TaskKey) {\n    match key {\n"
+            "        TaskKey::One => Box::pin(async move { drive(One::new(), c).await; }),\n"
+            "        TaskKey::Two => Box::pin(async move { drive(A, c).await; b().await; }),\n"
+            "    }\n}\n"
+        )
+        peer_text = "fn serve(alpn: Alpn) {\n    match alpn {\n        Alpn::Bao => {}\n    }\n}\n"
+        found = self.trigger_findings({**TRIGGER_SITES, timers: timer_text, peers: peer_text})
+        self.assertEqual(found, [f"{timers}: {timer_prefix}Two"])
+        self.assertTrue(peer_prefix.startswith("Alpn"))
+
+    def test_broker_impl(self):
+        rel = "aruna/src/plugin_host/broker.rs"
+        text = (
+            "impl Broker for RunBroker {\n    async fn get(&self) { self.a().await; drive(b).await }\n"
+            "    async fn one(&self) { Ok(drive(op, c).await?) }\n    fn sync(&self) {}\n}\n"
+            "async fn free() { x.await; y.await }\n"
+        )
+        found = self.trigger_findings({**TRIGGER_SITES, rel: text})
+        self.assertEqual(found, [f"{rel}: Broker::get"])
+
+
+class ClocksTest(unittest.TestCase):
+    def test_core_hooks(self):
+        hook = '#[cfg(any(test, feature = "test-hooks"))]\n'
+        files = {
+            "core/src/lib.rs": f"{hook}pub mod time;\npub mod rows;\n",
+            "core/src/time.rs": "pub fn now() -> u64 { unix_timestamp_millis() }\n",
+            "core/src/rows.rs": (
+                f"{hook}pub fn key() -> u8 {{ getrandom::fill(&mut b); 1 }}\n"
+                "pub fn now_ms(&self) -> u64 { self.now_ms }\nfn at(rows: &R) -> u64 { rows.now_ms() }\n"
+                "fn read() -> u64 { SystemTime::now(); now_ms() }\n"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            sources = [check_layers.load_source(root, rel) for rel in check_layers.rust_files(root)]
+        self.assertEqual(check_layers.core_clocks(sources), ["core/src/rows.rs:5", "core/src/rows.rs:5"])
 
 
 class HabitsTest(unittest.TestCase):
@@ -303,23 +380,27 @@ class CratesTest(unittest.TestCase):
 
 
 class GuardTest(unittest.TestCase):
-    def test_clean_await(self):
-        errors, output = run_report(base_tree(), zero_baseline(["abe"]))
+    def test_production_await(self):
+        errors, output = run_report(pure_tree(), zero_baseline())
         self.assertEqual(errors, 0, output)
-        added = base_tree({"operations/src/abe/mod.rs": PURE_OP + "fn later() { ready.await; }\n"})
-        errors, output = run_report(added, zero_baseline(["abe"]))
-        self.assertGreater(errors, 0)
-        self.assertIn("async code in a clean domain at operations/src/abe/mod.rs:3", output)
+        added = pure_tree({"operations/src/abe/plain.rs": "fn later() { ready.await; }\n"})
+        errors, output = run_report(added, zero_baseline())
+        self.assertEqual(errors, 1, output)
+        self.assertIn("error: async code in operations production at operations/src/abe/plain.rs:1", output)
+        errors, output = run_report(base_tree(), zero_baseline())
+        self.assertEqual(errors, 1, output)
+        self.assertIn("at operations/src/jobs/mod.rs:1", output)
 
     def test_count_rises(self):
-        files = base_tree({"operations/src/abe/mod.rs": PURE_OP + "async fn later() {}\n"})
+        files = pure_tree({"operations/src/abe/mod.rs": PURE_OP + "async fn later() {}\n"})
         errors, output = run_report(files, zero_baseline())
-        self.assertEqual(errors, 1)
+        self.assertEqual(errors, 2)
         self.assertIn("error: mixed_files rose above its baseline", output)
+        self.assertIn("error: async code in operations production at operations/src/abe/mod.rs:3", output)
         baseline = zero_baseline()
         baseline["structural"]["mixed_files"] = 2
         errors, output = run_report(files, baseline)
-        self.assertEqual(errors, 0)
+        self.assertEqual(errors, 1)
         self.assertIn("note: mixed_files fell below its baseline", output)
 
     def test_baseline_keys(self):

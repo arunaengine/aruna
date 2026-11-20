@@ -50,7 +50,7 @@ async fn git_server(
         state,
         ServerConfig {
             http_addr: address,
-            max_body_size: aruna_api::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors: CorsConfig::new(vec![]),
         },
     );
@@ -85,7 +85,7 @@ async fn native_clients() -> TestResult<()> {
                 "license":"https://creativecommons.org/licenses/by/4.0/","public":false}))
             .send().await?.error_for_status()?.json().await?;
         let id = document["document_id"].as_str().ok_or_else(|| std::io::Error::other("document ID missing"))?;
-        shared::wait_until("metadata registry visibility", shared::WAIT_CAP, Duration::from_millis(100), || async {
+        shared::wait_until("metadata registry visibility", shared::WAIT_CAP, || async {
             client.get(format!("{base}/api/v1/metadata/{id}")).bearer_auth(&token).send().await
                 .is_ok_and(|response| response.status().is_success())
         }).await?;
@@ -96,7 +96,7 @@ async fn native_clients() -> TestResult<()> {
                 permission: aruna_core::structs::identity::auth::Permission::READ,
             },
         ])?;
-        shared::wait_until("automatic ARC repository", shared::WAIT_CAP, Duration::from_millis(100), || async {
+        shared::wait_until("automatic ARC repository", shared::WAIT_CAP, || async {
             matches!(seed.context.storage_handle.send_storage_effect(StorageEffect::Read {
                 key_space: aruna_core::git::STATUS.into(), key: id.parse::<ulid::Ulid>().expect("document ID").to_bytes().to_vec().into(), txn_id: None,
             }).await, Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }))
@@ -106,7 +106,7 @@ async fn native_clients() -> TestResult<()> {
             .send().await?.error_for_status()?.json().await?;
         assert!(repository["error"].is_null(), "ARC conversion failed");
         let bucket = repository["bucket"].as_str().ok_or_else(|| std::io::Error::other("automatic LFS bucket missing"))?;
-        let other = aruna_core::UserId::local(ulid::Ulid::generate(), seed.realm_id);
+        let other = aruna_core::user::id::UserId::local(ulid::Ulid::generate(), seed.realm_id);
         let other_token = create_bearer_token(seed.context.as_ref(), other, seed.realm_id, seed.capabilities.clone()).await?;
         client.post(format!("{base}/api/v1/access/groups/{}/members", group.group_id)).bearer_auth(&token)
             .json(&serde_json::json!({"user_id": other.to_string()})).send().await?.error_for_status()?;
@@ -188,7 +188,7 @@ async fn holder_failover() -> TestResult<()> {
             .send().await?.error_for_status()?.json().await?;
         let id = document["document_id"].as_str().ok_or_else(|| std::io::Error::other("document ID missing"))?;
         for base in [&base_a, &base_b] {
-            shared::wait_until("ARC repository on each holder", shared::WAIT_CAP, Duration::from_millis(250), || async {
+            shared::wait_until("ARC repository on each holder", shared::WAIT_CAP, || async {
                 let Ok(response) = client.get(format!("{base}/api/v1/metadata/{id}/git")).bearer_auth(&token).send().await else {
                     return false;
                 };

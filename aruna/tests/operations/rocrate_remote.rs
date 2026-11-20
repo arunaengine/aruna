@@ -9,27 +9,29 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::job_calls::read_artifact_range;
-use crate::job_calls::{claim_job, read_job_record, transition_to_running};
-use crate::job_calls::{insert_job, list_job_entries};
-use aruna::inbound::initialize_incoming_fixture;
+use crate::job_calls::{
+    claim_job, insert_job, read_artifact_range, read_job_record, transition_to_running,
+};
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna::tasks::rocrate_jobs::run_export_job;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE,
     PATHS_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobId, JobPayload,
-    JobRecord, JobResultPayload, ReasonCode, RoCrateLimits,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    ArtifactRef, ExportReportRow, ExportReportSource, ExportRoCrateSpec, JobPayload, ReasonCode,
+    RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -43,27 +45,29 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_graph::GraphHandle;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::testing::fresh_job_id;
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::jobs::list_job_entries;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::replay_event_log;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use aruna_core::StructuredId;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
 
 const BUCKET: &str = "remote";
 const KEY: &str = "payload";
@@ -86,6 +90,8 @@ struct Node {
     _root: TempDir,
     net: NetHandle,
     context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 #[tokio::test]
@@ -228,7 +234,7 @@ async fn setup_remote(
     group_id: GroupId,
     version_id: Ulid,
 ) -> Result<(Node, Node, Ulid), Box<dyn std::error::Error>> {
-    let holder = build_node(realm_id, false).await?;
+    let mut holder = build_node(realm_id, false).await?;
     let exporter = build_node(realm_id, true).await?;
     connect(&exporter, &holder).await;
 
@@ -243,7 +249,7 @@ async fn setup_remote(
         &location,
     )
     .await?;
-    initialize_incoming_fixture(holder.context.clone());
+    holder._incoming = initialize_incoming_fixture(holder.context.clone());
 
     let config = seed_exporter(&exporter, holder.net.node_id(), owner, group_id, realm_id).await?;
     // Minted on the exporter so the document lands in a bucket it leads.
@@ -330,6 +336,7 @@ async fn build_node(
         _root: root,
         net,
         context,
+        _incoming: None,
     })
 }
 
@@ -608,7 +615,6 @@ async fn claim_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     })
 }
 
@@ -691,7 +697,7 @@ async fn export_rows(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Vec<ExportReportRow>, Box<dyn std::error::Error>> {
-    let (entries, _next) = list_job_entries(&context, job_id, None, 100).await?;
+    let (entries, _next) = list_job_entries(context, job_id, None, 100).await?;
     entries
         .into_iter()
         .map(|(_, value)| postcard::from_bytes(value.as_ref()).map_err(Into::into))

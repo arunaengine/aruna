@@ -4,9 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::plugin_installs::InstallState;
-use aruna_core::structs::execution::job::{
-    InputMode, InputSelection, InputSource, JobFamilyId, JobId, OutputDestination, OutputSelection,
-    PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG,
+use aruna_core::structs::execution::job::family::JobFamilyId;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    InputMode, InputSelection, InputSource, OutputDestination, OutputSelection, PLUGIN_INSTALL_TAG,
+    PLUGIN_WORK_TAG,
 };
 use aruna_core::structs::identity::realm::RealmId;
 
@@ -130,7 +132,7 @@ pub(crate) fn install() -> PluginInstall {
 fn fences_by_row() {
     let install = install();
     let family = JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId([5; 32]),
+        submission_id: aruna_core::structs::execution::job::family::SubmissionId([5; 32]),
         request_digest: [6; 32],
     };
     let adopted = (Some(family), family);
@@ -182,7 +184,7 @@ fn fences_by_row() {
 
 fn family() -> JobFamilyId {
     JobFamilyId {
-        submission_id: aruna_core::structs::execution::job::SubmissionId([5; 32]),
+        submission_id: aruna_core::structs::execution::job::family::SubmissionId([5; 32]),
         request_digest: [6; 32],
     }
 }

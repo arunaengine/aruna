@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::permission_path::permission_pattern_matches;
 use crate::structs::identity::auth::{Permission, Role};
 use crate::structs::identity::user::vault::UserKeyRecord;
 use crate::structs::storage::encryption::{BucketHolder, HolderOrigin, SealedCopy};
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 

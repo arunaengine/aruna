@@ -6,14 +6,13 @@
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::cursor::OBJECT_CURSOR_CONTEXT;
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::Span;
 
@@ -36,10 +35,11 @@ use super::search_types::{
 };
 use super::{DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::load_config::config_unavailable;
-use crate::s3::object::search::{SearchNodePage, SearchObjectsError, SearchObjectsInput};
-use crate::s3::object::search_scan::SearchObjectsOperation;
+use crate::s3::object::search::{SearchObjectsError, SearchObjectsInput};
+use crate::transfer::search_scan::SearchObjectsOperation;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_core::search::SearchNodePage;
 
 /// How the object fanout asks each node, from where the cursor left that node.
 #[derive(Debug, PartialEq)]
@@ -449,7 +449,7 @@ impl Operation for ObjectSearchOperation {
                 self.assembled(*answered, results)
             }
             ObjectStage::Sign(signing) => {
-                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = event(result) else {
+                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = result.event() else {
                     return Err(MetadataApiError::Internal(
                         "net handle unavailable for object search cursor signing".to_string(),
                     ));

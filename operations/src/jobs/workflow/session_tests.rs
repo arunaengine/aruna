@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::compute::session::StagedInput;
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::user::id::UserId;
 
 use super::*;
 use crate::jobs::workflow::fixtures::group_spec;

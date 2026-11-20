@@ -12,11 +12,10 @@ use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputContent, InputSelection, SubmissionId,
-};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{CapturedInput, InputContent, InputSelection};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
@@ -39,18 +38,17 @@ use super::submission_rules::{admitted_description, reference_content, source_er
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::jobs::read_access::{SourceObject, SourceReadError, SourceReadOperation};
-use crate::jobs::submit::SubmitJobError;
-use crate::s3::bucket::dataset::{
-    BucketMetadataError, BucketMetadataOperation, DatasetSummaryOperation,
-};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::release::access::MembersCheckOperation;
-use crate::s3::bucket::release::{BucketScope, MembersOutput, MembershipCaller, ReleaseError};
+use crate::metadata::forward::read::DatasetSummaryOperation;
+use crate::s3::bucket::dataset::{BucketMetadataError, BucketMetadataOperation};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
+use crate::s3::object::read_access::{SourceObject, SourceReadError, SourceReadOperation};
+use crate::transfer::release::access::MembersCheckOperation;
+use crate::transfer::release::{BucketScope, MembersOutput, MembershipCaller, ReleaseError};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::job_request::SubmitJobError;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Who captures inputs here, and what their grants and release checks need.
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +87,8 @@ impl Operation for VersionHashOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
-        let version = value(result)?.and_then(|row| postcard::from_bytes::<BlobVersion>(&row).ok());
+        let version =
+            (result.value()?).and_then(|row| postcard::from_bytes::<BlobVersion>(&row).ok());
         Ok(Next::Done(version.and_then(
             |version| match version.state {
                 BlobVersionState::Materialized { blob_hash, .. } => Some(blob_hash),
@@ -648,7 +647,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, InputSource};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSource};
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::MultipartChecksumType;
@@ -703,7 +702,7 @@ mod tests {
     }
 
     fn info() -> BucketInfo {
-        crate::tests::s3::bucket_info(GROUP, user())
+        aruna_test_support::s3::bucket_info(GROUP, user())
     }
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
@@ -776,7 +775,7 @@ mod tests {
 
     // An unreadable version record counts as no hash, so only a reference could still pass.
     #[test]
-    fn unread_hash_needs_reference() {
+    fn hash_needs_reference() {
         let mut operation = capture();
         operation.first().expect("head");
         calls_child(operation.next(child(Ok::<_, HeadObjectError>(head()))));
@@ -786,7 +785,7 @@ mod tests {
 
     // Metadata an earlier input of the bucket read is not read again.
     #[test]
-    fn known_database_skips_read() {
+    fn database_skips_read() {
         let mut operation = CaptureInputOperation::new(caller(), input("k"), Some(None));
         operation.step = CaptureStep::Bucket(Readable {
             located: Located {

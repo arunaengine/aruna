@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::structs::execution::notification_watch::{WatchEventRetry, watch_retry_key};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 
 pub(crate) const EVENT_BATCH_SIZE: usize = 128;
 pub(crate) const SUBSCRIPTION_SCAN_CAP: usize = 1024;

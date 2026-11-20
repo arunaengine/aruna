@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     UPLOAD_INVENTORY_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, read_row, value};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, Cursor, RangeAccount, RangeCounters, Rebuild, account_key,
     generation_key,
@@ -25,8 +25,6 @@ use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
-
-use crate::metadata::call_results::page_rows;
 
 use super::handoff::{
     HandoffError, account_row, activation_reads, decode_account, plan_activation,
@@ -369,20 +367,20 @@ impl Operation for RebuildStepOperation {
         match self.state {
             StepState::Read => self.planned(result.values()?),
             StepState::PageRows => {
-                let (rows, truncated) = page_rows(result)?;
+                let (rows, truncated) = result.page()?;
                 self.plan_page(rows, truncated)
             }
             StepState::Write => {
-                done(result)?;
+                result.done()?;
                 let deletes = std::mem::take(&mut self.plan.deletes);
                 self.call(StepState::Delete, IoCall::Delete(deletes))
             }
             StepState::Delete => {
-                done(result)?;
+                result.done()?;
                 self.count_plan()
             }
             StepState::Count => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }
@@ -486,12 +484,12 @@ impl Operation for RebuildOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<RebuildOutcome>, RebuildError> {
         match self.state {
             State::Account => {
-                let stored = value(result)?;
+                let stored = result.value()?;
                 let account = decode_account(stored.as_ref(), self.config.range_id)?;
                 self.advance(account)
             }
             State::Probe(walk) => {
-                let (rows, more) = page_rows(result)?;
+                let (rows, more) = result.page()?;
                 let kind = StepKind::Page {
                     walk,
                     probe_end: rows.last().map(|(key, _)| key.to_vec()),
@@ -517,7 +515,7 @@ impl Operation for RebuildOperation {
 }
 
 /// The set, range and account of one range account row; `None` for a malformed row.
-pub(super) fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
+pub(crate) fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
     let set_id = Ulid::from_bytes(key.get(..16)?.try_into().ok()?);
     let range_id = Ulid::from_bytes(key.get(16..32)?.try_into().ok()?);
     let account = RangeAccount::from_bytes(value).ok()?;
@@ -549,7 +547,7 @@ pub struct BeginRebuildsOperation {
 
 impl BeginRebuildsOperation {
     /// Pages of `account_page` accounts; each rebuild records walk pages of `walk` rows and bytes.
-    pub(super) fn new(account_page: usize, walk: (usize, usize)) -> Self {
+    pub(crate) fn new(account_page: usize, walk: (usize, usize)) -> Self {
         Self {
             walk,
             pages: PrefixPages::new(RANGE_ACCOUNT_KEYSPACE, Vec::new(), account_page),

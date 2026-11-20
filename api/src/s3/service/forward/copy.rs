@@ -9,30 +9,34 @@ use aruna_drivers::driver::drive;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::ByteStream;
 use aruna_core::member_read::{MemberBody, MemberMethod};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER, CopyContext};
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
-use aruna_operations::s3::object::copy::{CopySourceConditions, ReadCopyOperation, source_origin};
-use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult, ObjectRangeRequest};
-pub(in crate::s3::service) use aruna_operations::s3::object::member_write::CopyPath;
-use aruna_operations::s3::object::member_write::{
+use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult};
+use aruna_operations::s3::object::member::write::CopyPath;
+use aruna_operations::s3::object::member::write::{
     CopyPathError, CopyPathOperation, answered_metadata, answered_policies, copy_headers,
     source_read,
 };
+use aruna_operations::transfer::copy::{CopySourceConditions, ReadCopyOperation, source_origin};
 use s3s::dto::{
     CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, Timestamp, TimestampFormat,
     UploadPartCopyOutput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 
-use super::{Forward, ForwardBody, ForwardRequest, header, passed_headers, xml_field};
+use super::{header, passed_headers, xml_field};
 use crate::s3::error::{IntoS3Error, guard_error};
 use crate::s3::service::ArunaS3Service;
+use aruna_operations::s3::object::member::read::{
+    MemberPayload as ForwardBody, MemberRequest as ForwardRequest, MemberTarget as Forward,
+};
 
 /// The source a member streams: one whole version, or one byte range for a part.
 pub(in crate::s3::service) struct CopySource<'a> {
@@ -203,7 +207,7 @@ impl ArunaS3Service {
     async fn read_copy(
         &self,
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::read::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<GetObjectResult> {
         let input = GetObjectInput {
             bucket: source.name,
@@ -231,7 +235,7 @@ impl ArunaS3Service {
         (bucket, key): (String, String),
         source: CopySource<'_>,
         metadata: Option<HashMap<String, String>>,
-        token: Option<&aruna_operations::s3::object::read::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let (name, key_of) = (source.name.clone(), source.key.clone());
         let distributed = source.bucket.distribution.is_some();
@@ -296,7 +300,7 @@ impl ArunaS3Service {
         forward: &Forward,
         (bucket, key, query): (String, String, String),
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::read::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let read = self.read_copy(source, token).await?;
         let version = read.resolved_version_id.or(read.version_id);

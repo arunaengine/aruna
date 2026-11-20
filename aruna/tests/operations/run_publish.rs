@@ -14,21 +14,22 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::jobs::{JobRunOutcome, ProgressReporter};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobId, JobPayload, JobRecord, JobResultPayload, JobState, OutputObject,
-    RunCrateStatus,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    JobRecord, JobResultPayload, OutputObject, RunCrateStatus,
 };
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::structs::{RemoteBinding, SyncRefusal};
+use aruna_core::structs::synced_folder::{RemoteBinding, SyncRefusal};
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::context::JobContext;
-use aruna_operations::device::publish_run::{
+use aruna_operations::device_node::realm_documents::fetch_realm_documents;
+use aruna_operations::jobs::workflow::publish_run::{
     PublishRunError, PublishRunInput, local_run_crate, publish_run,
 };
-use aruna_operations::device::realm_documents::fetch_realm_documents;
 use aruna_operations::jobs::workflow::run_crate::{WriteCrateOperation, crate_outcome};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
@@ -315,7 +316,6 @@ async fn crate_stays_local() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     };
 
     assert!(matches!(
@@ -335,7 +335,7 @@ async fn crate_stays_local() -> TestResult<()> {
         .find(|entity| entity["conformsTo"]["@id"] == "https://w3id.org/ro/wfrun/process/0.5")
         .ok_or("the crate has a root")?;
     assert_eq!(root["@id"], "./");
-    let stranger = aruna_core::UserId::local(Ulid::from(9u128), realm.realm_id);
+    let stranger = aruna_core::user::id::UserId::local(Ulid::from(9u128), realm.realm_id);
     assert!(
         drive(local_run_crate(job_id, stranger), &device.context)
             .await
@@ -365,7 +365,7 @@ async fn crate_stays_local() -> TestResult<()> {
     storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: aruna_core::keyspaces::JOB_KEYSPACE.to_string(),
-            key: aruna_core::structs::execution::job::job_record_key(job_id),
+            key: aruna_core::structs::execution::job::local::job_record_key(job_id),
             txn_id: None,
         })
         .await;
@@ -442,7 +442,7 @@ async fn checks_empty_target() -> TestResult<()> {
 #[tokio::test]
 async fn crate_redrive_links() -> TestResult<()> {
     use aruna_core::keyspaces::RUN_LINK_KEYSPACE;
-    use aruna_core::structs::execution::job::run_crate_key;
+    use aruna_core::structs::execution::job::local::run_crate_key;
     let realm = Topology::spawn(2, 1, 1).await?;
     let group_id = realm.seed_group().await?;
     let server = realm.node(0);
@@ -467,7 +467,6 @@ async fn crate_redrive_links() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     };
     let JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) =
         write_run_crate(&context(), job_id).await

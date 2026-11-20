@@ -23,7 +23,6 @@ use crate::routes::promotion::promote_server_node;
 use crate::server::state::ServerState;
 use crate::tests::routes::{test_state, test_storage};
 use crate::tests::users::foreign_auth;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -34,6 +33,7 @@ use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
@@ -251,9 +251,9 @@ async fn admin_sees_operations() {
 /// member sees it redacted while a realm config admin sees it in full.
 #[test]
 fn peer_error_visibility() {
-    let peer = aruna_core::structs::PeerConnectionState {
+    let peer = aruna_core::structs::info::PeerConnectionState {
         node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-        status: aruna_core::structs::PeerConnectionStatus::Unreachable,
+        status: aruna_core::structs::info::PeerConnectionStatus::Unreachable,
         active_addresses: Vec::new(),
         last_error: Some("dial refused: 10.0.0.9:4433".to_string()),
         retry_in_secs: Some(5),
@@ -405,7 +405,8 @@ async fn usage_counts_documents() {
 
     let storage_dir = tempdir().unwrap();
     let metadata_dir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let node_id = iroh::SecretKey::generate().public();
     let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
@@ -575,7 +576,8 @@ fn quota_capacity_unavailable() {
 
 async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
@@ -2001,7 +2003,7 @@ async fn reports_device_seen() {
         &aruna_operations::realm::node_name::NodeDisplays::default(),
         now_ms,
     );
-    let device = |node_id: aruna_core::NodeId| {
+    let device = |node_id: aruna_core::id::NodeId| {
         nodes
             .iter()
             .find(|node| node.node_id == node_id.to_string() && node.kind == NodeKindInfo::User)

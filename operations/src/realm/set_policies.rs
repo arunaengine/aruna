@@ -9,9 +9,9 @@ use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_POLICIES_PATH};
+use aruna_core::reducer::paths::CONFIG_POLICIES_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -26,7 +26,7 @@ use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -325,14 +325,14 @@ impl Operation for PoliciesWrite {
                 self.emit_write_state(document, reducer)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Marks;
                 Ok(Next::Call(self.marks.first()))
             }
@@ -362,7 +362,6 @@ mod tests {
     };
     use crate::document_repository::GetConfigOperation;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
@@ -375,8 +374,9 @@ mod tests {
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;

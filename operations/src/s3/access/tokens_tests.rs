@@ -9,7 +9,6 @@ use crate::auth::bearer_token::UserCutoffOperation;
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use crate::session::index::encode_index;
 use crate::users::revoke_all::{RevokeAllConfig, RevokeAllError, RevokeAllOperation};
-use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::effects::StorageEffect;
@@ -26,6 +25,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::SERVICE_GROUP_ATTRIBUTE;
 use aruna_drivers::driver::{DriverContext, drive};
 use std::collections::{BTreeSet, HashMap};
@@ -171,7 +171,8 @@ async fn seed_credential(context: &DriverContext, owner: UserId, group_id: Group
 
 async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,

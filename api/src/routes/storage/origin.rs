@@ -5,18 +5,18 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::SyncMode;
 use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::identity::content_id;
-use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
+use aruna_core::structs::sync_relationship::SyncMode;
 use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::blob::migration::misplaced::AccessRule;
 use aruna_operations::distribution::guard::GuardError;
@@ -26,7 +26,7 @@ use aruna_operations::distribution::resolve::{
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
 use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
-use aruna_operations::s3::object::origin::{
+use aruna_operations::transfer::origin::{
     BucketRunsOperation, OriginError, OriginView, ReadOriginOperation,
 };
 use axum::extract::{Path, Query, State};
@@ -57,8 +57,8 @@ use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
 use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
-use aruna_operations::s3::bucket::release::access::MembersCheckOperation;
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
+use aruna_operations::transfer::release::access::MembersCheckOperation;
+use aruna_operations::transfer::release::{BucketScope, MembershipCaller};
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -606,7 +606,7 @@ async fn origin_answer(
 async fn copy_origin(
     state: &ServerState,
     (set_id, range_id): (Ulid, Ulid),
-    copies: Vec<aruna_core::NodeId>,
+    copies: Vec<aruna_core::id::NodeId>,
     path: &str,
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {
@@ -781,8 +781,8 @@ async fn global_origin(
 /// Asks `holders` in turn for the origin; a copy's miss goes on, the coordinator's decides.
 async fn relay_origin(
     state: &ServerState,
-    (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::NodeId),
-    holders: Vec<aruna_core::NodeId>,
+    (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::id::NodeId),
+    holders: Vec<aruna_core::id::NodeId>,
     (path, sent): (&str, HeaderMap),
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {

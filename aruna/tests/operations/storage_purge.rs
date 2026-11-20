@@ -13,7 +13,6 @@ use crate::job_calls::{claim_job, complete_job, fail_job, transition_to_running}
 use aruna::tasks::job_host::run_storage_purge;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -25,7 +24,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobResultPayload};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -45,8 +46,10 @@ use aruna_core::structs::storage::storage_purge::{
     StoragePurgeCheckpoint, StoragePurgeScope, StoragePurgeSpec,
 };
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
 use aruna_drivers::jobs::context::JobContext;
+use aruna_drivers::testing::read_value;
 use aruna_net::NetHandle;
 use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
@@ -58,12 +61,8 @@ use aruna_operations::s3::multipart::complete::{
 use aruna_operations::s3::multipart::create::{
     CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
-use aruna_operations::s3::multipart::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
 use aruna_operations::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation,
-};
-use aruna_operations::s3::object::copy::{
-    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
 use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
@@ -75,8 +74,12 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
-use aruna_operations::testing::read_value;
-use aruna_storage::{StorageHandle, storage};
+use aruna_operations::transfer::copy::{
+    CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
+};
+use aruna_operations::transfer::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
+use aruna_storage::storage;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -93,7 +96,7 @@ struct TestContext {
 async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     // Creating an upload asks the blob adapter whether the backend has a provider upload.
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
@@ -745,7 +748,6 @@ async fn claimed_job(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        handlers: Default::default(),
     }
 }
 
@@ -1335,7 +1337,7 @@ async fn purge_keeps_released() {
     assert!(row().await.is_some());
 
     // The failed file purge ends, which drops its fence; a bucket purge then checks alike.
-    let error = aruna_core::structs::execution::job::JobError::permanent("pinned");
+    let error = aruna_core::structs::execution::job::local::JobError::permanent("pinned");
     fail_job(
         &context.driver,
         job.job_id,

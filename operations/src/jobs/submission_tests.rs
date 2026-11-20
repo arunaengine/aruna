@@ -2,35 +2,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
     ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobId, JobPayload, JobRecord, JobState, MAX_EXECUTION_OUTPUTS,
-    OutputDestination, RoCrateLimits, WorkspaceMode, user_dedup_key,
+    ImportRoCrateTarget, JobPayload, OutputDestination, RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
 use ulid::Ulid;
 
-use super::job_artifacts::{ArtifactLookup, OwnedArtifactOperation};
-use super::job_cancel::CancelJobOutcome;
-use super::job_cancel::CancelOwnedOperation;
-use super::job_reads::tests::{read_owned_job, read_owned_report};
-use super::job_reports::{JobReportLookup, ReportQuery};
+use super::job::artifacts::{ArtifactLookup, OwnedArtifactOperation};
+use super::job::cancel::CancelJobOutcome;
+use super::job::cancel::CancelOwnedOperation;
+use super::job::reads::tests::{read_owned_job, read_owned_report};
+use super::job::reports::{JobReportLookup, ReportQuery};
 use super::store::row_calls::preserve_artifact_tombstone;
-use super::submit::SubmitJobError;
-use super::submit_execution::{ExecutionSubmission, SubmitExecutionOperation, validate_execution};
-use super::submit_local::DedupLookupOperation;
-use crate::jobs::store::test_calls::read_job_record;
-use crate::jobs::store::test_calls::{insert_job, submit_execution_job};
+use super::submit::execution::{ExecutionSubmission, SubmitExecutionOperation, validate_execution};
+use super::submit::local::DedupLookupOperation;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::read_job_record;
 
 fn node_id() -> NodeId {
     iroh::SecretKey::from_bytes(&[7u8; 32]).public()
@@ -71,6 +73,22 @@ fn submission(serving: Option<(NodeId, RealmId)>) -> ExecutionSubmission {
     }
 }
 
+/// Submits `spec` into the existing workspace `shared` through this context's node.
+async fn submit_shared(
+    context: &DriverContext,
+    spec: ExecutionSpec,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let submission = ExecutionSubmission {
+        spec,
+        workspace_mode: WorkspaceMode::Existing,
+        workspace_bucket: Some("shared".to_string()),
+        serving: context.node_and_realm(),
+        now_ms: aruna_core::time::unix_timestamp_millis(),
+        ..submission(None)
+    };
+    drive(SubmitExecutionOperation::new(submission), context).await
+}
+
 // An unplaced node submits at once; a placed node reads its realm config first and refuses
 // to own a job for another node.
 #[test]
@@ -92,7 +110,7 @@ fn mints_from_placement() {
 async fn caps_declared_outputs() {
     // The declaration bound is the immutable record's bound, so a valid
     // local success can never be impossible to publish.
-    let (storage_handle, _receivers) = aruna_storage::StorageHandle::new();
+    let (storage_handle, _receivers) = aruna_storage::storage::handle::StorageHandle::new();
     let context = DriverContext {
         storage_handle,
         net_handle: None,
@@ -102,7 +120,6 @@ async fn caps_declared_outputs() {
         compute_handle: None,
         outbound_handle: None,
     };
-    let realm_id = RealmId([1u8; 32]);
     let mut spec = ExecutionSpec {
         group_id: Ulid::from_bytes([3u8; 16]),
         name: None,
@@ -120,7 +137,7 @@ async fn caps_declared_outputs() {
         file_outputs: Vec::new(),
         workspace_outputs: (0..=MAX_EXECUTION_OUTPUTS)
             .map(
-                |index| aruna_core::structs::execution::job::WorkspaceOutput {
+                |index| aruna_core::structs::execution::job::input::WorkspaceOutput {
                     container_path: format!("/out/{index}"),
                     dest_key: format!("out/{index}"),
                 },
@@ -130,19 +147,7 @@ async fn caps_declared_outputs() {
         collision_policy: Default::default(),
     };
 
-    let error = submit_execution_job(
-        &context,
-        spec.clone(),
-        UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
-        node_id(),
-        None,
-        WorkspaceMode::Existing,
-        Some("shared".to_string()),
-        1,
-        None,
-    )
-    .await
-    .unwrap_err();
+    let error = submit_shared(&context, spec.clone()).await.unwrap_err();
     assert!(matches!(
         error,
         SubmitJobError::TooManyOutputs {
@@ -158,18 +163,7 @@ async fn caps_declared_outputs() {
     ));
     spec.output_prefixes.clear();
     assert!(!matches!(
-        submit_execution_job(
-            &context,
-            spec,
-            UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
-            node_id(),
-            None,
-            WorkspaceMode::Existing,
-            Some("shared".to_string()),
-            1,
-            None,
-        )
-        .await,
+        submit_shared(&context, spec).await,
         Err(SubmitJobError::TooManyOutputs { .. })
     ));
 }
@@ -190,15 +184,15 @@ fn refuses_pathless_input() {
         resources: Default::default(),
         executor_constraint: None,
         backend: None,
-        inputs: vec![aruna_core::structs::execution::job::InputSelection {
-            source: aruna_core::structs::execution::job::InputSource::S3 {
+        inputs: vec![aruna_core::structs::execution::job::input::InputSelection {
+            source: aruna_core::structs::execution::job::input::InputSource::S3 {
                 bucket: "data".to_string(),
                 key: "in.txt".to_string(),
                 version_id: None,
             },
             source_node_id: None,
             dest_key: "in.txt".to_string(),
-            mode: aruna_core::structs::execution::job::InputMode::Snapshot,
+            mode: aruna_core::structs::execution::job::input::InputMode::Snapshot,
             container_path: None,
             name: None,
             description: None,
@@ -220,7 +214,7 @@ fn refuses_pathless_input() {
 
 #[test]
 fn bounds_inline_inputs() {
-    use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSelection, InputSource};
     let inline = |bytes: usize| InputSelection {
         source: InputSource::Inline {
             bytes: vec![b'a'; bytes],
@@ -266,21 +260,25 @@ fn refuses_shared_destination() {
         executor_constraint: None,
         backend: None,
         inputs: Vec::new(),
-        file_outputs: vec![aruna_core::structs::execution::job::OutputSelection {
-            container_path: "/out/result.txt".to_string(),
-            path_prefix: None,
-            destination: OutputDestination::S3 {
-                bucket: "shared".to_string(),
-                key: "result.txt".to_string(),
+        file_outputs: vec![
+            aruna_core::structs::execution::job::input::OutputSelection {
+                container_path: "/out/result.txt".to_string(),
+                path_prefix: None,
+                destination: OutputDestination::S3 {
+                    bucket: "shared".to_string(),
+                    key: "result.txt".to_string(),
+                },
+                destination_node_id: None,
+                name: None,
+                description: None,
             },
-            destination_node_id: None,
-            name: None,
-            description: None,
-        }],
-        workspace_outputs: vec![aruna_core::structs::execution::job::WorkspaceOutput {
-            container_path: "/result.txt".to_string(),
-            dest_key: "result.txt".to_string(),
-        }],
+        ],
+        workspace_outputs: vec![
+            aruna_core::structs::execution::job::input::WorkspaceOutput {
+                container_path: "/result.txt".to_string(),
+                dest_key: "result.txt".to_string(),
+            },
+        ],
         output_prefixes: Vec::new(),
         collision_policy: Default::default(),
     };

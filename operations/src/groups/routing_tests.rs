@@ -5,12 +5,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
-use aruna_core::UserId;
+use aruna_core::calls::CallRun;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::format::Compression;
@@ -21,6 +21,7 @@ use aruna_core::structs::storage::routing::{
 };
 use aruna_core::structs::storage::usage::{UsageCounters, usage_backend_key, usage_backend_keys};
 use aruna_core::types::{GroupId, Key};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::*;
@@ -78,8 +79,8 @@ fn answer(effect: Effect, rows: &Rows) -> Event {
 }
 
 /// Runs `operation` to its end against `rows`.
-fn run<K, O: Runnable<K>>(operation: O, rows: &Rows) -> Result<O::Output, O::Error> {
-    let mut operation = operation.into_machine();
+fn run<O: Operation>(operation: O, rows: &Rows) -> Result<O::Output, O::Error> {
+    let mut operation = CallRun::new(operation);
     let mut effects = operation.start().into_vec();
     while !operation.is_complete() {
         let effect = effects

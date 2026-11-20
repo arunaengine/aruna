@@ -3,6 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::reducer::paths::{
+    CONFIG_STRATEGY_PATH, JOB_FAMILY_PATH, placement_entry_value, placement_override_value,
+    placement_strategy_value, strategy_binding_value,
+};
+use crate::reducer::placement::{
+    activation_path, candidate_map_path, placement_node_path, placement_override_path,
+    placement_strategy_path, strategy_binding_path,
+};
 
 impl AdminDocumentState {
     pub(super) fn apply_placement(

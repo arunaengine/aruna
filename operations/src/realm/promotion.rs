@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -15,8 +15,8 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 
 use crate::document_repository::read_row;
-use crate::metadata::protocol::{MetadataReadError, RealmKeyPem};
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::metadata::protocol::{MetadataReadError, RealmKeyPem};
 
 /// What a management node asks of the node it promotes.
 #[derive(Debug, PartialEq)]

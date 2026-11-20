@@ -4,10 +4,13 @@
 
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerResult};
-use crate::metadata::{
+use crate::metadata::model::{
     MetadataQueryMode, MetadataQueryResponse, MetadataSearchParams, SearchResultsResponse,
-    SparqlQueryRequest, bearer_token_string, map_api_error, map_query_mode, map_query_results,
-    map_search_hit, parse_document_id,
+    SparqlQueryRequest,
+};
+use crate::metadata::{
+    bearer_token_string, map_api_error, map_query_mode, map_query_results, map_search_hit,
+    parse_document_id,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;

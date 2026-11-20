@@ -6,17 +6,17 @@
 use std::collections::{HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_PENDING_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_KEY_KEYSPACE,
     PENDING_LOCATION_KEYSPACE, TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
     TRANSITION_QUEUE_KEYSPACE,
 };
-use aruna_core::node_vault::{VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, RealmId};
@@ -36,10 +36,11 @@ use aruna_core::types::{Key, Value};
 use super::shared::MigrationError;
 use crate::blob::migration::drain::MIGRATION_CONTINUE;
 use crate::blob::migration::rewrite::{RewriteError, RewriteOutcome, RewriteVersionOperation};
+use crate::blob::unlocked::KeyUnlockedOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::key_locks::KeyUnlockedOperation;
 use crate::replication::parking::WakeParkedOperation;
-use crate::replication::queue::{BlobQueueError, schedule_blob_drain};
+use crate::replication::queue::BlobQueueError;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 
 /// Versions, or old copies, one run checks per bucket.
 const PAGE: usize = 64;
@@ -1378,7 +1379,7 @@ mod tests {
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -1623,7 +1624,10 @@ mod tests {
 
     fn context(root: &std::path::Path) -> DriverContext {
         DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root.to_str().unwrap()).unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                root.to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

@@ -6,19 +6,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::CACHE_MANIFEST_KEY;
 use aruna_core::cursor;
 use aruna_core::errors::StagingSourceError;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::native_reference::GrantedBody;
 use aruna_core::operation::Operation;
-use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputContent, InputMode, InputSelection, InputSource, JobId, JobPayload,
-    JobRecord, credential_job_id,
+use aruna_core::stream::ByteStream;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputContent, InputMode, InputSelection, InputSource, JobPayload,
 };
+use aruna_core::structs::execution::job::local::{JobRecord, credential_job_id};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketEncryption;
@@ -26,22 +27,18 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
-use crate::jobs::read_access::SourceReadError;
-use crate::jobs::read_access::SourceReadOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
+use crate::s3::object::read_access::{SourceReadError, SourceReadOperation};
 use crate::s3::object::visible::SCAN_BUDGET;
 use crate::staging::granted_read::GrantedReadOperation;
+use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Keys one listing page returns at most, as S3 does.
 pub const MAX_VIEW_KEYS: usize = 1000;
-
-pub type ViewStream = BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ViewError {
@@ -541,7 +538,7 @@ pub struct ViewEntryOperation {
     step: EntryStep,
 }
 
-type EntryNext = Result<Next<Option<ViewStream>>, ViewError>;
+type EntryNext = Result<Next<Option<ByteStream>>, ViewError>;
 
 impl ViewEntryOperation {
     pub fn head(auth: AuthContext, entry: ViewEntry, local: NodeId) -> Self {
@@ -598,7 +595,7 @@ impl ViewEntryOperation {
 }
 
 impl Operation for ViewEntryOperation {
-    type Output = Option<ViewStream>;
+    type Output = Option<ByteStream>;
     type Error = ViewError;
 
     fn first(&mut self) -> EntryNext {
@@ -865,7 +862,7 @@ mod tests {
         assert_eq!(decode_token("in-a", &token).as_deref(), Some("db/sub/"));
         assert_eq!(decode_token("in-b", &token), None);
         let job = JobId::from_bytes([3; 16]);
-        let access = aruna_core::structs::execution::job::workspace_credential_id(job);
+        let access = aruna_core::structs::execution::job::local::workspace_credential_id(job);
         assert_eq!(view_job(&access, &view_bucket(job)), Some(job));
         assert_eq!(view_job(&access, "in-other"), None);
         assert_eq!(view_job("AKIAOTHER", &view_bucket(job)), None);
@@ -1025,7 +1022,7 @@ mod tests {
         use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::format::Compression;
 
-        let (_directory, storage) = crate::tests::s3::test_storage();
+        let (_directory, storage) = aruna_test_support::s3::test_storage();
         let context = aruna_drivers::testing::test_context(storage);
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(2, 2);
@@ -1039,9 +1036,14 @@ mod tests {
             enabled: true,
         };
         let scope = (realm_id, group_id, local);
-        let owner =
-            crate::testing_access::seed_open_access(&context, scope, "none/**", None, vec![policy])
-                .await;
+        let owner = aruna_drivers::testing::seed_open_access(
+            &context,
+            scope,
+            "none/**",
+            None,
+            vec![policy],
+        )
+        .await;
         let info = BucketInfo {
             group_id,
             created_at: std::time::SystemTime::UNIX_EPOCH,

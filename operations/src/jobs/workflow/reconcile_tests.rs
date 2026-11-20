@@ -5,7 +5,7 @@
 use aruna_core::compute::effect::BackendFacts;
 use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::{AdoptableEvidence, ResumePoint, TombstoneEvidence};
-use aruna_core::structs::execution::job::LocalAdmission;
+use aruna_core::structs::execution::job::local::LocalAdmission;
 
 use super::super::fixtures::{
     EPOCH, PINNED, artifact, child, claimed, compute, control, facts, intent, job, node, prepared,

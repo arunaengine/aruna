@@ -13,7 +13,7 @@ use aruna_core::types::GroupId;
 use byteview::ByteView;
 use ulid::Ulid;
 
-use crate::harvest::repository::{connector_key, connector_secret_key};
+use crate::connectors::harvest_rows::{connector_key, connector_secret_key};
 use crate::harvest::update_connector::UpdateConnectorError;
 
 /// The call a delete waits for.
@@ -56,7 +56,7 @@ impl Operation for DeleteRepositoryOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, UpdateConnectorError> {
         match self.stage {
             Stage::Record => {
-                let record = rows::value(result)?.ok_or(UpdateConnectorError::NotFound)?;
+                let record = result.value()?.ok_or(UpdateConnectorError::NotFound)?;
                 RepositoryConnector::from_bytes(&record)
                     .map_err(|_| UpdateConnectorError::Unexpected)?;
                 self.stage = Stage::Links;
@@ -68,7 +68,7 @@ impl Operation for DeleteRepositoryOperation {
                 }))
             }
             Stage::Links => {
-                if !rows::page(result)?.0.is_empty() {
+                if !result.page()?.0.is_empty() {
                     return Err(UpdateConnectorError::InUse);
                 }
                 self.stage = Stage::Delete;
@@ -84,7 +84,7 @@ impl Operation for DeleteRepositoryOperation {
                 ])))
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }
@@ -139,7 +139,7 @@ mod tests {
         let (_dir, context) = context();
         let group_id = Ulid::generate();
         let connector = create(&context, group_id).await.connector_id;
-        let key = aruna_core::repository::connector_link_key(connector, Ulid::generate());
+        let key = aruna_core::repository::link::connector_link_key(connector, Ulid::generate());
         let written = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {

@@ -5,17 +5,17 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::compute::offer::BackendLimits;
 use aruna_core::effects::LaunchFrame;
 use aruna_core::heartbeat::HeldHeartbeat;
-use aruna_core::structs::execution::job::JobFamilyRecord;
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
 use aruna_core::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 use crate::jobs::lifecycle::launch_admit::LaunchNode;
 use crate::jobs::lifecycle::submit_external::IngressNode;
-use crate::jobs::lifecycle::witness::WitnessNode;
+use crate::jobs::lifecycle::witness::round::WitnessNode;
 
 /// This node as the submission operations see it at `now_ms`; `None` without a network.
 pub fn ingress_node(

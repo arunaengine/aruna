@@ -8,11 +8,10 @@
 use ulid::Ulid;
 
 use super::snapshot::{DistributionSnapshot, RangeFill, Tombstone};
-use super::{
-    DataStrategy, DistributionError, DistributionMember, MemberState, SetPhase, Statement,
-    StatementKind,
-};
+use super::{DataStrategy, DistributionMember, MemberState, SetPhase};
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::distribution::statement::{Statement, StatementKind};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 const JOIN_DOMAIN: &str = "aruna-distribution-join-v1";
 const FILLED_DOMAIN: &[u8] = b"aruna-distribution-filled-v1";

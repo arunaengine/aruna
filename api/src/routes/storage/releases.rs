@@ -7,14 +7,14 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_drivers::driver::{drive, node_routing};
-use aruna_operations::s3::bucket::release::access::MembersCheckOperation;
-use aruna_operations::s3::bucket::release::publish::{
+use aruna_operations::transfer::release::access::MembersCheckOperation;
+use aruna_operations::transfer::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
-use aruna_operations::s3::bucket::release::view::{
+use aruna_operations::transfer::release::view::{
     CheckedViewOperation, FilePage, MAX_PAGE, ViewError,
 };
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
+use aruna_operations::transfer::release::{BucketScope, MembershipCaller};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};

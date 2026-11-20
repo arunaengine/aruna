@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::{PluginInstall, SecretBinding};
 use aruna_core::plugin_runs::{Decisions, EventBatch, HookRequest, PluginRun};
 use aruna_core::plugins::Released;
@@ -27,7 +27,7 @@ use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, CheckNodeBinding
 use super::check::RunScope;
 use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
 use super::copies::Assembled;
-use super::copy_rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
+use super::copy::rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
 use super::decide::DecideBatch;
 use super::dispatch::{EnqueueTimers, HookAuthorization, StartError, StartRun, VerifyHook};
 use super::finished::NotifyDue;
@@ -43,7 +43,7 @@ use super::lifecycle::{match_targets, targets};
 use super::marks::SweepMarks;
 use super::matcher::MatchJournal;
 use super::prune::PruneAudit;
-use super::publish::{CheckPublish, FinishPublish, PublishError, PublishStep};
+use super::publish::{PublishError, PublishPlugin};
 use super::receiver::lost_reason;
 use super::reconcile::{RepairSettled, repair_account};
 use super::records::{InstallEntryConfig, InstallEntryOperation};
@@ -56,7 +56,7 @@ use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
 use super::waiting::RecheckWaiting;
 use super::work::WorkRow;
-use super::work_calls::{JobOutputs, JobRow};
+use super::work::calls::{JobOutputs, JobRow};
 use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use aruna_drivers::driver::{DriverContext, drive};
@@ -342,6 +342,7 @@ pub async fn store_local(
     bytes: &[u8],
     now_ms: u64,
 ) -> Result<(), ArtifactError> {
+    let bytes = bytes::Bytes::copy_from_slice(bytes);
     drive(StoreCopy::new(config, digest, bytes, now_ms), ctx).await
 }
 
@@ -368,11 +369,6 @@ pub async fn fetch_artifact(
     digest: &str,
 ) -> Result<Assembled, ArtifactError> {
     let fetched = drive(FetchArtifact::new(config, digest, local_of(ctx))?, ctx).await?;
-    if fetched.fresh {
-        let bytes = &fetched.copy.bytes;
-        let store = StoreCopy::new(config, digest, bytes, unix_timestamp_millis());
-        drive(store, ctx).await?;
-    }
     Ok(fetched.copy)
 }
 
@@ -382,13 +378,7 @@ pub async fn publish_plugin(
     auth: AuthContext,
     artifact: Vec<u8>,
 ) -> Result<PublishedPlugin, PublishError> {
-    let check = CheckPublish::new(&actor, &auth, &artifact, unix_timestamp_millis())?;
-    let plan = match drive(check, ctx).await? {
-        PublishStep::Known(published) => return Ok(published),
-        PublishStep::Store(plan) => plan,
-    };
-    drive(plan.store_copy(&artifact), ctx).await?;
-    drive(FinishPublish::new(actor, auth, *plan, artifact), ctx).await
+    drive(PublishPlugin::new(actor, auth, artifact.into()), ctx).await
 }
 
 pub async fn job_row(
@@ -591,7 +581,7 @@ pub async fn run_replays(
     now_ms: u64,
     pages: (usize, usize),
 ) -> Result<usize, StoreError> {
-    drive(RunReplays::new(now_ms, pages), ctx).await
+    Ok(drive(RunReplays::new(now_ms, pages, None), ctx).await?.read)
 }
 
 pub async fn read_config(

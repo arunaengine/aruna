@@ -3,24 +3,24 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use aruna_core::StructuredId;
+use aruna_clock::testing::poll_until;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::shard::restore::RestoreTopicsOperation;
-use aruna_operations::shard::restore_plan::RESTORE_TOPIC_COUNT;
+use aruna_operations::shard::restore::plan::RESTORE_TOPIC_COUNT;
 use tempfile::TempDir;
-use tokio::time::sleep;
 use ulid::Ulid;
 
 use crate::convergence;
@@ -146,7 +146,7 @@ async fn finish_restart(
     let fresh: Vec<(GroupId, Ulid)> = fresh.into_iter().map(|(g, d, _)| (g, d)).collect();
     wait_auto_outbox(&nodes[0]).await?;
     let contexts: Vec<Arc<DriverContext>> = nodes.iter().map(|node| node.context.clone()).collect();
-    wait_for_visibility(&contexts, &fresh, Duration::from_millis(200)).await?;
+    wait_for_visibility(&contexts, &fresh).await?;
     println!("fresh write converged to all nodes after restart");
 
     shutdown_nodes(nodes).await;
@@ -352,7 +352,7 @@ const INCIDENT_SHARDS: u32 = 128;
 /// Only this short prefix needs revision-chain ordering during peer recovery.
 const INCIDENT_METADATA_RECORDS: usize = 32;
 /// The production drain examines two full topic pages per invocation.
-const INCIDENT_LIMIT: usize = 2 * aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
+const INCIDENT_LIMIT: usize = 2 * aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 /// Two full invocation windows keep the scale assertion away from the boundary.
 const INCIDENT_SCALE_RECORDS: usize = 2 * INCIDENT_LIMIT;
 /// One bounded pass plus a short chain keeps peer-return coverage controllable.
@@ -706,9 +706,8 @@ fn incident_target(
     ),
     BoxError,
 > {
-    use aruna_core::MetaResourceId;
     use aruna_core::document::DocumentTarget;
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 
     let placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: strategy.strategy_id,
@@ -792,17 +791,17 @@ async fn stop_peers(mut nodes: Vec<TestNode>) -> Result<(TestNode, TempDir, Temp
 async fn seed_outbox(
     node: &TestNode,
     realm_id: RealmId,
-    local: aruna_core::NodeId,
+    local: aruna_core::id::NodeId,
     target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     record_count: usize,
 ) -> Result<Vec<Vec<u8>>, BoxError> {
     for chunk_start in (0..record_count).step_by(1_024) {
         let mut writes = Vec::with_capacity(1_024);
         for index in chunk_start..(chunk_start + 1_024).min(record_count) {
             let record = incident_record(realm_id, local, target, placement, holders, index)?;
-            writes.push(aruna_operations::sync::outbox_record::outbox_write_entry(
+            writes.push(aruna_operations::sync::outbox::record::outbox_write_entry(
                 &record,
             )?);
         }
@@ -832,10 +831,10 @@ async fn seed_outbox(
 
 fn incident_record(
     realm_id: RealmId,
-    local: aruna_core::NodeId,
+    local: aruna_core::id::NodeId,
     target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     index: usize,
 ) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
     use aruna_core::document::{
@@ -864,7 +863,7 @@ fn incident_record(
     };
     let registry = incident_registry(realm_id, target, placement, holders, index)?;
     Ok(
-        aruna_operations::sync::outbox_record::new_identified_record(
+        aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target.clone(),
@@ -880,9 +879,9 @@ fn incident_record(
 }
 
 fn incident_delete(
-    local: aruna_core::NodeId,
+    local: aruna_core::id::NodeId,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     index: usize,
 ) -> Result<aruna_core::document::DocumentOutboxRecord, BoxError> {
     use aruna_core::document::{
@@ -905,7 +904,7 @@ fn incident_delete(
         graph_iri: format!("https://aruna.example/incident/graph/{index}"),
     };
     Ok(
-        aruna_operations::sync::outbox_record::new_identified_record(
+        aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             local,
             target,
@@ -921,7 +920,7 @@ fn incident_registry(
     realm_id: RealmId,
     target: &aruna_core::document::DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
-    holders: &[aruna_core::NodeId],
+    holders: &[aruna_core::id::NodeId],
     index: usize,
 ) -> Result<aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord, BoxError> {
     use aruna_core::document::DocumentTarget;
@@ -1031,56 +1030,58 @@ async fn wait_outbox(
     drainer: &aruna::tasks::incoming::OutboxDrainer,
     nodes: &[TestNode],
 ) -> Result<(), BoxError> {
-    let wait_cap = HANG_CAP.saturating_mul(3);
-    let mut previous = outbox_snapshot(&nodes[0]).await?;
-    let mut deadline = Instant::now() + wait_cap;
-    loop {
-        if previous.0.is_none() && previous.1.is_none() {
-            return Ok(());
-        }
-        tokio::time::timeout(wait_cap, drainer.run_once())
-            .await
-            .map_err(|_| "outbox drain invocation stalled")?;
-        let current = outbox_snapshot(&nodes[0]).await?;
-        if current.0.is_none() && current.1.is_none() {
-            return Ok(());
-        }
-        if current != previous {
-            previous = current;
-            deadline = Instant::now() + wait_cap;
-        } else if Instant::now() >= deadline {
-            return Err(format!(
-                "outbox did not drain without progress (first: {:?}, last: {:?})",
-                current.0, current.1
-            )
-            .into());
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    wait_drained(
+        &nodes[0],
+        Some(drainer),
+        "outbox did not drain without progress",
+    )
+    .await
 }
 
 async fn wait_auto_outbox(node: &TestNode) -> Result<(), BoxError> {
+    wait_drained(node, None, "automatic outbox drain made no progress").await
+}
+
+/// Waits until the outbox of `node` is empty, running `drainer` before each look when given.
+/// Fails only when a whole window passes without the outbox ends changing.
+async fn wait_drained(
+    node: &TestNode,
+    drainer: Option<&aruna::tasks::incoming::OutboxDrainer>,
+    stalled: &str,
+) -> Result<(), BoxError> {
     let wait_cap = HANG_CAP.saturating_mul(3);
-    let mut previous = outbox_snapshot(node).await?;
-    let mut deadline = Instant::now() + wait_cap;
+    let first = outbox_snapshot(node).await?;
+    let previous = &std::sync::Mutex::new(first);
     loop {
-        if previous.0.is_none() && previous.1.is_none() {
+        if *previous.lock().unwrap() == (None, None) {
             return Ok(());
         }
-        sleep(Duration::from_millis(50)).await;
-        let current = outbox_snapshot(node).await?;
-        if current.0.is_none() && current.1.is_none() {
-            return Ok(());
-        }
-        if current != previous {
-            previous = current;
-            deadline = Instant::now() + wait_cap;
-        } else if Instant::now() >= deadline {
-            return Err(format!(
-                "automatic outbox drain made no progress (first: {:?}, last: {:?})",
-                current.0, current.1
-            )
-            .into());
+        let seen = poll_until(wait_cap, move || async move {
+            if let Some(drainer) = drainer {
+                let run = tokio::time::timeout(wait_cap, drainer.run_once()).await;
+                if run.is_err() {
+                    return Some(Err("outbox drain invocation stalled".to_string()));
+                }
+            }
+            let current = match outbox_snapshot(node).await {
+                Ok(current) => current,
+                Err(error) => return Some(Err(error.to_string())),
+            };
+            let mut previous = previous.lock().unwrap();
+            if current == *previous {
+                return None;
+            }
+            *previous = current;
+            Some(Ok(()))
+        })
+        .await;
+        match seen {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(error.into()),
+            None => {
+                let last = previous.lock().unwrap().clone();
+                return Err(format!("{stalled} (first: {:?}, last: {:?})", last.0, last.1).into());
+            }
         }
     }
 }
@@ -1185,7 +1186,7 @@ async fn outbox_keys(node: &TestNode) -> Result<Vec<Vec<u8>>, BoxError> {
     let mut keys = Vec::new();
     let mut start: Option<Vec<u8>> = None;
     loop {
-        let batch = aruna_operations::testing::read_outbox_records(
+        let batch = aruna_test_support::documents::read_outbox_records(
             &node.context.storage_handle,
             &[],
             start.take(),

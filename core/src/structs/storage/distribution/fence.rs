@@ -6,8 +6,10 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::{DistributionSnapshot, KeyRange, RouteError};
+use super::KeyRange;
 use crate::errors::ConversionError;
+use crate::structs::storage::distribution::route::RouteError;
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
 
 /// A range this node fenced as its coordinator for a transfer; it never writes the range again
 /// at the fenced epoch or below, whatever record it later holds.

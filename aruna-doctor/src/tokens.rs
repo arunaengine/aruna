@@ -3,9 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use aruna::config::load;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
+use aruna_config::load;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::calls::Next;
 use aruna_core::onboarding::{
@@ -14,6 +13,7 @@ use aruna_core::onboarding::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
@@ -524,12 +524,11 @@ mod tests {
     use crate::tests::fixtures::env_lock;
     use aruna::bootstrap::ensure_onboarding_secret;
     use aruna::inbound::initialize_net_holder;
-    use aruna::tasks::incoming::start_task_queues;
+    use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListSecretsResponse;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
-    use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -540,14 +539,16 @@ mod tests {
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::structs::identity::user::User;
     use aruna_core::testing::EnvGuard;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::extract::State;
     use axum::routing::{get, post};
@@ -742,7 +743,7 @@ mod tests {
     }
 
     async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-        aruna_operations::testing::read_user(context, user_id).await
+        aruna_drivers::testing::read_user(context, user_id).await
     }
 
     async fn read_realm_config(
@@ -793,7 +794,7 @@ mod tests {
         let shutdown = aruna_tasks::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
-            aruna_core::structs::execution::job::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
             jobs_runtime.clone(),
             &shutdown,
         );
@@ -892,7 +893,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_body_size: aruna_api::server::MAX_BODY_SIZE,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         )
@@ -941,7 +942,7 @@ mod tests {
     }
 
     fn aruna_token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
-        aruna_operations::testing::token_claims(realm_id, user_id)
+        aruna_test_support::tokens::token_claims(realm_id, user_id)
     }
 
     fn sign_aruna_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {

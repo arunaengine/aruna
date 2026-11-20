@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::execution::job::{EffectiveResources, JobId};
+use aruna_core::structs::execution::job::family::EffectiveResources;
+use aruna_core::structs::execution::job::identity::JobId;
 use ulid::Ulid;
 
 use super::*;

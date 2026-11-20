@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::calls::CallRun;
 use aruna_core::events::StorageEvent;
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::abe::envelope_charge;
 use aruna_core::structs::storage::blob::{BackendRef, VersionKey};
 use aruna_core::structs::storage::encryption::ReadLease;
@@ -22,7 +23,10 @@ const TXN: Ulid = Ulid::from_bytes([7; 16]);
 type Stepper = crate::stepper::Stepper<Promotion, PromoteError>;
 
 fn committed() -> Event {
-    Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    Event::Storage(StorageEvent::TransactionCommitted {
+        txn_id: TXN,
+        sequence: 1,
+    })
 }
 
 fn written() -> Event {
@@ -182,7 +186,9 @@ fn changed_archive_aborts() {
 #[tokio::test]
 async fn retirement_fences_promotion() {
     let directory = tempfile::tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(directory.path().to_str().unwrap())
+            .unwrap();
     let key = sealed().format.bucket_key().unwrap();
     let mut record = BucketKeyRecord::new(key, Ulid::nil(), [1; 32], 0);
     record.state = KeyState::Retiring;
@@ -689,21 +695,22 @@ fn claim_mismatch_unregistered() {
 pub(crate) mod received {
     use super::*;
     use crate::blob::unlocked::{DropReceivedOperation, PromoteUnlockedOperation};
-    use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
-    use crate::s3::object::copy::test::{seed_authority, seed_bucket};
-    use crate::tests::s3::full_context;
-    use aruna_core::UserId;
+    use crate::transfer::copy::sealed::{SealedCopyInput, SealedCopyOperation};
+    use crate::transfer::copy::test::seed_authority;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, PATHS_INDEX_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer, ResolvedBackend};
     use aruna_core::structs::storage::encryption::{SealPlan, public_key_of};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::seed_bucket;
+    use aruna_test_support::s3::full_context;
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
 
     async fn put(context: &DriverContext, space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, space, key, value).await;
     }
 
     pub(crate) async fn fixture() -> (tempfile::TempDir, DriverContext, SealPlan, UserId) {
@@ -842,7 +849,7 @@ pub(crate) mod received {
     }
 
     async fn read_value(
-        storage: &aruna_storage::StorageHandle,
+        storage: &aruna_storage::storage::handle::StorageHandle,
         key_space: &str,
         key: Vec<u8>,
     ) -> Result<Option<aruna_core::types::Value>, PromoteError> {
@@ -933,7 +940,7 @@ pub(crate) mod received {
 
     async fn storage_step(
         context: &DriverContext,
-        operation: &mut impl EffectOperation,
+        operation: &mut CallRun<impl Operation>,
         effects: Effects,
     ) -> Effects {
         assert_eq!(effects.len(), 1);
@@ -960,7 +967,7 @@ pub(crate) mod received {
         let record =
             BlobQuarantineRecord::new([0; 32], archive.backend.clone(), "mismatch".into(), 0);
         let fence = RejectOwnersOperation::new(archive.clone(), &record).unwrap();
-        let mut first = fence.clone().into_machine();
+        let mut first = CallRun::new(fence.clone());
         let effects = first.start();
         let effects = storage_step(&context, &mut first, effects).await;
         let effects = storage_step(&context, &mut first, effects).await;

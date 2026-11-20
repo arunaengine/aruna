@@ -270,7 +270,6 @@ mod tests {
     use super::super::migrate_output;
     use super::super::tests::{read, write};
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::keyspaces::{
         BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, COPY_WAIT_KEYSPACE, IRI_INDEX_KEYSPACE,
         PLAINTEXT_COPY_KEYSPACE, REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE,
@@ -285,6 +284,7 @@ mod tests {
     use aruna_core::structs::storage::replication_queue::{
         ReplicateScopeInput, ReplicateScopeTarget,
     };
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;

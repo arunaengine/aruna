@@ -4,14 +4,10 @@
 
 use super::*;
 use crate::auth::UnrestrictedAuth;
-use crate::job_test_calls::insert_job;
-use crate::job_test_calls::put_job_entry;
-use crate::job_test_calls::{cancel_running_job, claim_job, read_job_record};
 use crate::tests::execution::auth_for;
-use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{ExecutorBackend, SessionChannel};
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::{Session, SessionConfig};
-use aruna_core::UserId;
 use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::session::SessionPhase;
 use aruna_core::compute::{
@@ -25,8 +21,9 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_KEYSPACE};
-use aruna_core::structs::execution::job::{
-    CollisionPolicy, ComputeResources, ExecutionSpec, JobId, SessionReportDetail, SessionReportRow,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CollisionPolicy, ComputeResources, ExecutionSpec, SessionReportDetail, SessionReportRow,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -50,11 +47,16 @@ use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::JobMutation;
 use aruna_operations::jobs::store::job_calls::{ClaimOutcome, change_job};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::put_job_entry;
+use aruna_test_support::jobs::{cancel_running_job, claim_job, read_job_record};
 use async_trait::async_trait;
 use byteview::ByteView;
 use std::collections::{BTreeMap, HashMap};

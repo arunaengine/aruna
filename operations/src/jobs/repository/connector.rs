@@ -4,9 +4,8 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::repository::RepositoryCredential;
+use aruna_core::repository::credential::RepositoryCredential;
 use aruna_core::repository::remote::{InvenioAccess, JobStop, NodeScope};
-use aruna_core::rows::event;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use ulid::Ulid;
@@ -15,10 +14,11 @@ use super::TransferError;
 use super::invenio::Session;
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::harvest::create_connector::INVENIO_TOKEN as CONNECTOR_TOKEN;
+use crate::connectors::harvest_rows::{
+    INVENIO_TOKEN as CONNECTOR_TOKEN, parse_secret_read, read_secret_effect,
+};
 use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};
-use crate::harvest::repository::{parse_secret_read, read_secret_effect};
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// Reads the group's repository connector, with the failures a transfer reports.
 #[derive(Debug, PartialEq)]
@@ -186,7 +186,7 @@ impl Operation for ConnectOperation {
                 ))
             }
             ConnectStep::Secret(view) => {
-                let secret = parse_secret_read(event(result)?).map_err(|_| {
+                let secret = parse_secret_read(result.event()?).map_err(|_| {
                     TransferError::Retryable("repository connector storage unavailable".into())
                 })?;
                 let token =

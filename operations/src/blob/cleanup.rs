@@ -5,17 +5,20 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use crate::blob::holders::dht_registration_effect;
+use aruna_core::blob_records::dht_registration_effect;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, CLEANUP_CURSOR_KEYSPACE, COPY_OWNER_KEYSPACE,
-    PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
+    JOB_KEYSPACE, PENDING_LOCATION_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
+    UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, read_row};
-use aruna_core::structs::execution::job::{JobId, JobRecord, RoCrateLimits};
+use aruna_core::rows::{PrefixPages, outside_call, read_row};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::execution::job::local::{JobRecord, decode_job_record, job_record_key};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, CopyOwner,
@@ -33,8 +36,6 @@ use crate::blob::migration::shared::MigrationError;
 use crate::blob::release::{DropClaimsOperation, ReleaseFile, ReleaseRenamedOperation};
 use crate::blob::trail::{DropTrailOperation, TrailError};
 use crate::groups::backends::backend_key;
-use crate::jobs::store::mutation_error::JobMutationError;
-use crate::jobs::store::row_calls::read_job_record;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use aruna_core::structs::storage::routing::NodeRouting;
 
@@ -484,7 +485,7 @@ enum WorkStep {
     Delete,
     Reconcile,
     Dht,
-    Planned(Box<ReleaseFile>),
+    Planned(Box<ReleaseFile>, JobId),
     Settle,
 }
 
@@ -612,8 +613,9 @@ impl CleanupWorkOperation {
                 let Ok(job_id) = JobId::try_from_bytes(job_id.to_bytes()) else {
                     return self.release(file);
                 };
-                let read = read_job_record(job_id);
-                self.call(WorkStep::Planned(Box::new(file)), IoCall::child(read))
+                // An outside read, so the purge job's row never joins this cleanup's commit.
+                let read = outside_call(read_row(JOB_KEYSPACE, job_record_key(job_id)));
+                self.call(WorkStep::Planned(Box::new(file), job_id), read)
             }
             BlobCleanupWork::SettleUpload {
                 attempt,
@@ -699,7 +701,7 @@ impl CleanupWorkOperation {
     fn planned(
         &mut self,
         file: ReleaseFile,
-        record: Result<Option<JobRecord>, JobMutationError>,
+        record: Result<Option<JobRecord>, IoError>,
     ) -> WorkTurn {
         match record {
             Ok(record) if record.as_ref().is_none_or(|record| record.is_settled()) => {
@@ -799,7 +801,12 @@ impl Operation for CleanupWorkOperation {
                 }
             })),
             WorkStep::Dht => Ok(Next::Done(registered(result.event()?))),
-            WorkStep::Planned(file) => self.planned(*file, result.child()?),
+            WorkStep::Planned(file, job_id) => {
+                let row = result
+                    .child::<IoResult, IoError>()?
+                    .and_then(IoResult::value);
+                self.planned(*file, row.map(|row| decode_job_record(job_id, row)))
+            }
             // The settlement removes the record itself, and only while it is unchanged.
             WorkStep::Settle => Ok(Next::Done(match result.event()? {
                 Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Kept,
@@ -1078,11 +1085,10 @@ mod tests {
         ProcessCleanupOperation, ReconcileTargetOperation, RowOutcome,
     };
     use crate::blob::migration::shared::MigrationError;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, UPLOAD_KEYSPACE};
-    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::execution::job::input::RoCrateLimits;
     use aruna_core::structs::storage::blob::{
         BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, WriteOwner,
     };
@@ -1091,9 +1097,11 @@ mod tests {
     use aruna_core::structs::storage::multipart::{
         BackendUpload, MultipartUpload, MultipartUploadStatus,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
     use aruna_storage::scan::iter_prefix_page;
-    use aruna_storage::storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};

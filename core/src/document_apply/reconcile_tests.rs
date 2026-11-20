@@ -5,7 +5,7 @@
 use super::super::fixtures::{actor, child, config_target, config_topic, realm};
 use super::*;
 use crate::document::DocumentEvent;
-use crate::structs::SyncQuarantineIdentity;
+use crate::structs::sync_quarantine::SyncQuarantineIdentity;
 
 type Answer = Result<Next<DocumentReconcileResult>, ApplyError>;
 
@@ -200,6 +200,36 @@ fn writes_batch_cursor() {
         panic!("the pass should have ended: {result:?}");
     };
     assert_eq!(result.targets, vec![config_target()]);
+}
+
+// A pull that queues follow-ups hands its node to each batch and to the creates plan, which
+// store them with each apply; the cursor then moves without a separate follow-up write.
+#[test]
+fn queues_followups_first() {
+    let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let node = FollowUpNode {
+        node_id,
+        realm_id: realm(),
+        from: AppliedStep::Usage,
+    };
+    let pass = ReconcileTopicsOperation::new(realm(), vec![config_topic()]);
+    let mut pass = pass.queuing_followups(node_id, AppliedStep::Usage);
+    pass.first().unwrap();
+    pass.next(child(work(&[config_topic()]))).unwrap();
+    pass.next(IoResult::Values(vec![None])).unwrap();
+    let apply = ApplyBatchOperation::new(config_topic(), realm(), Vec::new(), Vec::new());
+    let apply = Ok(Next::Call(IoCall::child(apply.queuing(Some(node)))));
+    assert_eq!(pass.next(batch_answer(Some(batch()))), apply);
+    let outcome = BatchOutcome {
+        applied_targets: vec![config_target()],
+        ..BatchOutcome::default()
+    };
+    assert_eq!(pass.next(child(outcome)), cursor_write());
+    let deferred = DeferredTopics::new();
+    assert_eq!(pass.next(IoResult::Done), deferred_write(&deferred));
+    let plan = CreateBatchPlan::new(Vec::new(), Vec::new(), Vec::new()).unwrap();
+    let plan = plan.queuing(Some(node));
+    assert_eq!(pass.next(IoResult::Done), Ok(Next::Call(plan_call(plan))));
 }
 
 #[test]

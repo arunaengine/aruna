@@ -9,7 +9,7 @@ use aruna_core::id::TopicId as DocumentTopic;
 use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineUsage};
+use aruna_core::structs::sync_quarantine::{QUARANTINE_USAGE_KEY, SyncQuarantineUsage};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use irokle::{FjallStorage, Storage, TopicId};
 use std::path::Path;
@@ -192,7 +192,7 @@ pub(super) mod tests {
         SYNC_QUARANTINE_KEYSPACE,
     };
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::sync::outbox_record::new_outbox_record;
+    use aruna_operations::sync::outbox::record::new_identified_record;
     use irokle::oplog::Oplog;
     use irokle::{Ed25519Signer, ReplicationPolicy, Signer, TopicGenesis, actor_id_for};
     use tempfile::tempdir;
@@ -200,7 +200,7 @@ pub(super) mod tests {
 
     const REALM: RealmId = RealmId([3u8; 32]);
 
-    pub(in crate::migrate) fn node(seed: u8) -> aruna_core::NodeId {
+    pub(in crate::migrate) fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -237,8 +237,15 @@ pub(super) mod tests {
             bytes: vec![1],
             change,
         };
-        let record =
-            new_outbox_record(node(1), target, Vec::new(), event, PlacementRef::NIL, false);
+        let record = new_identified_record(
+            Ulid::generate(),
+            node(1),
+            target,
+            Vec::new(),
+            event,
+            PlacementRef::NIL,
+            false,
+        );
         postcard::to_allocvec(&record).unwrap()
     }
 

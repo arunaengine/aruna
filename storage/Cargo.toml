@@ -28,9 +28,13 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tantivy = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [features]
 # Smaller key index limits for tests of crates that use the storage handle.
 test-hooks = []
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }

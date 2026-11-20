@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Layer guard: counts async code, references, test habits and duplicates against layers_baseline.json.
-A structural count above its baseline, async code in a clean domain or a new crate dependency fails."""
+Fails on a count above its baseline, async code in operations production or a new crate dependency."""
 # Copyright (c) 2026 The Aruna Contributors
 # SPDX-License-Identifier: MIT or Apache-2.0
 import argparse
@@ -19,32 +19,55 @@ from check_style import CHAR_RE, iter_rust_files, read_source, scan_block
 
 OPERATIONS_SRC = "operations/src"
 BASELINE_PATH = "scripts/dev/layers_baseline.json"
-RUNNER = frozenset({"driver", "effect_adapters", "storage_read"})
 # Domain groups of target-architecture.md section 5, lowest first. A module may
 # use its own group and lower groups only.
 GROUPS = (
     (
         "identity and realm",
         frozenset(
-            "abe auth realm realm_vault node_vault secrets session users groups device onboarding "
+            "abe auth realm realm_vault node_vault secrets session users groups device_node onboarding "
             "placement shard sync owner_index document_repository endpoint_screening forward tasks".split()
         ),
     ),
-    ("data", frozenset("s3 blob staging replication distribution metadata git shares connectors".split())),
+    (
+        "data",
+        frozenset(
+            "s3 blob staging replication distribution transfer metadata git shares connectors device "
+            "holder_choice".split()
+        ),
+    ),
     ("work and integrations", frozenset("jobs plugins assistant notifications federation harvest node".split())),
 )
 ANY_CRATE = "*"
 # Internal normal dependencies the target table (target-architecture.md section 2) allows.
 CRATE_TARGETS = {
     "aruna": ANY_CRATE,
-    "aruna-api": ("aruna-core", "aruna-clock", "aruna-operations", "aruna-drivers", "aruna-wire"),
+    "aruna-api": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-operations",
+        "aruna-drivers",
+        "aruna-wire",
+        "aruna-test-support",
+    ),
     "aruna-doctor": (
         "aruna-core",
         "aruna-clock",
+        "aruna-config",
         "aruna-storage",
         "aruna-blob",
         "aruna-operations",
         "aruna-drivers",
+    ),
+    # The node configuration, settings and identity that the node and the doctor share.
+    "aruna-config": (
+        "aruna-core",
+        "aruna-clock",
+        "aruna-drivers",
+        "aruna-graph",
+        "aruna-net",
+        "aruna-storage",
+        "aruna-wire",
     ),
     "aruna-cli": ("aruna-wire", "aruna-plugins", "aruna-plugin-types"),
     "aruna-operations": ("aruna-core", "aruna-plugin-types"),
@@ -69,6 +92,19 @@ CRATE_TARGETS = {
     "aruna-plugin-types": (),
     "aruna-graph": ("aruna-core",),
     "aruna-outbound": ("aruna-core",),
+    # Test helpers that drive operations; only dev-dependencies name it.
+    "aruna-test-support": (
+        "aruna-core",
+        "aruna-blob",
+        "aruna-graph",
+        "aruna-net",
+        "aruna-operations",
+        "aruna-drivers",
+        "aruna-outbound",
+        "aruna-plugin-types",
+        "aruna-storage",
+        "aruna-tasks",
+    ),
     "aruna-core": ("aruna-kpabe",),
     # Host clocks and the OS random source; core and operations never reach them.
     "aruna-clock": ("aruna-core",),
@@ -87,10 +123,18 @@ BACKENDS = frozenset(
     "aruna-storage aruna-net aruna-blob aruna-tasks aruna-compute aruna-plugins aruna-graph aruna-outbound".split()
 )
 TRIGGER_MATCHES = (
-    ("operations/src/tasks/incoming/mod.rs", "TaskKey::"),
-    ("operations/src/sync/incoming.rs", "Alpn::"),
+    ("aruna/src/tasks/incoming/mod.rs", "TaskKey::"),
+    ("aruna/src/inbound.rs", "Alpn::"),
 )
 TRIGGER_IMPLS = (("aruna/src/plugin_host/broker.rs", "Broker"),)
+# The one helper an arm without an inline async block may hand its work to, and the table that
+# helper must look the operation up in before it drives it.
+TRIGGER_HELPERS = {
+    "aruna/src/tasks/incoming/mod.rs": ("run_trigger", "timer_operation"),
+    "aruna/src/inbound.rs": ("serve_peer", "peer_operation"),
+}
+CALL_RE = re.compile(r"(?<![\w!])([a-z_]\w*)\s*\(")
+DRIVE_ANY = re.compile(r"\bdrive(?:_retry(?:_until)?)?\s*\(")
 SIMILAR_NAMES = (
     "*backoff*",
     "now_ms",
@@ -108,9 +152,9 @@ COUNTS = (
     ("upward_refs", "upward references between domain groups"),
     ("group_mutual_pairs", "mutual module pairs inside a domain group"),
     ("group_cycle_modules", "modules in cycle groups inside a domain group"),
-    ("runner_refs", "runner references into domain modules"),
     ("core_clocks", "clock and random calls in core production code"),
-    ("trigger_arms", "trigger shell arms that call async code"),
+    ("operation_clocks", "clock, random and id-mint calls in operations production code"),
+    ("trigger_arms", "trigger shell arms that do more than drive one operation"),
     ("state_clones", "match self.state.clone() in operations"),
     ("async_parallel", "files with parallel work only through async code"),
     ("test_sleeps", "real sleeps in tests without paused time"),
@@ -123,27 +167,33 @@ TOKEN_RE = re.compile(r"//|/\*|(?<!\w)(?:[bc]?r#*|[bc])?\"|'")
 STRING_RE = re.compile(r'(?:[^"\\]|\\.)*"', re.S)
 TEST_ATTR = re.compile(r"#\[\s*(?:cfg\s*\(\s*test\s*\)|test|rstest|tokio::test\b[^\]]*)\s*\]")
 FILE_TEST = re.compile(r"#!\[\s*cfg\s*\(\s*test\s*\)\s*\]")
+HOOK_ATTR = re.compile(
+    r'#\[\s*cfg\s*\(\s*(?:any\s*\(\s*test\s*,\s*)?feature\s*=\s*"test-hooks"\s*\)?\s*\)\s*\]'
+)
+HOOK_MOD = re.compile(r"\bmod\s+(\w+)\s*;")
 ATTR_RE = re.compile(r"\s*#\[")
 BRACE_RE = re.compile(r"[{}]")
 BRACKET_RE = re.compile(r"[\[\]]")
 ITEM_RE = re.compile(r"[()\[\]{};]")
 ARM_RE = re.compile(r"=>|[()\[\]{},]")
-ASYNC_RE = re.compile(r"\basync\s+(?:move\s+)?(?:fn\b|\{|\|)|\.await\b")
+ASYNC_RE = re.compile(r"\basync\b|\.await\b")
 OPERATION_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?(?:Sub|Effect)?Operation\s+for\b")
 DEF_RE = re.compile(r"\b(?:struct|enum|trait|type|fn|const|static|mod|union)\s+([A-Za-z_]\w*)")
 USE_RE = re.compile(r"\buse\s+((?:crate|super|self)\b[^;]*);")
 INLINE_RE = re.compile(r"\bcrate(?:::\w+)+")
 FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
+DRIVE_RE = re.compile(r"\bdrive\s*\(")
 MATCH_RE = re.compile(r"\bmatch\b")
 STATE_CLONE = re.compile(r"\bmatch\s+self\s*\.\s*state\s*\.\s*clone\s*\(\s*\)")
 PARALLEL_RE = re.compile(r"\b(?:join_all|FuturesUnordered|buffer_unordered|JoinSet|try_join\w*)\b")
 SLEEP_RE = re.compile(r"(?<![\w.:])(?:(?:std::)?thread::|(?:tokio::)?time::)?sleep\s*\(")
 CLOCK_RE = re.compile(
-    r"\b(?:(?:SystemTime|Instant|Utc)::now|unix_timestamp_(?:secs|millis)|now_ms(?=\s*\()"
-    r"|Ulid::(?:new|generate)|thread_rng|OsRng|rand::random|getrandom)\b"
+    r"\b(?:(?:SystemTime|Instant|Utc)::now|unix_timestamp_(?:secs|millis)|(?<!\.)(?<!fn )now_ms(?=\s*\()"
+    r"|Ulid::(?:new|generate)|thread_rng|OsRng|rand::(?:random|rng)|Uuid::new_v4|getrandom)\b"
 )
-EFFECT_OP_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?EffectOperation\s+for\b")
 PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
+# The shared bounded poll helper; the one real sleep in tests the guard does not count.
+POLL_HELPER = ("clock/src/testing.rs", "poll_until")
 SKIP_RE = re.compile(r"\be?println!\s*\([^;]*\)\s*;\s*(?:return\b|None\s*[},])")
 SPACE_RE = re.compile(r"\s+")
 COMMA_RE = re.compile(r"\s*,")
@@ -254,6 +304,7 @@ def is_test(rel):
     name = os.path.basename(rel)
     return (
         "/tests/" in "/" + rel
+        or "_tests/" in rel
         or name == "tests.rs"
         or name.endswith("_tests.rs")
         or name.startswith(("test_", "tests_"))
@@ -428,9 +479,9 @@ def cycle_groups(edges):
 
 
 def layer_counts(ops):
-    """Counts and details for mixed files, references, groups and the runner."""
+    """Counts and details for mixed files, references and groups."""
     details = collections.defaultdict(list)
-    upward, inside, pure_async, runner = collections.Counter(), collections.Counter(), 0, collections.Counter()
+    upward, inside, pure_async = collections.Counter(), collections.Counter(), 0
     for rel, info in sorted(ops.files.items()):
         if info["kind"] == "mixed":
             details["mixed_files"].append(rel)
@@ -442,8 +493,6 @@ def layer_counts(ops):
                 details["pure_async_refs"].append(f"{rel} -> {target}")
             if source_mod == target_mod or source_mod is None or target_mod is None:
                 continue
-            if source_mod in RUNNER and target_mod not in RUNNER:
-                runner[(source_mod, target_mod)] += 1
             source_rank, target_rank = group_rank(source_mod), group_rank(target_mod)
             if source_rank is None or target_rank is None:
                 continue
@@ -456,14 +505,12 @@ def layer_counts(ops):
     details["upward_refs"] = [f"{a} -> {b}: {count}" for (a, b), count in sorted(upward.items())]
     details["group_mutual_pairs"] = [f"{a} <-> {b}" for a, b in mutual]
     details["group_cycle_modules"] = [", ".join(group) for group in cycles]
-    details["runner_refs"] = [f"{a} -> {b}: {count}" for (a, b), count in sorted(runner.items())]
     counts = {
         "mixed_files": len(details["mixed_files"]),
         "pure_async_refs": pure_async,
         "upward_refs": sum(upward.values()),
         "group_mutual_pairs": len(mutual),
         "group_cycle_modules": sum(len(group) for group in cycles),
-        "runner_refs": sum(runner.values()),
     }
     return counts, details
 
@@ -520,25 +567,61 @@ def match_arms(masked):
 
 
 def trigger_arms(sources):
-    """Arms of the trigger shells whose bodies still run async code."""
+    """Arms of the trigger shells that do more than drive one operation; a shell without its
+    dispatch match counts too, so a moved shell cannot pass unchecked."""
     found = []
     for rel, prefix in TRIGGER_MATCHES:
         source = sources.get(rel)
-        if not source:
-            continue
-        for pattern, body in match_arms(source.masked):
-            if prefix in pattern and ASYNC_RE.search(body):
-                found.append(f"{rel}: {SPACE_RE.sub(' ', pattern.strip())}")
+        masked = source.masked if source else ""
+        arms = [(pattern, body) for pattern, body in match_arms(masked) if prefix in pattern]
+        if not arms:
+            found.append(f"{rel}: no {prefix} dispatch")
+        helper, table = TRIGGER_HELPERS.get(rel, ("", ""))
+        handed = False
+        for pattern, body in arms:
+            name = SPACE_RE.sub(" ", pattern.strip())
+            if ASYNC_RE.search(body):
+                if not one_drive(body):
+                    found.append(f"{rel}: {name}")
+                continue
+            # A helper future returned without an inline async block must be the table helper.
+            for call in CALL_RE.findall(body):
+                if call == helper:
+                    handed = True
+                elif call != "pin":
+                    found.append(f"{rel}: {name} hands off to {call}")
+        if handed:
+            found.extend(helper_shape(rel, masked, helper, table))
     for rel, trait in TRIGGER_IMPLS:
         source = sources.get(rel)
         if not source:
+            found.append(f"{rel}: no {trait} impl source")
             continue
         impl_re = re.compile(r"\bimpl\b[^{;]*\b" + trait + r"\s+for\b[^{;]*\{")
         for impl in impl_re.finditer(source.masked):
             body = source.masked[impl.end() - 1 : pair_end(source.masked, impl.end() - 1, BRACE_RE)]
-            for method in re.finditer(r"\basync\s+fn\s+(\w+)", body):
-                found.append(f"{rel}: {trait}::{method.group(1)}")
+            for name, keyword, start, end in function_bodies(body):
+                if body[:keyword].rstrip().endswith("async") and not one_drive(body[start:end]):
+                    found.append(f"{rel}: {trait}::{name}")
     return found
+
+
+def helper_shape(rel, masked, helper, table):
+    """Findings for a table helper that does not look its operation up once and drive it."""
+    for name, _, start, end in function_bodies(masked):
+        if name == helper:
+            body = masked[start:end]
+            lookups = len(re.findall(r"\b" + table + r"\s*\(", body))
+            if lookups == 1 and DRIVE_ANY.search(body):
+                return []
+            return [f"{rel}: {helper} does not drive one {table} operation"]
+    return [f"{rel}: no {helper} helper"]
+
+
+def one_drive(body):
+    """Whether an async arm only builds one operation, drives it and maps the result."""
+    awaits = body.count(".await")
+    return awaits == 0 or (awaits == 1 and DRIVE_RE.search(body) is not None)
 
 
 def function_bodies(masked):
@@ -560,31 +643,48 @@ def function_bodies(masked):
 
 
 def test_habits(sources):
-    """Real sleeps outside paused tests, and tests that print and return early."""
+    """Real sleeps outside paused tests and test-hooks helpers, and tests that print and return
+    early."""
     sleeps, skips = [], []
+    hooked = hook_modules(sources)
     for source in sources:
         text = source.test_masked
         if "sleep" in text:
             sleeps.extend(real_sleeps(source.rel, text))
+        hooks = hook_text(source, hooked)
+        if "sleep" in hooks:
+            sleeps.extend(real_sleeps(source.rel, hooks))
         if "println!" in text:
             for found in SKIP_RE.finditer(text):
                 skips.append(f"{source.rel}:{text.count(chr(10), 0, found.start()) + 1}")
     return sleeps, skips
 
 
+def hook_text(source, hooked):
+    """The production text that only the test-hooks feature compiles: a gated module file whole,
+    else its gated items."""
+    if any(source.rel == f"{prefix}.rs" or source.rel.startswith(f"{prefix}/") for prefix in hooked):
+        return source.masked
+    spans = hook_spans(source)
+    return blank(source.masked, outside(spans, len(source.masked))) if spans else ""
+
+
 def real_sleeps(rel, text):
-    """Sleep calls whose outermost enclosing fn neither starts paused nor pauses time."""
+    """Sleep calls whose outermost enclosing fn neither starts paused nor pauses time, outside
+    the one shared bounded poll helper."""
     outer, found_sleeps = [], []
-    for _, keyword, start, end in function_bodies(text):
+    for name, keyword, start, end in function_bodies(text):
         if outer and start < outer[-1][2]:
             continue
         head = max(text.rfind("}", 0, keyword), text.rfind(";", 0, keyword), 0)
-        outer.append((head, start, end))
+        outer.append((head, start, end, name))
     for found in SLEEP_RE.finditer(text):
         if text[: found.start()].rstrip().endswith("fn"):
             continue
         owner = next((item for item in outer if item[0] <= found.start() < item[2]), None)
         if owner and PAUSE_RE.search(text, owner[0], owner[2]):
+            continue
+        if owner and (rel, owner[3]) == POLL_HELPER:
             continue
         found_sleeps.append(f"{rel}:{text.count(chr(10), 0, found.start()) + 1}")
     return found_sleeps
@@ -681,6 +781,7 @@ def measure(root):
     details["async_parallel"] = [source.rel for source in operations if PARALLEL_RE.search(source.masked)]
     details["test_sleeps"], details["silent_skips"] = test_habits(sources)
     details["core_clocks"] = core_clocks(sources)
+    details["operation_clocks"] = core_clocks(sources, OPERATIONS_SRC + "/")
     duplicates = duplicate_groups(sources)
     details["duplicate_groups"] = [" | ".join(group) for group in duplicates]
     for key in (
@@ -690,38 +791,53 @@ def measure(root):
         "test_sleeps",
         "silent_skips",
         "core_clocks",
+        "operation_clocks",
         "duplicate_groups",
     ):
         counts[key] = len(details[key])
     return counts, details, async_lines(ops), ops, sources
 
 
-def clock_calls(ops):
-    """Clock and random calls in production files that define an operation, reported only."""
-    found = []
-    for rel, info in sorted(ops.files.items()):
-        if info["kind"] not in ("op", "mixed"):
-            continue
-        masked = info["source"].masked
-        for hit in CLOCK_RE.finditer(masked):
-            found.append(f"{rel}:{masked.count(chr(10), 0, hit.start()) + 1}")
-    return found
-
-
-def core_clocks(sources):
-    """Clock and random calls in production code of the core crate; the runner and inputs own them."""
+def hook_spans(source):
+    """Spans of items that only tests or the test-hooks feature compile."""
     return [
-        f"{source.rel}:{source.masked.count(chr(10), 0, hit.start()) + 1}"
-        for source in sources
-        if source.rel.startswith("core/src/")
-        for hit in CLOCK_RE.finditer(source.masked)
+        (found.start(), item_end(source.masked, found.end()))
+        for found in HOOK_ATTR.finditer(source.code)
     ]
 
 
-def clean_findings(ops, clean):
+def hook_modules(sources):
+    """Path prefixes of module files declared under a test-hooks gate."""
+    prefixes = []
+    for source in sources:
+        stem = source.rel[:-3]
+        base = os.path.dirname(stem) if os.path.basename(stem) in ("lib", "mod", "main") else stem
+        for start, end in hook_spans(source):
+            for found in HOOK_MOD.finditer(source.masked, start, end):
+                prefixes.append(f"{base}/{found.group(1)}")
+    return prefixes
+
+
+def core_clocks(sources, root="core/src/"):
+    """Clock, random and id-mint calls in a crate's production code; test hooks are helpers."""
+    core = [source for source in sources if source.rel.startswith(root)]
+    hooked = hook_modules(core)
+    found = []
+    for source in core:
+        if any(source.rel == f"{prefix}.rs" or source.rel.startswith(f"{prefix}/") for prefix in hooked):
+            continue
+        spans = hook_spans(source)
+        for hit in CLOCK_RE.finditer(source.masked):
+            if not any(start <= hit.start() < end for start, end in spans):
+                found.append(f"{source.rel}:{source.masked.count(chr(10), 0, hit.start()) + 1}")
+    return found
+
+
+def async_findings(ops):
+    """Every production file of operations with async code, at its first async line."""
     found = []
     for rel, info in sorted(ops.files.items()):
-        if info["module"] in clean and info["kind"] in ("async", "mixed"):
+        if info["kind"] in ("async", "mixed"):
             hit = ASYNC_RE.search(info["source"].masked)
             line = info["source"].masked.count("\n", 0, hit.start()) + 1
             found.append(f"{rel}:{line}")
@@ -735,9 +851,8 @@ def load_baseline(path):
     except FileNotFoundError:
         baseline = {}
     missing = [key for key, _ in COUNTS if key not in baseline.get("structural", {})]
-    for key in ("clean_domains", "crate_allow", "async_lines"):
-        if key not in baseline:
-            missing.append(key)
+    if "crate_allow" not in baseline:
+        missing.append("crate_allow")
     return baseline, missing
 
 
@@ -745,23 +860,12 @@ def report(root, baseline, show_all):
     """Print the guard report and return the number of errors."""
     counts, details, lines, ops, sources = measure(root)
     errors = 0
-    total, base_total = sum(lines.values()), sum(baseline["async_lines"].values())
-    print(f"async production lines in operations: {total} (baseline {base_total}), reported only")
-    for module in sorted(set(lines) | set(baseline["async_lines"])):
-        now, before = lines.get(module, 0), baseline["async_lines"].get(module, 0)
-        if show_all or now != before:
-            print(f"  {module}: {now} (baseline {before})")
-    effect_ops = [
-        source.rel
-        for source in sources
-        for _ in EFFECT_OP_RE.finditer(source.masked)
-    ]
-    print(f"EffectOperation implementations outside tests: {len(effect_ops)}, reported only")
-    clocks = clock_calls(ops)
-    print(f"clock and random calls in operation files: {len(clocks)}, reported only")
-    if show_all:
-        for hit in clocks:
-            print(f"    {hit}")
+    print(f"async production lines in operations: {sum(lines.values())}")
+    for module, count in lines.items():
+        print(f"  {module}: {count}")
+    for hit in async_findings(ops):
+        errors += 1
+        print(f"  error: async code in operations production at {hit}")
     for key, label in COUNTS:
         now, limit = counts[key], baseline["structural"][key]
         print(f"{label}: {now} (baseline {limit})")
@@ -773,12 +877,6 @@ def report(root, baseline, show_all):
         if show_all or now > limit:
             for line in details[key]:
                 print(f"    {line}")
-    clean = baseline["clean_domains"]
-    dirty = clean_findings(ops, set(clean))
-    print(f"clean domains: {', '.join(clean) if clean else 'none'}")
-    for hit in dirty:
-        errors += 1
-        print(f"  error: async code in a clean domain at {hit}")
     outside_deps, unused = crate_findings(root, baseline["crate_allow"])
     print(f"crate dependencies outside the target table and allow list: {len(outside_deps)}")
     for dep in outside_deps:
@@ -794,12 +892,10 @@ def report(root, baseline, show_all):
 
 
 def current_json(root, baseline):
-    counts, _, lines, _, _ = measure(root)
+    counts, _, _, _, _ = measure(root)
     result = {
-        "clean_domains": baseline.get("clean_domains", []),
         "crate_allow": baseline.get("crate_allow", {}),
         "structural": {key: counts[key] for key, _ in COUNTS},
-        "async_lines": lines,
     }
     return json.dumps(result, indent=2) + "\n"
 

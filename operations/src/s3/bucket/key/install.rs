@@ -10,6 +10,7 @@ use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::encryption::{
@@ -17,7 +18,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::task::TaskEffect;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::time::Duration;
 use thiserror::Error;
 use ulid::Ulid;
@@ -359,8 +360,7 @@ mod tests {
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
-    use aruna_core::operation::Runnable;
-    use aruna_core::structs::execution::job::RoCrateLimits;
+    use aruna_core::structs::execution::job::input::RoCrateLimits;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{BucketKeyError, public_key_of};
     use aruna_drivers::driver::DriverContext;
@@ -384,13 +384,13 @@ mod tests {
     }
 
     /// Activates a key as the routes do, then resumes the work that waited for it.
-    async fn activate_and_wake<O, K>(
+    async fn activate_and_wake<O>(
         context: &DriverContext,
         operation: O,
         origin: (RealmId, NodeId),
     ) -> Result<UnlockStatus, O::Error>
     where
-        O: Runnable<K, Output = UnlockStatus>,
+        O: Operation<Output = UnlockStatus>,
     {
         let status = drive(operation, context).await?;
         let now_ms = aruna_core::time::unix_timestamp_millis();
@@ -638,20 +638,20 @@ mod tests {
         use crate::s3::bucket::create::CreateBucketOperation;
         use crate::s3::bucket::encryption::{EnableEncryptionOperation, EnableInput};
         use aruna_blob::blob::BlobHandler;
-        use aruna_core::UserId;
         use aruna_core::effects::StorageEffect;
-        use aruna_core::node_vault::NodeVaultKey;
+        use aruna_core::node::vault::NodeVaultKey;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
         use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, EncryptionMode};
         use aruna_core::structs::storage::format::Compression;
         use aruna_core::structs::storage::holders::KeyLookup;
+        use aruna_core::user::id::UserId;
         use aruna_drivers::driver::drive;
         use std::collections::{BTreeMap, HashMap};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
-        let storage = aruna_storage::FjallStorage::open(root).unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(root).unwrap();
         storage.open_vault(NodeVaultKey::random());
         let net = aruna_net::NetHandle::new(aruna_drivers::testing::local_net(), storage.clone())
             .await
@@ -752,12 +752,13 @@ mod tests {
     #[tokio::test]
     async fn install_wakes_parked() {
         use crate::jobs::store::job_calls::ClaimOutcome;
-        use crate::jobs::store::test_calls::{claim_job, insert_job, park_job, read_job_record};
         use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
-        use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-        use aruna_core::structs::execution::job::{
-            JobId, JobPayload, JobRecord, JobState, KeyWait, due_index_key,
-        };
+        use aruna_core::node::vault::{VaultEntry, VaultPurpose};
+        use aruna_core::structs::execution::job::identity::{JobId, JobState};
+        use aruna_core::structs::execution::job::input::JobPayload;
+        use aruna_core::structs::execution::job::key_wait::KeyWait;
+        use aruna_core::structs::execution::job::local::{JobRecord, due_index_key};
+        use aruna_test_support::jobs::{insert_job, read_job_record};
 
         let (_dir, context, enabled) = enabled_context().await;
         let storage = &context.storage_handle;
@@ -775,9 +776,12 @@ mod tests {
         };
         let job = JobRecord::new(job_id, payload, creator, node, 1_000, 1_000, None);
         insert_job(&context, &job).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            claim_job(&context, job_id, node, 2_000).await.unwrap()
-        else {
+        let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node, 2_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let wait = KeyWait {
@@ -786,18 +790,20 @@ mod tests {
             group_id: None,
             key: key.key,
         };
-        park_job(
+        aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::park_job(
+                job_id,
+                claimed.claim.unwrap().claim_token,
+                3_000,
+                vec![wait],
+            ),
             &context,
-            job_id,
-            claimed.claim.unwrap().claim_token,
-            3_000,
-            vec![wait],
         )
         .await
         .unwrap();
         assert!(
             !aruna_drivers::driver::drive(
-                crate::jobs::key_locks::KeyUnlockedOperation::new(key.key),
+                crate::blob::unlocked::KeyUnlockedOperation::new(key.key),
                 &context
             )
             .await
@@ -875,7 +881,6 @@ mod tests {
     async fn unlock_resumes_rewrite() {
         use crate::blob::migration::queue::{ProcessTransitionsOperation, RECHECK};
         use crate::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
-        use crate::testing::RecordingTaskHandler;
         use crate::tests::records::read_row;
         use aruna_core::handle::Handle;
         use aruna_core::keyspaces::{
@@ -889,6 +894,7 @@ mod tests {
             EncryptionTransition, TransitionKind, TransitionState, TransitionTarget,
         };
         use aruna_core::task::{TaskEffect, TaskKey};
+        use aruna_drivers::testing::RecordingTaskHandler;
         use aruna_drivers::testing::freeze_clock;
 
         let (_dir, mut context, enabled) = enabled_context().await;

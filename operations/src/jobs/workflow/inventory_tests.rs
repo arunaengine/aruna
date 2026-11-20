@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use aruna_core::calls::ChildOutcome;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::execution::job::{JobErrorKind, OutputCommitIntent};
+use aruna_core::structs::execution::job::local::{JobErrorKind, OutputCommitIntent};
 use aruna_core::structs::storage::blob::BlobHeadKey;
 
 use super::*;
@@ -23,11 +23,11 @@ fn version() -> Ulid {
 }
 
 fn spec(prefixes: &[&str]) -> ExecutionSpec {
-    let output = aruna_core::structs::execution::job::OutputSelection {
+    let output = aruna_core::structs::execution::job::input::OutputSelection {
         container_path: "/out/a".to_string(),
         path_prefix: None,
         destination_node_id: Some(node()),
-        destination: aruna_core::structs::execution::job::OutputDestination::S3 {
+        destination: aruna_core::structs::execution::job::input::OutputDestination::S3 {
             bucket: BUCKET.to_string(),
             key: "reports/a".to_string(),
         },

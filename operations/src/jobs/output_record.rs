@@ -2,14 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, ExecutionClaim, ExecutionOutputRecord, JobError, JobFamilyRecord, JobRecord,
-    JobRecordEnvelope, LocalExecution, OutputObject, OutputSet, SubmissionId,
+use aruna_core::structs::execution::job::family::{
+    ExecutionClaim, ExecutionOutputRecord, JobFamilyRecord, JobRecordEnvelope, LocalExecution,
+    OutputSet, SubmissionId,
+};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, JobError, JobRecord, OutputObject,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::{debug, warn};
@@ -335,21 +338,19 @@ impl Operation for StoreOutputsOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobState,
-    };
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{AttemptIntent, JobClaim};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_core::user::id::UserId;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 
     use super::*;
-    use crate::jobs::store::test_calls::insert_job;
-    use crate::jobs::store::test_calls::read_output_record as read_stored;
-    use crate::jobs::store::test_calls::{read_attempt_control, reserve_output_commits};
-    use aruna_core::structs::execution::job::JobId;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_test_support::jobs::insert_job;
 
     const TOKEN: Ulid = Ulid(0x5EA1);
 
@@ -397,12 +398,12 @@ mod tests {
         let storage: StorageHandle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId([1u8; 32]);
         let net = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
+            aruna_net::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 realm_id,
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
-                ..aruna_net::NetConfig::default()
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
+                ..aruna_net::config::NetConfig::default()
             },
             storage.clone(),
         )
@@ -459,31 +460,40 @@ mod tests {
         // The signed record must be readable back under the digest terminal
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
-        crate::jobs::store::test_calls::record_attempt_intent(
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::record_attempt_intent(
+                record.job_id,
+                TOKEN,
+                AttemptIntent {
+                    attempt_no: 1,
+                    external_name: "aruna-test-a1".to_string(),
+                    executor_kind: "docker".to_string(),
+                    pinned_image: "alpine@sha256:0".to_string(),
+                    attempt_epoch: 0,
+                    backend: "docker".to_string(),
+                    config_generation: 0,
+                    home_digest: aruna_core::compute::identity::home_digest("docker", None),
+                },
+                None,
+                None,
+                2_000,
+            ),
             &context,
-            record.job_id,
-            TOKEN,
-            AttemptIntent {
-                attempt_no: 1,
-                external_name: "aruna-test-a1".to_string(),
-                executor_kind: "docker".to_string(),
-                pinned_image: "alpine@sha256:0".to_string(),
-                attempt_epoch: 0,
-                backend: "docker".to_string(),
-                config_generation: 0,
-                home_digest: aruna_core::compute::identity::home_digest("docker", None),
-            },
-            None,
-            None,
-            2_000,
         )
         .await
         .unwrap();
-        let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
-        let control =
-            reserve_output_commits(&context, record.job_id, &destinations, &Default::default())
-                .await
-                .unwrap();
+        let destinations = [(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
+        let control = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::reserve_output_commits(
+                record.job_id,
+                destinations.to_vec(),
+                Default::default(),
+                aruna_core::time::unix_timestamp_millis(),
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
         let version_id = control.output_commits[0].version_id;
         let outputs = vec![output(control.execution_id, version_id)];
 
@@ -491,16 +501,25 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = read_attempt_control(&context, record.job_id, control.attempt_epoch, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::read_attempt_control(
+                record.job_id,
+                control.attempt_epoch,
+            ),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = read_stored(&context, record.job_id, control.attempt_epoch)
-            .await
-            .unwrap()
-            .unwrap();
+        let envelope = aruna_drivers::driver::drive(
+            crate::jobs::store::row_calls::read_output_record(record.job_id, control.attempt_epoch),
+            &context,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(envelope.digest().unwrap(), digest);
         assert!(envelope.verify_signature().is_ok());
         let JobFamilyRecord::Output(output_record) = &envelope.record else {

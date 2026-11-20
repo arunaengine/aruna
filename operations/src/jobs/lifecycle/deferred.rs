@@ -4,7 +4,7 @@
 
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::events::LaunchDecline;
-use aruna_core::structs::execution::job::LAUNCH_WINDOW_MS;
+use aruna_core::structs::execution::job::family::LAUNCH_WINDOW_MS;
 use serde::{Deserialize, Serialize};
 
 /// The last temporary answer of a target whose receipt wait expired.

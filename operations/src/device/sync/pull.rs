@@ -5,16 +5,15 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal};
+use aruna_core::structs::synced_folder::{SyncPull, SyncPullAck, SyncPullStatus, SyncRefusal};
 use tracing::warn;
 
 use crate::forward::transport::{peer_answer, peer_call};
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::transport_message_kind;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, transport_message_kind};
 
 /// Delay before the first poll; it doubles up to [`PULL_POLL_AFTER`], so a small file settles
 /// within a few quick polls.

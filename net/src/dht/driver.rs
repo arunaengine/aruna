@@ -5,7 +5,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
-use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::DhtGetOptions;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -15,9 +14,10 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::DHT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::trace_context::DistributedTraceContext;
 use aruna_core::types::TxnId;
-use aruna_storage::StorageHandle;
-use aruna_storage::storage::TransactionOwner;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::owner::TransactionOwner;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
 use iroh::Endpoint;
@@ -50,11 +50,11 @@ use super::storage::{
     merge_entry, parse_deadline, retained_entries, row_deadline, validate_entries,
 };
 use crate::connection_pool::{ConnectionPool, PoolConnectError};
-use crate::telemetry::{
-    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
-    record_selected_path, warn_iroh_phase, warn_iroh_request,
-};
+use crate::telemetry::{record_selected_path, warn_iroh_phase, warn_iroh_request};
 use aruna_clock::unix_timestamp_secs;
+use aruna_core::telemetry::{
+    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
+};
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (SendStream, RecvStream, NodeId);
@@ -2332,9 +2332,9 @@ async fn commit_storage_txn(
     };
     let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
     match send_storage_effect(storage, commit, op_id, stage, "commit").await {
-        Ok(Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }))
-            if committed == txn_id =>
-        {
+        Ok(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: committed, ..
+        })) if committed == txn_id => {
             owner.finish();
             Ok(())
         }
@@ -2914,7 +2914,7 @@ mod tests {
     use super::*;
     use crate::test_support::make_node;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::{TempDir, tempdir};
 
     fn make_entry(seed: u8, key: DhtKeyId, expires_at: u64) -> StoredEntry {

@@ -5,8 +5,6 @@
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::distribution::guard::{authority_reads, write_epochs};
-use crate::metadata::call_results::page_rows as range_rows;
-use crate::replication::queue::schedule_blob_drain;
 use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::staging::page::rows::{
     MAX_PAGE_ENTRIES, PageGuards, PreparedRows, check_guards, decode_heads, guard_reads,
@@ -17,16 +15,15 @@ use aruna_core::effects::Effect;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::structs::storage::blob::CurrentVersionPointer;
-use aruna_core::structs::sync_relationship_prefix;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
+use aruna_core::structs::sync_relationship::sync_relationship_prefix;
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
-pub use crate::staging::page::rows::{
-    PageEntry, PageImportError, PageImportInput, PageImportResult,
-};
+use crate::staging::page::rows::{PageImportError, PageImportInput, PageImportResult};
 
 /// What the pending call of a page answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -239,7 +236,7 @@ impl Operation for PageImportOperation {
                     None => self.take_heads(Vec::new()),
                 }
             }
-            PageStep::Heads => match range_rows(result)? {
+            PageStep::Heads => match result.page()? {
                 (_, Some(_)) => {
                     let reads = head_reads(&self.input)?;
                     self.call(PageStep::HeadKeys, IoCall::Read(reads))
@@ -272,12 +269,12 @@ impl Operation for PageImportOperation {
                 self.write_rows(versions)
             }
             PageStep::WriteRows => {
-                done(result)?;
+                result.done()?;
                 let deletes = self.input.deletes.clone();
                 self.call(PageStep::DeleteRows, IoCall::Delete(deletes))
             }
             PageStep::DeleteRows => {
-                done(result)?;
+                result.done()?;
                 self.update_usage()
             }
             PageStep::Usage => self.step_usage(result),

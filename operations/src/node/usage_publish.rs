@@ -4,14 +4,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters,
@@ -24,14 +24,14 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::distribution::replica_shares::{GroupShare, ReplicaSharesOperation};
-use crate::node::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
+use crate::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
 use crate::s3::usage::{
     LoadCountersError, global_shard_rows, global_sum, schedule_snapshot_publish,
 };
 use crate::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,
 };
+use crate::transfer::replica_shares::{GroupShare, ReplicaSharesOperation};
 
 /// Rows one marker or counter scan reads per page.
 const SCAN_PAGE: usize = 1_000;
@@ -83,7 +83,7 @@ impl PublishedUsage {
 }
 
 /// The groups and global scope one publish reports.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct UsageScope {
     global: bool,
     groups: BTreeSet<GroupId>,
@@ -266,7 +266,7 @@ fn snapshot_rows(
     Ok(writes)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum PublishStep {
     Markers,
     Counters,
@@ -285,7 +285,7 @@ type PublishTurn = Result<Next<PublishedUsage>, UsagePublishError>;
 /// Rebuilds this node's snapshots from live counters and replicates them: dirty mode refreshes
 /// marked groups, full mode all groups plus the global. Markers clear only after replication (and
 /// with `refresh` the realm summary), never if re-dirtied; a later failure marks a retry.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PublishUsageOperation {
     node_id: NodeId,
     realm_id: RealmId,
@@ -468,7 +468,9 @@ impl Operation for PublishUsageOperation {
                 Ok(Next::Call(IoCall::Write(writes)))
             }
             PublishStep::Write => {
-                done(result).map_err(|error| failed(format!("snapshot write failed: {error}")))?;
+                result
+                    .done()
+                    .map_err(|error| failed(format!("snapshot write failed: {error}")))?;
                 self.replicate()
             }
             PublishStep::Replicate => match result.child::<(), ReplicateDocumentsError>()? {
@@ -568,7 +570,7 @@ impl Operation for RetrySignalOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if !self.scheduling {
-            done(result)?;
+            result.done()?;
             return self.schedule();
         }
         match result.event()? {
@@ -619,7 +621,7 @@ impl Operation for ClearMarkersOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         if self.deleting {
-            return done(result).map(Next::Done);
+            return result.done().map(Next::Done);
         }
         let current = result.values()?;
         let deletes: Vec<_> = (self.observed.iter().zip(current))

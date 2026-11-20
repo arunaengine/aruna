@@ -277,20 +277,20 @@ mod tests {
     use aruna_core::events::StorageEvent;
     use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
     use aruna_core::time::unix_timestamp_millis;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
 
     use crate::s3::object::metadata_drain::{
         DrainRefreshOperation, RefreshReferenceOperation, RefreshRunError, SettleJob,
     };
-    use aruna_core::UserId;
     use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::DriverContext;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
 
     async fn process_batch(

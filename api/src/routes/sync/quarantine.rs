@@ -7,12 +7,15 @@ use std::sync::Arc;
 
 use aruna_core::document::DocumentEvent;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::{SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage};
-use aruna_drivers::driver::{drive, drive_retry};
-use aruna_operations::sync::sync_quarantine::{
-    AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
-    QuarantineAdminError, QuarantinePageRequest, ReadQuarantineOperation,
+use aruna_core::structs::sync_quarantine::{
+    SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage,
 };
+use aruna_drivers::driver::{drive, drive_retry};
+use aruna_operations::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::list::ListQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::prune::PruneQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::read::ReadQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::{QuarantineAdminError, QuarantinePageRequest};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

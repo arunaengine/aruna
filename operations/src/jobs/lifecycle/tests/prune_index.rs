@@ -4,11 +4,11 @@
 
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::keyspaces::FAMILY_PRUNE_KEYSPACE;
+use aruna_core::structs::execution::job::family::{JobFamilyId, JobFamilyRecord};
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::prune::TOMBSTONE_RETENTION_MS;
 use aruna_core::structs::execution::job::record_keys::{
     PRUNE_DUE_PREFIX, parse_prune_due, prune_slot_key,
-};
-use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, RETENTION_MS, TOMBSTONE_RETENTION_MS,
 };
 use aruna_core::types::Key;
 use aruna_drivers::driver::{DriverContext, drive};

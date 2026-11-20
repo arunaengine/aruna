@@ -8,14 +8,14 @@
 
 use aruna_core::calls::{IoCall, IoResult};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE};
-use aruna_core::rows;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::types::Key;
 use byteview::ByteView;
 use ulid::Ulid;
 
 use crate::connectors::reference_prune::prune_queue_write;
-use crate::connectors::repository::{REFERENCE_PAGE_SIZE, StorageReadError, references_connector};
+use crate::connectors::repository::{REFERENCE_PAGE_SIZE, references_connector};
+use aruna_core::errors::StorageReadError;
 
 /// Connector id bytes ahead of the version key in a reference row.
 const ROW_PREFIX: usize = 16;
@@ -70,7 +70,7 @@ impl ReferenceScan {
     pub(crate) fn step(&mut self, result: IoResult) -> Result<ScanStep, StorageReadError> {
         match self.phase {
             ScanPhase::Rows => {
-                let (values, next) = rows::page(result)?;
+                let (values, next) = result.page()?;
                 if values.is_empty() {
                     return Ok(ScanStep::Complete);
                 }
@@ -90,7 +90,7 @@ impl ReferenceScan {
             }
             ScanPhase::Versions => {
                 let mut stale = Vec::new();
-                for (row, value) in self.rows.iter().zip(rows::all_values(result)?) {
+                for (row, value) in self.rows.iter().zip(result.values()?) {
                     let version = value
                         .map(|value| BlobVersion::from_bytes(value.as_ref()))
                         .transpose()
@@ -106,7 +106,7 @@ impl ReferenceScan {
                 Ok(ScanStep::Next(IoCall::Delete(stale)))
             }
             ScanPhase::Prune => {
-                rows::done(result)?;
+                result.done()?;
                 let Some(cursor) = self.next.take() else {
                     return Ok(ScanStep::Complete);
                 };
@@ -116,7 +116,7 @@ impl ReferenceScan {
                 Ok(ScanStep::Next(IoCall::Write(vec![write])))
             }
             ScanPhase::Queue => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(ScanStep::Deferred)
             }
         }

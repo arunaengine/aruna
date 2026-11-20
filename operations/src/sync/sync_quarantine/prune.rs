@@ -5,8 +5,10 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::SYNC_QUARANTINE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
-use aruna_core::structs::{SyncQuarantineRecord, SyncQuarantineUsage, quarantine_usage_entry};
+use aruna_core::rows::values;
+use aruna_core::structs::sync_quarantine::{
+    SyncQuarantineRecord, SyncQuarantineUsage, quarantine_usage_entry,
+};
 use aruna_core::types::{Key, KeySpace, Value};
 
 use super::{
@@ -103,14 +105,14 @@ impl Operation for PruneQuarantineOperation {
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Phase::Deleting(usage) => {
-                done(result)?;
+                result.done()?;
                 self.phase = Phase::Writing(usage);
                 Ok(Next::Call(IoCall::Write(vec![quarantine_usage_entry(
                     usage,
                 )?])))
             }
             Phase::Writing(usage) => {
-                done(result)?;
+                result.done()?;
                 Ok(self.result(usage))
             }
         }

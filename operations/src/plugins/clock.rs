@@ -3,15 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 
 use super::artifacts::{ServingNode, served_config};
 use super::peer::{ask_peer, peer_answer};
 use crate::document_repository::GetConfigOperation;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 /// Supported clock skew between nodes; a replay starts this much before its mapped boundary.
 pub const SKEW_MARGIN_MS: u64 = 5 * 60 * 1000;

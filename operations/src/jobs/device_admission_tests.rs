@@ -8,7 +8,7 @@ use aruna_core::compute::ResourceEnvelope;
 use aruna_core::compute::backend::{Suitability, WorkloadSuitability};
 use aruna_core::compute::offer::BackendCaps;
 use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
-use aruna_core::structs::execution::job::JobErrorKind;
+use aruna_core::structs::execution::job::local::JobErrorKind;
 
 use super::*;
 use crate::jobs::workflow::fixtures::{child, claimed, compute, spec, token};

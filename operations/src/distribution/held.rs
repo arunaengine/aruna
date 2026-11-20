@@ -6,6 +6,10 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -21,7 +25,7 @@ use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
 use crate::connectors::resolver::NATIVE_SET_ID;
-use crate::s3::object::get::{ObjectInfo, ObjectRangeRequest};
+use aruna_core::structs::storage::object_read::{ObjectInfo, ObjectRangeRequest};
 
 /// A distributed version whose record this member holds without its bytes.
 #[derive(Clone, Debug, PartialEq)]
@@ -151,4 +155,24 @@ pub struct PullRequest {
 /// Whether a kept copy of `size` bytes may be fetched: a cache entry must fit the cache.
 pub fn admitted(kind: KeptKind, size: u64) -> bool {
     kind != KeptKind::Cache || size <= CACHE_CAPACITY_BYTES
+}
+
+/// Asks whether a read holds the kept copy at `backend_path`.
+pub(crate) fn held_call(backend_path: &str) -> IoCall {
+    let held = BlobEffect::ReadHeld {
+        backend_path: backend_path.to_string(),
+    };
+    IoCall::from(Effect::Blob(held))
+}
+
+/// The answer of a [`held_call`]; a node without a blob backend has no reads to hold a copy.
+pub(crate) fn held_answer(result: IoResult) -> Result<bool, IoError> {
+    match result.event()? {
+        Event::Blob(BlobEvent::ReadHeld { held }) => Ok(held),
+        Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Ok(false),
+        other => Err(IoError::Unexpected {
+            expected: "BlobEvent::ReadHeld",
+            got: other.label(),
+        }),
+    }
 }

@@ -9,18 +9,22 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::job_calls::drain_job_batch;
 use crate::job_calls::insert_job;
 use crate::job_calls::set_cancel_requested;
-use crate::job_calls::{JobClassBudget, drain_job_batch};
 use crate::job_calls::{claim_job, read_job_record};
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobState};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_drivers::testing::test_context;
-use aruna_storage::{FjallPersistPolicy, FjallStorage};
+use aruna_operations::jobs::drain::JobClassBudget;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ulid::Ulid;
 
@@ -129,7 +133,7 @@ async fn drive_until_terminal(
     runtime: &Arc<JobsRuntime>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let batch = drain_job_batch(
-        &context,
+        context,
         node_id(1),
         JobClassBudget {
             in_process: 8,
@@ -143,8 +147,8 @@ async fn drive_until_terminal(
     }
 
     let (a, b) = tokio::join!(
-        wait_for_terminal(runtime, &context, job_a(), Duration::from_secs(60)),
-        wait_for_terminal(runtime, &context, job_b(), Duration::from_secs(60)),
+        wait_for_terminal(runtime, context, job_a(), Duration::from_secs(60)),
+        wait_for_terminal(runtime, context, job_b(), Duration::from_secs(60)),
     );
     if a.is_none() || b.is_none() {
         return Err("jobs did not reach terminal state after restart".into());

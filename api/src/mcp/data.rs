@@ -12,29 +12,30 @@ use crate::routes::storage::objects::object_page;
 use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
-use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::placement::policy::gate::GateOperation;
 use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::s3::object::read::GetRoutedOperation;
-use aruna_operations::staging::bucket_guard::BucketGuardOperation;
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
+use aruna_operations::transfer::read::GetRoutedOperation;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use rmcp::Json;
@@ -899,7 +900,7 @@ pub(crate) async fn read_text(
     server: &McpServer,
     auth: &AuthContext,
     input: ReadObjectInput,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<ReadObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let max_bytes = bounded_bytes(input.max_bytes)?;
@@ -993,7 +994,7 @@ pub(crate) async fn write_text(
     server: &McpServer,
     auth: &AuthContext,
     input: WriteObjectInput,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
     (headers, bearer): (&http::HeaderMap, Option<&crate::auth::ValidatedBearer>),
 ) -> Result<WriteObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
@@ -1238,7 +1239,7 @@ fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
 async fn authorize_search(
     server: &McpServer,
     auth: &AuthContext,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(server.state.as_ref(), auth, Permission::READ, extras)
         .await

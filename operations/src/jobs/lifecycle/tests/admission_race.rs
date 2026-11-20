@@ -11,9 +11,11 @@ use aruna_core::effects::{JobRecordFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
-};
+use aruna_core::structs::execution::job::family::{JobFamilyRecord, JobRecordKind, LaunchIntent};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::types::Key;
 use tokio::sync::Barrier;
 use ulid::Ulid;
@@ -26,11 +28,10 @@ use crate::jobs::lifecycle::launch_admit::{
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::store::test_calls::read_job_record;
 use crate::tests::records::{Family, REALM, context};
-use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
+use aruna_test_support::jobs::read_job_record;
 
 pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {

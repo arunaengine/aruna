@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::compute::{AttemptRef, FenceContext};
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
@@ -13,56 +12,35 @@ use aruna_core::keyspaces::{
     LAUNCH_RECORD_KEYSPACE, OUTPUT_RECORD_KEYSPACE, PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE,
     SCHEDULE_INDEX_KEYSPACE,
 };
-use aruna_core::structs::execution::job::AttemptControl;
-use aruna_core::structs::execution::job::AttemptIntent;
-use aruna_core::structs::execution::job::JobClaim;
-use aruna_core::structs::execution::job::JobError;
-use aruna_core::structs::execution::job::JobErrorKind;
-use aruna_core::structs::execution::job::JobExecutionClass;
-use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::execution::job::JobPayload;
-use aruna_core::structs::execution::job::JobProgress;
-use aruna_core::structs::execution::job::JobRecord;
-use aruna_core::structs::execution::job::JobRecordEnvelope;
-use aruna_core::structs::execution::job::JobResultPayload;
-use aruna_core::structs::execution::job::JobState;
-use aruna_core::structs::execution::job::LaunchRecord;
-use aruna_core::structs::execution::job::RunCrateStatus;
-use aruna_core::structs::execution::job::attempt_control_key;
-use aruna_core::structs::execution::job::cleanup_dedup_key;
-use aruna_core::structs::execution::job::cleanup_job_id;
-use aruna_core::structs::execution::job::crate_dedup_key;
-use aruna_core::structs::execution::job::crate_job_id;
-use aruna_core::structs::execution::job::job_entry_key;
-use aruna_core::structs::execution::job::job_entry_prefix;
-use aruna_core::structs::execution::job::job_owner_cursor;
-use aruna_core::structs::execution::job::job_prune_key;
-use aruna_core::structs::execution::job::job_record_key;
-use aruna_core::structs::execution::job::job_wait_key;
-use aruna_core::structs::execution::job::owner_index_key;
-use aruna_core::structs::execution::job::owner_index_prefix;
-use aruna_core::structs::execution::job::parse_dedup_value;
-use aruna_core::structs::execution::job::parse_entry_key;
-use aruna_core::structs::execution::job::parse_owner_key;
-use aruna_core::structs::execution::job::run_crate_key;
-use aruna_core::structs::execution::job::validate_transition;
-use aruna_core::structs::execution::job::workspace_credential_id;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::JobRecordEnvelope;
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::key_wait::job_wait_key;
+use aruna_core::structs::execution::job::launch::LaunchRecord;
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobClaim, JobError, JobErrorKind, JobProgress, JobRecord,
+    JobResultPayload, RunCrateStatus, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
+    crate_dedup_key, crate_job_id, job_entry_key, job_entry_prefix, job_owner_cursor,
+    job_prune_key, job_record_key, owner_index_key, owner_index_prefix, parse_dedup_value,
+    parse_entry_key, parse_owner_key, run_crate_key, validate_transition, workspace_credential_id,
+};
+use aruna_core::structs::execution::job::rows::{
     ClaimGuard, JobDeletes, JobWrites, dedup_index_key, index_deltas, job_insert_entries,
     prune_delete_entries,
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
 use crate::queue_backoff::retry_delay_ms;
+use aruna_core::job_request::session_of;
 
 pub mod attempt_intent;
 pub mod control_mutation;
@@ -120,7 +98,5 @@ fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
 
 #[cfg(test)]
 mod key_wait_tests;
-#[cfg(any(test, feature = "test-hooks"))]
-pub mod test_calls;
 #[cfg(test)]
 mod tests;

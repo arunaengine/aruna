@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::{info, warn};
@@ -23,8 +23,8 @@ use crate::shard::recovery::{
     PhaseOutcome, RecoveryBaseline, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass,
     RecoveryRotation, RecoveryStatus, RecoveryStop, apply_recovery_pass,
 };
+use crate::shard::restore::plan::{ShardRestoreCursor, sync_eligible_node};
 use crate::shard::restore::{RestorePassOperation, RestoredPass};
-use crate::shard::restore_plan::{ShardRestoreCursor, sync_eligible_node};
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 pub const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -422,16 +422,16 @@ impl Operation for RecoveryOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use irokle::TopicId;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::shard::recovery::RecoveryState;
-    use crate::shard::restore_plan::ShardRestorePass;
+    use crate::shard::restore::plan::ShardRestorePass;
 
     fn node() -> NodeId {
         iroh::SecretKey::from_bytes(&[1; 32]).public()

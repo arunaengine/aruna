@@ -5,16 +5,15 @@
 
 use super::stage::{Batch, Change};
 use super::{Coordinator, MergeError, coordinator};
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{AuthorizationError, ConversionError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::decode_reducer_state;
-use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -22,7 +21,7 @@ use aruna_core::types::Value;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::ensure_config::overlay_reducer_state;
-use crate::sync::outbox_record::schedule_drain_effect;
+use crate::sync::outbox::record::schedule_drain_effect;
 use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -215,13 +214,13 @@ impl Operation for HandoffWrite {
                 self.write(&values)
             }
             Stage::Write if !self.batch.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::DeleteStale;
                 let deletes = std::mem::take(&mut self.batch.deletes);
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Stage::Write | Stage::DeleteStale => {
-                done(result)?;
+                result.done()?;
                 Ok(Self::committed())
             }
         }

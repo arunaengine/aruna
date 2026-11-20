@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::{
     NotificationRecord, NotificationRequest, NotificationTransportMessage,
@@ -70,7 +70,8 @@ fn expect<T>(
     take: impl FnOnce(NotificationTransportMessage) -> Result<T, NotificationTransportMessage>,
 ) -> Result<T, String> {
     match answer.map_err(|error| error.0)? {
-        NotificationTransportMessage::Reject(reason) => Err(reason),
+        NotificationTransportMessage::Reject(reason)
+        | NotificationTransportMessage::Unavailable(reason) => Err(reason),
         other => take(other).map_err(|_| "unexpected notification response".to_string()),
     }
 }

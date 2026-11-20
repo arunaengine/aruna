@@ -32,6 +32,7 @@ struct Bucket {
     fallback: Option<String>,
     read_only: bool,
     access: Option<S3Access>,
+    records: PathBuf,
 }
 
 impl Bucket {
@@ -44,6 +45,7 @@ impl Bucket {
             fallback: context.s3_endpoint.clone(),
             read_only,
             access: None,
+            records: context.config.dir.join(transfer::UPLOAD_RECORDS),
         })
     }
 
@@ -183,8 +185,9 @@ async fn upload_one(
     key: &str,
     part_size: u64,
 ) -> Result<Copied, CliError> {
-    let name = bucket.placement.bucket.clone();
-    let done = transfer::upload(bucket.access().await?, &name, key, local, part_size).await?;
+    let (name, records) = (bucket.placement.bucket.clone(), bucket.records.clone());
+    let access = bucket.access().await?;
+    let done = transfer::upload(access, (&name, key), local, part_size, &records).await?;
     let stored = remote::find_object(&bucket.node_api, &name, key).await?;
     let verified = verify_stored(stored.as_ref(), key, done.size, &done.blake3)?;
     Ok(Copied {

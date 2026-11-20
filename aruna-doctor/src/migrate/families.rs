@@ -8,24 +8,29 @@ use super::jobs::LegacyInput;
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
 use aruna_core::compute::ExecutionTargetId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE,
 };
-use aruna_core::structs::execution::job::prune_delete_entries;
+use aruna_core::structs::execution::job::family::{
+    EffectiveResources, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+    JobRetryPolicy, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    JobRecord, RunCrateStatus, cleanup_job_id, job_entry_prefix,
+};
 use aruna_core::structs::execution::job::record_rows::{
     ConflictRecord, PendingNeed, PendingRecord,
 };
-use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobPayload, JobRecord, JobRecordEnvelope, JobRetryPolicy, RunCrateStatus, SubmissionClaim,
-    SubmissionId, WitnessBudgetRecord, cleanup_job_id, job_entry_prefix,
-};
+use aruna_core::structs::execution::job::rows::prune_delete_entries;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -520,28 +525,31 @@ pub(super) mod tests {
     use crate::migrate::tests::{read, write};
     use crate::migrate::{MigrateOutput, migrate_output};
     use aruna::tasks::runner::recover_stale_jobs;
-    use aruna_core::NodeId;
-    use aruna_core::UserId;
     use aruna_core::compute::ExecutionTargetId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         ACTIVE_USER_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
         FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE,
         RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::job_insert_entries;
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionReceipt, ExecutionSpec, JobAdmissionRecord, JobFamilyId,
-        JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKey,
-        JobRecordKind, JobRetryPolicy, LaunchIntent, RunCrateStatus, SubmissionClaim, SubmissionId,
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, ExecutionReceipt, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
+        JobRecordEnvelope, JobRecordKey, JobRecordKind, JobRetryPolicy, LaunchIntent,
+        SubmissionClaim, SubmissionId,
     };
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
+    use aruna_core::structs::execution::job::rows::job_insert_entries;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::GroupId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::jobs::runtime::JobsRuntime;
     use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use serde::Serialize;
     use std::collections::BTreeMap;
     use std::path::Path;

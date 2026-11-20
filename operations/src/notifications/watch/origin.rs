@@ -5,23 +5,21 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
-use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
-};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::execution::notification_watch::{WatchEvent, watch_path_matches};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::notifications::client::{HolderRequestOperation, RemoteError, events_delivered};
+use crate::notifications::client::{HolderRequestOperation, RemoteError};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::unexpected_event;
 use crate::notifications::watch::digest::{InterestError, InterestOperation};
@@ -44,20 +42,27 @@ enum EmitState {
     Forward(NodeId),
 }
 
-/// Delivers one event to known holders. Best effort: every failure only warns. System writes
-/// with a nil actor are not emitted, since watches are a user-plane feature.
+/// Delivers one event to known holders and answers the holders it is still open for: an
+/// unreached holder, or this node when its own expansion may pass later; a refusal settles.
+/// System writes with a nil actor are not emitted; watches are a user-plane feature.
 #[derive(Debug, PartialEq)]
 pub(crate) struct EmitWatchOperation {
     event: WatchEvent,
     local: NodeId,
     /// The remote holders the interest table matches, and this node when it holds a watch.
     holders: Vec<NodeId>,
+    /// On a retry, the holders an earlier delivery left open; the others already settled.
+    only: Option<Vec<NodeId>>,
+    /// On a retry, its remote holders that are still sync-eligible realm members; `None` until
+    /// the realm config is read.
+    members: Option<Vec<NodeId>>,
     config: Option<RealmConfigDocument>,
     pending: VecDeque<NodeId>,
+    open: Vec<NodeId>,
     state: EmitState,
 }
 
-type Turn = Result<Next<()>, IoError>;
+type Turn = Result<Next<Vec<NodeId>>, IoError>;
 
 impl EmitWatchOperation {
     /// `holders` are the nodes this node's interest table matches for the event.
@@ -66,15 +71,42 @@ impl EmitWatchOperation {
             event,
             local,
             holders,
+            only: None,
+            members: None,
             config: None,
             pending: VecDeque::new(),
+            open: Vec::new(),
             state: EmitState::Config,
+        }
+    }
+
+    /// Delivers only to `holders`, when an earlier delivery left the event open for them.
+    pub fn only(mut self, holders: Option<Vec<NodeId>>) -> Self {
+        self.only = holders;
+        self
+    }
+
+    /// This node's own delivery may pass later, when this delivery is meant for it at all.
+    fn local_open(&mut self) {
+        let local = self.local;
+        if self.only.as_ref().is_none_or(|only| only.contains(&local)) {
+            self.open.push(local);
         }
     }
 
     fn configured(&mut self, config: Result<RealmConfigDocument, GetConfigError>) -> Turn {
         match config {
             Ok(config) => {
+                let local = self.local;
+                // A key the realm now lists as a user device is no holder, whoever it was.
+                let eligible = |holder: &NodeId| {
+                    (config.node_kind(holder)).is_some_and(RealmNodeKind::is_sync_eligible)
+                };
+                self.members = (self.only.as_ref()).map(|only| {
+                    (only.iter().copied())
+                        .filter(|holder| *holder != local && eligible(holder))
+                        .collect()
+                });
                 self.config = Some(config);
                 self.state = EmitState::List;
                 let list = ListWatchesOperation::new(WatchScope::Realm(self.event.realm_id));
@@ -82,6 +114,10 @@ impl EmitWatchOperation {
             }
             Err(error) => {
                 warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+                // A realm without a config holds no watches here; any other failure may pass.
+                if !matches!(error, GetConfigError::DocumentNotFound) {
+                    self.local_open();
+                }
                 self.deliver()
             }
         }
@@ -103,6 +139,7 @@ impl EmitWatchOperation {
             }
             Err(error) => {
                 warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+                self.local_open();
                 self.config = None;
                 return self.deliver();
             }
@@ -114,6 +151,7 @@ impl EmitWatchOperation {
             Ok(held) => held,
             Err(error) => {
                 warn!(%error, "Failed to scan local watch subscriptions while emitting event");
+                self.local_open();
                 self.config = None;
                 return self.deliver();
             }
@@ -137,9 +175,25 @@ impl EmitWatchOperation {
         self.deliver()
     }
 
-    /// Orders the holders, then delivers to each once.
+    /// Orders the holders, then delivers to each once. A retry goes to its saved holders that are
+    /// still sync-eligible members whatever the interest table matches now, as a failed rebuild
+    /// may empty it; without the realm config it sends to none of them and keeps them open.
     fn deliver(&mut self) -> Turn {
         let mut holders = std::mem::take(&mut self.holders);
+        if let Some(only) = &self.only {
+            let local = self.local;
+            match &self.members {
+                Some(members) => {
+                    holders.retain(|holder| *holder == local && only.contains(holder));
+                    holders.extend(members);
+                }
+                None => {
+                    self.open
+                        .extend(only.iter().filter(|holder| **holder != local));
+                    holders.retain(|holder| *holder == local && only.contains(holder));
+                }
+            }
+        }
         holders.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         holders.dedup();
         self.pending = holders.into();
@@ -148,7 +202,10 @@ impl EmitWatchOperation {
 
     fn next_holder(&mut self) -> Turn {
         let Some(holder) = self.pending.pop_front() else {
-            return Ok(Next::Done(()));
+            let mut open = std::mem::take(&mut self.open);
+            open.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            open.dedup();
+            return Ok(Next::Done(open));
         };
         if holder != self.local {
             self.state = EmitState::Forward(holder);
@@ -180,6 +237,9 @@ impl EmitWatchOperation {
             Ok(outcome) => outcome,
             Err(error) => {
                 warn!(%error, "Failed to expand watch event for local holder");
+                if !matches!(error, ExpandError::Fatal(_)) {
+                    self.local_open();
+                }
                 return self.next_holder();
             }
         };
@@ -203,12 +263,12 @@ impl EmitWatchOperation {
 }
 
 impl Operation for EmitWatchOperation {
-    type Output = ();
+    type Output = Vec<NodeId>;
     type Error = IoError;
 
     fn first(&mut self) -> Turn {
         if self.event.actor == UserId::nil(self.event.realm_id) {
-            return Ok(Next::Done(()));
+            return Ok(Next::Done(Vec::new()));
         }
         let config = GetConfigOperation::new(self.event.realm_id);
         Ok(Next::Call(IoCall::child(config)))
@@ -238,9 +298,16 @@ impl Operation for EmitWatchOperation {
                 self.next_holder()
             }
             EmitState::Forward(holder) => {
-                let answer = result.child::<NotificationTransportMessage, RemoteError>()?;
-                if let Err(error) = events_delivered(answer) {
-                    warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
+                // Only an ack or a lasting refusal settles the holder; anything else is retried.
+                match result.child::<NotificationTransportMessage, RemoteError>()? {
+                    Ok(NotificationTransportMessage::WatchEventsAck { .. }) => {}
+                    Ok(NotificationTransportMessage::Reject(reason)) => {
+                        warn!(holder = %holder, %reason, "A remote holder refused the watch event");
+                    }
+                    other => {
+                        warn!(%holder, answer = ?other, "Watch event not forwarded; retried");
+                        self.open.push(holder);
+                    }
                 }
                 self.next_holder()
             }
@@ -249,10 +316,12 @@ impl Operation for EmitWatchOperation {
 }
 
 /// Post-commit emission of an origin watch event to the holders this node's interest matches
-/// and to this node when it holds a matching watch. A node without a net handle emits nothing.
+/// and to this node when it holds a matching watch; answers the holders it is still open for. A
+/// node without a net handle emits nothing.
 #[derive(Debug, PartialEq)]
 pub struct EmitEventOperation {
     event: WatchEvent,
+    only: Option<Vec<NodeId>>,
     emitting: bool,
 }
 
@@ -260,7 +329,16 @@ impl EmitEventOperation {
     pub fn new(event: WatchEvent) -> Self {
         Self {
             event,
+            only: None,
             emitting: false,
+        }
+    }
+
+    /// Delivers again only to the holders an earlier delivery left open; `None` asks them all.
+    pub fn retrying(event: WatchEvent, holders: Option<Vec<NodeId>>) -> Self {
+        Self {
+            only: holders,
+            ..Self::new(event)
         }
     }
 
@@ -274,23 +352,19 @@ impl EmitEventOperation {
         document_path: &str,
         event_id: Ulid,
     ) -> Self {
-        Self::new(WatchEvent {
-            event_id,
+        Self::new(WatchEvent::metadata_created(
             realm_id,
-            kind: WatchEventKind::MetadataCreated,
-            path: format!("meta/{group_id}/{document_path}"),
             actor,
-            occurred_at_ms: event_id.timestamp_ms(),
-            detail: WatchEventDetail::MetadataCreated {
-                group_id,
-                document_id,
-            },
-        })
+            group_id,
+            document_id,
+            document_path,
+            event_id,
+        ))
     }
 }
 
 impl Operation for EmitEventOperation {
-    type Output = ();
+    type Output = Vec<NodeId>;
     type Error = IoError;
 
     fn first(&mut self) -> Turn {
@@ -304,13 +378,14 @@ impl Operation for EmitEventOperation {
 
     fn next(&mut self, result: IoResult) -> Turn {
         if self.emitting {
-            return result.child::<(), IoError>()?.map(Next::Done);
+            return result.child::<Vec<NodeId>, IoError>()?.map(Next::Done);
         }
         match result.event()? {
-            Event::Net(NetEvent::WatchHolders(None)) => Ok(Next::Done(())),
+            Event::Net(NetEvent::WatchHolders(None)) => Ok(Next::Done(Vec::new())),
             Event::Net(NetEvent::WatchHolders(Some((local, holders)))) => {
                 self.emitting = true;
                 let emit = EmitWatchOperation::new(self.event.clone(), local, holders);
+                let emit = emit.only(self.only.clone());
                 Ok(Next::Call(IoCall::child(emit)))
             }
             other => Err(unexpected_event("NetEvent::WatchHolders", &other)),

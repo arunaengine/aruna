@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -21,22 +20,23 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use tempfile::tempdir;
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
-use crate::testing::path_context;
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::path_context;
 
-fn node(seed: u8) -> aruna_core::NodeId {
+fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn node_secret(node_id: &aruna_core::NodeId) -> iroh::SecretKey {
+fn node_secret(node_id: &aruna_core::id::NodeId) -> iroh::SecretKey {
     (1..=8u8)
         .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
         .find(|secret| secret.public() == *node_id)
@@ -152,7 +152,7 @@ fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> Metadata
 }
 
 async fn write_entries(context: &DriverContext, writes: Vec<(String, Key, Value)>) {
-    crate::testing::write_entries(&context.storage_handle, writes).await;
+    aruna_drivers::testing::write_entries(&context.storage_handle, writes).await;
 }
 
 #[tokio::test]
@@ -609,7 +609,7 @@ fn mutation_schedules_revalidation() {
 async fn seed_placement_config(
     context: &DriverContext,
     actor: &Actor,
-    nodes: &[aruna_core::NodeId],
+    nodes: &[aruna_core::id::NodeId],
     replica: Option<u32>,
 ) -> RealmConfigDocument {
     let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
@@ -644,7 +644,7 @@ async fn seed_placement_config(
     document
 }
 
-fn draining_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+fn draining_entry(node_id: aruna_core::id::NodeId) -> NodePlacementEntry {
     NodePlacementEntry {
         node_id,
         location: String::new(),
@@ -675,7 +675,7 @@ fn draining_change_rejected() {
     }
 }
 
-fn placed_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+fn placed_entry(node_id: aruna_core::id::NodeId) -> NodePlacementEntry {
     NodePlacementEntry {
         node_id,
         location: "eu-west".to_string(),
@@ -693,7 +693,7 @@ fn placed_document(entry: NodePlacementEntry) -> RealmConfigDocument {
 }
 
 fn set_attributes(
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     location: Option<&str>,
     labels: Option<BTreeMap<String, String>>,
 ) -> RealmPlacementMutation {
@@ -1149,7 +1149,7 @@ fn rejects_plan_mismatch() {
     ));
 }
 
-fn issuer(realm_id: RealmId, node_id: aruna_core::NodeId) -> Actor {
+fn issuer(realm_id: RealmId, node_id: aruna_core::id::NodeId) -> Actor {
     Actor {
         node_id,
         user_id: UserId::nil(realm_id),
@@ -1348,7 +1348,7 @@ async fn unauthorized_writes_nothing() {
         .expect("the realm config survives a rejected mutation");
     assert!(stored.candidate_maps.is_empty());
     assert!(
-        crate::testing::read_outbox_tails(&context.storage_handle)
+        aruna_test_support::documents::read_outbox_tails(&context.storage_handle)
             .await
             .expect("outbox scan")
             .is_empty()

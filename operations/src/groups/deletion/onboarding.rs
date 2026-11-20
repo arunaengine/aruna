@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_DELETE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentState, decode_reducer_state};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{group_deletion_entries, reducer_state_key};
 use aruna_core::structs::identity::group_delete::{
     GroupDeletePhase, GroupDeleteRecord, GroupDeletionError, MembershipFence,
@@ -129,14 +129,14 @@ impl Operation for InstallOperation {
         match self.state {
             State::Read => self.inspect(values::<4>(result)?),
             State::Write => {
-                done(result)?;
+                result.done()?;
                 self.state = State::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             State::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }

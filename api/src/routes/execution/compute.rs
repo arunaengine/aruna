@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use aruna_core::compute::quota::{ComputeQuota, ResourceTotals};
-use aruna_core::node_state::DrainStateOperation;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::DrainStateOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::compute_config::{
     GroupComputeQuota, LocationLink, RealmComputeConfig,
@@ -496,9 +496,9 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
             ServerError::Forbidden
         }
         SetComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
-        SetComputeError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
+        SetComputeError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
+        }
         SetComputeError::StorageError(error) => error.into(),
         other => ServerError::InternalError(other.into()),
     }

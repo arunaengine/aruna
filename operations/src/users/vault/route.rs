@@ -3,32 +3,32 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::VaultQuery;
 use aruna_core::events::{Event, PeerAuthRefusal};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::placement::{holds_placement, target_placement_ref};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::VaultRecords;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::read::LocalRecordsOperation;
-use super::write::{
-    AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended, VaultRefusal,
-};
+use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
-use crate::metadata::transport_message_kind;
-use crate::metadata::write_peer::WritePeerOperation;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, WriteAuthError, transport_message_kind,
+};
+use aruna_core::structs::identity::user::vault::{VaultAppended, VaultRefusal};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum VaultRouteError {

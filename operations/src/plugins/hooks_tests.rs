@@ -10,13 +10,14 @@ use aruna_core::plugin_runs::{HookRequest, PluginRun, RunTrigger};
 use serde_json::json;
 
 use super::*;
-use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, hook_secret};
+use crate::plugins::bound::tests::hook_secret;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
-use crate::plugins::test_support::leaks;
 use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::leaks;
+use aruna_test_support::plugins::{TOKEN, bound, edit_config, hold_keys};
 
 /// An install moved to a version whose webhook the `header` slot `hook_key` verifies, bound to
 /// the group secret `hook-key` that checks `x-signature`.
@@ -214,7 +215,7 @@ async fn node_checks_relay() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     node_secret(&fixture, "x-signature", 0).await;
     assert_eq!(relay(here).await, Some(false));
     node_secret(&fixture, "Authorization", 1).await;
@@ -226,7 +227,7 @@ async fn node_checks_relay() {
 
 #[test]
 fn delivery_admitted_once() {
-    let run = crate::plugins::runs::tests::queued(Ulid::from_parts(1, 1), 1);
+    let run = aruna_test_support::plugins::queued(Ulid::from_parts(1, 1), 1);
     let ids = (run.install_id, Some("d1".to_string()));
     let mut plan = AdmitHook::new(run.clone(), ids.clone(), 9).unwrap();
     assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));

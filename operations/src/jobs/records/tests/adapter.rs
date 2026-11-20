@@ -8,15 +8,18 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, PageLimit, StorageEffect};
 use aruna_core::events::{JobRecordRejection, LaunchDecline};
 use aruna_core::handle::Handle;
-use aruna_core::structs::execution::job::{InputPage, JobFamilyRecord, PageManifest};
+use aruna_core::structs::execution::job::family::JobFamilyRecord;
+use aruna_core::structs::execution::job::pages::{InputPage, PageManifest};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;
 
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::tests::records::{Family, REALM, secret, serve_job_record, serve_launch_offer, user};
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_drivers::driver::DriverContext;
 
 pub(super) async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family) {
@@ -52,7 +55,7 @@ pub(super) async fn fixture() -> (TempDir, Arc<DriverContext>, NetHandle, Family
 async fn seed_config(
     storage: &StorageHandle,
     config: &RealmConfigDocument,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) {
     let target = DocumentTarget::RealmConfig {
         realm_id: RealmId(REALM.0),
@@ -73,7 +76,7 @@ async fn seed_config(
 }
 
 /// The fixture spec created now: a holder refuses a spec older than the horizon.
-fn fresh_spec(family: &Family) -> aruna_core::structs::execution::job::LogicalJobSpec {
+fn fresh_spec(family: &Family) -> aruna_core::structs::execution::job::family::LogicalJobSpec {
     let mut spec = family.spec();
     spec.created_at_ms = aruna_core::time::unix_timestamp_millis();
     spec.store_digest().expect("spec digest stored")
@@ -186,9 +189,10 @@ async fn refuses_absent_scheduler() {
 
 /// One captured input of a spec as its input pages.
 fn spec_pages(family: &Family) -> (PageManifest, Vec<InputPage>) {
-    use aruna_core::structs::execution::job::{
-        CapturedInput, InputContent, InputMode, InputSelection, InputSource, PageEntries, paginate,
+    use aruna_core::structs::execution::job::input::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource,
     };
+    use aruna_core::structs::execution::job::pages::{PageEntries, paginate};
     let version_id = ulid::Ulid::from_parts(1, 1);
     let pair = (
         InputSelection {

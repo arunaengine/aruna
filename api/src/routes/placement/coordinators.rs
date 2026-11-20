@@ -7,7 +7,7 @@ use aruna_drivers::driver::drive;
 use axum::http::HeaderMap;
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_operations::distribution::routing::bound_view;
 use serde::{Deserialize, Serialize};

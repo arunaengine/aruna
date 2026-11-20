@@ -2,14 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{GitChange, GitRecord};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::reducer::decode_reducer_state;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
@@ -28,9 +28,9 @@ use super::state::reduce;
 use super::{GitError, records};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::git_state::Ancestry;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 type Document = MetadataRegistryRecord;
 type Chosen = (DatasetLocation, bool);
@@ -456,7 +456,8 @@ impl Operation for GroupDefaultOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<DatasetLocation>, GitError> {
-        let state = value(result)?
+        let state = result
+            .value()?
             .map(|bytes| decode_reducer_state(&bytes))
             .transpose()
             .map_err(|_| GitError::Unavailable)?;

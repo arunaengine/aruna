@@ -5,12 +5,12 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentOperation;
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
 use aruna_core::plugin_installs::{InstallState, PluginInstall, Prerequisite, Widening};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, RoleId};
+use aruna_core::user::id::UserId;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -37,7 +37,7 @@ struct StoredInstall {
     grants: BTreeMap<String, Vec<String>>,
     account: UserId,
     role_id: RoleId,
-    receiver: aruna_core::NodeId,
+    receiver: aruna_core::id::NodeId,
     granted_by: UserId,
     request: String,
     revision: u64,
@@ -60,14 +60,14 @@ struct CoveredInstall(
     BTreeMap<String, Vec<String>>,
     UserId,
     RoleId,
-    aruna_core::NodeId,
+    aruna_core::id::NodeId,
     UserId,
     String,
     u64,
     Option<u64>,
     Option<String>,
     Vec<Prerequisite>,
-    Option<aruna_core::NodeId>,
+    Option<aruna_core::id::NodeId>,
     Option<Widening>,
 );
 
@@ -224,7 +224,7 @@ mod tests {
         grants: BTreeMap<String, Vec<String>>,
         account: UserId,
         role_id: RoleId,
-        receiver: aruna_core::NodeId,
+        receiver: aruna_core::id::NodeId,
         granted_by: UserId,
         request: String,
         revision: u64,
@@ -325,7 +325,7 @@ mod tests {
         use aruna_core::document::DocumentTarget;
         use aruna_core::structs::identity::auth::Actor;
         use aruna_core::structs::placement::record::PlacementRef;
-        use aruna_operations::sync::outbox_record::new_outbox_record;
+        use aruna_operations::sync::outbox::record::new_identified_record;
         let realm_id = RealmId::from_bytes([3; 32]);
         let origin = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let stored = postcard::to_allocvec(&old_install(4, realm_id)).unwrap();
@@ -353,7 +353,15 @@ mod tests {
             origin_signature,
         };
         let target = DocumentTarget::RealmConfig { realm_id };
-        let record = new_outbox_record(origin, target, Vec::new(), event, PlacementRef::NIL, false);
+        let record = new_identified_record(
+            Ulid::generate(),
+            origin,
+            target,
+            Vec::new(),
+            event,
+            PlacementRef::NIL,
+            false,
+        );
         let current = postcard::to_allocvec(&record).unwrap();
         let encoded = postcard::to_allocvec(&install).unwrap();
         // The empty `secrets` map is the install's last byte.

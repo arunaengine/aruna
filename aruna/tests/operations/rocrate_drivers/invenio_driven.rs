@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::jobs::JobRunOutcome;
-use aruna_core::repository::{
-    RemoteState, RepositoryCredential, RepositoryDestination, RepositoryLink, RepositoryQuery,
-};
+use aruna_core::repository::credential::RepositoryCredential;
+use aruna_core::repository::link::{RemoteState, RepositoryLink};
+use aruna_core::repository::{RepositoryDestination, RepositoryQuery};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{JobError, JobId};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::JobError;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_drivers::driver::{DriverContext, drive};
@@ -18,17 +19,17 @@ use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::RegisterIdentifiersOperation;
 use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
 use aruna_operations::jobs::repository::invenio::query::{
-    ResolveRecordOperation, SearchRecordsOperation,
+    RecordReference, ResolveRecordOperation, SearchRecordsOperation,
 };
 use aruna_operations::jobs::repository::invenio::remote::RemoteStateOperation;
 use aruna_operations::jobs::repository::link_queue::{
-    DrainLinksOperation, OwnerHoldsOperation, PushRevisionOperation, StartPushOperation,
-    revision_event,
+    DrainLinksOperation, OwnerHoldsOperation, PushRevisionOperation, QueueChangesOperation,
+    StartPushOperation, revision_event,
 };
 use aruna_operations::jobs::repository::link_store::{ApplyChangeOperation, ListLinksOperation};
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::pull::StartPullOperation;
-use aruna_operations::jobs::repository::{RecordReference, TransferError, seal_token};
+use aruna_operations::jobs::repository::{TransferError, seal_token};
 use serde_json::Value;
 use ulid::Ulid;
 
@@ -94,6 +95,11 @@ pub(super) async fn drain_links(context: &DriverContext) -> Result<Option<Durati
     drive(DrainLinksOperation::new(context.node_scope()), context).await
 }
 
+/// Queues the link checks of changed documents, as the link drain does right after a change.
+pub(super) async fn queue_changes(context: &DriverContext) -> Result<(), LinkError> {
+    drive(QueueChangesOperation::new(), context).await
+}
+
 pub(super) async fn owner_holds(context: &DriverContext, link: &RepositoryLink) -> bool {
     let holds = OwnerHoldsOperation::new(context.node_scope(), link);
     drive(holds, context).await.unwrap_or(true)
@@ -131,7 +137,7 @@ pub(super) async fn seal_credential(
 
 pub(super) async fn seal_link_token(
     context: &DriverContext,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
     group_id: Ulid,
     connector_id: Ulid,
     link_id: Ulid,

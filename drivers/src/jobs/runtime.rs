@@ -9,15 +9,14 @@ use std::sync::{Arc, Mutex};
 
 use aruna_core::heartbeat::RunningJobs;
 use aruna_core::jobs::{JobKind, RunningJobView};
-use aruna_core::structs::execution::job::{JobExecutionClass, JobId, JobRecord};
+use aruna_core::structs::execution::job::identity::{JobExecutionClass, JobId};
+use aruna_core::structs::execution::job::local::JobRecord;
 use tokio::sync::{RwLock, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::executor::RangeTurns;
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
-use crate::jobs::context::ExternalReconciler;
-use crate::jobs::context::PayloadHandler;
 use aruna_core::jobs::ProgressReporter;
 
 struct RunningJob {
@@ -92,14 +91,12 @@ pub struct JobsRuntime {
     next_nonce: AtomicU64,
     internal_cap: usize,
     external_cap: usize,
-    reconciler: Mutex<Option<Arc<dyn ExternalReconciler>>>,
     claim_producer_barrier: RwLock<()>,
     /// Node shutdown. Deliberately not the per-job cancel token: that one means the
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
     range_turns: RangeTurns,
-    handlers: Mutex<Vec<Arc<dyn PayloadHandler>>>,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -118,71 +115,28 @@ impl JobsRuntime {
     }
 
     pub fn new_paused() -> Arc<Self> {
-        Self::build(JOB_CONCURRENCY_CAP, EXTERNAL_CONCURRENCY_CAP, None, false)
+        Self::build(JOB_CONCURRENCY_CAP, EXTERNAL_CONCURRENCY_CAP, false)
     }
 
     pub fn with_capacity(cap: usize) -> Arc<Self> {
-        Self::build(cap, EXTERNAL_CONCURRENCY_CAP, None, true)
+        Self::build(cap, EXTERNAL_CONCURRENCY_CAP, true)
     }
 
-    /// Wire the reconcile hook that receives lost external attempts (Stage 2).
-    pub fn with_reconciler(reconciler: Arc<dyn ExternalReconciler>) -> Arc<Self> {
-        Self::build(
-            JOB_CONCURRENCY_CAP,
-            EXTERNAL_CONCURRENCY_CAP,
-            Some(reconciler),
-            true,
-        )
-    }
-
-    fn build(
-        internal_cap: usize,
-        external_cap: usize,
-        reconciler: Option<Arc<dyn ExternalReconciler>>,
-        started: bool,
-    ) -> Arc<Self> {
+    fn build(internal_cap: usize, external_cap: usize, started: bool) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(RuntimeState::default()),
             started: AtomicBool::new(started),
             next_nonce: AtomicU64::new(0),
             internal_cap,
             external_cap,
-            reconciler: Mutex::new(reconciler),
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
             range_turns: RangeTurns::default(),
-            handlers: Mutex::default(),
         })
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, RuntimeState> {
         self.state.lock().expect("runtime mutex poisoned")
-    }
-
-    pub fn reconciler(&self) -> Option<Arc<dyn ExternalReconciler>> {
-        self.reconciler
-            .lock()
-            .expect("reconciler mutex poisoned")
-            .clone()
-    }
-
-    pub fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
-        *self.reconciler.lock().expect("reconciler mutex poisoned") = Some(reconciler);
-    }
-
-    /// Adds the runner of payload kinds another domain owns; the node wiring calls it at start.
-    pub fn register_handler(&self, handler: Arc<dyn PayloadHandler>) {
-        self.handlers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(handler);
-    }
-
-    /// The registered runners of payload kinds other domains own.
-    pub fn handlers(&self) -> Vec<Arc<dyn PayloadHandler>> {
-        (self.handlers.lock())
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 
     pub fn running_count(&self) -> usize {
@@ -293,7 +247,7 @@ impl JobsRuntime {
                     kind: JobKind::Probe,
                     target: None,
                     group_id: None,
-                    created_by: aruna_core::UserId::nil(
+                    created_by: aruna_core::user::id::UserId::nil(
                         aruna_core::structs::identity::realm::RealmId([0; 32]),
                     ),
                     progress: None,
@@ -455,7 +409,7 @@ mod tests {
     use super::*;
     use crate::testing::import_record;
     use aruna_core::jobs::JobTarget;
-    use aruna_core::structs::execution::job::JobProgress;
+    use aruna_core::structs::execution::job::local::JobProgress;
     use ulid::Ulid;
 
     // Staging and both import kinds count as imports in the node telemetry.

@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row};
-use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 

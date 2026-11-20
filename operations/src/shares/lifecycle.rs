@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, SubOperationEvent};
@@ -13,6 +12,7 @@ use aruna_core::rows;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::share::{ShareAction, ShareEvent, ShareLink, ShareToken};
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -141,11 +141,11 @@ impl Operation for CreateShareOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ShareLink>, ShareError> {
         if self.saving {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(self.config.link.clone()));
         }
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) =
-            rows::event(result)?
+            result.event()?
         else {
             return Err(ShareError::UnexpectedEvent("create"));
         };
@@ -309,16 +309,16 @@ impl Operation for OpenShareOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<OpenedShare>, ShareError> {
         match self.state {
             OpenState::Load => {
-                let link = parse_link(rows::value(result)?, self.config.token.share_id())?;
+                let link = parse_link(result.value()?, self.config.token.share_id())?;
                 self.loaded(link)
             }
-            OpenState::CheckCreator => self.creator_read(rows::value(result)?),
+            OpenState::CheckCreator => self.creator_read(result.value()?),
             OpenState::LogOpen => {
-                logged(rows::event(result)?)?;
+                logged(result.event()?)?;
                 (self.opened.take().map(Next::Done)).ok_or(ShareError::NotFinished)
             }
             OpenState::LogWrong => {
-                logged(rows::event(result)?)?;
+                logged(result.event()?)?;
                 Err(ShareError::WrongPassword)
             }
         }
@@ -355,10 +355,10 @@ impl Operation for RevokeShareOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ShareError> {
         if self.saving {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
-        let link = parse_link(rows::value(result)?, self.id)?;
+        let link = parse_link(result.value()?, self.id)?;
         let link = link.filter(|link| link.created_by == self.owner);
         let link = link.ok_or(ShareError::Unavailable)?;
         if link.revoked_at.is_some() {

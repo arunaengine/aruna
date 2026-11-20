@@ -14,7 +14,6 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::onboarding::{authorize_onboarding_admin, map_consume_error, map_inspect_error};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs as now_timestamp;
-use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission, Role, SessionKind,
@@ -22,11 +21,12 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::email_hash;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
-use aruna_operations::device::remove_node::{
+use aruna_operations::device_node::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
 };
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
@@ -37,11 +37,12 @@ use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
 use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
-use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
+use aruna_operations::onboarding::list_secrets::{ListSecretsOperation, OnboardingSecretEntry};
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
-use aruna_operations::session::{CreateSessionConfig, CreateSessionError, MakeRoomOperation};
+use aruna_operations::session::create::{CreateSessionConfig, CreateSessionError};
+use aruna_operations::session::limit::MakeRoomOperation;
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
@@ -822,7 +823,7 @@ async fn get_token(
 
     ensure_active(&state, user_id).await?;
     let now = now_timestamp();
-    let expiry = aruna_operations::session::bound_session_expiry(
+    let expiry = aruna_operations::session::create::bound_session_expiry(
         now,
         query.expires_in_seconds,
         now.saturating_add(TOKEN_EXPIRY_SECONDS),
@@ -1175,11 +1176,11 @@ pub(crate) async fn authorize_directory(
     drive(
         EnforcePolicyOperation::new(
             state.get_realm_id(),
-            aruna_operations::auth::request_policy::policy_request_with(
+            aruna_core::request_policy::policy_request_with(
                 &path,
                 &Permission::READ,
                 Some(auth),
-                aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
+                aruna_core::request_policy::PolicyRequestExtras::rest(),
             )
             .clone(),
         ),
@@ -1606,7 +1607,7 @@ fn enrollment_status(claimed: bool, expires_at: u64, now: u64) -> &'static str {
 /// an outstanding enrollment secret only shows what has not landed yet.
 async fn owned_devices(
     state: &Arc<ServerState>,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
 ) -> ServerResult<Vec<UserDeviceResponse>> {
     let config = drive(
         GetConfigOperation::new(state.get_realm_id()),
@@ -1630,9 +1631,7 @@ async fn owned_devices(
         })
         .collect::<Vec<_>>();
 
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))?;
+    let secrets = secrets_where(state, |entry| entry.record.mode.owner() == Some(owner)).await?;
     let now = aruna_clock::unix_timestamp_secs();
     for entry in secrets {
         if entry.record.mode.owner() != Some(owner) {
@@ -1762,7 +1761,8 @@ async fn revoke_user_device(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    let node_id = aruna_core::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    let node_id =
+        aruna_core::id::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::Owner).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1803,7 +1803,7 @@ async fn evict_device(
     Path(node_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = authorize_onboarding_admin(&state, auth).await?;
-    let node_id = aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
+    let node_id = aruna_core::id::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::RealmAdmin).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1815,7 +1815,7 @@ async fn evict_device(
 async fn evict_node(
     state: &Arc<ServerState>,
     auth: &AuthContext,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     scope: DeviceEvictionScope,
 ) -> ServerResult<()> {
     if let Some(enrollment_id) = claimed_enrollment(state, &node_id.to_string()).await? {
@@ -1849,13 +1849,28 @@ async fn evict_node(
 
 /// Enrollment whose secret this node claimed, so an eviction can retire it.
 async fn claimed_enrollment(state: &Arc<ServerState>, node_id: &str) -> ServerResult<Option<Ulid>> {
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))?;
-    Ok(secrets
-        .into_iter()
-        .find(|entry| entry.state.claimed_node_id() == Some(node_id))
-        .map(|entry| entry.record.enrollment_id))
+    let claimed = secrets_where(state, |entry| {
+        entry.state.claimed_node_id() == Some(node_id)
+    });
+    Ok((claimed.await?.into_iter().next()).map(|entry| entry.record.enrollment_id))
+}
+
+/// The onboarding secrets `keep` selects, read a page at a time.
+async fn secrets_where(
+    state: &Arc<ServerState>,
+    keep: impl Fn(&OnboardingSecretEntry) -> bool,
+) -> ServerResult<Vec<OnboardingSecretEntry>> {
+    let (mut kept, mut after) = (Vec::new(), None);
+    loop {
+        let page = drive(ListSecretsOperation::new(after), &state.get_ctx())
+            .await
+            .map_err(|err| ServerError::InternalError(err.into()))?;
+        kept.extend(page.entries.into_iter().filter(&keep));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(kept),
+        }
+    }
 }
 
 async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> ServerResult<()> {

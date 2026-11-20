@@ -2,9 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
 use crate::compute::{ExecutorCapability, NetworkAccess, StagingMode};
-use crate::structs::execution::job::{EffectiveResources, InputContent, SubmissionId};
+use crate::id::NodeId;
+use crate::structs::execution::job::family::{EffectiveResources, SubmissionId};
+use crate::structs::execution::job::input::InputContent;
 use crate::structs::identity::realm::RealmNodeKind;
 use crate::structs::placement::compute_config::ComputeConfigError;
 use crate::structs::placement::policy::{

@@ -5,10 +5,10 @@
 pub mod session;
 pub mod vault;
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::structs::identity::auth::Actor;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use crate::user::validation::{
     DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
     SERVICE_GROUP_ATTRIBUTE, STOPPED_BY_INSTALL,
@@ -100,9 +100,9 @@ impl User {
 #[cfg(test)]
 mod tests {
     use super::User;
-    use crate::UserId;
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
     use std::collections::HashMap;
     use ulid::Ulid;
 

@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::lane_jobs::run_staging_job;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::bucket_read::GetBucketOperation;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::table::SEARCH_EXACT_KEY;
 use aruna_core::structs::storage::origin::VersionOrigin;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::tests::staging::{
+use aruna_test_support::staging::{
     COLI, Fixture, HUMAN, STRUCTURE, Site, serve, summary_table, write_object,
 };
 use axum::http::Method;
@@ -15,12 +15,13 @@ use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::local::JobResultPayload;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use aruna_clock::testing::poll_until;
 use aruna_core::jobs::JobRunOutcome;
-use aruna_core::structs::execution::job::StagingJobSpec;
+use aruna_core::structs::execution::job::input::StagingJobSpec;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
 
@@ -32,7 +33,7 @@ async fn paused_job_stops() {
         throttled: true,
         ..Site::ncbi(endpoint)
     };
-    let (endpoint, _site, server) = serve(throttled).await;
+    let (endpoint, site, server) = serve(throttled).await;
     let fixture = Fixture::new(&endpoint, summary_table()).await;
     for (seed, cancel) in [(20u8, true), (21u8, false)] {
         let ctx = fixture.context(seed).await;
@@ -40,8 +41,12 @@ async fn paused_job_stops() {
             true => ctx.cancel.clone(),
             false => ctx.shutdown.clone(),
         };
+        // The source answers each request with a pause, so the run pauses once it asked.
+        let asked = site.requests.lock().unwrap().len();
         let stopping = async {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let more = async || (site.requests.lock().unwrap().len() > asked).then_some(());
+            let paused = poll_until(std::time::Duration::from_secs(60), more).await;
+            assert!(paused.is_some(), "the run never asked its source");
             stop.cancel();
         };
         let run = run_staging_job(&ctx, &fixture.spec);
@@ -141,9 +146,9 @@ async fn record_pages_resume() {
     use aruna_core::key_index::KeyQuery;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
-    use aruna_operations::distribution::feed_walks::FeedLimits;
     use aruna_operations::distribution::test_store::Feeder;
     use aruna_operations::staging::page::rows::MAX_PAGE_ENTRIES;
+    use aruna_operations::transfer::feed_walks::FeedLimits;
     use aruna_storage::key_index::RangeIndexes;
     use std::ops::Bound;
 
@@ -259,7 +264,12 @@ async fn record_pages_resume() {
     let indexes = RangeIndexes::new(fixture._dir.path().join("range-indexes"));
     let indexes = fixture.driver.storage_handle.install_range_indexes(indexes);
     let mut feeder = Feeder::new(FeedLimits::default());
-    while feeder.pass(&fixture.driver).await {}
+    loop {
+        let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
+        if !feeder.passed(pass) {
+            break;
+        }
+    }
     for row in [0, MAX_PAGE_ENTRIES, rows - 1, rows + 299] {
         let query = KeyQuery {
             start: Bound::Unbounded,
@@ -362,7 +372,7 @@ async fn import_records(
                 aruna_operations::replication::drain::ProcessBatchOperation::new(
                     aruna_operations::replication::page::deliver::MetadataPages,
                     aruna_drivers::driver::node_routing(&drain),
-                    (&drain).node_and_realm(),
+                    drain.node_and_realm(),
                 ),
                 &drain,
             )
@@ -379,14 +389,15 @@ async fn import_records(
     let stopping = stop.clone();
     let mut woken = pages.subscribe();
     let feed = tokio::spawn(async move {
-        use aruna_operations::distribution::feed_walks::FeedLimits;
         use aruna_operations::distribution::test_store::Feeder;
+        use aruna_operations::transfer::feed_walks::FeedLimits;
         use aruna_storage::key_index::RangeIndexes;
         feed.storage_handle
             .install_range_indexes(RangeIndexes::new(indexes));
         let mut feeder = Feeder::new(FeedLimits::default());
         while background && !stopping.is_cancelled() {
-            if !feeder.pass(&feed).await {
+            let pass = aruna_drivers::driver::drive(feeder.next_pass(), &feed).await;
+            if !feeder.passed(pass) {
                 tokio::select! {
                     _ = stopping.cancelled() => {}
                     _ = woken.changed() => {}
@@ -415,7 +426,14 @@ async fn import_records(
     let mut feeder = feed.await.unwrap();
     server.abort();
     // The index catches up with what the jobs wrote.
-    while background && feeder.pass(&fixture.driver).await {}
+    if background {
+        loop {
+            let pass = aruna_drivers::driver::drive(feeder.next_pass(), &fixture.driver).await;
+            if !feeder.passed(pass) {
+                break;
+            }
+        }
+    }
     let index = ended.elapsed().as_secs_f64();
     if background {
         assert!(
@@ -449,12 +467,19 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     use aruna_core::structs::storage::distribution::accounting::{
         RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
     };
-    use aruna_operations::distribution::test_record::{binding, searched, store_record};
-    use aruna_operations::distribution::test_store::{begin, commit, install, range};
+    use aruna_operations::distribution::inventory::open_ranges;
+    use aruna_operations::distribution::test_record::{binding, searched};
+    use aruna_operations::distribution::test_store::range;
     let handle = &ctx.driver.storage_handle;
     let (snapshot, bytes) = searched();
     let set_id = snapshot.set_id();
-    store_record(handle, set_id, bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let found = GetBucketOperation::new(spec.bucket.clone());
     let mut bucket = aruna_drivers::driver::drive(found, &ctx.driver)
         .await
@@ -465,7 +490,8 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
         range_id,
         ..range(1, "m", None)
     }];
-    install(handle, set_id, &ranges).await;
+    let writes = open_ranges(set_id, &ranges).expect("ranges encode");
+    aruna_drivers::testing::write_entries(handle, writes).await;
     let full = RangeCounters {
         sampled: i128::from(SAMPLE_SIZE),
         ..RangeCounters::default()
@@ -474,7 +500,7 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
         priority: u64::MAX,
         key: "largest".to_string(),
     };
-    let txn_id = begin(handle).await;
+    let txn_id = handle.begin_write().await;
     let effects = [
         StorageEffect::Write {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -497,7 +523,15 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     for effect in effects {
         handle.send_storage_effect(effect).await;
     }
-    assert!(commit(handle, txn_id).await);
+    let committed = handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await;
+    assert!(matches!(
+        committed,
+        aruna_core::events::Event::Storage(
+            aruna_core::events::StorageEvent::TransactionCommitted { .. }
+        )
+    ));
     (set_id, range_id)
 }
 

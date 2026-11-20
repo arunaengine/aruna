@@ -4,18 +4,20 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
-use aruna_core::structs::execution::job::{
-    FamilyTombstone, Freshness, JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordError,
-    JobRecordKey, JobRecordKind, LocalExecution, RecordVerdict, spec_freshness,
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKey, JobRecordKind,
+    LocalExecution, RecordVerdict,
 };
-use tracing::warn;
-
-use super::verify::{EvidenceSet, FamilyView};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::prune::{FamilyTombstone, Freshness, spec_freshness};
 use aruna_core::structs::execution::job::record_keys::budget_key;
 use aruna_core::structs::execution::job::record_rows::{
     ConflictRecord, PendingNeed, PendingRecord,
 };
+use tracing::warn;
+
+use super::verify::{EvidenceSet, FamilyView};
 
 /// Records one family may retain pending at once.
 pub const MAX_PENDING_RECORDS: usize = 64;

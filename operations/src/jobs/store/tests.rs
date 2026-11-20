@@ -10,32 +10,32 @@ use super::job_calls::{
 use super::list_jobs::ListJobsOperation;
 use super::store_call::RowBatch;
 use super::*;
-use crate::jobs::store::test_calls::{
-    adopt_external_attempt, begin_external_running, cancel_running_job, claim_job,
-    complete_execution, complete_job, defer_job, delete_finished_run, exhaust_job, fail_job,
-    find_dedup_job, handoff_external_attempt, insert_job, list_job_entries, mark_indeterminate,
-    persist_output_record, put_job_entry, put_state, read_attempt_control, read_crate_status,
-    read_job_record, read_launch_record, read_state, record_attempt_intent, release_job,
-    renew_lease, requeue_before_attempt, requeue_job, set_cancel_requested, settle_attempt,
-    transition_to_running,
-};
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::MintPersistentSpec;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::identity::LEASE_INDEX_PREFIX;
+use aruna_core::structs::execution::job::input::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateResult,
-    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, LEASE_INDEX_PREFIX,
-    RoCrateLimits, encode_dedup_value, job_schedule_key, parse_schedule_key, pid_dedup_key,
+    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, RoCrateLimits,
 };
+use aruna_core::structs::execution::job::local::{
+    encode_dedup_value, parse_schedule_key, pid_dedup_key,
+};
+use aruna_core::structs::execution::job::rows::job_schedule_key;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::MintPersistentSpec;
 use aruna_core::types::TxnId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_storage::scan::iter_prefix_page;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::jobs::{
+    find_dedup_job, insert_job, list_job_entries, read_crate_status, read_job_record,
+    read_launch_record, read_state,
+};
 use tempfile::tempdir;
 
 /// The stored value of one row.
@@ -192,33 +192,40 @@ async fn adopt_spares_live() {
         lease_expires_ms: 10_000,
     });
     insert_job(&context, &record).await.unwrap();
-    record_attempt_intent(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            live_token,
+            AttemptIntent {
+                attempt_no: 0,
+                external_name: aruna_core::structs::execution::job::local::attempt_external_name(
+                    job_id, 0,
+                ),
+                executor_kind: "docker".to_string(),
+                pinned_image:
+                    "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                attempt_epoch: 0,
+                backend: "docker".to_string(),
+                config_generation: 0,
+                home_digest: aruna_core::compute::identity::home_digest("docker", None),
+            },
+            None,
+            None,
+            1_000,
+        ),
         &context,
-        job_id,
-        live_token,
-        AttemptIntent {
-            attempt_no: 0,
-            external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
-            executor_kind: "docker".to_string(),
-            pinned_image:
-                "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                    .to_string(),
-            attempt_epoch: 0,
-            backend: "docker".to_string(),
-            config_generation: 0,
-            home_digest: aruna_core::compute::identity::home_digest("docker", None),
-        },
-        None,
-        None,
-        1_000,
     )
     .await
     .unwrap();
 
     // The holder renewed: its lease outlives `now`, so adoption must skip.
-    let outcome = adopt_external_attempt(&context, job_id, node_id(4), 9_000)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::adopt_external_attempt(job_id, node_id(4), 9_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, AdoptOutcome::Skipped));
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -227,11 +234,12 @@ async fn adopt_spares_live() {
     assert_eq!(stored.claim.unwrap().claim_token, live_token);
 
     // Once the lease really has expired, the attempt is adopted with a fresh token.
-    let AdoptOutcome::Adopted(adopted, _) =
-        adopt_external_attempt(&context, job_id, node_id(4), 11_000)
-            .await
-            .unwrap()
-    else {
+    let AdoptOutcome::Adopted(adopted, _) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::adopt_external_attempt(job_id, node_id(4), 11_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("expired lease must be adopted");
     };
     let claim = adopted.claim.unwrap();
@@ -356,9 +364,12 @@ async fn handoff_releases_preintent() {
     });
     insert_job(&context, &record).await.unwrap();
 
-    let outcome = handoff_external_attempt(&context, job_id, token, 2_000)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::handoff_external_attempt(job_id, token, 2_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
     let ReleaseOutcome::Released(released) = outcome else {
         panic!("pre-intent handoff must release the job");
@@ -374,10 +385,12 @@ async fn claim_moves_index() {
     let job_id = JobId::from_bytes([9u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
 
-    let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .expect("claim succeeds")
-    else {
+    let ClaimOutcome::Claimed(record) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .expect("claim succeeds") else {
         panic!("expected claimed outcome");
     };
 
@@ -403,16 +416,23 @@ async fn exhausted_job_cancels() {
     record.locally_exhausted = true;
     insert_job(&context, &record).await.unwrap();
 
-    let outcome = set_cancel_requested(&context, record.job_id, 9_000)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(record.job_id, 9_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
     let CancelRequestOutcome::Cancelled(cancelled) = outcome else {
         panic!("an exhausted job must settle as cancelled");
     };
     assert_eq!(cancelled.state, JobState::Cancelled);
     assert!(!cancelled.locally_exhausted && cancelled.cancel_requested);
-    let deleted = delete_finished_run(&context, record.created_by, record.job_id, true).await;
+    let deleted = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::delete_finished_run(record.created_by, record.job_id, true),
+        &context,
+    )
+    .await;
     assert_eq!(deleted.unwrap(), RunDelete::Deleted);
 }
 
@@ -460,9 +480,12 @@ async fn claim_transition_bounded() {
     insert_job(&context, &queued_record(job_id)).await.unwrap();
 
     let before = storage.snapshot_metrics().requests_total;
-    claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(storage.snapshot_metrics().requests_total - before, 5);
 }
 
@@ -472,44 +495,57 @@ async fn report_freezes() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x42; 16]);
     insert_job(&context, &rocrate_record(job_id)).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node_id(3), 2_000)
-        .await
-        .unwrap()
-    else {
+    let ClaimOutcome::Claimed(claimed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 2_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("job must be claimed");
     };
     let token = claimed.claim.unwrap().claim_token;
     let row_b = report_row("b");
     let row_a = report_row("a");
-    put_job_entry(&context, job_id, token, b"b", &row_b)
-        .await
-        .unwrap();
-    put_job_entry(&context, job_id, token, b"a", &row_a)
-        .await
-        .unwrap();
-    transition_to_running(&context, job_id, token, 3_000)
-        .await
-        .unwrap();
-
-    let terminal = complete_job(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::put_job_entry(job_id, token, b"b", &row_b),
         &context,
-        job_id,
-        token,
-        JobResultPayload::ImportRoCrate(ImportRoCrateResult {
-            document_id: None,
-            entries_total: 2,
-            imported: 2,
-            unlisted: 0,
-            failed: 0,
-            report_digest: [0; 32],
-        }),
-        JobProgress {
-            current: 2,
-            total: Some(2),
-            unit: "items".to_string(),
-            paused_until: None,
-        },
-        4_000,
+    )
+    .await
+    .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::put_job_entry(job_id, token, b"a", &row_a),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::transition_to_running(job_id, token, 3_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let terminal = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            token,
+            JobResultPayload::ImportRoCrate(ImportRoCrateResult {
+                document_id: None,
+                entries_total: 2,
+                imported: 2,
+                unlisted: 0,
+                failed: 0,
+                report_digest: [0; 32],
+            }),
+            JobProgress {
+                current: 2,
+                total: Some(2),
+                unit: "items".to_string(),
+                paused_until: None,
+            },
+            4_000,
+        ),
+        &context,
     )
     .await
     .unwrap();
@@ -530,7 +566,11 @@ async fn report_freezes() {
     assert_eq!(second[0].0, b"b");
     assert!(cursor.is_none());
     assert!(matches!(
-        put_job_entry(&context, job_id, token, b"c", &report_row("c")).await,
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::put_job_entry(job_id, token, b"c", &report_row("c")),
+            &context
+        )
+        .await,
         Err(JobMutationError::ReportFrozen)
     ));
 }
@@ -570,17 +610,22 @@ async fn zombie_rejected() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([1u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
-    claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap();
-
-    let err = complete_job(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
         &context,
-        job_id,
-        Ulid::generate(),
-        JobResultPayload::Probe { completed_steps: 1 },
-        JobProgress::new("steps"),
-        6_000,
+    )
+    .await
+    .unwrap();
+
+    let err = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            Ulid::generate(),
+            JobResultPayload::Probe { completed_steps: 1 },
+            JobProgress::new("steps"),
+            6_000,
+        ),
+        &context,
     )
     .await
     .expect_err("stale token must be rejected");
@@ -603,33 +648,39 @@ async fn stale_checkpoint_rejected() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([2u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
-    let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap()
-    else {
+    let ClaimOutcome::Claimed(record) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("job must be claimed")
     };
     let token = record.claim.unwrap().claim_token;
     let key = ByteView::from(job_id.to_bytes().to_vec());
-    put_state(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::put_state(
+            job_id,
+            token,
+            STAGING_STATE_KEYSPACE,
+            key.clone(),
+            &b"newer".to_vec(),
+        ),
         &context,
-        job_id,
-        token,
-        STAGING_STATE_KEYSPACE,
-        key.clone(),
-        &b"newer".to_vec(),
     )
     .await
     .unwrap();
 
     assert!(matches!(
-        put_state(
-            &context,
-            job_id,
-            Ulid::generate(),
-            STAGING_STATE_KEYSPACE,
-            key.clone(),
-            &b"stale".to_vec(),
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::put_state(
+                job_id,
+                Ulid::generate(),
+                STAGING_STATE_KEYSPACE,
+                key.clone(),
+                &b"stale".to_vec()
+            ),
+            &context
         )
         .await,
         Err(JobMutationError::TokenMismatch)
@@ -649,17 +700,22 @@ async fn requeue_backs_off() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([4u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
-    claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap();
-
-    let RequeueOutcome::Requeued(record) = requeue_job(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
         &context,
-        job_id,
-        None,
-        6_000,
-        None,
-        Some(JobError::retryable("lease expired")),
+    )
+    .await
+    .unwrap();
+
+    let RequeueOutcome::Requeued(record) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            6_000,
+            None,
+            Some(JobError::retryable("lease expired")),
+        ),
+        &context,
     )
     .await
     .unwrap() else {
@@ -678,21 +734,25 @@ async fn deferral_keeps_attempt() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x44u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
-    let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap()
-    else {
+    let ClaimOutcome::Claimed(record) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("job must be claimed")
     };
     let token = record.claim.unwrap().claim_token;
 
-    let ReleaseOutcome::Released(deferred) = defer_job(
+    let ReleaseOutcome::Released(deferred) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::defer_job(
+            job_id,
+            token,
+            6_000,
+            1_000,
+            JobError::retryable("metadata projection pending"),
+        ),
         &context,
-        job_id,
-        token,
-        6_000,
-        1_000,
-        JobError::retryable("metadata projection pending"),
     )
     .await
     .unwrap() else {
@@ -719,15 +779,23 @@ async fn success_clears_error() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x45u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
-    let claim = |now| claim_job(&context, job_id, node_id(3), now);
+    let claim = |now| {
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node_id(3), now),
+            &context,
+        )
+    };
     let ClaimOutcome::Claimed(record) = claim(5_000).await.unwrap() else {
         panic!("job must be claimed")
     };
     let token = record.claim.unwrap().claim_token;
     let conflict = JobError::retryable("Transaction conflict");
-    defer_job(&context, job_id, token, 6_000, 1_000, conflict)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::defer_job(job_id, token, 6_000, 1_000, conflict),
+        &context,
+    )
+    .await
+    .unwrap();
     let ClaimOutcome::Claimed(record) = claim(7_000).await.unwrap() else {
         panic!("job must be claimed again")
     };
@@ -744,12 +812,18 @@ async fn success_clears_error() {
         completed_items: 1,
         failed_items: 0,
     };
-    transition_to_running(&context, job_id, token, 7_500)
-        .await
-        .unwrap();
-    let done = complete_job(&context, job_id, token, payload, progress, 8_000)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::transition_to_running(job_id, token, 7_500),
+        &context,
+    )
+    .await
+    .unwrap();
+    let done = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_job(job_id, token, payload, progress, 8_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(done.state, JobState::Succeeded);
     assert!(done.last_error.is_none());
@@ -764,26 +838,51 @@ async fn finish_clears_pause() {
     for (seed, cancel) in [(0x46u8, false), (0x47u8, true)] {
         let job_id = JobId::from_bytes([seed; 16]);
         insert_job(&context, &queued_record(job_id)).await.unwrap();
-        let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
-            .await
-            .unwrap()
-        else {
+        let ClaimOutcome::Claimed(record) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
             panic!("job must be claimed")
         };
         let token = record.claim.unwrap().claim_token;
-        transition_to_running(&context, job_id, token, 5_500)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::transition_to_running(job_id, token, 5_500),
+            &context,
+        )
+        .await
+        .unwrap();
         let mut progress = JobProgress::new("items");
         progress.paused_until = paused;
-        renew_lease(&context, job_id, token, 6_000, Some(progress))
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::renew_lease(job_id, token, 6_000, Some(progress)),
+            &context,
+        )
+        .await
+        .unwrap();
         let stored = read_job_record(&context, job_id, None).await.unwrap();
         assert_eq!(stored.unwrap().progress.paused_until, paused);
         let finished = match cancel {
-            true => cancel_running_job(&context, job_id, token, 7_000).await,
-            false => fail_job(&context, job_id, token, JobError::retryable("x"), 7_000).await,
+            true => {
+                aruna_drivers::driver::drive(
+                    crate::jobs::store::job_calls::cancel_running_job(job_id, token, 7_000),
+                    &context,
+                )
+                .await
+            }
+            false => {
+                aruna_drivers::driver::drive(
+                    crate::jobs::store::job_calls::fail_job(
+                        job_id,
+                        token,
+                        JobError::retryable("x"),
+                        7_000,
+                    ),
+                    &context,
+                )
+                .await
+            }
         };
         assert_eq!(finished.unwrap().progress.paused_until, None);
     }
@@ -796,15 +895,21 @@ async fn undecided_never_retries() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([0x48u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
-    let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap()
-    else {
+    let ClaimOutcome::Claimed(record) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("job must be claimed")
     };
     let token = record.claim.unwrap().claim_token;
     let error = JobError::permanent("the request may have been sent");
-    let ended = exhaust_job(&context, job_id, token, error, 6_000).await;
+    let ended = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::exhaust_job(job_id, token, error, 6_000),
+        &context,
+    )
+    .await;
     let ended = ended.unwrap();
     assert_eq!(ended.state, JobState::Indeterminate);
     assert!(ended.locally_exhausted && ended.claim.is_none() && ended.is_settled());
@@ -812,9 +917,12 @@ async fn undecided_never_retries() {
         ended.last_error.map(|error| error.kind),
         Some(JobErrorKind::Retryable)
     );
-    let again = claim_job(&context, job_id, node_id(3), 7_000)
-        .await
-        .unwrap();
+    let again = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 7_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(
         !matches!(again, ClaimOutcome::Claimed(_)),
         "it must not run again"
@@ -831,14 +939,19 @@ async fn retry_resets_progress() {
     record.progress.current = 1;
     record.progress.total = Some(1);
     insert_job(&context, &record).await.unwrap();
-    claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
-    let RequeueOutcome::Requeued(record) = requeue_job(&context, job_id, None, 6_000, None, None)
-        .await
-        .unwrap()
-    else {
+    let RequeueOutcome::Requeued(record) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("expected requeue");
     };
     assert_eq!(
@@ -862,10 +975,12 @@ async fn requeue_exhausts() {
     });
     insert_job(&context, &record).await.unwrap();
 
-    let RequeueOutcome::Exhausted(failed) = requeue_job(&context, job_id, None, 6_000, None, None)
-        .await
-        .unwrap()
-    else {
+    let RequeueOutcome::Exhausted(failed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("expected local exhaustion");
     };
     assert_eq!(failed.state, JobState::Indeterminate);
@@ -890,13 +1005,15 @@ async fn permanent_cap_fails() {
     });
     insert_job(&context, &record).await.unwrap();
 
-    let RequeueOutcome::Exhausted(failed) = requeue_job(
+    let RequeueOutcome::Exhausted(failed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            6_000,
+            None,
+            Some(JobError::permanent("input is not readable")),
+        ),
         &context,
-        job_id,
-        None,
-        6_000,
-        None,
-        Some(JobError::permanent("input is not readable")),
     )
     .await
     .unwrap() else {
@@ -922,13 +1039,19 @@ async fn exhausted_stops_sweep() {
         lease_expires_ms: 5_000,
     });
     insert_job(&context, &record).await.unwrap();
-    requeue_job(&context, job_id, None, 6_000, Some(6_000), None)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, Some(6_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
 
-    let swept = requeue_job(&context, job_id, None, 9_000, Some(9_000), None)
-        .await
-        .unwrap();
+    let swept = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(swept, RequeueOutcome::Skipped));
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -964,10 +1087,12 @@ async fn cleanup_retries_forever() {
     });
     insert_job(&context, &record).await.unwrap();
 
-    let RequeueOutcome::Requeued(requeued) = requeue_job(&context, job_id, None, 6_000, None, None)
-        .await
-        .unwrap()
-    else {
+    let RequeueOutcome::Requeued(requeued) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("cleanup must remain retryable");
     };
     assert_eq!(requeued.state, JobState::Queued);
@@ -989,10 +1114,12 @@ async fn import_exhausts() {
     });
     insert_job(&context, &record).await.unwrap();
 
-    let RequeueOutcome::Exhausted(failed) = requeue_job(&context, job_id, None, 6_000, None, None)
-        .await
-        .unwrap()
-    else {
+    let RequeueOutcome::Exhausted(failed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("import must stop after exhausting attempts");
     };
     assert_eq!(failed.state, JobState::Indeterminate);
@@ -1013,9 +1140,12 @@ async fn release_keeps_attempts() {
     record.progress.total = Some(10);
     insert_job(&context, &record).await.unwrap();
 
-    let ReleaseOutcome::Released(released) =
-        release_job(&context, job_id, token, 6_000).await.unwrap()
-    else {
+    let ReleaseOutcome::Released(released) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::release_job(job_id, token, 6_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("expected release");
     };
     assert_eq!(released.state, JobState::Queued);
@@ -1037,9 +1167,12 @@ async fn release_guards_token() {
         .await
         .unwrap();
 
-    let error = release_job(&context, job_id, Ulid::generate(), 6_000)
-        .await
-        .expect_err("a foreign token must not release the lease");
+    let error = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::release_job(job_id, Ulid::generate(), 6_000),
+        &context,
+    )
+    .await
+    .expect_err("a foreign token must not release the lease");
     assert!(matches!(error, JobMutationError::TokenMismatch));
     let record = read_job_record(&context, job_id, None)
         .await
@@ -1058,10 +1191,12 @@ async fn cancel_before_claim() {
     record.cancel_requested = true;
     insert_job(&context, &record).await.unwrap();
 
-    let ClaimOutcome::CancelledFresh(cancelled) = claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap()
-    else {
+    let ClaimOutcome::CancelledFresh(cancelled) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("expected fresh cancellation");
     };
     assert_eq!(cancelled.state, JobState::Cancelled);
@@ -1077,7 +1212,12 @@ async fn cancel_terminal_noop() {
     record.finished_at_ms = Some(2_000);
     insert_job(&context, &record).await.unwrap();
 
-    let outcome = set_cancel_requested(&context, job_id, 9_000).await.unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 9_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, CancelRequestOutcome::AlreadyTerminal(_)));
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -1108,13 +1248,15 @@ async fn terminal_clears_dedup() {
         Some(job_id)
     );
 
-    complete_job(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            token,
+            JobResultPayload::Probe { completed_steps: 1 },
+            JobProgress::new("steps"),
+            6_000,
+        ),
         &context,
-        job_id,
-        token,
-        JobResultPayload::Probe { completed_steps: 1 },
-        JobProgress::new("steps"),
-        6_000,
     )
     .await
     .unwrap();
@@ -1127,7 +1269,7 @@ async fn terminal_clears_dedup() {
     );
     let keys = schedule_keys(&context).await;
     assert_eq!(keys.len(), 1);
-    assert!(keys[0].starts_with(aruna_core::structs::execution::job::PRUNE_INDEX_PREFIX));
+    assert!(keys[0].starts_with(aruna_core::structs::execution::job::identity::PRUNE_INDEX_PREFIX));
 }
 
 #[tokio::test]
@@ -1230,23 +1372,25 @@ fn named_result(digest: [u8; 32]) -> JobResultPayload {
 
 /// Fence an attempt so the success path has a control row to read.
 async fn fence_attempt(context: &DriverContext, job_id: JobId, token: Ulid) -> AttemptControl {
-    record_attempt_intent(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            token,
+            AttemptIntent {
+                attempt_no: 1,
+                external_name: "aruna-test-a1".to_string(),
+                executor_kind: "docker".to_string(),
+                pinned_image: "alpine@sha256:0".to_string(),
+                attempt_epoch: 0,
+                backend: "docker".to_string(),
+                config_generation: 0,
+                home_digest: aruna_core::compute::identity::home_digest("docker", None),
+            },
+            None,
+            None,
+            2_000,
+        ),
         context,
-        job_id,
-        token,
-        AttemptIntent {
-            attempt_no: 1,
-            external_name: "aruna-test-a1".to_string(),
-            executor_kind: "docker".to_string(),
-            pinned_image: "alpine@sha256:0".to_string(),
-            attempt_epoch: 0,
-            backend: "docker".to_string(),
-            config_generation: 0,
-            home_digest: aruna_core::compute::identity::home_digest("docker", None),
-        },
-        None,
-        None,
-        2_000,
     )
     .await
     .unwrap()
@@ -1263,13 +1407,15 @@ async fn revived_lease_kept() {
         .unwrap();
 
     // Sweep at now=5_000 with the lease valid until 10_000 must not revoke it.
-    let outcome = requeue_job(
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            5_000,
+            Some(5_000),
+            Some(JobError::retryable("lease expired")),
+        ),
         &context,
-        job_id,
-        None,
-        5_000,
-        Some(5_000),
-        Some(JobError::retryable("lease expired")),
     )
     .await
     .unwrap();
@@ -1292,13 +1438,15 @@ async fn sweep_skips_requeued() {
     record.attempts = 1;
     insert_job(&context, &record).await.unwrap();
 
-    let outcome = requeue_job(
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            6_000,
+            Some(6_000),
+            Some(JobError::retryable("lease expired")),
+        ),
         &context,
-        job_id,
-        None,
-        6_000,
-        Some(6_000),
-        Some(JobError::retryable("lease expired")),
     )
     .await
     .unwrap();
@@ -1318,14 +1466,20 @@ async fn reclaim_not_eligible() {
     let context = aruna_drivers::testing::test_context(storage.clone());
     let job_id = JobId::from_bytes([2u8; 16]);
     insert_job(&context, &queued_record(job_id)).await.unwrap();
-    claim_job(&context, job_id, node_id(3), 5_000)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
     // A second claim of an already-Claimed job must not hand back a token.
-    let outcome = claim_job(&context, job_id, node_id(4), 6_000)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(4), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, ClaimOutcome::NotEligible));
 }
 
@@ -1504,7 +1658,7 @@ async fn terminal_enqueues_cleanup() {
     let token = Ulid::from_bytes([0xCA; 16]);
     let intent = AttemptIntent {
         attempt_no: 2,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 2),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 2),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -1550,20 +1704,22 @@ async fn terminal_enqueues_cleanup() {
     });
     insert_job(&context, &record).await.unwrap();
 
-    let terminal = complete_job(
+    let terminal = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            token,
+            JobResultPayload::Execution {
+                exit_code: Some(0),
+                workspace_bucket: Some("ws-test".to_string()),
+                outputs: Vec::new(),
+                stdout: String::new(),
+                stderr: String::new(),
+                output_digest: None,
+            },
+            JobProgress::new("phases"),
+            6_000,
+        ),
         &context,
-        job_id,
-        token,
-        JobResultPayload::Execution {
-            exit_code: Some(0),
-            workspace_bucket: Some("ws-test".to_string()),
-            outputs: Vec::new(),
-            stdout: String::new(),
-            stderr: String::new(),
-            output_digest: None,
-        },
-        JobProgress::new("phases"),
-        6_000,
     )
     .await
     .unwrap();
@@ -1652,7 +1808,12 @@ async fn run_delete_rules() {
     .await
     .unwrap();
 
-    let delete = |user, job| delete_finished_run(&context, user, job, true);
+    let delete = |user, job| {
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::delete_finished_run(user, job, true),
+            &context,
+        )
+    };
     assert_eq!(
         delete(other, finished.job_id).await.unwrap(),
         RunDelete::NotFound
@@ -1671,7 +1832,11 @@ async fn run_delete_rules() {
         RunDelete::NotFound
     );
     // A run whose deletion was not recorded first stays, whatever state it settled in since.
-    let unrecorded = delete_finished_run(&context, owner, finished.job_id, false).await;
+    let unrecorded = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::delete_finished_run(owner, finished.job_id, false),
+        &context,
+    )
+    .await;
     assert!(matches!(unrecorded, Ok(RunDelete::Unrecorded(_))));
     assert_eq!(
         delete(owner, finished.job_id).await.unwrap(),
@@ -1764,20 +1929,22 @@ async fn session_skips_crate() {
             lease_expires_ms: 5_000,
         });
         insert_job(&context, &record).await.unwrap();
-        complete_job(
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::complete_job(
+                job_id,
+                token,
+                JobResultPayload::Execution {
+                    exit_code: Some(0),
+                    workspace_bucket: Some("ws-test".to_string()),
+                    outputs: Vec::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_digest: None,
+                },
+                JobProgress::new("phases"),
+                6_000,
+            ),
             &context,
-            job_id,
-            token,
-            JobResultPayload::Execution {
-                exit_code: Some(0),
-                workspace_bucket: Some("ws-test".to_string()),
-                outputs: Vec::new(),
-                stdout: String::new(),
-                stderr: String::new(),
-                output_digest: None,
-            },
-            JobProgress::new("phases"),
-            6_000,
         )
         .await
         .unwrap();
@@ -1823,13 +1990,15 @@ async fn dedup_delete_guarded() {
     .await
     .unwrap();
 
-    complete_job(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_a,
+            token,
+            JobResultPayload::Probe { completed_steps: 1 },
+            JobProgress::new("steps"),
+            6_000,
+        ),
         &context,
-        job_a,
-        token,
-        JobResultPayload::Probe { completed_steps: 1 },
-        JobProgress::new("steps"),
-        6_000,
     )
     .await
     .unwrap();
@@ -1864,9 +2033,12 @@ async fn external_never_requeued() {
     });
     insert_job(&context, &record).await.unwrap();
 
-    let outcome = requeue_job(&context, job_id, None, 9_000, Some(9_000), None)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, RequeueOutcome::NeedsReconcile(_)));
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -1901,19 +2073,24 @@ async fn park_sweep_budget() {
     insert_job(&context, &record).await.unwrap();
 
     for cycle in 1..JOB_MAX_ATTEMPTS {
-        let parked = mark_indeterminate(
+        let parked = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::mark_indeterminate(
+                job_id,
+                token,
+                JobError::retryable("attempt unobservable"),
+                6_000,
+            ),
             &context,
-            job_id,
-            token,
-            JobError::retryable("attempt unobservable"),
-            6_000,
         )
         .await
         .unwrap();
         assert!(matches!(parked, ParkOutcome::Parked(_)), "cycle {cycle}");
-        let swept = requeue_job(&context, job_id, None, 9_000, Some(9_000), None)
-            .await
-            .unwrap();
+        let swept = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(
             matches!(swept, RequeueOutcome::NeedsReconcile(_)),
             "cycle {cycle}"
@@ -1926,12 +2103,14 @@ async fn park_sweep_budget() {
         assert_eq!(stored.state, JobState::Indeterminate);
     }
 
-    let capped = mark_indeterminate(
+    let capped = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::mark_indeterminate(
+            job_id,
+            token,
+            JobError::retryable("attempt unobservable"),
+            7_000,
+        ),
         &context,
-        job_id,
-        token,
-        JobError::retryable("attempt unobservable"),
-        7_000,
     )
     .await
     .unwrap();
@@ -1956,12 +2135,14 @@ async fn park_spends_attempt() {
     insert_job(&context, &record).await.unwrap();
 
     for attempt in 1..JOB_MAX_ATTEMPTS {
-        let ParkOutcome::Parked(parked) = mark_indeterminate(
+        let ParkOutcome::Parked(parked) = aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::mark_indeterminate(
+                job_id,
+                token,
+                JobError::retryable("output capture failed"),
+                6_000,
+            ),
             &context,
-            job_id,
-            token,
-            JobError::retryable("output capture failed"),
-            6_000,
         )
         .await
         .unwrap() else {
@@ -1971,12 +2152,14 @@ async fn park_spends_attempt() {
         assert_eq!(parked.attempts, attempt);
     }
 
-    let ParkOutcome::Exhausted(failed) = mark_indeterminate(
+    let ParkOutcome::Exhausted(failed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::mark_indeterminate(
+            job_id,
+            token,
+            JobError::retryable("output capture failed"),
+            7_000,
+        ),
         &context,
-        job_id,
-        token,
-        JobError::retryable("output capture failed"),
-        7_000,
     )
     .await
     .unwrap() else {
@@ -2012,11 +2195,12 @@ async fn cap_sites_result() {
     record.workspace_bucket = Some("ws-test".to_string());
     insert_job(&context, &record).await.unwrap();
 
-    let RequeueOutcome::Exhausted(failed) =
-        requeue_job(&context, swept, None, 9_000, Some(9_000), None)
-            .await
-            .unwrap()
-    else {
+    let RequeueOutcome::Exhausted(failed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(swept, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap() else {
         panic!("the sweep must exhaust at the cap");
     };
     assert!(matches!(
@@ -2024,12 +2208,14 @@ async fn cap_sites_result() {
         Some(JobResultPayload::Execution { .. })
     ));
 
-    let failed = requeue_before_attempt(
+    let failed = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_before_attempt(
+            presubmit,
+            token,
+            9_000,
+            JobError::retryable("image pull failed"),
+        ),
         &context,
-        presubmit,
-        token,
-        9_000,
-        JobError::retryable("image pull failed"),
     )
     .await
     .unwrap();
@@ -2050,9 +2236,12 @@ async fn preintent_requeues() {
     record.claim.as_mut().unwrap().lease_expires_ms = 1;
     insert_job(&context, &record).await.unwrap();
 
-    let outcome = requeue_job(&context, job_id, None, 9_000, Some(9_000), None)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, RequeueOutcome::Requeued(_)));
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -2075,7 +2264,7 @@ async fn attempt_intent_persists() {
 
     let intent = AttemptIntent {
         attempt_no: 1,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 1),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 1),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2085,9 +2274,14 @@ async fn attempt_intent_persists() {
         config_generation: 0,
         home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
-    let committed = record_attempt_intent(&context, job_id, token, intent, None, None, 6_000)
-        .await
-        .unwrap();
+    let committed = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id, token, intent, None, None, 6_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
 
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -2107,11 +2301,16 @@ async fn cancel_blocks_intent() {
     record.execution_class = JobExecutionClass::ExternalAttempt;
     record.state = JobState::Ready;
     insert_job(&context, &record).await.unwrap();
-    set_cancel_requested(&context, job_id, 5_000).await.unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
     let intent = AttemptIntent {
         attempt_no: 0,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2121,9 +2320,14 @@ async fn cancel_blocks_intent() {
         config_generation: 0,
         home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
-    let error = record_attempt_intent(&context, job_id, token, intent, None, None, 6_000)
-        .await
-        .unwrap_err();
+    let error = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id, token, intent, None, None, 6_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap_err();
 
     assert!(matches!(error, JobMutationError::IntentConflict));
 }
@@ -2139,7 +2343,7 @@ async fn cancel_blocks_running() {
         .unwrap();
     let intent = AttemptIntent {
         attempt_no: 0,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2149,14 +2353,27 @@ async fn cancel_blocks_running() {
         config_generation: 0,
         home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
-    let committed = record_attempt_intent(&context, job_id, token, intent, None, None, 4_000)
-        .await
-        .unwrap();
-    set_cancel_requested(&context, job_id, 5_000).await.unwrap();
+    let committed = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id, token, intent, None, None, 4_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
-    let stored = begin_external_running(&context, job_id, token, Some(5_500), 6_000)
-        .await
-        .unwrap();
+    let stored = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(5_500), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(stored.state, JobState::Ready);
     assert!(stored.cancel_requested);
@@ -2181,7 +2398,7 @@ fn sample_launch() -> LaunchRecord {
 fn plain_intent(job_id: JobId) -> AttemptIntent {
     AttemptIntent {
         attempt_no: 0,
-        external_name: aruna_core::structs::execution::job::attempt_external_name(job_id, 0),
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
         executor_kind: "docker".to_string(),
         pinned_image:
             "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -2204,14 +2421,16 @@ async fn launch_marks_executed() {
         .await
         .unwrap();
     let launch = sample_launch();
-    let committed = record_attempt_intent(
+    let committed = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            token,
+            plain_intent(job_id),
+            None,
+            (Some(&launch)).cloned(),
+            4_000,
+        ),
         &context,
-        job_id,
-        token,
-        plain_intent(job_id),
-        None,
-        Some(&launch),
-        4_000,
     )
     .await
     .unwrap();
@@ -2220,9 +2439,12 @@ async fn launch_marks_executed() {
         Ok(None)
     );
 
-    let running = begin_external_running(&context, job_id, token, Some(5_500), 6_000)
-        .await
-        .unwrap();
+    let running = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(5_500), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
     let executed = read_launch_record(&context, &running)
         .await
         .unwrap()
@@ -2243,14 +2465,16 @@ async fn stale_launch_refused() {
         .await
         .unwrap();
     let launch = sample_launch();
-    let stale = record_attempt_intent(
+    let stale = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            Ulid::generate(),
+            plain_intent(job_id),
+            None,
+            (Some(&launch)).cloned(),
+            4_000,
+        ),
         &context,
-        job_id,
-        Ulid::generate(),
-        plain_intent(job_id),
-        None,
-        Some(&launch),
-        4_000,
     )
     .await;
     assert!(stale.is_err());
@@ -2258,21 +2482,31 @@ async fn stale_launch_refused() {
     let row = read_raw(&context, LAUNCH_RECORD_KEYSPACE, key, None).await;
     assert_eq!(row, Ok(None));
 
-    record_attempt_intent(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            token,
+            plain_intent(job_id),
+            None,
+            (Some(&launch)).cloned(),
+            4_000,
+        ),
         &context,
-        job_id,
-        token,
-        plain_intent(job_id),
-        None,
-        Some(&launch),
-        4_000,
     )
     .await
     .unwrap();
-    set_cancel_requested(&context, job_id, 5_000).await.unwrap();
-    let stored = begin_external_running(&context, job_id, token, Some(5_500), 6_000)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    let stored = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(5_500), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(stored.state, JobState::Ready);
     let executed = read_launch_record(&context, &stored)
         .await
@@ -2293,17 +2527,23 @@ async fn running_backfills_start() {
         .await
         .unwrap();
 
-    let stored = begin_external_running(&context, job_id, token, None, 6_000)
-        .await
-        .unwrap();
+    let stored = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, None, 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(stored.state, JobState::Running);
     assert_eq!(stored.started_at_ms, Some(6_000));
 
     // Later evidence must not move an already anchored start.
-    let stored = begin_external_running(&context, job_id, token, Some(9_000), 9_100)
-        .await
-        .unwrap();
+    let stored = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(9_000), 9_100),
+        &context,
+    )
+    .await
+    .unwrap();
     assert_eq!(stored.started_at_ms, Some(6_000));
 }
 
@@ -2320,15 +2560,24 @@ async fn cancel_blocks_completion() {
     .await
     .unwrap();
     fence_attempt(&context, job_id, token).await;
-    set_cancel_requested(&context, job_id, 5_000).await.unwrap();
-
-    let ExecutionCompleteOutcome::CancelRequested(stored) = complete_execution(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
         &context,
-        job_id,
-        token,
-        execution_result(),
-        JobProgress::new("phases"),
-        6_000,
+    )
+    .await
+    .unwrap();
+
+    let ExecutionCompleteOutcome::CancelRequested(stored) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: execution_result(),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_000,
+            },
+        ),
+        &context,
     )
     .await
     .unwrap() else {
@@ -2362,17 +2611,29 @@ async fn success_wins_cancel() {
 
     let control = fence_attempt(&context, job_id, token).await;
     let digest = [8u8; 32];
-    persist_output_record(&context, job_id, &control, digest, vec![1, 2, 3])
-        .await
-        .unwrap();
-
-    let ExecutionCompleteOutcome::Completed(completed) = complete_execution(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(
+            job_id,
+            &control,
+            digest,
+            vec![1, 2, 3],
+        ),
         &context,
-        job_id,
-        token,
-        named_result(digest),
-        JobProgress::new("phases"),
-        6_000,
+    )
+    .await
+    .unwrap();
+
+    let ExecutionCompleteOutcome::Completed(completed) = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: named_result(digest),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_000,
+            },
+        ),
+        &context,
     )
     .await
     .unwrap() else {
@@ -2381,7 +2642,12 @@ async fn success_wins_cancel() {
     assert_eq!(completed.state, JobState::Succeeded);
     assert!(completed.claim.is_none());
 
-    let outcome = set_cancel_requested(&context, job_id, 7_000).await.unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 7_000),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, CancelRequestOutcome::AlreadyTerminal(_)));
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -2414,13 +2680,33 @@ async fn output_record_cas() {
     let control = fence_attempt(&context, job_id, token).await;
     let first = vec![1, 2, 3];
 
-    persist_output_record(&context, job_id, &control, [8u8; 32], first.clone())
-        .await
-        .unwrap();
-    persist_output_record(&context, job_id, &control, [8u8; 32], vec![4, 5])
-        .await
-        .unwrap();
-    let conflict = persist_output_record(&context, job_id, &control, [9u8; 32], vec![6]).await;
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(
+            job_id,
+            &control,
+            [8u8; 32],
+            first.clone(),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(
+            job_id,
+            &control,
+            [8u8; 32],
+            vec![4, 5],
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    let conflict = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(job_id, &control, [9u8; 32], vec![6]),
+        &context,
+    )
+    .await;
     assert!(matches!(
         conflict,
         Err(JobMutationError::OutputRecordConflict)
@@ -2436,10 +2722,13 @@ async fn output_record_cas() {
     .unwrap()
     .unwrap();
     assert_eq!(raw.as_ref(), first.as_slice());
-    let stored = read_attempt_control(&context, job_id, control.attempt_epoch, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = aruna_drivers::driver::drive(
+        crate::jobs::store::row_calls::read_attempt_control(job_id, control.attempt_epoch),
+        &context,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(stored.output_record, Some([8u8; 32]));
 }
 
@@ -2459,13 +2748,17 @@ async fn success_needs_record() {
     .unwrap();
     let control = fence_attempt(&context, job_id, token).await;
 
-    let unproven = complete_execution(
+    let unproven = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: execution_result(),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_000,
+            },
+        ),
         &context,
-        job_id,
-        token,
-        execution_result(),
-        JobProgress::new("phases"),
-        6_000,
     )
     .await;
     assert!(matches!(
@@ -2473,16 +2766,23 @@ async fn success_needs_record() {
         Err(JobMutationError::OutputsUnproven(_))
     ));
 
-    persist_output_record(&context, job_id, &control, [8u8; 32], vec![9])
-        .await
-        .unwrap();
-    let mismatched = complete_execution(
+    aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(job_id, &control, [8u8; 32], vec![9]),
         &context,
-        job_id,
-        token,
-        named_result([1u8; 32]),
-        JobProgress::new("phases"),
-        6_100,
+    )
+    .await
+    .unwrap();
+    let mismatched = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: named_result([1u8; 32]),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_100,
+            },
+        ),
+        &context,
     )
     .await;
     assert!(matches!(
@@ -2508,9 +2808,12 @@ async fn external_live_skipped() {
     record.execution_class = JobExecutionClass::ExternalAttempt;
     insert_job(&context, &record).await.unwrap();
 
-    let outcome = requeue_job(&context, job_id, None, 5_000, Some(5_000), None)
-        .await
-        .unwrap();
+    let outcome = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 5_000, Some(5_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
     assert!(matches!(outcome, RequeueOutcome::Skipped));
     let stored = read_job_record(&context, job_id, None)
         .await
@@ -2530,7 +2833,7 @@ fn capacity_not_conflict() {
 
 // A listing reads the record of an index row that carries none, and a short page ends it.
 #[test]
-fn list_reads_bare_rows() {
+fn list_reads_bare() {
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     let record = queued_record(job_id(1_000));
@@ -2610,21 +2913,6 @@ fn marks_launch_once() {
     assert_eq!(kept.started_at_ms, Some(2_600));
 }
 
-// Only a lost conflict runs again, and the last one reports the exhausted retries.
-#[tokio::test(start_paused = true)]
-async fn retries_conflicts() {
-    let retry = settle_attempt::<()>(Err(JobMutationError::Conflict), 0, "spent").await;
-    assert_eq!(retry, None);
-    let last = MUTATE_MAX_ATTEMPTS - 1;
-    let spent = settle_attempt::<()>(Err(JobMutationError::Conflict), last, "spent").await;
-    assert_eq!(
-        spent,
-        Some(Err(JobMutationError::Storage("spent".to_string())))
-    );
-    let refused = settle_attempt::<()>(Err(JobMutationError::NotFound), 0, "spent").await;
-    assert_eq!(refused, Some(Err(JobMutationError::NotFound)));
-}
-
 fn draft() -> AttemptIntent {
     AttemptIntent {
         attempt_no: 1,
@@ -2699,7 +2987,7 @@ fn delete_removes_run() {
 
 // Only the claim token holder writes and deletes a running job's rows.
 #[test]
-fn rows_fenced_by_claim() {
+fn claim_fences_rows() {
     use super::job_rows::PutRowsOperation;
     use super::mutation::{run_in_memory, seeded_rows};
     let token = Ulid::from_bytes([5u8; 16]);
@@ -2736,7 +3024,7 @@ fn rows_fenced_by_claim() {
 
 // A running job adds report entries under its claim; a settled report is frozen.
 #[test]
-fn entries_need_live_claim() {
+fn entries_need_claim() {
     use super::job_rows::PutEntryOperation;
     use super::mutation::{run_in_memory, seeded_rows};
     let token = Ulid::from_bytes([5u8; 16]);
@@ -2814,7 +3102,7 @@ fn intent_takes_epoch() {
 
 // A control change writes both rows; a job without an intent has no control to change.
 #[test]
-fn control_changes_with_job() {
+fn control_follows_job() {
     use super::attempt_intent::RecordIntentOperation;
     use super::control_mutation::MutateControlOperation;
     use super::mutation::{run_in_memory, seeded_rows};

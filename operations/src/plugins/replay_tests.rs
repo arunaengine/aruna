@@ -7,18 +7,18 @@ use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::clock::ClockReading;
 use crate::plugins::journal::JOURNAL_PAGE;
-use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
+use crate::plugins::matcher::tests::gap;
 use crate::plugins::rows::decode;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;
-use crate::plugins::store::Txn;
-use crate::plugins::test_support::{
-    created, echoed_sync, install_artifact, installed, scoped, synced,
-};
 use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
 use aruna_core::plugin_installs::Widening;
 use aruna_core::plugin_runs::{GapRow, gap_key};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_test_support::plugins::artifacts::{echoed_sync, install_artifact, installed};
+use aruna_test_support::plugins::flows::matcher::{config, forwarded, journal};
+use aruna_test_support::plugins::rows::Txn;
+use aruna_test_support::plugins::{created, scoped, synced};
 
 const MINUTE: u64 = 60 * 1000;
 
@@ -34,7 +34,7 @@ fn dataset(install: &PluginInstall, resource: &str, at_ms: u64) -> SourceEvent {
 }
 
 /// Matches the pending rows as a node that did not know any install yet.
-async fn unmatched(fixture: &crate::plugins::install::tests::Fixture, now: u64) {
+async fn unmatched(fixture: &aruna_test_support::plugins::Fixture, now: u64) {
     let mut bare = config(fixture).await;
     bare.installs.clear();
     let local = fixture.actor.node_id;
@@ -46,7 +46,7 @@ async fn unmatched(fixture: &crate::plugins::install::tests::Fixture, now: u64) 
 #[tokio::test]
 async fn late_install() {
     // Active elsewhere, committed here before this node had the install: one row, once.
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     journal(&fixture, &dataset(&install, "D1", now)).await;
@@ -73,7 +73,7 @@ async fn late_install() {
 
 #[tokio::test]
 async fn widened_grant() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now, auth) = (
         fixture.actor.node_id,
@@ -126,7 +126,7 @@ async fn widened_grant() {
 #[tokio::test]
 async fn widened_sync() {
     // A sync row journaled while the grant left its path out is read once the grant widens.
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now, auth) = (
         fixture.actor.node_id,
@@ -171,7 +171,7 @@ async fn widened_sync() {
 
 #[tokio::test]
 async fn growth_rules() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let mut install = installed(&fixture).await;
     let since = install.active_since_ms.unwrap();
     let wide = Coverage::from([(
@@ -211,7 +211,7 @@ async fn growth_rules() {
 
 #[tokio::test]
 async fn cut_replay_continues() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     for (n, resource) in ["D1", "D2", "D3"].into_iter().enumerate() {
@@ -222,7 +222,8 @@ async fn cut_replay_continues() {
     plan_replays(&fixture.ctx, &config, local, now, no_clock)
         .await
         .unwrap();
-    assert_eq!(run_replays(&fixture.ctx, now, (1, 1)).await, Ok(1));
+    // One key page and one journal page of one row.
+    assert_eq!(run_replays(&fixture.ctx, now, (1, 2)).await, Ok(1));
     // After a restart the replay reads on from its last row.
     assert_eq!(
         run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await,
@@ -234,7 +235,7 @@ async fn cut_replay_continues() {
 #[tokio::test]
 async fn unreadable_clock() {
     // Six minutes off with two minutes of round trip: the replay starts at the earliest row.
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     journal(&fixture, &dataset(&install, "D0", now - 24 * 60 * MINUTE)).await;
@@ -266,7 +267,7 @@ async fn unreadable_clock() {
 
 #[tokio::test]
 async fn pruned_journal() {
-    let fixture = crate::plugins::install::tests::Fixture::new().await;
+    let fixture = aruna_test_support::plugins::Fixture::new().await;
     let install = install_artifact(&fixture, echoed_sync()).await;
     let local = fixture.actor.node_id;
     let now = install.active_since_ms.unwrap() + JOURNAL_RETENTION_MS + 60 * MINUTE;
@@ -348,37 +349,120 @@ fn moved_record_updates() {
     );
 }
 
+fn key_page(keys: &[&[u8]]) -> IoResult {
+    let rows = keys.iter().map(|key| (key.to_vec(), Vec::new())).collect();
+    crate::plugins::rows::tests::page_result(rows, None)
+}
+
 #[test]
 fn replays_pages_bounded() {
-    let key = (b"r1".to_vec(), Vec::new());
-    let page = crate::plugins::rows::tests::page_result(vec![key], None);
-    let mut replays = RunReplays::new(9, (10, 2));
+    // The key page and every journal page cost one page; a spent budget names where to go on.
+    let mut replays = RunReplays::new(9, (10, 3), None);
     assert!(matches!(
         replays.first(),
         Ok(Next::Call(IoCall::Page { .. }))
     ));
-    assert!(matches!(
-        replays.next(page),
-        Ok(Next::Call(IoCall::Child(_)))
-    ));
+    let turn = replays.next(key_page(&[b"r1"]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let more = child_result(Ok::<_, StoreError>((4usize, false)));
     assert!(matches!(
         replays.next(more),
-        Ok(Next::Call(IoCall::Child(_)))
+        Ok(Next::Call(IoCall::Page { .. }))
     ));
-    let last = child_result(Ok::<_, StoreError>((1usize, false)));
+    let spent = Replayed {
+        read: 4,
+        more: true,
+        after: Some(b"r1".to_vec()),
+        failed: 0,
+    };
+    assert_eq!(replays.next(key_page(&[b"r1"])), Ok(Next::Done(spent)));
+}
+
+#[test]
+fn replays_take_turns() {
+    // Each replay reads a page in turn, so a long replay cannot hold back the others.
+    let mut replays = RunReplays::new(9, (10, 3), None);
+    replays.first().unwrap();
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
+    let more = || child_result(Ok::<_, StoreError>((10usize, false)));
+    replays.next(more()).unwrap();
     assert_eq!(
-        replays.next(last),
-        Ok(Next::Done(5)),
-        "the page bound ends it"
+        replays.current.as_deref(),
+        Some(&b"r2"[..]),
+        "then the other one"
     );
+    let ended = child_result(Ok::<_, StoreError>((2usize, true)));
+    let spent = Replayed {
+        read: 12,
+        more: true,
+        after: Some(b"r2".to_vec()),
+        failed: 0,
+    };
+    assert_eq!(replays.next(ended), Ok(Next::Done(spent)));
+}
+
+#[test]
+fn failed_replay_waits() {
+    // A failing replay neither stops the pass nor asks for the next tick at once; the position
+    // goes past it, so the other installs come first.
+    let mut replays = RunReplays::new(9, (10, 5), None);
+    replays.first().unwrap();
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(
+        Err::<(usize, bool), _>(StoreError("unreadable".into())),
+    ));
+    replays.next(failed).unwrap();
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r2"[..]),
+        "the next install goes on"
+    );
+    let more = child_result(Ok::<_, StoreError>((3usize, false)));
+    let done = Replayed {
+        read: 3,
+        more: false,
+        after: Some(b"r2".to_vec()),
+        failed: 1,
+    };
+    assert_eq!(replays.next(more), Ok(Next::Done(done)));
+}
+
+#[test]
+fn cursor_wraps_once() {
+    // A pass goes on after the last replay of the previous one, then wraps to the first once.
+    let mut replays = RunReplays::new(9, (10, 10), Some(b"r1".to_vec()));
+    let Ok(Next::Call(IoCall::Page { after, .. })) = replays.first() else {
+        panic!("expected the key page after the cursor");
+    };
+    assert_eq!(after.map(|key| key.to_vec()), Some(b"r1".to_vec()));
+    replays.next(key_page(&[b"r2"])).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]));
+    let ended = || child_result(Ok::<_, StoreError>((1usize, true)));
+    assert!(matches!(
+        replays.next(ended()),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r1"[..]),
+        "then the first one"
+    );
+    let done = Replayed {
+        read: 2,
+        more: false,
+        after: None,
+        failed: 0,
+    };
+    assert_eq!(replays.next(ended()), Ok(Next::Done(done)));
 }
 
 mod replay_pass {
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use serde_json::json;
 
     use super::*;

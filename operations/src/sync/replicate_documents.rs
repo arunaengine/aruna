@@ -2,16 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentTarget, PendingShardPlacement};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::placement::{document_class, plan_target_placement};
-use aruna_core::rows::{done, encoded_row, read_row, values};
+use aruna_core::placement::plan_target_placement;
+use aruna_core::placement::resolver::document_class;
+use aruna_core::rows::{encoded_row, read_row, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementRef};
 use aruna_core::task::TaskEvent;
@@ -45,6 +46,7 @@ pub struct ReplicateDocumentsOperation {
     retry_needed: bool,
     /// Fail when a document was not handed to the outbox instead of deferring it.
     strict: bool,
+    now_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,6 +121,7 @@ impl ReplicateDocumentsOperation {
             placement_action: None,
             retry_needed: false,
             strict: false,
+            now_ms: 0,
         }
     }
 
@@ -184,6 +187,7 @@ impl ReplicateDocumentsOperation {
                     placement,
                     self.config.local_node_id,
                     Vec::new(),
+                    self.now_ms / 1_000,
                 )));
                 return self.emit_placement_update().map(Some);
             }
@@ -210,6 +214,7 @@ impl ReplicateDocumentsOperation {
                 placement,
                 local_node_id,
                 selected_peers.clone(),
+                self.now_ms / 1_000,
             )))
         };
 
@@ -273,6 +278,7 @@ impl ReplicateDocumentsOperation {
             placement,
             self.config.local_node_id,
             Vec::new(),
+            self.now_ms / 1_000,
         )));
         self.emit_placement_update()
     }
@@ -307,6 +313,10 @@ impl Operation for ReplicateDocumentsOperation {
     type Output = ();
     type Error = ReplicateDocumentsError;
 
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> Result<Next<()>, ReplicateDocumentsError> {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
@@ -329,7 +339,7 @@ impl Operation for ReplicateDocumentsOperation {
                 self.published(published)
             }
             Phase::StorePlacement => {
-                done(result)?;
+                result.done()?;
                 if !self.retry_needed {
                     return self.emit_next_publish();
                 }

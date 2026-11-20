@@ -14,10 +14,13 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{
-    ExecutionClaim, ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord,
-    JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
-    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, job_record_key,
+use aruna_core::structs::execution::job::family::{
+    ExecutionClaim, ExecutionUpdate, JobFamilyRecord, JobRecordBody, JobRecordEnvelope,
+    JobRecordKind, PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
+};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::{
+    JobErrorKind, JobRecord, JobResultPayload, job_record_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
@@ -29,7 +32,7 @@ use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::held::HeldReservations;
 use super::outbox::schedule_outbox_drain;
 use super::reservation::ReleaseExecutionOperation;
-use super::witness_arm::ArmFamilyOperation;
+use super::witness::arm::ArmFamilyOperation;
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -134,10 +137,9 @@ enum PublishState {
 
 type PublishStep = Result<Next<bool>, LifecycleError>;
 
-/// Publishes one state of the local execution. The sequence and the previous
-/// digest are derived from the records already stored, so a replay of the same
-/// state is idempotent and a lost publication never breaks the chain. Only the
-/// receipted executor publishes; it signs the update through `NetEffect::ExecutionSign`.
+/// Publishes one local execution state; sequence and previous digest come from stored records, so
+/// a replay is idempotent and a lost publication never breaks the chain. Only the receipted
+/// executor publishes, signing through `NetEffect::ExecutionSign`.
 #[derive(Debug, PartialEq)]
 pub struct PublishStateOperation {
     chain: ExecutionChain,
@@ -492,7 +494,7 @@ impl Operation for PublishTerminalOperation {
 /// Retries terminal publication and capacity release for every durable local
 /// terminal execution that still has a reservation. `true` means at least one obligation
 /// stayed pending, so the caller must run it again.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SettleTerminalsOperation {
     serving: Serving,
     now_ms: u64,
@@ -629,9 +631,10 @@ mod pure_tests {
     use super::*;
     use crate::tests::records::{Family, node, payload, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionReceipt, JobError, JobId, JobPayload,
-    };
+    use aruna_core::structs::execution::job::family::{EffectiveResources, ExecutionReceipt};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::JobError;
     use aruna_core::types::Value;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult

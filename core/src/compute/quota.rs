@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::{ExecutorAvailability, ResourceEnvelope};
-use crate::structs::execution::job::{EffectiveResources, JobId, SubmissionId};
+use crate::structs::execution::job::family::{EffectiveResources, SubmissionId};
+use crate::structs::execution::job::identity::JobId;
 use crate::structs::storage::node_info::AdvertisementEpoch;
 use crate::types::GroupId;
 use serde::{Deserialize, Serialize};

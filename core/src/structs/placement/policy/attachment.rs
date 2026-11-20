@@ -190,9 +190,9 @@ mod tests {
         PolicyBulkRun, PolicyIntent, PolicyIntentKey, PolicyIntentOutcome, PolicyMutationParams,
         PolicyMutationRecord, PolicyRefMode, PolicyStatus,
     };
-    use crate::UserId;
     use crate::structs::placement::policy::PlacementPolicyRef;
     use crate::structs::storage::blob::CurrentVersionPointer;
+    use crate::user::id::UserId;
     use std::time::UNIX_EPOCH;
     use ulid::Ulid;
 

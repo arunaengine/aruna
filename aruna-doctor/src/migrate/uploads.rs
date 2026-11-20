@@ -85,13 +85,13 @@ pub(super) fn stale_uploads(
 mod tests {
     use super::super::migrate_output;
     use super::super::tests::{read, write};
-    use aruna_core::UserId;
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BlobCleanupWork};
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::{
         MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;

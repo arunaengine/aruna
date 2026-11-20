@@ -4,9 +4,9 @@
 
 use crate::shared;
 
-use aruna_api::routes::groups::AddMemberRequest;
-use aruna_core::UserId;
+use aruna_api::routes::access::groups::AddMemberRequest;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{

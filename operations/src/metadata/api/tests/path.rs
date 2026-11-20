@@ -6,7 +6,7 @@ use super::*;
 use crate::metadata::api::path_types::{
     merge_path_views, reduce_path_candidates, select_path_holders,
 };
-use aruna_core::StructuredId;
+use aruna_core::structured_id::StructuredId;
 
 #[test]
 fn user_result_opaque() {
@@ -30,7 +30,7 @@ fn user_result_opaque() {
         .iter()
         .map(|candidate| candidate.claim.clone())
         .collect::<Vec<_>>();
-    let winner = aruna_core::structs::resolve_path_claim(&claims)
+    let winner = aruna_core::structs::path_claim::resolve_path_claim(&claims)
         .unwrap()
         .winner;
     let hidden_id = winner.document_id.to_bytes();

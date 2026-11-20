@@ -4,34 +4,35 @@
 
 use super::*;
 use crate::auth::UnrestrictedAuth;
-use crate::job_test_calls::insert_job;
-use crate::job_test_calls::put_job_entry;
-use crate::job_test_calls::{claim_job, complete_job, transition_to_running};
 use crate::jobs::{
     JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,
     output_buckets, validate_output_prefixes, workspace_request,
 };
 use crate::tests::execution::{auth_for, build_state, management_state, node_id, realm};
-use aruna_core::UserId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
-    ImportMetadataTarget, ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec,
-    ImportRoCrateTarget, JobPayload, JobProgress, JobResultPayload, RoCrateLimits,
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
+    ArtifactRef, CollisionPolicy, ComputeResources, ExecutionSpec, ExportOmissionCounts,
+    ExportRoCrateResult, ExportRoCrateSpec, ImportMetadataTarget, ImportRoCrateResult,
+    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, OutputDestination,
+    RoCrateLimits,
 };
-use aruna_core::structs::execution::job::{
-    CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
+use aruna_core::structs::execution::job::local::{
+    JobProgress, JobRecord, JobResultPayload, WorkspaceMode,
 };
-use aruna_core::structs::execution::job::{JobRecord, JobState};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::user::id::UserId;
 use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,
 };
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::put_job_entry;
+use aruna_test_support::jobs::{claim_job, complete_job, transition_to_running};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::collections::HashMap;
@@ -41,10 +42,14 @@ use ulid::Ulid;
 /// One reduced family with a duplicate success and a locally exhausted view.
 fn family_report_fixture() -> FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec,
-        LogicalJobState, OutputObject, SubmissionId,
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+        SubmissionId,
     };
+    use aruna_core::structs::execution::job::input::{
+        ExecutionSpec, SessionReportDetail, SessionReportRow,
+    };
+    use aruna_core::structs::execution::job::local::OutputObject;
     use aruna_core::structs::placement::record::PlacementRef;
 
     let created_by = user(2);
@@ -67,7 +72,7 @@ fn family_report_fixture() -> FamilyReport {
         command: vec!["true".to_string()],
         workdir: None,
         env: BTreeMap::new(),
-        resources: aruna_core::structs::execution::job::ComputeResources::default(),
+        resources: aruna_core::structs::execution::job::input::ComputeResources::default(),
         executor_constraint: None,
         backend: None,
         inputs: Vec::new(),
@@ -106,7 +111,7 @@ fn family_report_fixture() -> FamilyReport {
             group_id: payload.group_id,
             created_by,
             created_at_ms: 10,
-            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
             payload,
             request_digest: [7u8; 32],
             spec_digest: [8u8; 32],
@@ -291,8 +296,6 @@ fn report_row(entry_key: &str) -> ImportReportRow {
 
 #[test]
 fn decodes_session_report() {
-    use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
-
     let row = SessionReportRow {
         entry_key: "input/0000".to_string(),
         detail: SessionReportDetail::Input {
@@ -580,9 +583,9 @@ async fn report_pending_typed() {
 #[test]
 fn submit_conflict_typed() {
     let existing_job_id = JobId::from_bytes([15u8; 16]);
-    let error = map_submit_error(
-        aruna_operations::jobs::submit::SubmitJobError::JobPlanConflict { existing_job_id },
-    );
+    let error = map_submit_error(aruna_core::job_request::SubmitJobError::JobPlanConflict {
+        existing_job_id,
+    });
     assert!(matches!(
         error,
         ServerError::JobPlanConflict(message)

@@ -2,17 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::records::HeadAliasContext;
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, record_completion};
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, InventoryUpdate, stamp_head, stamp_version, version_written,
 };
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
-use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision,
-    split_drift_reads, union_refs, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, split_drift_reads,
+    union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::multipart::create::storage_current;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
@@ -24,7 +23,7 @@ use crate::s3::usage::{
     schedule_snapshot_publish, upload_count,
 };
 use crate::s3::write_cleanup::{RollbackWrite, WriteCleanup, record_rows};
-use aruna_core::UserId;
+use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -43,7 +42,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::checksum::{Hasher, combine_crcs};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
@@ -56,6 +55,7 @@ use aruna_core::structs::storage::blob::{
     BlobVersion, BucketInfo, CopyOrigin, CopyOwner, CurrentVersionPointer, ResolvedBackend,
     VersionKey, WriteOwner,
 };
+use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::distribution::inventory::VersionEntry;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
@@ -75,6 +75,7 @@ use aruna_core::structs::storage::routing::{PlainTarget, RoutingSnapshot};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -385,11 +386,11 @@ pub struct CompleteUploadOperation {
     dedup: Option<BackendLocation>,
     dedup_checked: bool,
     /// The delete trail read for a listed upload's version before its head moves.
-    trail_scan: Option<crate::s3::object::put::TrailScan>,
+    trail_scan: Option<crate::s3::object::put::trail::TrailScan>,
     /// The intent record of the compose in flight.
     written_intent: Vec<Key>,
     /// The rules that read the composed path, as the finalize transaction reads them.
-    readers: crate::s3::object::put::ReaderScan,
+    readers: crate::s3::object::put::sharing::ReaderScan,
     version_origin: Option<VersionOrigin>,
 }
 

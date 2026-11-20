@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::calls::{IoCall, IoError, IoResult, Next};
-use crate::operation::Operation;
+use crate::operation::{Operation, TransactionMode};
 use crate::types::{Key, KeySpace, Value};
 
 /// The call that reads one row.
@@ -46,45 +46,31 @@ pub fn outside_answer(result: IoResult) -> Result<IoResult, IoError> {
     }
 }
 
+/// A call of an embedded update: one for the host's transaction, or a read that runs outside
+/// it so that rows other writers change meanwhile never conflict the host's commit.
+#[derive(Debug, PartialEq)]
+pub enum StagedCall {
+    InTransaction(IoCall),
+    Outside(IoCall),
+}
+
+impl StagedCall {
+    /// The call a host operation makes; an outside read runs as its own child run, which never
+    /// joins the host's transaction.
+    pub fn into_call(self) -> IoCall {
+        match self {
+            Self::InTransaction(call) => call,
+            Self::Outside(call) => outside_call(call),
+        }
+    }
+}
+
 /// The `N` values of a read of `N` rows, in the order they were asked for.
 pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Value>; N], IoError> {
-    match result {
-        IoResult::Values(values) => <[_; N]>::try_from(values).map_err(|_| IoError::Unexpected {
-            expected: "one value per row read",
-            got: "a read of another length",
-        }),
-        other => Err(unexpected("IoResult::Values", &other)),
-    }
-}
-
-/// The value of a one-row read; a missing row is `None`.
-pub fn value(result: IoResult) -> Result<Option<Value>, IoError> {
-    let [value] = values::<1>(result)?;
-    Ok(value)
-}
-
-/// The values of a read of any number of rows, in the order they were asked for.
-pub fn all_values(result: IoResult) -> Result<Vec<Option<Value>>, IoError> {
-    match result {
-        IoResult::Values(values) => Ok(values),
-        other => Err(unexpected("IoResult::Values", &other)),
-    }
-}
-
-/// The rows of one page and the key to continue after.
-pub fn page(result: IoResult) -> Result<crate::types::PageRows, IoError> {
-    match result {
-        IoResult::Page { rows, next } => Ok((rows, next)),
-        other => Err(unexpected("IoResult::Page", &other)),
-    }
-}
-
-/// The event that answered an `IoCall::Effect` or an `IoCall::Child`.
-pub fn event(result: IoResult) -> Result<crate::events::Event, IoError> {
-    match result {
-        IoResult::Event(event) => Ok(*event),
-        other => Err(unexpected("IoResult::Event", &other)),
-    }
+    <[_; N]>::try_from(result.values()?).map_err(|_| IoError::Unexpected {
+        expected: "one value per row read",
+        got: "a read of another length",
+    })
 }
 
 /// The decoded value of a one-row read; a missing row is `None`.
@@ -110,14 +96,6 @@ pub fn encoded_row<T: Serialize>(
     value: &T,
 ) -> Result<(KeySpace, Key, Value), IoError> {
     Ok((space.to_string(), key.into(), encode(value)?))
-}
-
-/// Checks that a write, delete or sync finished.
-pub fn done(result: IoResult) -> Result<(), IoError> {
-    match result {
-        IoResult::Done => Ok(()),
-        other => Err(unexpected("IoResult::Done", &other)),
-    }
 }
 
 /// Reads every row below a prefix one page at a time, so an operation handles each page before
@@ -155,7 +133,7 @@ impl PrefixPages {
 
     /// The rows of the page that answered [`Self::call`].
     pub fn take(&mut self, result: IoResult) -> Result<Vec<(Key, Value)>, IoError> {
-        let (rows, next) = page(result)?;
+        let (rows, next) = result.page()?;
         self.done = next.is_none();
         self.after = next;
         Ok(rows)
@@ -167,10 +145,53 @@ impl PrefixPages {
     }
 }
 
-fn unexpected(expected: &'static str, got: &IoResult) -> IoError {
-    IoError::Unexpected {
-        expected,
-        got: got.label(),
+/// Deletes a set's marker row only while it still holds `seen`: a record installed since the
+/// pass read it wrote a newer revision, and its work is looked at again.
+#[derive(Debug, PartialEq)]
+pub struct SettleMarkerOperation {
+    key_space: String,
+    key: Vec<u8>,
+    seen: Vec<u8>,
+    deleting: bool,
+}
+
+impl SettleMarkerOperation {
+    pub fn new(key_space: &str, key: Vec<u8>, seen: Vec<u8>) -> Self {
+        Self {
+            key_space: key_space.to_string(),
+            key,
+            seen,
+            deleting: false,
+        }
+    }
+
+    fn row(&self) -> (String, Key) {
+        (self.key_space.clone(), self.key.clone().into())
+    }
+}
+
+impl Operation for SettleMarkerOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Read(vec![self.row()])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.deleting {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        if result.value()?.as_deref() != Some(self.seen.as_slice()) {
+            return Ok(Next::Done(()));
+        }
+        self.deleting = true;
+        Ok(Next::Call(IoCall::Delete(vec![self.row()])))
     }
 }
 
@@ -198,7 +219,7 @@ mod tests {
             Err(IoError::Unexpected { .. })
         ));
         assert_eq!(
-            done(IoResult::Woke),
+            IoResult::Woke.done(),
             Err(IoError::Unexpected {
                 expected: "IoResult::Done",
                 got: "IoResult::Woke",

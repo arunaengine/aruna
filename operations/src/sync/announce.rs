@@ -2,21 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use aruna_core::operation::Operation;
-use aruna_core::repository::RepositoryLink;
-use aruna_core::rows::{done, read_row, values};
+use aruna_core::repository::link::RepositoryLink;
+use aruna_core::rows::{read_row, values};
 use aruna_core::storage_entries::lifecycle_revision_change;
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRevision};
-use aruna_core::structs::persistent_id_change;
+use aruna_core::structs::persistent_id::{PersistentIdMapping, persistent_id_change};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change,
 };
@@ -27,7 +26,7 @@ use aruna_core::types::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
@@ -354,7 +353,7 @@ impl Operation for AnnounceTopicOperation {
                 [None] => Ok(Next::Done(())),
             },
             Phase::Writing => {
-                done(result)?;
+                result.done()?;
                 self.phase = Phase::Scheduling;
                 let schedule = Box::new(schedule_drain_effect());
                 Ok(Next::Call(IoCall::Effect(schedule)))
@@ -392,11 +391,11 @@ fn unexpected(got: &'static str) -> AnnounceTopicError {
 mod pure_tests {
     use super::*;
 
-    use aruna_core::UserId;
     use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::GroupId;
+    use aruna_core::user::id::UserId;
     use std::time::Duration;
 
     fn local_node_id() -> NodeId {

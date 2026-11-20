@@ -24,7 +24,8 @@ use super::versions::{
     Named, Version, WriteOptions, branch_ref, diff, expect, log, open, parse_conflict, peeled_tags,
     plain, protected, resolve, rocrate, version,
 };
-use super::{GitError, GitNode, MergeConflict, pending};
+use super::{GitError, MergeConflict, pending};
+use aruna_core::git::GitNode;
 
 type Document = MetadataRegistryRecord;
 type Opened = (Document, Projection);

@@ -15,6 +15,4 @@ pub mod revoke_all;
 pub mod search_users;
 pub mod service_account;
 pub mod update_user;
-mod vault;
-
-pub use vault::{read as vault_read, route as vault_route, write as vault_write};
+pub mod vault;

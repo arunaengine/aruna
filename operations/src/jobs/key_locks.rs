@@ -5,10 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -16,8 +14,11 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{page, read_row, value};
-use aruna_core::structs::execution::job::{CapturedInput, JobError, JobId, JobRecord, KeyWait};
+use aruna_core::rows::read_row;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::CapturedInput;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::{JobError, JobRecord};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobVersion, BlobVersionState, HashIndex, VersionKey,
@@ -33,6 +34,7 @@ use super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
 use super::store::mutation_error::JobMutationError;
 use super::store::park_wake::AwaitOutcome;
 use super::store::row_calls::{park_job, satisfy_key_wait};
+use crate::blob::unlocked::KeyUnlockedOperation;
 
 /// Aliases of one content checked on this node; a content beyond them stays unknown.
 pub(crate) const ALIAS_PAGE: usize = 64;
@@ -53,43 +55,6 @@ impl From<IoError> for KeyCheckError {
 
 fn check_error(error: impl std::fmt::Display) -> KeyCheckError {
     KeyCheckError(error.to_string())
-}
-
-/// Whether this node holds an active unlock of `key`. A node that cannot tell holds none.
-#[derive(Debug, PartialEq)]
-pub struct KeyUnlockedOperation {
-    key: BucketKeyRef,
-}
-
-impl KeyUnlockedOperation {
-    pub fn new(key: BucketKeyRef) -> Self {
-        Self { key }
-    }
-}
-
-impl Operation for KeyUnlockedOperation {
-    type Output = bool;
-    type Error = IoError;
-
-    fn first(&mut self) -> Result<Next<bool>, IoError> {
-        let effect = Effect::Blob(BlobEffect::ReadKeyStatus {
-            bucket_id: self.key.bucket_id,
-        });
-        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-        let unlocked = match result {
-            IoResult::Event(event) => match *event {
-                Event::Blob(BlobEvent::KeyStatus { generations }) => generations
-                    .iter()
-                    .any(|status| status.key == self.key && status.active),
-                _ => false,
-            },
-            _ => false,
-        };
-        Ok(Next::Done(unlocked))
-    }
 }
 
 /// One page of a content's aliases on this node, and the cursor of the next page.
@@ -127,7 +92,7 @@ impl Operation for AliasPageOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AliasPage>, KeyCheckError> {
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let next = (rows.len() == ALIAS_PAGE)
             .then(|| rows.last().map(|(row, _)| row.clone()))
             .flatten();
@@ -271,10 +236,10 @@ impl Operation for VersionWaitOperation {
 
     fn next(&mut self, result: IoResult) -> WaitNext {
         match self.step {
-            WaitStep::Version => self.versioned(value(result)?),
-            WaitStep::Location => self.located(value(result)?),
+            WaitStep::Version => self.versioned(result.value()?),
+            WaitStep::Location => self.located(result.value()?),
             WaitStep::Bucket => {
-                let settings = value(result)?;
+                let settings = result.value()?;
                 let key = BucketEncryption::from_row(settings.as_deref())
                     .map_err(check_error)?
                     .active_key();
@@ -633,7 +598,9 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, payload, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, InputSelection, InputSource, JobPayload};
+    use aruna_core::structs::execution::job::input::{
+        InputMode, InputSelection, InputSource, JobPayload,
+    };
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
     where
@@ -697,14 +664,6 @@ mod tests {
 
     fn calls_child(next: ParkNext) {
         assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))), "{next:?}");
-    }
-
-    // Only an active unlock of exactly this key counts; a missing blob handle holds none.
-    #[test]
-    fn unlock_needs_status() {
-        let mut check = KeyUnlockedOperation::new(key(1));
-        assert!(matches!(check.first(), Ok(Next::Call(IoCall::Effect(_)))));
-        assert_eq!(check.next(IoResult::Done), Ok(Next::Done(false)));
     }
 
     // An alias page continues only when it came back full.
@@ -792,7 +751,7 @@ mod tests {
 
     // A node names its own keys only, and a failed request adds nothing.
     #[test]
-    fn answers_filtered_by_node() {
+    fn filters_by_node() {
         let auth = AuthContext::anonymous(REALM);
         let target = WaitTarget::Content { blake3: [1; 32] };
         let job = JobId::from_bytes([3; 16]);

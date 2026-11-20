@@ -13,7 +13,9 @@ use super::link::{
 use super::remote::remote;
 use super::*;
 use aruna_core::metadata::ProfileValidationSeverity;
-use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
+use aruna_core::repository::link::{
+    LinkDirection, LinkFailure, LinkPatch, LinkPull, LinkReview, LinkStatus, RepositoryLink,
+};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
@@ -141,7 +143,7 @@ async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
     let ctx = claim_context(&fixture, job_id, record.payload).await?;
     assert!(matches!(
         Box::pin(run_export_job(&ctx, &spec)).await,
-        JobRunOutcome::Failed(error) if error.kind == aruna_core::structs::execution::job::JobErrorKind::Retryable
+        JobRunOutcome::Failed(error) if error.kind == aruna_core::structs::execution::job::local::JobErrorKind::Retryable
     ));
     let (waiting, _) = current(&fixture, &link).await;
     // The draft is on the link before its DOI, so the retry continues it.
@@ -179,7 +181,7 @@ async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     write_value(
         storage,
         aruna_core::keyspaces::REPOSITORY_LINK_KEYSPACE,
-        aruna_core::repository::link_key(link.document_id, link.link_id),
+        aruna_core::repository::link::link_key(link.document_id, link.link_id),
         started.to_bytes()?,
     )
     .await?;
@@ -212,26 +214,25 @@ async fn revive_checks_lineage() -> Result<(), Box<dyn std::error::Error>> {
     let mut pull = failed.clone();
     pull.link_id = ulid::Ulid::from_parts(9, 9);
     pull.status = LinkStatus::Enabled;
-    pull.direction =
-        aruna_core::repository::LinkDirection::Pull(Box::new(aruna_core::repository::LinkPull {
-            auto_update: false,
-            options: Default::default(),
-            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
-                bucket: "research".into(),
-                prefix: "zenodo".into(),
-            },
-            latest_remote_id: None,
-            latest_revision: None,
-            last_checked_at: None,
-            next_check_ms: u64::MAX,
-            failures: 0,
-            revision: None,
-            local_changed: false,
-        }));
+    pull.direction = LinkDirection::Pull(Box::new(LinkPull {
+        auto_update: false,
+        options: Default::default(),
+        target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
+            bucket: "research".into(),
+            prefix: "zenodo".into(),
+        },
+        latest_remote_id: None,
+        latest_revision: None,
+        last_checked_at: None,
+        next_check_ms: u64::MAX,
+        failures: 0,
+        revision: None,
+        local_changed: false,
+    }));
     write_value(
         &fixture.context.storage_handle,
         aruna_core::keyspaces::REPOSITORY_LINK_KEYSPACE,
-        aruna_core::repository::link_key(pull.document_id, pull.link_id),
+        aruna_core::repository::link::link_key(pull.document_id, pull.link_id),
         pull.to_bytes()?,
     )
     .await?;
@@ -657,7 +658,7 @@ async fn stale_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     write_value(
         &fixture.context.storage_handle,
         aruna_core::keyspaces::REPOSITORY_LINK_KEYSPACE,
-        aruna_core::repository::link_key(link.document_id, link.link_id),
+        aruna_core::repository::link::link_key(link.document_id, link.link_id),
         started.to_bytes()?,
     )
     .await?;

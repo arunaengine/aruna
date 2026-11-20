@@ -22,7 +22,7 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::write_stage::{WriteStage, WriteStep};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 
@@ -427,7 +427,6 @@ pub mod test {
     };
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
@@ -441,8 +440,10 @@ pub mod test {
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -795,7 +796,7 @@ pub mod test {
     pub async fn test_add_role() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

@@ -2,85 +2,36 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#[cfg(test)]
-use std::sync::Arc;
-#[cfg(test)]
-use std::time::SystemTime;
-
-#[cfg(test)]
-use aruna_core::UserId;
-#[cfg(test)]
+use super::check::CheckOperation;
+use super::check::{CheckNodeOperation, ScanOperation};
 use aruna_core::calls::{IoCall, IoResult, Next};
-#[cfg(test)]
 use aruna_core::effects::StorageEffect;
-#[cfg(test)]
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::AUTH_KEYSPACE;
-#[cfg(test)]
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
-#[cfg(test)]
 use aruna_core::operation::{Operation, TransactionMode};
-#[cfg(test)]
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-#[cfg(test)]
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
-#[cfg(test)]
 use aruna_core::structs::identity::group_delete::MembershipFence;
-#[cfg(test)]
 use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_core::structs::storage::blob::bucket_permission_path;
-#[cfg(test)]
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::drive;
+use aruna_test_support::groups::{Fixture, buckets, node, read, write};
+use std::sync::Arc;
+use std::time::SystemTime;
 use ulid::Ulid;
 
-#[cfg(test)]
-use super::check::CheckOperation;
-#[cfg(test)]
-use super::check::{CheckNodeOperation, ScanOperation};
-use super::tests::{Fixture, node, read, write};
-use crate::s3::bucket::create::CreateBucketOperation;
-use aruna_drivers::driver::drive;
-
-/// Creates the buckets and denies the caller READ on `hidden` at `seed`.
-pub async fn buckets(fixture: &Fixture, seed: u8, names: &[&str]) {
-    for name in names {
-        drive(
-            CreateBucketOperation::new(name.to_string(), fixture.bucket()),
-            &fixture.context,
-        )
-        .await
-        .unwrap();
-    }
-    let group_id = fixture.plan.group_id;
-    let key = group_id.to_bytes().to_vec();
-    let bytes = read(&fixture.context, AUTH_KEYSPACE, key.clone())
-        .await
-        .unwrap();
-    let mut document = GroupAuthorizationDocument::from_bytes(&bytes).unwrap();
-    let path = bucket_permission_path(fixture.auth.realm_id, group_id, node(seed), "hidden");
-    for role in document.roles.values_mut() {
-        role.permissions.insert(path.clone(), Permission::DENY);
-    }
-    let bytes = document.to_bytes(&fixture.actor).unwrap();
-    write(&fixture.context, AUTH_KEYSPACE, key, bytes).await;
-}
-
-#[cfg(test)]
 fn keyspaces(fixture: &Fixture) -> usize {
     std::fs::read_dir(fixture.dir.path().join("keyspaces"))
         .unwrap()
         .count()
 }
 
-#[cfg(test)]
 fn stranger(fixture: &Fixture) -> AuthContext {
     let mut auth = fixture.auth.clone();
     auth.user_id = UserId::local(Ulid::from_bytes([8; 16]), auth.realm_id);
     auth
 }
 
-#[cfg(test)]
 fn blocked(names: &[&str], more: bool, hidden: u64) -> Result<(), GroupDeletionError> {
     Err(GroupDeletionError::NotEmpty {
         kinds: vec!["S3 buckets".into()],
@@ -239,10 +190,14 @@ fn check_scans_snapshot() {
 async fn finished_jobs_pass() {
     // A purge job a bucket delete leaves behind must not block the group until it expires.
     use aruna_core::keyspaces::JOB_KEYSPACE;
-    use aruna_core::structs::execution::job::{
-        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobId,
-        JobPayload, JobRecord, JobState, RoCrateLimits,
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{
+        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
+        JobPayload, RoCrateLimits,
     };
+    use aruna_core::structs::execution::job::local::JobRecord;
+    use aruna_core::structs::execution::job::record_keys::record_key;
+    use aruna_core::structs::execution::job::record_rows::to_bytes;
     use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     let fixture = Fixture::new(&[1]).await;
@@ -311,8 +266,6 @@ async fn pruned_families_pass() {
     use crate::jobs::records::tests::prune::{index, pass, write as write_rows};
     use crate::tests::records::{Family, payload};
     use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-    use aruna_core::structs::execution::job::record_keys::record_key;
-    use aruna_core::structs::execution::job::record_rows::to_bytes;
     let fixture = Fixture::new(&[1]).await;
     let group_id = payload().group_id;
     let family = Family::new([95u8; 32]);

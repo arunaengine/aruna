@@ -14,7 +14,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
+use crate::metadata::model::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
 use crate::server::state::ServerState;
 
 use super::rocrate_import::{
@@ -272,8 +272,10 @@ pub async fn import_record(
     auth: UnrestrictedAuth,
     Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::repository::invenio::query::ResolveRecordOperation;
-    use aruna_operations::jobs::repository::{RecordReference, TransferError};
+    use aruna_operations::jobs::repository::TransferError;
+    use aruna_operations::jobs::repository::invenio::query::{
+        RecordReference, ResolveRecordOperation,
+    };
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),

@@ -7,7 +7,7 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::offered_directory::{FileStat, weak_fingerprint};
-use aruna_core::structs::{SYNC_TRASH_DIR, WriteGuard};
+use aruna_core::structs::synced_folder::{SYNC_TRASH_DIR, WriteGuard};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::{Component, Path, PathBuf};
@@ -783,7 +783,7 @@ mod tests {
             panic!("the file must be written");
         };
 
-        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+        let (entries, _) = list_local(&access(root.path(), ""), Vec::new(), 10, true, true)
             .await
             .unwrap();
         let observed = entries
@@ -819,7 +819,7 @@ mod tests {
             panic!("an unchanged base must be replaced");
         };
         assert_eq!(tokio::fs::read(&file).await.unwrap(), b"newer");
-        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+        let (entries, _) = list_local(&access(root.path(), ""), Vec::new(), 10, true, true)
             .await
             .unwrap();
         let observed = entries
@@ -1042,7 +1042,7 @@ mod tests {
             .unwrap();
         age_spool(&root.path().join(SPOOL_DIR).join("stale")).await;
 
-        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+        let (entries, _) = list_local(&access(root.path(), ""), Vec::new(), 10, true, true)
             .await
             .unwrap();
         let mut paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();

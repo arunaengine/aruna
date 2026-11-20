@@ -4,22 +4,16 @@
 
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::auth::permission_rules::PermissionRules;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::connectors::resolver::NATIVE_SET_ID;
+use crate::connectors::resolver::{NATIVE_SET_ID, ResolveBindingInput, resolve_binding_effect};
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::groups::backends::RecordReadError;
 use crate::groups::storage_routing::load_group_inputs;
-use crate::placement::policy::{
-    GateContext, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::replication::error::ReplicationError;
-use crate::replication::protocol::{
-    MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
-    VersionReplicationMessage, VersionReplicationRequest,
-};
 use crate::s3::object::put::abe::keyed;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::StorageReadError;
@@ -37,6 +31,11 @@ use aruna_core::managed_copy::{
 };
 use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
 use aruna_core::operation::Operation;
+use aruna_core::replication_protocol::{
+    MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
+    VersionReplicationMessage, VersionReplicationRequest,
+};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::{
@@ -53,7 +52,8 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey, object_permission_path,
 };
 use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
-use aruna_core::structs::storage::distribution::{OriginalEpoch, Publication};
+use aruna_core::structs::storage::distribution::OriginalEpoch;
+use aruna_core::structs::storage::distribution::delivery::Publication;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, BucketKeyRef};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::multipart::{
@@ -70,9 +70,12 @@ use aruna_core::structs::storage::replication_queue::{
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::structs::storage::routing::{GroupRoutingInputs, RoutingError};
 use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, resolve_backend};
-use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
+use aruna_core::structs::sync_relationship::{
+    ReferenceHandling, SyncMode, SyncRelationship, sync_state_key,
+};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -2927,8 +2930,6 @@ mod tests {
         ReplicationFailure, ReplicationVersion, SourceAuthorization, SyncTransferContext,
         target_key,
     };
-    use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
-    use aruna_core::UserId;
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::BlobError;
@@ -2939,8 +2940,8 @@ mod tests {
         AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::operation::Operation;
+    use aruna_core::replication_protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::ReferenceHandling;
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -2968,9 +2969,11 @@ mod tests {
         ReferenceAdvance, ReplicationMode, SyncOrigin,
     };
     use aruna_core::structs::storage::routing::GroupRoutingInputs;
+    use aruna_core::structs::sync_relationship::ReferenceHandling;
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use bytes::Bytes;
     use futures_util::stream;
     use std::collections::HashMap;

@@ -12,11 +12,11 @@ use aruna_core::events::{
 };
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::record_keys::record_key;
-use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     ExpiryReason, JobFamilyRecord, JobRecordEnvelope, JobRecordKind,
 };
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::{OutboxEntry, to_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::{Key, Value};
 
@@ -26,8 +26,8 @@ use crate::jobs::lifecycle::cancel::PublishCancelOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_DRAIN_BATCH;
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::route::JobRouteError;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::tests::records::{Family, REALM, actor, node};
+use aruna_core::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 
 type Step = Result<Next<bool>, LifecycleError>;
 
@@ -314,7 +314,7 @@ fn picks_bound_spec() {
     let update = family.run(
         1,
         0,
-        aruna_core::structs::execution::job::PhysicalExecutionState::Failed,
+        aruna_core::structs::execution::job::family::PhysicalExecutionState::Failed,
     )[6]
     .clone();
     assert!(matches!(update.record, JobFamilyRecord::Update(_)));
@@ -335,7 +335,7 @@ fn bundles_receipt_records() {
     let run = family.run(
         1,
         0,
-        aruna_core::structs::execution::job::PhysicalExecutionState::Failed,
+        aruna_core::structs::execution::job::family::PhysicalExecutionState::Failed,
     );
     let (budget, launch, receipt) = (&run[2], &run[3], &run[4]);
     let key = record_key(&receipt.key());

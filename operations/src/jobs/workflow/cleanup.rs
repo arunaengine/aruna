@@ -4,15 +4,17 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
 use aruna_core::compute::{BackendError, FenceContext, TombstoneSpec};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload, JobWrites,
-    StopEvidence,
+use aruna_core::structs::execution::job::family::StopEvidence;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobResultPayload,
 };
+use aruna_core::structs::execution::job::rows::JobWrites;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::UserAccess;
 use ulid::Ulid;
@@ -361,9 +363,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
-    use aruna_compute::ExecutorBackend;
-    use aruna_compute::ExecutorRegistry;
-    use aruna_core::UserId;
+    use aruna_compute::executor::ExecutorBackend;
+    use aruna_compute::registry::ExecutorRegistry;
     use aruna_core::compute::identity::home_digest;
     use aruna_core::compute::{
         AttemptRef, AttemptStatus, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
@@ -371,27 +372,30 @@ mod tests {
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USER_ACCESS_KEYSPACE};
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState,
-        WorkspaceMode,
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{
+        JobClaim, JobProgress, JobRecord, WorkspaceMode,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{
         BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
     };
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_core::user::id::UserId;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
 
     use super::*;
-    use crate::jobs::store::test_calls::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
-    use crate::s3::bucket::get::GetBucketOperation;
+    use aruna_core::bucket_read::GetBucketOperation;
     use aruna_core::jobs::ProgressReporter;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::jobs::context::JobContext;
+    use aruna_test_support::jobs::insert_job;
 
     async fn run_terminal_cleanup(
         ctx: &JobContext,
@@ -535,7 +539,6 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
             range_turns: Default::default(),
-            handlers: Default::default(),
         }
     }
 
@@ -596,12 +599,22 @@ mod tests {
             lease_expires_ms: 10_000,
         });
         insert_job(context, &record).await.unwrap();
-        record_attempt_intent(context, job_id, token, intent(job_id, kind), None, None, 2)
-            .await
-            .unwrap()
-            .record
-            .attempt_intent
-            .unwrap()
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::record_attempt_intent(
+                job_id,
+                token,
+                intent(job_id, kind),
+                None,
+                None,
+                2,
+            ),
+            context,
+        )
+        .await
+        .unwrap()
+        .record
+        .attempt_intent
+        .unwrap()
     }
 
     async fn seed_workspace(

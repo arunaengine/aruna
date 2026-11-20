@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_clock::SystemEnvironment;
-use aruna_core::IdEnvironment;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structured_id::clock_health::IdEnvironment;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

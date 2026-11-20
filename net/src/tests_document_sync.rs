@@ -19,6 +19,7 @@ use aruna_core::document::{
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -42,11 +43,13 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
+use aruna_core::structs::sync_quarantine::{
+    QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage,
+};
 use aruna_core::types::Value;
-use aruna_core::{NodeId, UserId};
-use aruna_storage::FjallPersistPolicy;
-use aruna_storage::StorageHandle;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use irokle::PeerId;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -76,13 +79,14 @@ pub(crate) fn test_genesis(seed: u8) -> ::irokle::OpId {
 
 pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("temp path"))
-        .expect("storage opens");
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
     (dir, storage)
 }
 
 pub(crate) fn storage_at(path: &Path) -> StorageHandle {
-    aruna_storage::FjallStorage::open(path.to_str().expect("utf-8 storage path"))
+    aruna_storage::storage::worker::FjallStorage::open(path.to_str().expect("utf-8 storage path"))
         .expect("storage opens")
 }
 

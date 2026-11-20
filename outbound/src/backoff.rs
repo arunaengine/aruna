@@ -5,9 +5,9 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
-use aruna_core::UserId;
 use aruna_core::outbound::{BackoffChange, BackoffRequest, StoredBackoff};
 use aruna_core::structs::execution::setting::SettingChannel;
+use aruna_core::user::id::UserId;
 
 /// Delays per owner and channel. They start empty and are lost on restart, as before.
 #[derive(Debug, Default)]

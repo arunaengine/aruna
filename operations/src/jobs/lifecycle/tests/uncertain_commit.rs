@@ -7,15 +7,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LaunchDecline, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE, NODE_INFO_KEYSPACE};
-use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordKind, LaunchIntent};
+use aruna_core::structs::execution::job::family::{JobFamilyRecord, JobRecordKind, LaunchIntent};
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
@@ -39,8 +41,6 @@ use crate::jobs::lifecycle::reservation::{ReserveExecutionOperation, reservation
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::node::info::flows::OperatorDrainOperation;
 use crate::tests::records::{Family, REALM, context, local_capability};
-use aruna_core::structs::execution::job::record_keys::record_key;
-use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
 

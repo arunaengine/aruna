@@ -4,19 +4,16 @@
 
 use crate::distribution::guard::write_authority;
 use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, check_authority};
-use crate::distribution::inventory::{
-    InventoryChange, InventoryError, InventoryUpdate, StagedCall, outside_answer,
-};
+use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::groups::backends::{BackendFenceError, backend_key};
-use crate::placement::policy::read::ReadPolicyError;
-use crate::placement::policy::{
+use crate::placement::policy::gate::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::s3::object::put::abe::{abe_reads, keyed, parse_abe};
-use crate::s3::object::put::{owner_call, path_owned, same_name_path};
+use crate::s3::object::put::plain::{owner_call, path_owned, same_name_path};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::usage::upload_count;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -27,7 +24,7 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::read_row;
+use aruna_core::rows::{StagedCall, outside_answer, read_row};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};
@@ -43,6 +40,7 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -753,6 +751,11 @@ impl Operation for CreateMultipartOperation {
         calls.into_iter().collect()
     }
 
+    /// A refused commit recorded nothing, so the abort releases the provider upload again.
+    fn rolled_back(&mut self) {
+        self.committing = false;
+    }
+
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
     }
@@ -801,7 +804,7 @@ mod pure_tests {
             bucket: "bucket".to_string(),
             key: "archive/one".to_string(),
             group_id: snapshot.group_id,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             checksum_hint: None,
             routing: snapshot,
         }
@@ -849,7 +852,7 @@ mod pure_tests {
     /// The effect a step asks the adapter for.
     fn asked(turn: &Turn) -> &Effect {
         match turn {
-            Ok(Next::Call(IoCall::Effect(effect))) => &**effect,
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
             other => panic!("expected an effect, got {other:?}"),
         }
     }
@@ -977,7 +980,7 @@ mod pure_tests {
         let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id: Ulid::from_parts(1, 1),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1025,7 +1028,7 @@ mod pure_tests {
         let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id: Ulid::from_parts(1, 1),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -1056,7 +1059,7 @@ mod pure_tests {
             turn,
             Err(CreateMultipartError::Distribution(
                 crate::distribution::guard::GuardError::Route(
-                    aruna_core::structs::storage::distribution::RouteError::Moving(_)
+                    aruna_core::structs::storage::distribution::route::RouteError::Moving(_)
                 )
             ))
         ));
@@ -1288,7 +1291,7 @@ mod pure_tests {
                 backend_path: "bucket/key".to_string(),
                 ulid: Ulid::from_bytes([6u8; 16]),
                 format: aruna_core::structs::storage::format::StoredFormat::default(),
-                created_by: aruna_core::UserId::default(),
+                created_by: aruna_core::user::id::UserId::default(),
                 created_at: std::time::SystemTime::UNIX_EPOCH,
                 staging: false,
                 partial: false,
@@ -1363,6 +1366,23 @@ mod pure_tests {
         assert!(operation.abort().is_empty());
     }
 
+    #[test]
+    fn refused_commit_aborts() {
+        // A commit refused for certain recorded nothing, so the provider upload is aborted.
+        let mut operation = CreateMultipartOperation::new(input(snapshot()));
+        operation.first().unwrap();
+        operation.next(ungoverned_bucket()).unwrap();
+        operation.next(fence_clear()).unwrap();
+        let upload = provider_upload(BackendRef::node_default(), "bucket");
+        operation.next(opened(Some(upload.clone()))).unwrap();
+        operation.next(fence_clear()).unwrap();
+        operation.next(plain_settings()).unwrap();
+        operation.next(IoResult::Done).unwrap();
+        assert!(matches!(operation.next(IoResult::Done), Ok(Next::Done(_))));
+        operation.rolled_back();
+        assert_eq!(aborted(&operation.abort()), Some(&upload));
+    }
+
     /// An import rule writing `archive/` keys of `bucket` to `raw/` with `pattern`.
     fn plain_create(pattern: &str) -> (CreateMultipartOperation, Turn) {
         plain_create_at(pattern, None)
@@ -1378,7 +1398,7 @@ mod pure_tests {
             bucket: "bucket".to_string(),
             key_prefix: "archive/".to_string(),
             schedule: None,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             updated_at: std::time::SystemTime::UNIX_EPOCH,
             last_job: None,
@@ -1507,7 +1527,7 @@ mod pure_tests {
             public_config: std::collections::HashMap::new(),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             updated_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: true,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }

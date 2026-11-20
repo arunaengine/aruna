@@ -10,7 +10,7 @@ use aruna_core::backoff::capped_backoff;
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{
+use aruna_core::structs::info::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
 };
@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use crate::config::DiscoveryMethod;
 use crate::connection_pool::ConnectionPool;
-use crate::dht::DhtHandle;
+use crate::dht::handle::DhtHandle;
 use crate::discovery::{install_signed_endpoint, resolve_signed_endpoint};
 use crate::unique_peer_nodes;
 

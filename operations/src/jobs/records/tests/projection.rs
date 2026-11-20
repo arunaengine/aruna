@@ -7,9 +7,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, JOB_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    JobPayload, JobRecord, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    JobRecordEnvelope, LogicalJobState, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::types::{Key, Value};
 
 use crate::jobs::records::project::{
@@ -18,11 +21,11 @@ use crate::jobs::records::project::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::{MAX_PROJECTION_RECORDS, RecordStoreError};
 use crate::tests::records::{Family, payload, user};
-use aruna_core::structs::execution::job::JobWrites;
 use aruna_core::structs::execution::job::record_keys::record_key;
 use aruna_core::structs::execution::job::record_rows::{
     PROJECTION_CACHE_VERSION, ProjectionCache, to_bytes,
 };
+use aruna_core::structs::execution::job::rows::JobWrites;
 
 /// What one sans-I/O run of the projection did, with no storage behind it.
 struct Run {

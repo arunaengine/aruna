@@ -12,11 +12,11 @@ use aruna_core::keyspaces::{
     SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::operation::{HoldScope, Operation};
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::structs::{FolderState, SyncedFolder};
+use aruna_core::structs::synced_folder::{FolderState, SyncedFolder};
 use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
 use ulid::Ulid;
@@ -24,19 +24,16 @@ use ulid::Ulid;
 use crate::device::sync_status::ArmTimerOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
-use crate::s3::multipart::uploads::{
-    ListUploadsError, ListUploadsInput, ListUploadsOperation, ListUploadsResult,
-};
+use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
 };
-use crate::s3::object::versions::{
-    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-    ListVersionsResult,
-};
-use crate::staging::offered_directory::{
-    OfferedDirectoryError, WithdrawOfferInput, withdraw_offer,
+use crate::s3::object::versions::{ListVersionsError, ListVersionsInput, ListVersionsOperation};
+use crate::staging::offer::run::withdraw_offer;
+use crate::staging::offered_directory::{OfferedDirectoryError, WithdrawOfferInput};
+use aruna_core::structs::storage::listing::{
+    ListUploadsResult, ListVersionsItem, ListVersionsResult,
 };
 
 use super::super::repository::{SYNC_PAGE_SIZE, folder_key, folder_prefix};
@@ -200,7 +197,7 @@ impl Operation for FinishUnbindOperation {
                 Ok(Next::Call(IoCall::Delete(vec![row])))
             }
             UnbindStep::Drop => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }
@@ -248,7 +245,7 @@ impl Operation for ClearRowsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, FolderError> {
         if self.deleting {
-            done(result)?;
+            result.done()?;
             return Ok(self.page());
         }
         let (rows, _) = result.page()?;
@@ -377,7 +374,7 @@ impl Operation for DeleteLocalOperation {
     fn next(&mut self, result: IoResult) -> BucketTurn {
         match self.step {
             BucketStep::Row => {
-                let Some(row) = value(result)? else {
+                let Some(row) = result.value()? else {
                     return Ok(Next::Done(()));
                 };
                 BucketInfo::from_bytes(&row).map_err(OfferedDirectoryError::Conversion)?;

@@ -6,6 +6,7 @@
 use super::*;
 use crate::tests::locations::node_id;
 use crate::tests::notifications::user;
+use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::notification::InboxWriteOutcome;
 use aruna_core::structs::execution::notification_watch::{
     WatchEventDetail, WatchEventKind, WatchEventMask, WatchSubscription, watch_resource_path,
@@ -50,10 +51,11 @@ fn single_server() -> RealmConfigDocument {
 fn nil_actor_skipped() {
     let realm_id = user(1, 2).realm_id;
     let mut emit = EmitWatchOperation::new(event(UserId::nil(realm_id)), node_id(1), Vec::new());
-    assert_eq!(emit.first(), Ok(Next::Done(())));
+    assert_eq!(emit.first(), Ok(Next::Done(Vec::new())));
 }
 
-/// Without the realm config only remote holders get the event; a failed forward only warns.
+/// Without the realm config only remote holders get the event; a holder not reached leaves it
+/// unsettled for a later run.
 #[test]
 fn remote_forward_only() {
     let holders = vec![node_id(1), node_id(2)];
@@ -66,7 +68,121 @@ fn remote_forward_only() {
     ));
     assert_eq!(emit.state, EmitState::Forward(node_id(2)));
     let failed = child::<NotificationTransportMessage, _>(Err(RemoteError("down".into())));
-    assert_eq!(emit.next(failed), Ok(Next::Done(())));
+    assert_eq!(emit.next(failed), Ok(Next::Done(vec![node_id(2)])));
+}
+
+/// A holder that cannot take the event now, or answers anything but an ack, leaves it open.
+#[test]
+fn unavailable_reply_unsettled() {
+    for answer in [
+        NotificationTransportMessage::Unavailable("busy".into()),
+        NotificationTransportMessage::WatchDeleted,
+    ] {
+        let mut emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), vec![node_id(2)]);
+        emit.first().unwrap();
+        let unread = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
+        emit.next(unread).unwrap();
+        let answer = child::<_, RemoteError>(Ok(answer));
+        assert_eq!(emit.next(answer), Ok(Next::Done(vec![node_id(2)])));
+    }
+}
+
+/// A local discovery that failed, here the config read, leaves the event open even when every
+/// remote holder took it.
+#[test]
+fn failed_discovery_unsettled() {
+    let mut emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), vec![node_id(2)]);
+    emit.first().unwrap();
+    let failed = GetConfigError::StorageError(StorageError::Timeout);
+    emit.next(child::<RealmConfigDocument, _>(Err(failed)))
+        .unwrap();
+    let acked = NotificationTransportMessage::WatchEventsAck { written: 1 };
+    let acked = child::<_, RemoteError>(Ok(acked));
+    assert_eq!(emit.next(acked), Ok(Next::Done(vec![node_id(1)])));
+}
+
+/// A retry goes only to the holders an earlier delivery left open; the others already settled.
+#[test]
+fn retry_only_open() {
+    let holders = vec![node_id(2), node_id(3)];
+    let emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), holders);
+    let mut emit = emit.only(Some(vec![node_id(3)]));
+    emit.first().unwrap();
+    let mut config = single_server();
+    config.ensure_node(node_id(2), RealmNodeKind::Server);
+    config.ensure_node(node_id(3), RealmNodeKind::Server);
+    emit.next(child::<_, GetConfigError>(Ok(config))).unwrap();
+    let empty = child::<_, WatchSubscriptionError>(Ok(WatchPage::default()));
+    emit.next(empty).unwrap();
+    assert_eq!(emit.state, EmitState::Forward(node_id(3)));
+}
+
+/// A failed interest rebuild between two attempts leaves an empty table: the retry still goes to
+/// its saved holder while it is in the realm, settles once it left, and stays open without the
+/// realm config.
+#[test]
+fn rebuild_keeps_holders() {
+    let retrying = || {
+        let emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), Vec::new());
+        let mut emit = emit.only(Some(vec![node_id(3)]));
+        emit.first().unwrap();
+        emit
+    };
+    let empty = || child::<_, WatchSubscriptionError>(Ok(WatchPage::default()));
+    let mut member = single_server();
+    member.ensure_node(node_id(3), RealmNodeKind::Server);
+    let mut emit = retrying();
+    emit.next(child::<_, GetConfigError>(Ok(member))).unwrap();
+    emit.next(empty()).unwrap();
+    assert_eq!(emit.state, EmitState::Forward(node_id(3)));
+
+    let mut left = retrying();
+    left.next(child::<_, GetConfigError>(Ok(single_server())))
+        .unwrap();
+    assert_eq!(left.next(empty()), Ok(Next::Done(Vec::new())));
+
+    let mut unread = retrying();
+    let failed = GetConfigError::StorageError(StorageError::Timeout);
+    let failed = child::<RealmConfigDocument, _>(Err(failed));
+    assert_eq!(unread.next(failed), Ok(Next::Done(vec![node_id(3)])));
+}
+
+/// A retry sends to no saved holder while the realm config cannot be read, not even one the
+/// interest table still lists, and never to a key the realm now enrolls as a user device.
+#[test]
+fn retry_needs_membership() {
+    let retrying = || {
+        let emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), vec![node_id(3)]);
+        let mut emit = emit.only(Some(vec![node_id(3)]));
+        emit.first().unwrap();
+        emit
+    };
+    let mut unread = retrying();
+    let failed = GetConfigError::StorageError(StorageError::Timeout);
+    let failed = child::<RealmConfigDocument, _>(Err(failed));
+    assert_eq!(unread.next(failed), Ok(Next::Done(vec![node_id(3)])));
+
+    let mut device = single_server();
+    device.ensure_node(node_id(3), RealmNodeKind::User { owner: user(1, 2) });
+    let mut enrolled = retrying();
+    enrolled
+        .next(child::<_, GetConfigError>(Ok(device)))
+        .unwrap();
+    let empty = child::<_, WatchSubscriptionError>(Ok(WatchPage::default()));
+    assert_eq!(enrolled.next(empty), Ok(Next::Done(Vec::new())));
+}
+
+/// A holder that refuses the event settles it: a refusal does not pass on a later run.
+#[test]
+fn refused_forward_settles() {
+    let holders = vec![node_id(2)];
+    let mut emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), holders);
+    emit.first().unwrap();
+    let unread = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
+    emit.next(unread).unwrap();
+    let refused = NotificationTransportMessage::Reject("not a holder".into());
+    let refused = child::<_, RemoteError>(Ok(refused));
+    assert_eq!(emit.next(refused), Ok(Next::Done(Vec::new())));
 }
 
 /// A matching watch held here makes this node a holder; the expansion's new records wake their
@@ -107,7 +223,7 @@ fn local_watch_expands() {
     assert!(matches!(emit.next(woken), Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(
         emit.next(child::<_, InterestError>(Ok(true))),
-        Ok(Next::Done(()))
+        Ok(Next::Done(Vec::new()))
     );
 }
 
@@ -138,7 +254,10 @@ fn event_reads_holders() {
     );
     let found = holders_answer(Some((node_id(1), vec![node_id(2)])));
     assert!(matches!(emit.next(found), Ok(Next::Call(IoCall::Child(_)))));
-    assert_eq!(emit.next(child::<(), IoError>(Ok(()))), Ok(Next::Done(())));
+    assert_eq!(
+        emit.next(child::<Vec<NodeId>, IoError>(Ok(Vec::new()))),
+        Ok(Next::Done(Vec::new()))
+    );
 
     let mut failed = EmitEventOperation::new(event);
     failed.first().unwrap();
@@ -150,7 +269,7 @@ fn event_reads_holders() {
         got: "another",
     };
     assert_eq!(
-        failed.next(child::<(), IoError>(Err(error.clone()))),
+        failed.next(child::<Vec<NodeId>, IoError>(Err(error.clone()))),
         Err(error)
     );
 }
@@ -160,7 +279,7 @@ fn event_reads_holders() {
 fn event_without_net() {
     let mut emit = EmitEventOperation::new(event(user(1, 2)));
     emit.first().unwrap();
-    assert_eq!(emit.next(holders_answer(None)), Ok(Next::Done(())));
+    assert_eq!(emit.next(holders_answer(None)), Ok(Next::Done(Vec::new())));
 
     let mut wrong = EmitEventOperation::new(event(user(1, 2)));
     wrong.first().unwrap();

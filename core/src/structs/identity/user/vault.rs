@@ -5,13 +5,14 @@
 
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use crate::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
 use crate::types::{Key, KeySpace, Value};
+use crate::user::id::UserId;
 use crate::vault_format::key_fingerprint;
-use crate::{NodeId, UserId};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -320,6 +321,58 @@ pub fn head_rows(revision: &VaultRevision, bytes: &[u8]) -> Result<HeadRows, Con
         deletes.push((VAULT_REVISION_KEYSPACE.to_string(), key));
     }
     Ok((writes, deletes))
+}
+
+/// One change a user makes to their own vault records.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultChange {
+    /// A new head replacing `predecessors`, the heads the client read.
+    Save {
+        payload: String,
+        predecessors: Vec<Ulid>,
+    },
+    /// Replaces every current head with a delete marker.
+    Delete,
+    PublishKey {
+        key_id: String,
+        public_key: [u8; 32],
+        has_recovery: bool,
+    },
+}
+
+/// Shows the payload size only, so no formatted message carries vault ciphertext.
+impl std::fmt::Debug for VaultChange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Save {
+                payload,
+                predecessors,
+            } => formatter
+                .debug_struct("Save")
+                .field("payload_bytes", &payload.len())
+                .field("predecessors", predecessors)
+                .finish(),
+            Self::Delete => formatter.write_str("Delete"),
+            Self::PublishKey { key_id, .. } => formatter
+                .debug_struct("PublishKey")
+                .field("key_id", key_id)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// The heads after a save or delete, or the published key record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultAppended {
+    Heads(Vec<VaultRevision>),
+    Key(Box<UserKeyRecord>),
+}
+
+/// Why a holder refused a forwarded vault change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultRefusal {
+    Invalid,
+    TooManyKeys,
 }
 
 #[cfg(test)]

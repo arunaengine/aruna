@@ -7,6 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::storage::listing::ListUploadsResult;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
@@ -45,15 +46,6 @@ pub struct ListUploadsInput {
     pub key_marker: Option<String>,
     pub upload_id_marker: Option<Ulid>,
     pub max_uploads: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListUploadsResult {
-    pub uploads: Vec<MultipartUpload>,
-    pub common_prefixes: Vec<String>,
-    pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
-    pub next_upload_marker: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -239,13 +231,13 @@ impl Operation for ListUploadsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::tests::s3::seed_upload;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
+    use aruna_test_support::s3::seed_upload;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
@@ -306,7 +298,7 @@ mod test {
     async fn bucket_filters() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -345,7 +337,7 @@ mod test {
     async fn scans_foreign_rounds() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -380,7 +372,7 @@ mod test {
     async fn scan_budget_fails() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a", "b", "c"].into_iter().enumerate() {
@@ -404,7 +396,7 @@ mod test {
     async fn sorts_before_cutoff() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -439,7 +431,7 @@ mod test {
     async fn zero_limit_empty() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
@@ -462,7 +454,7 @@ mod test {
     async fn key_order_stable() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let first = Ulid::generate();
@@ -507,7 +499,7 @@ mod test {
     async fn orders_same_key() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let versions = {
@@ -561,7 +553,7 @@ mod test {
     async fn markers_paginate() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a", "b", "c", "d"] {
@@ -607,7 +599,7 @@ mod test {
     async fn resumes_same_key() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let ids = [
@@ -674,7 +666,7 @@ mod test {
     async fn resumes_missing_marker() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let lower = Ulid::from_bytes([1; 16]);
@@ -716,7 +708,7 @@ mod test {
     async fn prefix_filters() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["docs/1", "docs/2", "images/1", "readme"] {
@@ -753,7 +745,7 @@ mod test {
     async fn delimiter_groups() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a.txt", "dir/1", "dir/2", "z.txt"] {

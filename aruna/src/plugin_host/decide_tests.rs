@@ -7,12 +7,12 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::keyspaces::PLUGIN_OUTBOX_KEYSPACE;
 use aruna_core::plugin_runs::RunState;
 use aruna_core::plugin_runs::RunTrigger;
-use aruna_operations::plugins::flow_support::decide::event;
-use aruna_operations::plugins::flow_support::decide::runs;
-use aruna_operations::plugins::flow_support::matcher::journal;
-use aruna_operations::plugins::store::Txn;
-use aruna_operations::plugins::test_support::Fixture;
-use aruna_operations::plugins::test_support::installed;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::flows::decide::event;
+use aruna_test_support::plugins::flows::decide::runs;
+use aruna_test_support::plugins::flows::matcher::journal;
+use aruna_test_support::plugins::rows::Txn;
 
 #[tokio::test]
 async fn end_to_end() {

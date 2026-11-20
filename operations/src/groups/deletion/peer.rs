@@ -4,14 +4,13 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentEvent, AdminDocumentOperation};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::group_delete::{
     GroupDeleteAction, GroupDeletePhase, GroupDeletePlan, GroupDeleteProof, GroupDeletionError,
@@ -26,9 +25,11 @@ use super::coordinator::{
     read_config,
 };
 use crate::forward::authorize::{ForwardAuthError, ForwardedCallerOperation};
-use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer, peer_call, peer_reply};
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message};
+use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, peer_call, peer_reply,
+};
 
 /// Each answer bounds itself in the transport; this only stops a request that never ends.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
@@ -261,7 +262,7 @@ impl Operation for ApplyControlOperation {
                 let sign = Effect::Net(NetEffect::SignDeletePlan(plan));
                 Ok(Next::Call(IoCall::Effect(Box::new(sign))))
             }
-            ControlStage::Signed => match event(result)? {
+            ControlStage::Signed => match result.event()? {
                 Event::Net(NetEvent::DeletePlanSigned(signed)) => Ok(Next::Done(Some(
                     signed.map_err(GroupDeletionError::Unavailable)?,
                 ))),

@@ -4,7 +4,11 @@
 
 use super::tests::{create_event, node};
 use super::*;
+use crate::metadata::raw_events::RawRevisionState;
+use aruna_core::keyspaces::RAW_REVISION_KEYSPACE;
+use aruna_core::metadata::MetadataBatch;
 use aruna_core::storage_entries::create_event_entry;
+use aruna_core::task::TaskKey;
 
 type Error = MetadataMaterializationError;
 
@@ -344,42 +348,270 @@ fn plan_parks_job() {
         job: job(1),
         status,
     };
-    let mut plan = PlanFinishOperation::new(vec![parked]);
-    plan.stamp(5);
+    let mut commit = CommitFinishOperation::new(vec![parked]);
+    commit.stamp(5);
     let dead_letter = (
         DEAD_LETTER_KEYSPACE.to_string(),
         dead_letter_key(document_id, event_id),
     );
     let reads = vec![status_read(document_id), dead_letter];
-    assert_eq!(plan.first(), Ok(Next::Call(IoCall::Read(reads))));
-    assert!(is_child(&plan.next(IoResult::Values(vec![None, None]))));
-    let queued = child(Ok::<Vec<(String, Key, Value)>, LinkError>(Vec::new()));
-    let Ok(Next::Done(rows)) = plan.next(queued) else {
-        panic!("expected the finish plan");
+    assert_eq!(commit.first(), Ok(Next::Call(IoCall::Read(reads))));
+    let written = commit.next(IoResult::Values(vec![None, None]));
+    let Ok(Next::Call(IoCall::Write(writes))) = written else {
+        panic!("expected the finish writes, got {written:?}");
     };
-    let parks = (rows.writes.iter()).any(|(space, _, _)| space == DEAD_LETTER_KEYSPACE);
-    assert!(parks);
-    assert!(rows.deletes.contains(&global_row(job_key())));
+    assert!((writes.iter()).any(|(space, _, _)| space == DEAD_LETTER_KEYSPACE));
+    let deleted = commit.next(IoResult::Done);
+    let Ok(Next::Call(IoCall::Delete(deletes))) = deleted else {
+        panic!("expected the finish deletes, got {deleted:?}");
+    };
+    assert!(deletes.contains(&global_row(job_key())));
 }
 
+// The guard reads run in the write transaction, so a status written meanwhile fails the
+// commit with a conflict the drain's retry reruns, and the writes come before the deletes.
 #[test]
 fn commit_writes_first() {
-    let row = (
-        MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+    let status = materialization_failure_status(&job(1), &event(), ("boom".into(), 10), true, 5);
+    let parked = FinishedMaterializationJob::Parked {
+        job_key: job_key(),
+        job: job(1),
+        status,
+    };
+    let mut commit = CommitFinishOperation::new(vec![parked]);
+    assert_eq!(commit.transaction(), TransactionMode::Write);
+    assert!(matches!(commit.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let written = commit.next(IoResult::Values(vec![None, None]));
+    assert!(matches!(written, Ok(Next::Call(IoCall::Write(_)))));
+    assert!(matches!(
+        commit.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(_)))
+    ));
+    assert_eq!(commit.next(IoResult::Done), Ok(Next::Done(())));
+    let conflict = Error::from(IoError::Conflict);
+    assert!(CommitFinishOperation::is_conflict(&conflict));
+}
+
+fn marking() -> MaterializationJobOperation {
+    let job_ids = (job_key(), job(1));
+    let cache = RawStateCache::default();
+    let mut operation = MaterializationJobOperation::new(job_ids, None, cache, GitNode::default());
+    operation.stamp(40);
+    operation.event = Some(event());
+    operation
+}
+
+fn materialized(raw_revision: Option<MetadataRawRevision>) -> MaterializedCreateEvent {
+    let state_write = (
+        RAW_REVISION_KEYSPACE.to_string(),
         Key::from(vec![1]),
         Value::from(vec![2]),
     );
-    let delete = global_row(job_key());
-    let plan = FinishPlan {
-        writes: vec![row.clone()],
-        deletes: vec![delete.clone()],
+    MaterializedCreateEvent {
+        raw_revision,
+        raw_state_write: state_write,
+        validation_write: None,
+    }
+}
+
+// The hold row a job writes before its finish; the job keeps the mark itself for the finish.
+fn hold_write() -> MaterializationTurn<ProcessedMaterializationJob> {
+    let row = (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        Key::from(sidecar_key()),
+        Value::from(Vec::new()),
+    );
+    Ok(Next::Call(IoCall::Write(vec![row])))
+}
+
+fn capture_mark(event_id: Ulid, jsonld: &str) -> CaptureMark {
+    CaptureMark {
+        event_id,
+        jsonld: jsonld.to_string(),
+    }
+}
+
+// The capture mark holds the graph the job displays, so the drain snapshots that graph.
+#[test]
+fn mark_holds_revision() {
+    let revision = MetadataRawRevision {
+        jsonld: "{}".to_string(),
+        winning_event_id: ids().1,
+        context_digest: [1; 32],
+        dataset_digest: None,
+        merged: None,
     };
-    let mut commit = CommitFinishOperation::new(plan);
-    assert_eq!(commit.transaction(), TransactionMode::Write);
-    assert_eq!(commit.first(), Ok(Next::Call(IoCall::Write(vec![row]))));
+    let mut operation = marking();
+    let written = operation.mark(&event(), materialized(Some(revision)));
+    assert_eq!(written, hold_write());
+    assert_eq!(operation.capture, Some(capture_mark(ids().1, "{}")));
+}
+
+// A job without a displayed revision, as a scaffold, exports the graph it made for its mark.
+#[test]
+fn scaffold_mark_exported() {
+    let mut operation = marking();
+    let graph_iri = event().record.graph_iri;
+    let export = MetadataEffect::ExportRoCrate {
+        graph_iri: graph_iri.clone(),
+    };
+    let marked = operation.mark(&event(), materialized(None));
+    assert_eq!(marked, Ok(graph_call(export)));
+    let jsonld = "{\"name\":\"scaffold\"}".to_string();
+    let exported = MetadataEvent::RoCrateExportResult {
+        graph_iri,
+        jsonld: jsonld.clone(),
+    };
+    let exported = IoResult::Event(Box::new(Event::Metadata(exported)));
+    assert_eq!(operation.next(exported), hold_write());
+    assert_eq!(operation.capture, Some(capture_mark(ids().1, &jsonld)));
+}
+
+// A scaffold applied in the job's own run reaches its mark export, so the job never defers.
+#[test]
+fn applied_scaffold_marked() {
+    let mut prepare = PrepareRawOperation::new(event(), RawStateCache::default());
+    prepare.first().unwrap();
+    let plan = match prepare.next(child(Ok::<_, RawReadError>(None::<RawRevisionState>))) {
+        Ok(Next::Done(plan)) => plan,
+        other => panic!("expected a raw plan, got {other:?}"),
+    };
+    let mut operation = marking();
+    operation.stage = JobStage::Raw;
+    let applied = operation.next(child(Ok::<_, RawReadError>(plan)));
+    let create = graph_materialization_effect(&event(), None, false);
+    assert_eq!(applied, Ok(graph_call(create)));
+    let graph_iri = event().record.graph_iri;
+    let created = MetadataEvent::CreateCrateResult {
+        graph_iri: graph_iri.clone(),
+        batch: MetadataBatch {
+            graph_iri: graph_iri.clone(),
+            actor: [1; 32],
+            counter: 1,
+            base_clock: craqle::VectorClock::default(),
+            ops: Vec::new(),
+            timestamp_millis: 1,
+        },
+    };
+    let created = IoResult::Event(Box::new(Event::Metadata(created)));
+    let export = MetadataEffect::ExportRoCrate { graph_iri };
+    assert_eq!(operation.next(created), Ok(graph_call(export)));
+}
+
+// The finish that stores a job's graph queues its capture mark under the document's next
+// capture sequence and drops the hold; a job that stored none only drops its hold.
+#[test]
+fn finish_readies_mark() {
+    let capture = capture_mark(ids().1, "{}");
+    let status = materialization_success_status(&job(1), &event(), None, 50);
+    let mut stored = CompletedMaterializationJob::without_rows(job_key(), sidecar_key(), None);
+    stored.status = Some(status);
+    stored.capture = Some(capture.clone());
+    let mut commit =
+        CommitFinishOperation::new(vec![FinishedMaterializationJob::Completed(stored)]);
+    commit.first().unwrap();
+    let written = commit.next(IoResult::Values(vec![None, None]));
+    let Ok(Next::Call(IoCall::Write(writes))) = written else {
+        panic!("expected the finish writes, got {written:?}");
+    };
+    assert!(writes.contains(&queued(0, &capture)));
+    assert!(writes.contains(&counter(1)));
     let deleted = commit.next(IoResult::Done);
-    assert_eq!(deleted, Ok(Next::Call(IoCall::Delete(vec![delete]))));
-    assert_eq!(commit.next(IoResult::Done), Ok(Next::Done(())));
+    let Ok(Next::Call(IoCall::Delete(deletes))) = deleted else {
+        panic!("expected the finish deletes, got {deleted:?}");
+    };
+    assert!(deletes.contains(&hold()));
+
+    let mut unstored = CompletedMaterializationJob::without_rows(job_key(), sidecar_key(), None);
+    unstored.capture = Some(capture);
+    let mut commit =
+        CommitFinishOperation::new(vec![FinishedMaterializationJob::Completed(unstored)]);
+    commit.first().unwrap();
+    let deleted = commit.next(IoResult::Values(vec![None, None]));
+    let Ok(Next::Call(IoCall::Delete(deletes))) = deleted else {
+        panic!("expected the finish deletes, got {deleted:?}");
+    };
+    assert!(deletes.contains(&hold()));
+}
+
+fn hold() -> (String, Key) {
+    (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        Key::from(sidecar_key()),
+    )
+}
+
+fn queued(sequence: u64, mark: &CaptureMark) -> (String, Key, Value) {
+    (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        capture_key(ids().0, sequence),
+        Value::from(mark.to_bytes().unwrap()),
+    )
+}
+
+fn counter(next: u64) -> (String, Key, Value) {
+    (
+        CAPTURE_SEQUENCE_KEYSPACE.to_string(),
+        Key::from(ids().0.to_bytes().to_vec()),
+        Value::from(next.to_be_bytes().to_vec()),
+    )
+}
+
+// A newer event still pending wins the status guard, but the graph this job made stays the
+// newest one materialized, so the finish queues its capture and leaves the status alone.
+#[test]
+fn pending_readies_capture() {
+    let capture = capture_mark(ids().1, "{}");
+    let mut done = CompletedMaterializationJob::without_rows(job_key(), sidecar_key(), None);
+    done.status = Some(materialization_success_status(&job(1), &event(), None, 50));
+    done.capture = Some(capture.clone());
+    let newer = create_event(ids().0, Ulid::from_parts(32, 1), "newer");
+    let pending = MaterializationStatusRecord::pending(&newer, 45);
+    let (_, _, pending) = materialization_status_entry(&pending).unwrap();
+    let mut commit = CommitFinishOperation::new(vec![FinishedMaterializationJob::Completed(done)]);
+    commit.first().unwrap();
+    let written = commit.next(IoResult::Values(vec![Some(pending), None]));
+    let Ok(Next::Call(IoCall::Write(writes))) = written else {
+        panic!("expected the finish writes, got {written:?}");
+    };
+    assert_eq!(writes, vec![queued(0, &capture), counter(1)]);
+}
+
+// A finished job whose graph the finish keeps, with the capture its job made.
+fn captured(event_id: Ulid, jsonld: &str, merge: bool) -> FinishedMaterializationJob {
+    let event = create_event(ids().0, event_id, "ordered");
+    let job = MetadataMaterializationRecord::new(&event, 1);
+    let job_key = materialization_job_key(&job).to_vec();
+    let hold = document_job_key(ids().0, event_id).to_vec();
+    let mut done = CompletedMaterializationJob::without_rows(job_key, hold, None);
+    done.status = Some(materialization_success_status(&job, &event, None, 50));
+    done.merge = merge;
+    let raw_state = (
+        RAW_REVISION_KEYSPACE.to_string(),
+        Key::from(vec![1]),
+        Value::from(vec![2]),
+    );
+    done.raw_state_write = merge.then_some(raw_state);
+    done.capture = Some(capture_mark(ids().1, jsonld));
+    FinishedMaterializationJob::Completed(done)
+}
+
+// Two graphs of one document with the same winning event, whose job keys sort against the order
+// they finished in, queue in finish order after the sequence the document already counted.
+#[test]
+fn finish_orders_captures() {
+    let newer = captured(Ulid::from_parts(33, 1), "newer", false);
+    let late = captured(Ulid::from_parts(32, 1), "late", true);
+    let mut commit = CommitFinishOperation::new(vec![newer, late]);
+    commit.first().unwrap();
+    let counted = Value::from(5u64.to_be_bytes().to_vec());
+    let written = commit.next(IoResult::Values(vec![None, Some(counted)]));
+    let Ok(Next::Call(IoCall::Write(writes))) = written else {
+        panic!("expected the finish writes, got {written:?}");
+    };
+    assert!(writes.contains(&queued(5, &capture_mark(ids().1, "newer"))));
+    assert!(writes.contains(&queued(6, &capture_mark(ids().1, "late"))));
+    assert!(writes.contains(&counter(7)));
 }
 
 fn drain_result(turn: MaterializationTurn<MetadataDrainResult>) -> MetadataDrainResult {
@@ -430,11 +662,6 @@ fn syncing(graph_iri: &str) -> MaterializationBatchOperation {
         ..MaterializationGroupOutcome::default()
     };
     assert!(is_child(&batch.next(group_answer(outcome))));
-    let plan = FinishPlan {
-        writes: Vec::new(),
-        deletes: vec![global_row(job_key())],
-    };
-    assert!(is_child(&batch.next(child(Ok::<_, Error>(plan)))));
     let sync = GraphSyncOperation::new(graph_iri.to_string(), vec![node(2)]);
     let call = IoCall::background(sync);
     same_call(batch.next(child(Ok::<(), Error>(()))), Ok(Next::Call(call)));
@@ -447,11 +674,34 @@ fn started(started: bool) -> IoResult {
     })))
 }
 
+fn scheduled(key: TaskKey) -> IoResult {
+    let after = Duration::ZERO;
+    IoResult::Event(Box::new(Event::Task(TaskEvent::TimerScheduled {
+        key,
+        after,
+    })))
+}
+
+/// The link queue and Git capture drains are armed to run now, after the finished jobs queued
+/// their changes and capture marks.
+fn armed(
+    batch: &mut MaterializationBatchOperation,
+    turn: MaterializationTurn<MetadataDrainResult>,
+) -> IoResult {
+    let link_drain = IoCall::from(schedule_drain(Duration::ZERO));
+    same_call(turn, Ok(Next::Call(link_drain)));
+    let captures = batch.next(scheduled(TaskKey::DrainLinkQueue));
+    let capture_drain = IoCall::from(schedule_capture_drain());
+    same_call(captures, Ok(Next::Call(capture_drain)));
+    scheduled(TaskKey::DrainCaptures)
+}
+
 #[test]
 fn batch_syncs_graphs() {
     let mut batch = syncing(&event().record.graph_iri);
-    assert!(is_child(&batch.next(started(true))));
-    let result = drain_result(batch.next(child(Ok::<(), LinkError>(()))));
+    let turn = batch.next(started(true));
+    let armed = armed(&mut batch, turn);
+    let result = drain_result(batch.next(armed));
     assert_eq!(result.processed, 1);
     assert_eq!(result.next_due_after, None);
 }
@@ -463,8 +713,9 @@ fn busy_slot_waits() {
     let mut batch = syncing(&graph_iri);
     let inline = IoCall::child(GraphSyncOperation::new(graph_iri, vec![node(2)]));
     same_call(batch.next(started(false)), Ok(Next::Call(inline)));
-    assert!(is_child(&batch.next(child(Ok::<(), MetadataError>(())))));
-    let result = drain_result(batch.next(child(Ok::<(), LinkError>(()))));
+    let turn = batch.next(child(Ok::<(), MetadataError>(())));
+    let armed = armed(&mut batch, turn);
+    let result = drain_result(batch.next(armed));
     assert_eq!(result.processed, 1);
 }
 

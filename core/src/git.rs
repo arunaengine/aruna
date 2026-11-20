@@ -2,14 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
+use crate::effects::Effect;
+use crate::errors::ConversionError;
 use crate::git_state::{Ancestry, Projection, ProjectionInputs};
+use crate::id::NodeId;
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
 use crate::operation::SubOperation;
-use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::realm::{NodeRealm, RealmId};
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::dataset_location::DatasetLocation;
+use crate::structs::storage::routing::NodeRouting;
+use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key, KeySpace, Value};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -844,6 +851,46 @@ pub fn record_change(record: &GitRecord) -> crate::document::DocumentChange {
     }
 }
 
+/// What the Git operations need to know about this node; the input reads it from its context.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GitNode {
+    pub ids: NodeRealm,
+    pub routing: NodeRouting,
+}
+
+impl GitNode {
+    pub fn node(&self) -> Option<NodeId> {
+        self.ids.map(|(node_id, _)| node_id)
+    }
+}
+
+/// A materialized graph waiting for its Git snapshot, stored under its document and the capture
+/// sequence its finish gave it, so a document's marks are captured in finish order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureMark {
+    /// The event whose graph the snapshot shows, and that graph as JSON-LD.
+    pub event_id: Ulid,
+    pub jsonld: String,
+}
+
+impl CaptureMark {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// Arms the Git capture drain to run now.
+pub fn schedule_capture_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainCaptures,
+        after: Duration::ZERO,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,7 +1040,7 @@ mod tests {
         };
         assert_eq!(
             target.topic_id(),
-            crate::TopicId::metadata(record.document_id)
+            crate::id::TopicId::metadata(record.document_id)
         );
         assert!(target.uses_shard_topic());
         let (keyspace, key, _) = git_record_entry(&record).expect("entry");

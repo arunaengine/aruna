@@ -10,18 +10,17 @@ use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
-use aruna_core::structs::execution::harvest::{
-    RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
-};
+use aruna_core::structs::execution::harvest::{RepositoryConnector, RepositoryConnectorKind};
+use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::connectors::harvest_rows::{connector_key, connector_secret_key, connector_writes};
 use crate::groups::fence::group_fence_key;
 use crate::harvest::create_connector::{CreateConnectorError, validate_connector};
 use crate::harvest::read_connector::ConnectorView;
-use crate::harvest::repository::{connector_key, connector_secret_key, connector_writes};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct UpdateConnectorInput {
@@ -135,10 +134,11 @@ impl UpdateRepositoryOperation {
             updated_at: now,
             ..existing
         };
-        let secret =
-            self.input.secret_config.clone().and_then(|config| {
-                RepositoryConnectorSecret::new(connector.connector_id, config, now)
-            });
+        let secret = self
+            .input
+            .secret_config
+            .clone()
+            .and_then(|config| SourceConnectorSecret::new(connector.connector_id, config, now));
         let has_secret_config = match &self.input.secret_config {
             None => stored,
             Some(_) => secret.is_some(),
@@ -195,11 +195,11 @@ impl Operation for UpdateRepositoryOperation {
         match std::mem::replace(&mut self.stage, Stage::Delete) {
             Stage::Read => self.write(rows::values::<3>(result)?),
             Stage::Write(deletes) => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Stage::Delete => {
-                rows::done(result)?;
+                result.done()?;
                 self.view
                     .take()
                     .map(Next::Done)
@@ -224,7 +224,8 @@ pub(crate) mod tests {
 
     pub(crate) fn context() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

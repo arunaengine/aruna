@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
-use aruna_core::operation::{Operation, Runnable, TransactionMode, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::rows;
 use aruna_core::types::{Key, KeySpace, Value};
 
@@ -31,13 +31,12 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreEr
 }
 
 /// Runs `operation` as a child whose outcome `map` reduces to what the parent decides with.
-pub(crate) fn mapped_child<O, K, T, E>(
+pub(crate) fn mapped_child<O, T, E>(
     operation: O,
     map: impl FnOnce(Result<O::Output, O::Error>) -> Result<T, E> + Send + 'static,
 ) -> IoCall
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: Send + 'static,
     O::Error: Send + 'static,
     T: Send + std::fmt::Debug + PartialEq + 'static,
@@ -141,6 +140,14 @@ impl Scan {
         )
     }
 
+    /// Takes one page and hands its rows over at once, keeping none; `true` while more follow.
+    pub fn page(&mut self, answer: IoResult) -> Result<(Rows, bool), StoreError> {
+        let (rows, next) = page_of(answer)?;
+        let more = next.is_some();
+        self.after = next;
+        Ok((rows, more))
+    }
+
     /// Takes one page; returns every row once the last page arrived.
     pub fn take(&mut self, answer: IoResult) -> Result<Option<Rows>, StoreError> {
         let (rows, next) = page_of(answer)?;
@@ -155,14 +162,17 @@ impl Scan {
     }
 }
 
-/// The values of these rows, read on their own.
+/// The values of these rows, read on their own; only test fixtures read rows this way.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn read_rows(reads: Vec<(&'static str, Vec<u8>)>) -> ReadRows {
     ReadRows(Some(read_call(reads)))
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, PartialEq)]
 pub struct ReadRows(Option<IoCall>);
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl Operation for ReadRows {
     type Output = Vec<Option<Vec<u8>>>;
     type Error = StoreError;
@@ -285,7 +295,7 @@ pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Vec<u8>>; N], 
 
 /// Checks that a write or delete was answered.
 pub fn done(result: IoResult) -> Result<(), StoreError> {
-    Ok(rows::done(result)?)
+    Ok(result.done()?)
 }
 
 /// An answer the operation did not ask for.

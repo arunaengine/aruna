@@ -6,15 +6,14 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::cursor::SEARCH_CURSOR_CONTEXT;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataError, MetadataSearchHit};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::event;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
@@ -31,15 +30,16 @@ use super::node_fanout::{
 use super::path_types::{deduplicate_fanout_nodes, select_fanout_nodes};
 use super::search_types::{MetadataSearchExecution, MetadataSearchRequest};
 use super::{ApiQueryMode, DISTRIBUTED_QUERY_DEADLINE, MetadataApiError, MetadataReadError};
-use crate::forward::fetch::{peer_call, peer_reply};
 use crate::metadata::profile::validation::equivalent_profile_iris;
-use crate::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_read_error};
 use crate::metadata::search_cursor::{
     MAX_PAGINATION_DEPTH, NodeSearchResult, SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE, SearchCursor,
     SearchCursorError, SearchWatermark, blank_signature, merge_search_hits, paginate,
     query_fingerprint, resume_fetch_limit,
 };
 use crate::metadata::text_search::LocalSearchOperation;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, encode_message, metadata_read_error, peer_call, peer_reply,
+};
 
 /// Where one node's search runs.
 #[derive(Clone, Debug, PartialEq)]
@@ -471,7 +471,7 @@ impl Operation for MetadataSearchOperation {
                 self.paged(parts)
             }
             SearchStage::Sign(unsigned) => {
-                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = event(result) else {
+                let Ok(Event::Net(NetEvent::CursorSigned(Some(signature)))) = result.event() else {
                     return Err(MetadataApiError::Internal(
                         "net handle unavailable for search cursor signing".to_string(),
                     ));

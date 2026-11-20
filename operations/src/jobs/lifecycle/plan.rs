@@ -7,13 +7,14 @@ use std::collections::BTreeMap;
 
 use aruna_core::compute::{ExecutionTargetId, ExecutorCapability, NetworkAccess, StagingMode};
 use aruna_core::id::NodeId;
-use aruna_core::scheduling::{
-    ExecutionPlan, InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, Planner,
-    ResolvedInput, TargetCandidate,
+use aruna_core::job_request;
+use aruna_core::scheduling::ExecutionPlan;
+use aruna_core::scheduling::scan::Planner;
+use aruna_core::structs::execution::job::family::LogicalJobSpec;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputSource, named_install, object_count, tagged,
 };
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputSource, LogicalJobSpec, WorkspaceMode, named_install, object_count, tagged,
-};
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::node_subject::storage_subject;
@@ -30,17 +31,18 @@ use ulid::Ulid;
 
 use super::advertised::{Advertised, AdvertisementsOperation};
 use super::deferred::{DeferredTarget, Signal, reconsidered};
-use super::ids;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
-use crate::placement::policy::{PolicySetError, PolicySetResolver, Resolutions, ResolveMode};
+use crate::placement::policy::resolve_set::{
+    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
+};
 use crate::plugins::screen::{ScreenError, ScreenTask};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::types::Value;
 
 /// Tag that pins the container network mode, shared with the executor path.
@@ -58,9 +60,9 @@ pub enum PlanBuildError {
     #[error("planning inputs are unavailable: {0}")]
     Unavailable(String),
     #[error(transparent)]
-    Plan(#[from] aruna_core::scheduling::PlanError),
+    Plan(#[from] aruna_core::scheduling::inputs::PlanError),
     #[error(transparent)]
-    Request(#[from] ids::RequestError),
+    Request(#[from] job_request::RequestError),
 }
 
 impl From<IoError> for PlanBuildError {
@@ -95,10 +97,9 @@ enum PlanStep {
     Screen,
 }
 
-/// Builds and runs one planning round from the members' advertisements, the pinned inputs, the
-/// policies and the submitter's grants. Declined targets, and deferred ones not reconsidered yet,
-/// are excluded; an unread advertisement may hold the only legal target, so the round is then a
-/// continuation, not a conclusive refusal.
+/// Runs one planning round over member advertisements, pinned inputs and holders, policies and
+/// per-node grants; declined targets, and deferred ones not reconsidered yet, are excluded. An
+/// unread advertisement may hold the only legal target, so the round then continues instead.
 #[derive(Debug, PartialEq)]
 pub struct BuildPlanOperation {
     round: PlanRound,
@@ -187,7 +188,7 @@ impl BuildPlanOperation {
             self.step = PlanStep::Screen;
             return Ok(Next::Call(IoCall::child(ScreenTask::new(config, task))));
         }
-        let existing = ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing;
+        let existing = job_request::workspace_of(&spec.payload).0 == WorkspaceMode::Existing;
         let mut targets: Vec<NodeId> = self
             .documents
             .keys()
@@ -380,10 +381,10 @@ fn plan_request(
         group_id: spec.group_id,
         executor_constraint: spec.payload.executor_constraint.clone(),
         backend: spec.payload.backend.clone(),
-        required_labels: ids::required_labels(&spec.payload)?,
+        required_labels: job_request::required_labels(&spec.payload)?,
         staging: REALM_STAGING,
         network: network_access(spec),
-        session: ids::session_of(&spec.payload).is_some(),
+        session: job_request::session_of(&spec.payload).is_some(),
         inputs,
         output_policies,
         policies,
@@ -411,9 +412,6 @@ struct Scan {
     scanned: u64,
 }
 
-/// One candidate per advertised backend, screened in pages of at most
-/// [`MAX_TARGET_SCAN`]. A document may only describe a backend, never its own
-/// standing; eligibility is decided by the planner over the whole scan.
 /// For a plugin task, the only node it may run on: its install's receiver, or `None` when the
 /// install is gone. `None` for an ordinary job.
 fn plugin_target(config: &RealmConfigDocument, spec: &LogicalJobSpec) -> Option<Option<NodeId>> {
@@ -496,6 +494,9 @@ impl Operation for DeferredReadyOperation {
     }
 }
 
+/// One candidate per advertised backend, screened in pages of at most
+/// [`MAX_TARGET_SCAN`]. A document may only describe a backend, never its own
+/// standing; eligibility is decided by the planner over the whole scan.
 fn candidates(
     round: &PlanRound,
     documents: &BTreeMap<NodeId, NodeInfoDocument>,
@@ -511,7 +512,7 @@ fn candidates(
     // Members come out of the map in node id byte order and every document's
     // backends are walked by name: the canonical order pages must continue in.
     for (node_id, document) in documents {
-        if ids::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
+        if job_request::workspace_of(&spec.payload).0 == WorkspaceMode::Existing
             && *node_id != spec.ingress_node_id
         {
             continue;
@@ -649,11 +650,9 @@ fn pinned_inputs(
     Ok(inputs)
 }
 
-/// The source endpoint owns the stored bucket/key/version, and every node the DHT lists for
-/// the same content hash holds a registered copy, so running next to one saves the transfer; a
+/// Adds the copies the DHT lists for the content hash to the holders, source endpoint first,
+/// without repeats and up to the planner's bound; running next to one saves the transfer, and a
 /// failed lookup leaves the source as the only route.
-/// Adds the registered copies to the holder list, keeping the source endpoint
-/// first, dropping repeats, and stopping at the bound the planner accepts.
 fn merge_holders(
     config: &RealmConfigDocument,
     holders: &mut Vec<InputHolder>,
@@ -706,7 +705,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::scheduling::plan_execution;
-    use aruna_core::structs::execution::job::{InputMode, InputSelection};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSelection};
     use aruna_core::structs::storage::node_info::{
         AdvertisementEpoch, NodeUrls, NodeUtilization, node_info_key,
     };
@@ -1108,7 +1107,7 @@ mod tests {
     fn signal_needs_room() {
         use super::super::deferred::DeferKind;
         use aruna_core::compute::ExecutorAvailability;
-        use aruna_core::structs::execution::job::EffectiveResources;
+        use aruna_core::structs::execution::job::family::{EffectiveResources, LAUNCH_WINDOW_MS};
         let target = node(1);
         let mut executor = docker(target);
         executor.limits.max_concurrent = Some(2);
@@ -1168,7 +1167,6 @@ mod tests {
     #[test]
     fn reoffer_needs_screening() {
         use super::super::deferred::DeferKind;
-        use aruna_core::structs::execution::job::LAUNCH_WINDOW_MS;
         let (config, _) = realm(1);
         let spec = Family::new([5u8; 32]).spec();
         let mut planning = round(&config, &spec, &[]);

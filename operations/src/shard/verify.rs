@@ -4,16 +4,16 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::manifest_entry_digest;
 use aruna_core::document::{ShardManifest, shard_topic_id};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, ShardNetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, ShardNetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SHARD_VERIFICATION_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::rows::{PrefixPages, done, encoded_row, read_row, value};
+use aruna_core::rows::{PrefixPages, encoded_row, read_row};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::Key;
@@ -264,7 +264,7 @@ impl Operation for VerifyShardOperation {
     fn next(&mut self, result: IoResult) -> VerifyTurn {
         match self.stage {
             VerifyStage::Known => {
-                if value(result)?.is_some() {
+                if result.value()?.is_some() {
                     return Ok(Next::Done(ShardVerdict::Known));
                 }
                 // A sole holder converges only after its genesis exists: a genesis-less
@@ -338,7 +338,7 @@ impl Operation for MarkVerifiedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(()))
     }
 }
@@ -591,7 +591,7 @@ impl Operation for ShardVerifiedOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-        Ok(Next::Done(value(result)?.is_some()))
+        Ok(Next::Done(result.value()?.is_some()))
     }
 }
 

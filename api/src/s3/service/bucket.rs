@@ -7,26 +7,28 @@ use super::object::restrictions_reach;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::resolve_scope;
+use aruna_core::bucket_read::GetBucketOperation;
+use aruna_core::live_version::LiveVersionInput;
 use aruna_core::metadata::AuthToken;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
+use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship};
+use aruna_core::structs::sync_relationship::{SyncMode, SyncRelationship};
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::metadata::mirror_request::MirrorRequestOperation;
-use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::sync::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, RemoveMirrorOperation, SyncMirrorIntent,
-};
-use aruna_operations::sync::sync_relationship::{
-    DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
-    SyncRelationshipDirection,
-};
+use aruna_operations::replication::live_queue::QueueLiveOperation;
+use aruna_operations::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_operations::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_operations::replication::mirror_repair::remove::RemoveMirrorOperation;
+use aruna_operations::replication::mirror_repair::request::MirrorRequestOperation;
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::replication::sync_relationship::delete::DeleteRelationshipOperation;
+use aruna_operations::replication::sync_relationship::list::ListRelationshipsOperation;
+use aruna_operations::replication::sync_relationship::store::StoreRelationshipOperation;
 use s3s::dto::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus,
@@ -402,8 +404,8 @@ impl ArunaS3Service {
         version_id: ulid::Ulid,
         delete_marker: bool,
     ) {
-        let result = match drive(
-            LiveVersionOperation::new(LiveVersionInput {
+        if let Err(error) = drive(
+            QueueLiveOperation::new(LiveVersionInput {
                 local_node_id: self.node_id,
                 auth_context,
                 bucket: bucket.clone(),
@@ -415,22 +417,14 @@ impl ArunaS3Service {
         )
         .await
         {
-            Ok(result) => result,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    bucket,
-                    key,
-                    version_id = %version_id,
-                    delete_marker,
-                    "Failed to queue live replication after committed write; durable obligation remains for repair"
-                );
-                return;
-            }
-        };
-
-        if result.queued > 0 && !result.scheduled {
-            warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker,
+                "Failed to queue live replication after committed write; durable obligation remains for repair"
+            );
         }
     }
 }

@@ -4,16 +4,18 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::repository::remote::NodeScope;
-use aruna_core::repository::{
+use aruna_core::repository::link::{
     LinkDirection, LinkFailure, LinkPull, LinkRemote, LinkStatus, PULL_CHECK_MS, PullCheck,
-    PushOutcome, RepositoryLink, RepositoryPull, RepositoryRecord,
+    PushOutcome, RepositoryLink,
 };
-use aruna_core::rows::{event, value};
+use aruna_core::repository::remote::NodeScope;
+use aruna_core::repository::{RepositoryPull, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::{
-    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobRecord, JobState,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec,
 };
+use aruna_core::structs::execution::job::local::JobRecord;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -27,8 +29,8 @@ use super::links::{LinkChange, LinkError};
 use super::push::creator_auth;
 use super::submit::{LinkJob, LinkJobOperation};
 use crate::jobs::store::job_rows::ReadJobOperation;
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 /// How often a check waits for a running pull before it looks again.
 const ACTIVE_RETRY_MS: u64 = 60_000;
@@ -295,7 +297,7 @@ impl Operation for StartPullOperation {
                 self.read_document()
             }
             PullStep::Document => {
-                let document = parse_registry_read(event(result)?)
+                let document = parse_registry_read(result.event()?)
                     .map_err(|error| LinkError::Unexpected(format!("{error:?}")))?
                     .ok_or(LinkError::NotHolder)?;
                 let pull = self.pull()?;
@@ -391,7 +393,7 @@ impl Operation for PullRunningOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, TransferError> {
-        let link = parse_link(value(result)?)
+        let link = parse_link(result.value()?)
             .map_err(|error| TransferError::Retryable(error.to_string()))?
             .filter(|link| link.status != LinkStatus::Paused && link.pull().is_some())
             .ok_or(TransferError::Cancelled)?;
@@ -420,7 +422,7 @@ enum SettleStep {
 pub(crate) struct SettleImportOperation {
     scope: NodeScope,
     job_id: JobId,
-    owner_node: aruna_core::NodeId,
+    owner_node: aruna_core::id::NodeId,
     spec: ImportRoCrateSpec,
     progress: Option<PullProgress>,
     failure: Option<String>,
@@ -432,7 +434,7 @@ impl SettleImportOperation {
     pub(crate) fn new(
         scope: NodeScope,
         job_id: JobId,
-        owner_node: aruna_core::NodeId,
+        owner_node: aruna_core::id::NodeId,
         spec: ImportRoCrateSpec,
         progress: Option<PullProgress>,
         failure: Option<String>,

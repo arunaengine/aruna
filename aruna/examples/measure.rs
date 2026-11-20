@@ -14,15 +14,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna::tasks::incoming::drain_notification_outbox;
+use aruna::tasks::incoming::restore::drain_notification_outbox;
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -32,8 +34,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::types::{Effects, GroupId};
-use aruna_core::{NodeId, StructuredId, UserId};
+use aruna_core::structured_id::StructuredId;
+use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_operations::document_repository::GetConfigOperation;
@@ -41,12 +44,15 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::testing::project_logged_events;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_operations::sync::notification_outbox::{
+    EmitNotificationsInput, EmitNotificationsOperation,
+};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::projection::project_logged_events;
 use convergence::{NO_PROGRESS_TIMEOUT, wait_empty_queues, wait_for_visibility};
 use futures_util::StreamExt;
 use tempfile::TempDir;
@@ -71,7 +77,6 @@ const TAIL_PERIOD: Duration = Duration::from_millis(40);
 const PROBE_PERIOD: Duration = Duration::from_millis(500);
 const PROBE_POLL: Duration = Duration::from_millis(50);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
-const VISIBILITY_POLL: Duration = Duration::from_millis(200);
 const OUTBOX_SIZE: usize = 10_000;
 const EMIT_BATCH: usize = 100;
 const STORAGE_ROWS: usize = 100_000;
@@ -237,7 +242,7 @@ async fn measure_spread() -> Result<(), BoxError> {
     let newest = created.len().saturating_sub(SAMPLE_DOCS);
     let sample = pairs_of(&created[newest..]);
     let started = Instant::now();
-    let result = wait_for_visibility(&contexts(&nodes), &sample, VISIBILITY_POLL).await;
+    let result = wait_for_visibility(&contexts(&nodes), &sample).await;
     let seconds = started.elapsed().as_secs_f64();
     shutdown_nodes(nodes).await;
     result?;
@@ -285,7 +290,7 @@ async fn converge_all(realm_id: RealmId, nodes: &[TestNode]) -> Result<(usize, f
     .await?;
     let pairs = pairs_of(&created);
     let all = contexts(nodes);
-    wait_for_visibility(&all, &pairs, VISIBILITY_POLL).await?;
+    wait_for_visibility(&all, &pairs).await?;
     wait_empty_queues(&all).await?;
     Ok((pairs.len(), started.elapsed().as_secs_f64()))
 }
@@ -330,7 +335,7 @@ async fn sample_tail(realm_id: RealmId, nodes: &[TestNode]) -> Result<(), BoxErr
     let _ = done_tx.send(true);
     let pairs = pairs_of(&created?);
     let convergence = async {
-        wait_for_visibility(&all, &pairs, VISIBILITY_POLL).await?;
+        wait_for_visibility(&all, &pairs).await?;
         wait_empty_queues(&all).await?;
         Ok::<f64, String>(started.elapsed().as_secs_f64())
     };
@@ -737,7 +742,6 @@ struct ReadRows {
     reads: usize,
     grouped: bool,
     answered: usize,
-    failed: bool,
 }
 
 fn runner_read(index: usize) -> Effect {
@@ -748,56 +752,52 @@ fn runner_read(index: usize) -> Effect {
     })
 }
 
-impl EffectOperation for ReadRows {
-    type Output = ();
-    type Error = ();
+/// A read that found no row, or an answer of another kind.
+fn read_failed() -> IoError {
+    IoError::Unexpected {
+        expected: "a stored row",
+        got: "another answer",
+    }
+}
 
-    fn start(&mut self) -> Effects {
-        let effect = match self.grouped {
-            true => Effect::Group(EffectGroup {
+impl Operation for ReadRows {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(match self.grouped {
+            true => IoCall::Group(EffectGroup {
                 members: (0..self.reads).map(runner_read).collect(),
                 limit: self.reads,
                 form: GroupForm::All { deadline: None },
             }),
-            false => runner_read(0),
-        };
-        Effects::from_iter([effect])
+            false => IoCall::from(runner_read(0)),
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) if !self.grouped => {
-                self.answered += 1;
-            }
-            Event::Group(GroupEvent::Finished { results }) if self.grouped => {
-                self.answered = results
-                    .iter()
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match result {
+            IoResult::Group(GroupEvent::Finished { results }) if self.grouped => {
+                let done = (results.iter())
                     .filter(|result| matches!(result, GroupResult::Done(_)))
                     .count();
-                self.failed = self.answered < self.reads;
+                match done >= self.reads {
+                    true => Ok(Next::Done(())),
+                    false => Err(read_failed()),
+                }
             }
-            _ => self.failed = true,
+            IoResult::Event(event) if !self.grouped => match *event {
+                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {
+                    self.answered += 1;
+                    match self.answered >= self.reads {
+                        true => Ok(Next::Done(())),
+                        false => Ok(Next::Call(IoCall::from(runner_read(self.answered)))),
+                    }
+                }
+                _ => Err(read_failed()),
+            },
+            _ => Err(read_failed()),
         }
-        match self.is_complete() {
-            true => Effects::new(),
-            false => Effects::from_iter([runner_read(self.answered)]),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.failed || self.answered >= self.reads
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.failed {
-            true => Err(()),
-            false => Ok(()),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.failed = true;
-        Effects::new()
     }
 }
 
@@ -844,11 +844,10 @@ async fn measure_runner() -> Result<(), BoxError> {
                 reads,
                 grouped,
                 answered: 0,
-                failed: false,
             };
             drive(operation, &context)
                 .await
-                .map_err(|()| format!("runner {detail} failed"))?;
+                .map_err(|error| format!("runner {detail} failed: {error}"))?;
         }
         let seconds = started.elapsed().as_secs_f64();
         report(

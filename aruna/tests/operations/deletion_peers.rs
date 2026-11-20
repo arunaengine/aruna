@@ -9,12 +9,13 @@ use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::structs::identity::group_delete::{
     GroupDeletePhase, GroupDeleteRecord, GroupDeletionError,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 
 use ulid::Ulid;
 
 use aruna::inbound::initialize_incoming_fixture;
-use aruna_operations::groups::deletion::tests::{Fixture, read};
+use aruna_test_support::groups::{Fixture, read};
 
 async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
     let net = NetHandle::new(
@@ -71,7 +72,7 @@ async fn peers_delete_together() {
     };
     for _ in 0..2 {
         aruna_drivers::driver::drive(
-            aruna_operations::groups::deletion::DeleteGroupOperation::new(
+            aruna_operations::groups::deletion::coordinator::DeleteGroupOperation::new(
                 context.node_and_realm(),
                 auth.clone(),
                 None,
@@ -110,8 +111,7 @@ async fn check_reports_nodes() {
     let second_net = connect_fixture(&mut second, 2).await;
     first_net.add_peer_addr(second_net.endpoint_addr()).await;
     second_net.add_peer_addr(first_net.endpoint_addr()).await;
-    aruna_operations::groups::deletion::check_tests::buckets(&second, 2, &["owned", "hidden"])
-        .await;
+    aruna_test_support::groups::buckets(&second, 2, &["owned", "hidden"]).await;
     let auth = first.auth.clone();
     let group_id = first.plan.group_id;
     let first_context = Arc::new(first.context);
@@ -119,7 +119,7 @@ async fn check_reports_nodes() {
     let first_handler = initialize_incoming_fixture(first_context.clone()).unwrap();
     let second_handler = initialize_incoming_fixture(second_context.clone()).unwrap();
     let replies = aruna_drivers::driver::drive(
-        aruna_operations::groups::deletion::CheckGroupOperation::new(
+        aruna_operations::groups::deletion::check::CheckGroupOperation::new(
             first_context.node_and_realm(),
             auth,
             group_id,
@@ -131,7 +131,7 @@ async fn check_reports_nodes() {
     let reply = |seed| {
         replies
             .iter()
-            .find(|(node, _)| *node == aruna_operations::groups::deletion::tests::node(seed))
+            .find(|(node, _)| *node == aruna_test_support::groups::node(seed))
             .map(|(_, result)| result.clone())
             .unwrap()
     };

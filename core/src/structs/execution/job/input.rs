@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::identity::{JobExecutionClass, JobId, RETENTION_MS};
+use super::local::AttemptIntent;
 use super::*;
 use crate::plugin_installs::{InstallState, PluginInstall};
 
@@ -123,7 +125,7 @@ pub fn object_count(inputs: &[InputSelection]) -> usize {
 pub struct InputSelection {
     pub source: InputSource,
     /// Node-local endpoint that owns the source object once the job is stored.
-    pub source_node_id: Option<crate::NodeId>,
+    pub source_node_id: Option<crate::id::NodeId>,
     /// Input name, unique across the run; nothing copies it into a bucket.
     pub dest_key: String,
     pub mode: InputMode,
@@ -146,7 +148,7 @@ pub struct OutputSelection {
     /// destination key. Required with wildcards, absent otherwise.
     pub path_prefix: Option<String>,
     /// Node-local endpoint that owns the destination once the job is stored.
-    pub destination_node_id: Option<crate::NodeId>,
+    pub destination_node_id: Option<crate::id::NodeId>,
     pub destination: OutputDestination,
     pub name: Option<String>,
     pub description: Option<String>,
@@ -274,7 +276,7 @@ pub struct ExecutionSpec {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapturedInput {
     pub destination_key: String,
-    pub source_node_id: crate::NodeId,
+    pub source_node_id: crate::id::NodeId,
     pub version_id: Ulid,
     pub content: InputContent,
     pub bytes: u64,
@@ -803,7 +805,7 @@ pub struct ExportRoCrateResult {
 impl ExecutionSpec {
     /// Materialize workspace output intents against the resolved bucket.
     /// Deterministic across retries: the bucket name derives from the `JobId`.
-    pub fn resolve_outputs(&mut self, bucket: &str, node_id: crate::NodeId) {
+    pub fn resolve_outputs(&mut self, bucket: &str, node_id: crate::id::NodeId) {
         for output in std::mem::take(&mut self.workspace_outputs) {
             self.file_outputs.push(OutputSelection {
                 container_path: output.container_path,

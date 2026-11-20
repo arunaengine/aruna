@@ -70,13 +70,13 @@ pub(super) fn stale_sessions(
 mod tests {
     use super::super::migrate_output;
     use super::super::tests::{read, write};
-    use aruna_core::UserId;
     use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::keyspaces::{
         S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::s3_session::S3Session;
+    use aruna_core::user::id::UserId;
     use std::collections::BTreeSet;
     use std::time::{Duration, SystemTime};
     use ulid::Ulid;

@@ -9,13 +9,12 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputSelection, SubmissionId,
-};
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec, InputSelection};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
-use super::admit_here::placement_failure;
+use super::admit::here::placement_failure;
 use super::input_capture::{CaptureCaller, CaptureInputsOperation};
 use super::input_walk::{
     ExpandDirectoryOperation, FollowLinkOperation, InputCaller, RangeHolderOperation,
@@ -23,7 +22,7 @@ use super::input_walk::{
 use super::output_policies::OutputPoliciesOperation;
 use super::remote_inputs::{RemoteInputsOperation, ResolveCaller};
 use super::submission_rules::{exact_version, is_directory};
-use crate::jobs::submit::SubmitJobError;
+use aruna_core::job_request::SubmitJobError;
 
 /// The caller of a resolve, and until when its grants hold.
 #[derive(Clone, Debug, PartialEq)]
@@ -261,7 +260,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{REALM, captured_input, node, payload, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{InputMode, InputSource};
+    use aruna_core::structs::execution::job::input::{InputMode, InputSource};
     use ulid::Ulid;
 
     fn input(key: &str, version: Option<&str>, holder: Option<NodeId>) -> InputSelection {

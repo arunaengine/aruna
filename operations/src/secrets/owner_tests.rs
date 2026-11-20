@@ -5,13 +5,13 @@
 use super::*;
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use crate::secrets::tests::{create, name, token};
-use crate::testing::path_context;
 use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::admin_audit::{AuditIndex, audit_prefix};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::path_context;
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
 

@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -19,16 +18,18 @@ use aruna_core::structs::execution::source_connector::{
 };
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::types::{GroupId, Key};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    LIST_CONNECTOR_SIZE, StorageReadError, connector_id_key, parse_secret_read, read_secret_effect,
+    LIST_CONNECTOR_SIZE, connector_id_key, parse_secret_read, read_secret_effect,
     source_connector_key,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 use crate::groups::fence::{group_write_result, write_group_new};
-use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceConnectorInput {
@@ -288,7 +289,7 @@ impl Operation for SourceConnectorOperation {
         let chosen = self.chosen_id.unwrap_or_default();
         match self.stage {
             Stage::Existing => {
-                let existing = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+                let existing = decode_row(result.value()?, SourceConnector::from_bytes)?;
                 if existing
                     .as_ref()
                     .is_some_and(|existing| !self.same_record(existing))
@@ -301,7 +302,7 @@ impl Operation for SourceConnectorOperation {
                 Ok(Next::Call(IoCall::Effect(Box::new(read))))
             }
             Stage::Secret => {
-                let secret = parse_secret_read(rows::event(result)?, chosen)?;
+                let secret = parse_secret_read(result.event()?, chosen)?;
                 match (secret, self.existing.take()) {
                     (Some(_), _) => Err(SourceConnectorError::IdTaken),
                     (None, Some(existing)) => Ok(Next::Done(SourceConnectorResult {
@@ -311,8 +312,8 @@ impl Operation for SourceConnectorOperation {
                     (None, None) => Ok(self.scan_ids(None)),
                 }
             }
-            Stage::Scan => self.scanned(rows::event(result)?, chosen),
-            Stage::Write => self.written(rows::event(result)?),
+            Stage::Scan => self.scanned(result.event()?, chosen),
+            Stage::Write => self.written(result.event()?),
         }
     }
 }
@@ -329,8 +330,9 @@ mod tests {
     #[tokio::test]
     async fn persists_connector_secret() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -397,8 +399,9 @@ mod tests {
     #[tokio::test]
     async fn given_id_registered() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -450,8 +453,9 @@ mod tests {
     #[tokio::test]
     async fn concurrent_id_once() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,

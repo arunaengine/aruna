@@ -8,7 +8,10 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::routes::storage::relay::{RestRead, holder_json, missed_json, query_path};
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
+use aruna_core::replication_protocol::{
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
+};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
     CopyOrigin, bucket_permission_path, object_permission_path,
@@ -18,14 +21,12 @@ use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, Repli
 use aruna_drivers::driver::{drive, drive_until};
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::distribution::resolve::key_holders;
-use aruna_operations::replication::locations::{
-    LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
-    RelationshipNodesOperation, RemoteLocationOperation,
-};
+use aruna_operations::replication::locations::LocationSummaryError;
+use aruna_operations::replication::locations::local::LocationSummaryOperation;
+use aruna_operations::replication::locations::queued::{QueuedNodesOperation, QueuedReplicas};
+use aruna_operations::replication::locations::relationships::RelationshipNodesOperation;
+use aruna_operations::replication::locations::remote::RemoteLocationOperation;
 use aruna_operations::replication::plaintext::{EncryptionCheckOperation, HolderCheckOperation};
-use aruna_operations::replication::protocol::{
-    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
-};
 use aruna_operations::replication::queue::QueueBlobOperation;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -232,7 +233,7 @@ pub async fn replicate_blob(
 pub(crate) async fn plaintext_holder(
     state: &ServerState,
     bucket: &str,
-    user: aruna_core::UserId,
+    user: aruna_core::user::id::UserId,
 ) -> ServerResult<bool> {
     let context = state.get_ctx();
     let encrypted = drive(EncryptionCheckOperation::new(bucket, true), &context)

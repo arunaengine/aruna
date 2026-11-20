@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -297,7 +297,6 @@ impl Operation for WriteDefault {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::Event;
     use aruna_core::id::NodeId;
@@ -306,6 +305,7 @@ mod pure_tests {
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use std::time::UNIX_EPOCH;
 
     fn group_id() -> Ulid {

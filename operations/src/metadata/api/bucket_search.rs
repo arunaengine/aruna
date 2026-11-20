@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::RealmId;
@@ -24,9 +24,10 @@ use super::node_fanout::{
 };
 use super::search_types::{BucketSearchExecution, BucketSearchRequest};
 use super::{ApiQueryMode, MetadataApiError, MetadataReadError, query_fingerprint};
-use crate::metadata::protocol::MetadataTransportMessage;
 use crate::s3::bucket::local_search::LocalBucketSearch;
-use crate::s3::bucket::search::{BucketPage, SearchBucketsError, SearchBucketsInput};
+use crate::s3::bucket::search::{SearchBucketsError, SearchBucketsInput};
+use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_core::search::BucketPage;
 
 /// How the bucket fanout asks each node, from where the cursor left that node. Nodes the cursor
 /// marks done are skipped by the fanout scope, so they are never asked.
@@ -184,9 +185,9 @@ mod call_tests {
     //! Drives the bucket search through its cursor, fanout and retired node answers.
 
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::NetEffect;
     use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::user::id::UserId;
 
     fn realm() -> RealmId {
         RealmId::from_bytes([1; 32])

@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
+use aruna_core::repository::kind::{KindDescriptor, kinds};
 use aruna_core::repository::rules::Mapped;
-use aruna_core::repository::{KindDescriptor, kinds};
 use aruna_core::structs::identity::auth::Permission;
 use axum::Json;
 use axum::extract::{Path, State};

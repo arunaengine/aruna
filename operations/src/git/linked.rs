@@ -4,9 +4,9 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{LinkedObject, StoredObject};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::repo_layout::{data_path, entity_path, is_file, path_id};
 use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_SHA256};
@@ -23,15 +23,16 @@ use super::calls::{child_member, group_call, group_results, member_outcome};
 use super::{GitError, download, location, objects};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::metadata::global_entries::{LocalVersionError, LocalVersionOperation};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
-use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectInfo};
-use crate::s3::object::read::ObjectInfoOperation;
+use crate::s3::object::get::{GetObjectError, GetObjectInput};
+use crate::transfer::read::ObjectInfoOperation;
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::replication_protocol::{BaoReadRequest, BaoReadTarget};
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::object_read::ObjectInfo;
 
 type Document = MetadataRegistryRecord;
 

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,17 +15,26 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{error, warn};
 
 const TASK_COMMAND_BUFFER: usize = 1024;
 const HANDLER_WARN_AFTER: Duration = Duration::from_secs(30);
+/// Handlers of distinct keys run at most this many at once; later deadlines wait their turn.
+const HANDLER_LIMIT: usize = 64;
 
 #[async_trait]
 pub trait InboundTaskHandler: Send + Sync {
     async fn handle_timer(&self, key: TaskKey);
+
+    /// Handles one firing; `stamp` names the durable row the firing timer was armed from, if a
+    /// stamped change armed it.
+    async fn handle_firing(&self, key: TaskKey, _stamp: Option<u64>) {
+        self.handle_timer(key).await;
+    }
 }
 
 #[derive(Clone)]
@@ -46,12 +55,15 @@ enum TaskCommand {
     ResetTimer {
         key: TaskKey,
         after: Duration,
+        stamp: Option<u64>,
         response: oneshot::Sender<TaskEvent>,
     },
     ShortenTimer {
         key: TaskKey,
         after: Duration,
-        response: oneshot::Sender<TaskEvent>,
+        stamp: Option<u64>,
+        /// The event, and whether this change armed a new wake rather than keeping one.
+        response: oneshot::Sender<(TaskEvent, bool)>,
     },
     ScheduleIdleTimer {
         key: TaskKey,
@@ -116,22 +128,27 @@ struct SchedulerState {
     running_by_id: HashMap<u64, RunningTaskEntry>,
     running_warn_deadlines: BTreeSet<(Instant, u64)>,
     in_flight_keys: HashMap<TaskKey, usize>,
-    refire_requested: HashSet<TaskKey>,
+    /// Keys that fired while a run held them, with the stamp of that firing.
+    refire_requested: HashMap<TaskKey, Option<u64>>,
     inbound_handler: Option<Arc<dyn InboundTaskHandler>>,
     drained_waiters: Vec<oneshot::Sender<()>>,
     next_timer_id: u64,
     next_run_id: u64,
+    handler_limit: usize,
 }
 
 struct TimerEntry {
     id: u64,
     deadline: Instant,
+    /// The durable row this timer was armed from, so its firing deletes only that row.
+    stamp: Option<u64>,
 }
 
 #[derive(Clone)]
 struct RunningTask {
     id: Option<u64>,
     key: TaskKey,
+    stamp: Option<u64>,
     started_at: Instant,
 }
 
@@ -157,12 +174,17 @@ impl SchedulerState {
             running_by_id: HashMap::new(),
             running_warn_deadlines: BTreeSet::new(),
             in_flight_keys: HashMap::new(),
-            refire_requested: HashSet::new(),
+            refire_requested: HashMap::new(),
             inbound_handler: None,
             drained_waiters: Vec::new(),
             next_timer_id: 1,
             next_run_id: 1,
+            handler_limit: HANDLER_LIMIT,
         }
+    }
+
+    fn at_capacity(&self) -> bool {
+        self.running_by_id.len() >= self.handler_limit
     }
 
     fn allocate_timer_id(&mut self, deadline: Instant) -> Option<u64> {
@@ -203,11 +225,17 @@ impl SchedulerState {
         Some(entry)
     }
 
-    fn prepare_running_task(&mut self, key: TaskKey, started_at: Instant) -> RunningTask {
+    fn prepare_running_task(
+        &mut self,
+        key: TaskKey,
+        stamp: Option<u64>,
+        started_at: Instant,
+    ) -> RunningTask {
         let id = self.allocate_run_id();
         RunningTask {
             id,
             key,
+            stamp,
             started_at,
         }
     }
@@ -243,7 +271,7 @@ impl SchedulerState {
 
     fn spawn_handler(
         &mut self,
-        key: TaskKey,
+        (key, stamp): (TaskKey, Option<u64>),
         started_at: Instant,
         command_tx: &mpsc::WeakSender<TaskCommand>,
     ) {
@@ -251,7 +279,7 @@ impl SchedulerState {
             return;
         }
         if let Some(handler) = self.inbound_handler.clone() {
-            let task = self.prepare_running_task(key, started_at);
+            let task = self.prepare_running_task(key, stamp, started_at);
             let (cancel_tx, cancel_rx) = oneshot::channel();
             let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone(), cancel_rx);
             self.track_running_task(&task, handle, Some(cancel_tx));
@@ -270,9 +298,9 @@ impl SchedulerState {
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        let next_timer = self
-            .timers_by_deadline
-            .first_key_value()
+        // With every slot taken a completion wakes the loop, so overdue timers cause no spin.
+        let next_timer = (self.timers_by_deadline.first_key_value())
+            .filter(|_| !self.at_capacity())
             .map(|(&(deadline, _), _)| deadline);
         let next_running_warning = self
             .running_warn_deadlines
@@ -289,7 +317,7 @@ impl SchedulerState {
 
     fn dispatch_due_timers(&mut self, now: Instant, command_tx: &mpsc::WeakSender<TaskCommand>) {
         while let Some((&(deadline, timer_id), key)) = self.timers_by_deadline.first_key_value() {
-            if deadline > now {
+            if deadline > now || self.at_capacity() {
                 break;
             }
 
@@ -298,12 +326,15 @@ impl SchedulerState {
 
             if matches!(self.timers_by_key.get(&key), Some(entry) if entry.id == timer_id && entry.deadline == deadline)
             {
-                self.timers_by_key.remove(&key);
+                let stamp = self
+                    .timers_by_key
+                    .remove(&key)
+                    .and_then(|entry| entry.stamp);
 
                 if self.in_flight_keys.contains_key(&key) {
-                    self.refire_requested.insert(key);
+                    self.refire_requested.insert(key, stamp);
                 } else {
-                    self.spawn_handler(key, now, command_tx);
+                    self.spawn_handler((key, stamp), now, command_tx);
                 }
             }
         }
@@ -332,7 +363,12 @@ impl SchedulerState {
         }
     }
 
-    fn reset_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
+    fn reset_timer(
+        &mut self,
+        (key, stamp): (TaskKey, Option<u64>),
+        after: Duration,
+        now: Instant,
+    ) -> TaskEvent {
         let Some(deadline) = now.checked_add(after) else {
             return TaskEvent::Error {
                 key: Some(key),
@@ -348,33 +384,41 @@ impl SchedulerState {
         };
 
         self.remove_timer(&key);
-        self.insert_timer(key.clone(), TimerEntry { id, deadline });
+        let entry = TimerEntry {
+            id,
+            deadline,
+            stamp,
+        };
+        self.insert_timer(key.clone(), entry);
 
         TaskEvent::TimerScheduled { key, after }
     }
 
-    fn shorten_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
+    /// Moves the wake of `key` earlier; answers whether it armed a new wake with `stamp`, rather
+    /// than keeping an earlier live one that owns its own row.
+    fn shorten_timer(
+        &mut self,
+        (key, stamp): (TaskKey, Option<u64>),
+        after: Duration,
+        now: Instant,
+    ) -> (TaskEvent, bool) {
         let Some(requested_deadline) = now.checked_add(after) else {
-            return TaskEvent::Error {
-                key: Some(key),
-                message: "timer deadline overflow".to_string(),
-            };
+            let message = "timer deadline overflow".to_string();
+            let key = Some(key);
+            return (TaskEvent::Error { key, message }, false);
         };
 
         if let Some(existing) = self.timers_by_key.get(&key)
             && existing.deadline <= requested_deadline
         {
-            return TaskEvent::TimerScheduled {
-                key,
-                after: existing.deadline.saturating_duration_since(now),
-            };
+            let after = existing.deadline.saturating_duration_since(now);
+            return (TaskEvent::TimerScheduled { key, after }, false);
         }
 
         let Some(id) = self.allocate_timer_id(requested_deadline) else {
-            return TaskEvent::Error {
-                key: Some(key),
-                message: "timer id space exhausted".to_string(),
-            };
+            let message = "timer id space exhausted".to_string();
+            let key = Some(key);
+            return (TaskEvent::Error { key, message }, false);
         };
 
         self.remove_timer(&key);
@@ -383,10 +427,11 @@ impl SchedulerState {
             TimerEntry {
                 id,
                 deadline: requested_deadline,
+                stamp,
             },
         );
 
-        TaskEvent::TimerScheduled { key, after }
+        (TaskEvent::TimerScheduled { key, after }, true)
     }
 
     fn schedule_idle_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
@@ -401,11 +446,13 @@ impl SchedulerState {
             return TaskEvent::TimerScheduled { key, after };
         }
 
-        self.reset_timer(key, after, now)
+        self.reset_timer((key, None), after, now)
     }
 
     fn cancel_timer(&mut self, key: TaskKey) -> TaskEvent {
         self.remove_timer(&key);
+        // A firing that waited for a running handler is cancelled too, so no run follows it.
+        self.refire_requested.remove(&key);
         TaskEvent::TimerCancelled { key }
     }
 
@@ -433,8 +480,10 @@ impl SchedulerState {
             );
         }
 
-        if self.release_key(&entry.key) && self.refire_requested.remove(&entry.key) {
-            self.spawn_handler(entry.key, now, command_tx);
+        if self.release_key(&entry.key)
+            && let Some(stamp) = self.refire_requested.remove(&entry.key)
+        {
+            self.spawn_handler((entry.key, stamp), now, command_tx);
         }
 
         self.notify_if_drained();
@@ -523,16 +572,18 @@ impl SchedulerState {
             TaskCommand::ResetTimer {
                 key,
                 after,
+                stamp,
                 response,
             } => {
-                let _ = response.send(self.reset_timer(key, after, now));
+                let _ = response.send(self.reset_timer((key, stamp), after, now));
             }
             TaskCommand::ShortenTimer {
                 key,
                 after,
+                stamp,
                 response,
             } => {
-                let _ = response.send(self.shorten_timer(key, after, now));
+                let _ = response.send(self.shorten_timer((key, stamp), after, now));
             }
             TaskCommand::ScheduleIdleTimer {
                 key,
@@ -627,11 +678,17 @@ fn spawn_timer_handler(
 
         // A cooperative stop drops the handler future at its next await, then
         // still reports completion so the scheduler releases the key and the
-        // drain only after the run really ended.
+        // drain only after the run really ended. A panic reports completion too.
+        let firing = handler.handle_firing(task.key.clone(), task.stamp);
+        let run = std::panic::AssertUnwindSafe(firing);
         tokio::select! {
             biased;
             _ = &mut cancel => {}
-            _ = handler.handle_timer(task.key.clone()) => {}
+            ran = run.catch_unwind() => {
+                if ran.is_err() {
+                    error!(key = ?task.key, "Timer handler panicked");
+                }
+            }
         }
 
         let elapsed = task.started_at.elapsed();
@@ -746,22 +803,54 @@ impl TaskHandle {
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
     }
 
-    async fn reset_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
+    async fn reset_timer(&self, key: TaskKey, after: Duration, stamp: Option<u64>) -> TaskEvent {
         self.dispatch_command(key, |key, response| TaskCommand::ResetTimer {
             key,
             after,
+            stamp,
             response,
         })
         .await
     }
 
-    async fn shorten_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
-        self.dispatch_command(key, |key, response| TaskCommand::ShortenTimer {
+    async fn shorten_timer(
+        &self,
+        key: TaskKey,
+        after: Duration,
+        stamp: Option<u64>,
+    ) -> (TaskEvent, bool) {
+        let command_key = key.clone();
+        let (response, result) = oneshot::channel();
+        let command = TaskCommand::ShortenTimer {
             key,
             after,
+            stamp,
             response,
-        })
-        .await
+        };
+        if self.command_tx.send(command).await.is_err() {
+            return (scheduler_unavailable(command_key), false);
+        }
+        (result.await).unwrap_or_else(|_| (scheduler_unavailable(command_key), false))
+    }
+
+    /// Moves the wake of `key` earlier as admission `stamp`; answers whether the scheduler armed
+    /// that admission, so the caller writes its row, or kept an earlier wake that owns its own.
+    pub async fn shorten_owned(&self, key: TaskKey, after: Duration, stamp: u64) -> (Event, bool) {
+        let (event, armed) = self.shorten_timer(key, after, Some(stamp)).await;
+        (Event::Task(event), armed)
+    }
+
+    /// Hands a timer change to the scheduler with the due time of the durable row it wrote, so
+    /// the firing it arms deletes only that row and never a newer one.
+    pub async fn send_stamped(&self, effect: TaskEffect, stamp: Option<u64>) -> Event {
+        let event = match effect {
+            TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after, stamp).await,
+            TaskEffect::ShortenTimer { key, after } => {
+                self.shorten_timer(key, after, stamp).await.0
+            }
+            other => return self.send_effect(Effect::Task(other)).await,
+        };
+        Event::Task(event)
     }
 
     pub async fn schedule_idle_timer(&self, key: TaskKey, after: Duration) -> TaskEvent {
@@ -952,8 +1041,12 @@ impl Handle for TaskHandle {
         match effect {
             Effect::Task(task_effect) => {
                 let event = match task_effect {
-                    TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after).await,
-                    TaskEffect::ShortenTimer { key, after } => self.shorten_timer(key, after).await,
+                    TaskEffect::ResetTimer { key, after } => {
+                        self.reset_timer(key, after, None).await
+                    }
+                    TaskEffect::ShortenTimer { key, after } => {
+                        self.shorten_timer(key, after, None).await.0
+                    }
                     TaskEffect::ScheduleIdleTimer { key, after } => {
                         self.schedule_idle_timer(key, after).await
                     }
@@ -982,6 +1075,43 @@ mod tests {
 
     use tokio::sync::Notify;
 
+    struct StampHandler {
+        seen: Arc<Mutex<Option<Option<u64>>>>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for StampHandler {
+        async fn handle_timer(&self, _key: TaskKey) {}
+
+        async fn handle_firing(&self, _key: TaskKey, stamp: Option<u64>) {
+            *self.seen.lock().expect("stamp lock") = Some(stamp);
+            self.notify.notify_one();
+        }
+    }
+
+    // A firing carries the stamp of the change that armed it, so the handler deletes that row.
+    #[tokio::test]
+    async fn firing_carries_stamp() {
+        let handle = TaskHandle::new();
+        let seen = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        let handler = StampHandler {
+            seen: seen.clone(),
+            notify: notify.clone(),
+        };
+        handle.set_inbound_handler(Arc::new(handler)).await;
+        let reset = TaskEffect::ResetTimer {
+            key: test_key(),
+            after: Duration::ZERO,
+        };
+        handle.send_stamped(reset, Some(42)).await;
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the timer fires");
+        assert_eq!(*seen.lock().expect("stamp lock"), Some(Some(42)));
+    }
+
     #[derive(Clone)]
     struct ReschedulingHandler {
         handle: TaskHandle,
@@ -1004,6 +1134,21 @@ mod tests {
             }
 
             self.notify.notify_waiters();
+        }
+    }
+
+    /// Panics on its first run and counts every run.
+    struct PanickingHandler {
+        runs: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for PanickingHandler {
+        async fn handle_timer(&self, _key: TaskKey) {
+            let run = self.runs.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            assert!(run > 0, "the first run fails");
         }
     }
 
@@ -1078,6 +1223,7 @@ mod tests {
     #[derive(Clone)]
     struct RecordingHandler {
         runs: Arc<Mutex<Vec<(TaskKey, Instant)>>>,
+        recorded: Arc<Notify>,
     }
 
     #[async_trait]
@@ -1087,6 +1233,7 @@ mod tests {
                 .lock()
                 .expect("run log lock should stay open")
                 .push((key, Instant::now()));
+            self.recorded.notify_one();
         }
     }
 
@@ -1099,10 +1246,11 @@ mod tests {
             .await;
     }
 
-    async fn wait_for_runs(runs: &Arc<AtomicUsize>, expected: usize) {
+    /// Waits until the handler counted `expected` runs; each run notifies `started` once.
+    async fn wait_for_runs(runs: &Arc<AtomicUsize>, started: &Notify, expected: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
             while runs.load(Ordering::SeqCst) < expected {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                started.notified().await;
             }
         })
         .await
@@ -1119,10 +1267,17 @@ mod tests {
         count.await.expect("drain waiter query should be answered")
     }
 
-    async fn wait_for_records(runs: &Arc<Mutex<Vec<(TaskKey, Instant)>>>, expected: usize) {
+    /// Waits until the handler recorded `expected` runs; each run notifies `recorded` once.
+    async fn wait_for_records(handler: &RecordingHandler, expected: usize) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while runs.lock().expect("run log lock should stay open").len() < expected {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            while handler
+                .runs
+                .lock()
+                .expect("run log lock should stay open")
+                .len()
+                < expected
+            {
+                handler.recorded.notified().await;
             }
         })
         .await
@@ -1202,6 +1357,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panic_releases_key() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+        let handler = PanickingHandler {
+            runs: runs.clone(),
+            notify: notify.clone(),
+        };
+        handle.set_inbound_handler(Arc::new(handler)).await;
+        for seen in 0..2 {
+            let _ = handle
+                .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                    key: test_key(),
+                    after: Duration::ZERO,
+                }))
+                .await;
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while runs.load(Ordering::SeqCst) == seen {
+                    notify.notified().await;
+                }
+            })
+            .await
+            .expect("the timer runs after an earlier run panicked");
+        }
+    }
+
+    #[tokio::test]
     async fn handler_reset_survives() {
         let handle = TaskHandle::new();
         let started = Arc::new(Notify::new());
@@ -1269,7 +1451,7 @@ mod tests {
             .expect("handler future should be dropped after abort");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn overlap_coalesces_refire() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1297,12 +1479,12 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         gate.add_permits(16);
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn running_fire_refires() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1328,12 +1510,12 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         gate.add_permits(16);
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn fires_run_once() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -1350,11 +1532,11 @@ mod tests {
             .await;
 
         fire_timer(&handle, key.clone()).await;
-        wait_for_runs(&runs, 1).await;
+        wait_for_runs(&runs, &started, 1).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         fire_timer(&handle, key).await;
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
@@ -1418,9 +1600,11 @@ mod tests {
         let handle = TaskHandle::new();
         let runs = Arc::new(Mutex::new(Vec::new()));
         let key = test_key();
-        handle
-            .set_inbound_handler(Arc::new(RecordingHandler { runs: runs.clone() }))
-            .await;
+        let handler = RecordingHandler {
+            runs: runs.clone(),
+            recorded: Arc::new(Notify::new()),
+        };
+        handle.set_inbound_handler(Arc::new(handler.clone())).await;
 
         tokio::time::advance(Duration::from_secs(3600)).await;
 
@@ -1454,7 +1638,7 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        wait_for_records(&runs, 1).await;
+        wait_for_records(&handler, 1).await;
         let recorded = runs.lock().expect("run log lock should stay open").clone();
         assert_eq!(recorded[0].0, key);
         assert_eq!(recorded[0].1, submitted_at + Duration::from_secs(10));
@@ -1467,9 +1651,11 @@ mod tests {
         let runs = Arc::new(Mutex::new(Vec::new()));
         let waiting = test_key();
         let added = other_key();
-        handle
-            .set_inbound_handler(Arc::new(RecordingHandler { runs: runs.clone() }))
-            .await;
+        let handler = RecordingHandler {
+            runs: runs.clone(),
+            recorded: Arc::new(Notify::new()),
+        };
+        handle.set_inbound_handler(Arc::new(handler.clone())).await;
 
         let _ = handle
             .send_effect(Effect::Task(TaskEffect::ResetTimer {
@@ -1510,7 +1696,7 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        wait_for_records(&runs, 1).await;
+        wait_for_records(&handler, 1).await;
         {
             let recorded = runs.lock().expect("run log lock should stay open");
             assert_eq!(recorded.len(), 1, "the pending timer must stay pending");
@@ -1519,7 +1705,7 @@ mod tests {
         }
 
         tokio::time::advance(Duration::from_secs(4990)).await;
-        wait_for_records(&runs, 2).await;
+        wait_for_records(&handler, 2).await;
         let recorded = runs.lock().expect("run log lock should stay open").clone();
         assert_eq!(recorded[1].0, waiting);
     }
@@ -1607,12 +1793,14 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel();
         let key = test_key();
         handle
             .set_inbound_handler(Arc::new(SlowSyncHandler {
                 runs: runs.clone(),
                 started: started.clone(),
                 finished: finished.clone(),
+                release: Arc::new(Mutex::new(released)),
             }))
             .await;
         fire_timer(&handle, key.clone()).await;
@@ -1645,6 +1833,7 @@ mod tests {
         };
         assert_eq!(count, 1, "the force-stopped run must stay owned");
 
+        release.send(()).expect("the handler waits for its release");
         tokio::time::timeout(Duration::from_secs(1), finished.notified())
             .await
             .expect("handler should reach its completion");
@@ -1701,6 +1890,53 @@ mod tests {
             second.drained(),
             "the second drain must observe the same completion"
         );
+    }
+
+    #[tokio::test]
+    async fn handlers_wait_capacity() {
+        let mut state = SchedulerState::new(Arc::new(AtomicBool::new(false)));
+        state.handler_limit = 2;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        state.inbound_handler = Some(Arc::new(CountingGatedHandler {
+            runs: Arc::new(AtomicUsize::new(0)),
+            started: Arc::new(Notify::new()),
+            gate: gate.clone(),
+        }));
+        let (command_tx, mut command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+        let weak = command_tx.downgrade();
+        let now = Instant::now();
+        for key in [
+            TaskKey::DrainSyncOutbox,
+            TaskKey::DrainPruneQueue,
+            TaskKey::DrainRefreshQueue,
+        ] {
+            state.reset_timer((key, None), Duration::ZERO, now);
+        }
+        state.dispatch_due_timers(now, &weak);
+        assert_eq!(state.running_by_id.len(), 2);
+        assert!(
+            state
+                .timers_by_key
+                .contains_key(&TaskKey::DrainRefreshQueue)
+        );
+        assert!(
+            state.next_deadline().is_none_or(|deadline| deadline > now),
+            "a full scheduler does not wake for the waiting deadline"
+        );
+        gate.add_permits(1);
+        let Some(TaskCommand::HandlerCompleted {
+            run_id,
+            key,
+            elapsed,
+        }) = command_rx.recv().await
+        else {
+            panic!("a handler completes");
+        };
+        state.complete_handler(run_id, key, elapsed, Instant::now(), &weak);
+        state.dispatch_due_timers(Instant::now(), &weak);
+        assert_eq!(state.running_by_id.len(), 2);
+        assert!(state.timers_by_key.is_empty(), "the waiting deadline ran");
+        gate.add_permits(2);
     }
 
     // A drain waiter that the scheduler drops without a completion is not a
@@ -1865,6 +2101,7 @@ mod tests {
         runs: Arc<AtomicUsize>,
         started: Arc<Notify>,
         finished: Arc<Notify>,
+        release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
     }
 
     #[async_trait]
@@ -1872,7 +2109,9 @@ mod tests {
         async fn handle_timer(&self, _key: TaskKey) {
             self.runs.fetch_add(1, Ordering::SeqCst);
             self.started.notify_one();
-            std::thread::sleep(Duration::from_millis(150));
+            let release = self.release.lock().expect("release lock should stay open");
+            release.recv().expect("the test releases the section");
+            drop(release);
             self.finished.notify_one();
         }
     }
@@ -1886,12 +2125,14 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel();
         let key = test_key();
         handle
             .set_inbound_handler(Arc::new(SlowSyncHandler {
                 runs: runs.clone(),
                 started: started.clone(),
                 finished: finished.clone(),
+                release: Arc::new(Mutex::new(released)),
             }))
             .await;
         fire_timer(&handle, key.clone()).await;
@@ -1921,6 +2162,7 @@ mod tests {
         };
         assert_eq!(count, 1, "the aborted run must stay owned until completion");
 
+        release.send(()).expect("the handler waits for its release");
         tokio::time::timeout(Duration::from_secs(1), finished.notified())
             .await
             .expect("handler should reach its completion");
@@ -1952,14 +2194,19 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(Notify::new());
         let finished = Arc::new(Notify::new());
+        let (release, released) = std::sync::mpsc::channel();
         let key = test_key();
         handle
             .set_inbound_handler(Arc::new(SlowSyncHandler {
                 runs: runs.clone(),
                 started: started.clone(),
                 finished: finished.clone(),
+                release: Arc::new(Mutex::new(released)),
             }))
             .await;
+        // One thread runs the test and the handler, so both runs are released up front.
+        release.send(()).expect("the handler waits for its release");
+        release.send(()).expect("the handler waits for its release");
         fire_timer(&handle, key.clone()).await;
         tokio::time::timeout(Duration::from_secs(1), started.notified())
             .await
@@ -1972,7 +2219,7 @@ mod tests {
             .await;
         fire_timer(&handle, key.clone()).await;
 
-        wait_for_runs(&runs, 2).await;
+        wait_for_runs(&runs, &started, 2).await;
     }
 
     // Repeating shutdown after handlers were already drained is a clean no-op
@@ -2009,7 +2256,7 @@ mod tests {
         };
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_ignores_running() {
         let handle = TaskHandle::new();
         let runs = Arc::new(AtomicUsize::new(0));
@@ -2064,7 +2311,7 @@ mod decision_tests {
         let mut state = state();
         let start = Instant::now();
         let key = key();
-        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        state.reset_timer((key.clone(), None), Duration::from_secs(10), start);
         let (tx, _rx) = mpsc::channel(1);
         let weak = tx.downgrade();
 
@@ -2080,20 +2327,41 @@ mod decision_tests {
         );
     }
 
+    // A cancellation acknowledged while a handler runs also drops the firing that waited for it.
+    #[test]
+    fn cancel_drops_refire() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.in_flight_keys.insert(key.clone(), 1);
+        state.reset_timer((key.clone(), None), Duration::ZERO, start);
+        let (tx, _rx) = mpsc::channel(1);
+        state.dispatch_due_timers(start, &tx.downgrade());
+        assert!(
+            state.refire_requested.contains_key(&key),
+            "the firing waits"
+        );
+        state.cancel_timer(key.clone());
+        assert!(
+            !state.refire_requested.contains_key(&key),
+            "no run follows the cancel"
+        );
+    }
+
     #[test]
     fn shorten_earlier_deadlines() {
         let mut state = state();
         let start = Instant::now();
         let key = key();
-        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        state.reset_timer((key.clone(), None), Duration::from_secs(10), start);
 
-        state.shorten_timer(key.clone(), Duration::from_secs(30), start);
+        state.shorten_timer((key.clone(), None), Duration::from_secs(30), start);
         assert_eq!(
             state.timers_by_key.get(&key).unwrap().deadline,
             start + Duration::from_secs(10),
             "a later request keeps the existing deadline"
         );
-        state.shorten_timer(key.clone(), Duration::from_secs(5), start);
+        state.shorten_timer((key.clone(), None), Duration::from_secs(5), start);
         assert_eq!(
             state.timers_by_key.get(&key).unwrap().deadline,
             start + Duration::from_secs(5),
@@ -2124,7 +2392,7 @@ mod decision_tests {
         let mut state = state();
         let start = Instant::now();
         let key = key();
-        state.reset_timer(key.clone(), Duration::from_secs(10), start);
+        state.reset_timer((key.clone(), None), Duration::from_secs(10), start);
         assert!(!state.timers_by_deadline.is_empty());
 
         state.cancel_timer(key.clone());

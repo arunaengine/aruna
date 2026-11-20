@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id_mint::IdMint;
+use aruna_core::metadata::api::IdentifierMatch;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
-use aruna_core::structs::PersistentIdMapping;
-use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
-use serde::{Deserialize, Serialize};
+use aruna_core::structs::persistent_id::PersistentIdMapping;
+use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use ulid::Ulid;
 
 use crate::metadata::id_mapping::{
@@ -39,6 +39,8 @@ pub struct AddIdentifiersOperation {
     input: AddIdentifiersInput,
     step: Step,
     merged: Option<PersistentIdMapping>,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl AddIdentifiersOperation {
@@ -47,6 +49,8 @@ impl AddIdentifiersOperation {
             input,
             step: Step::Read,
             merged: None,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -64,7 +68,8 @@ impl AddIdentifiersOperation {
             .input
             .occurred_at_ms
             .max(mapping.revision.occurred_at_ms.saturating_add(1));
-        merged.revision = mapping_revision(&self.input.route, occurred_at_ms);
+        let event_id = self.ids.mint(self.now_ms);
+        merged.revision = mapping_revision(&self.input.route, event_id, occurred_at_ms);
         let Some(fence) = fence_call(&self.input.route) else {
             return self.write(merged);
         };
@@ -79,7 +84,8 @@ impl AddIdentifiersOperation {
     }
 
     fn write(&mut self, merged: PersistentIdMapping) -> AddTurn {
-        let writes = transition_entries(&self.input.route, &merged)?;
+        let outbox_id = self.ids.mint(self.now_ms);
+        let writes = transition_entries(&self.input.route, &merged, outbox_id)?;
         self.step = Step::Write;
         self.merged = Some(merged);
         Ok(Next::Call(IoCall::Write(writes)))
@@ -92,6 +98,14 @@ impl Operation for AddIdentifiersOperation {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
     fn first(&mut self) -> AddTurn {
@@ -107,20 +121,11 @@ impl Operation for AddIdentifiersOperation {
                 self.write(merged)
             }
             Step::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done((self.take_merged()?, true)))
             }
         }
     }
-}
-
-/// One readable document that holds a looked-up identifier.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IdentifierMatch {
-    pub document_id: Ulid,
-    /// The document's w3id PID once it is active.
-    pub pid: Option<String>,
-    pub origin: IdentifierOrigin,
 }
 
 /// Merges answers from several nodes: one entry per document, `Published` first, then by id.
@@ -152,10 +157,10 @@ pub(crate) mod tests {
     use aruna_core::calls::IoError;
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, SECONDARY_ID_KEYSPACE};
-    use aruna_core::structs::PersistentIdRevision;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::secondary_id::SecondaryIdKind;
+    use aruna_core::structs::persistent_id::PersistentIdRevision;
+    use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 
     pub(crate) fn mapping(document_id: Ulid) -> PersistentIdMapping {
         PersistentIdMapping::requested(

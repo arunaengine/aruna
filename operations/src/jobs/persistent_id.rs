@@ -2,21 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::{
+    MintPersistentSpec, PersistentIdFailure, PersistentIdMapping,
+};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
-use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure, PersistentIdMapping};
 use ulid::Ulid;
 
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::persistent_id::forward::{PidNode, PidRouteOperation, outcome_mapping};
-use crate::metadata::protocol::{PersistentIdOutcome, PersistentIdRequest};
 use aruna_core::jobs::JobRunOutcome;
+use aruna_core::metadata::protocol::{PersistentIdOutcome, PersistentIdRequest};
 
 /// How long identifier registration waits for a missing mapping without using attempts.
 const IDENTIFIER_WAIT_MS: u64 = 600_000;
@@ -215,10 +217,10 @@ impl Operation for RegisterIdentifiersOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::JobId;
-    use aruna_core::structs::{PersistentIdRevision, PersistentIdStatus};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::persistent_id::{PersistentIdRevision, PersistentIdStatus};
+    use aruna_core::user::id::UserId;
 
     use super::*;
 

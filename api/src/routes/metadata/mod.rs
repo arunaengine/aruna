@@ -22,7 +22,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 #[derive(OpenApi)]
-#[openapi(components(schemas(crate::metadata::MetadataRoCrateView)))]
+#[openapi(components(schemas(crate::metadata::model::MetadataRoCrateView)))]
 pub struct MetadataApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

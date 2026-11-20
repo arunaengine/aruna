@@ -9,7 +9,7 @@ use crate::effects::{
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::key_index::IndexEvent;
 use crate::metadata::MetadataEvent;
-use crate::node_vault::VaultEntry;
+use crate::node::vault::VaultEntry;
 use crate::outbound::OutboundEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::execution::source_access::{
@@ -25,7 +25,6 @@ use crate::structs::storage::encryption::{
     BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
 };
 use crate::structs::storage::multipart::{BackendUpload, PartPiece, WorkingShare};
-use crate::structs::storage::replication::{ReplicationItemError, ReplicationSuboperationResult};
 use crate::structs::storage::routing::GroupRoutingInputs;
 use crate::{
     document::DocumentNetEvent,
@@ -119,9 +118,6 @@ pub enum SubOperationEvent {
     AuthorizationResult {
         allowed: Result<bool, AuthorizationError>,
     },
-    RealmNodesResult {
-        result: Result<Vec<NodeId>, String>,
-    },
     DocumentSyncResult {
         result: Result<(), String>,
     },
@@ -130,15 +126,6 @@ pub enum SubOperationEvent {
     },
     VersionAccessResolved {
         result: Result<ResolvedSourceAccess, SourceResolutionError>,
-    },
-    ReplicationItemResult {
-        result: Result<ReplicationSuboperationResult, ReplicationItemError>,
-    },
-    ReplicationTransferResult {
-        result: Result<(), String>,
-    },
-    ReplicationApplyResult {
-        result: Result<(), String>,
     },
     LiveReplicationQueued {
         result: Result<(), String>,
@@ -166,23 +153,6 @@ pub enum SubOperationEvent {
     /// BLAKE3 digests of the saved payloads of a user's vault heads; empty without a vault.
     VaultHeld {
         result: Result<Vec<[u8; 32]>, String>,
-    },
-    KeyRequestsOpened {
-        request_ids: Vec<Ulid>,
-    },
-    /// A key request run failed and may succeed on retry.
-    KeyRequestsFailed,
-    /// The key directory answer for one user.
-    KeysLooked {
-        lookup: crate::structs::storage::holders::KeyLookup,
-    },
-    /// Whether a bucket sealed a missing key copy for a holder's new user key.
-    CopySealed {
-        sealed: bool,
-    },
-    /// Whether one parked copy job woke; the row of its wait is gone either way.
-    CopyWoken {
-        result: Result<bool, String>,
     },
     /// The emission stored no notification; its failure as text.
     NotificationsFailed {
@@ -373,6 +343,10 @@ pub enum BlobEvent {
     Remote(
         Result<crate::repository::remote::RemoteAnswer, crate::repository::remote::RemoteFailure>,
     ),
+    /// A collected stream went past the byte limit its read set; the rest was not read.
+    StreamTooLarge {
+        limit: u64,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -451,8 +425,11 @@ pub enum StorageEvent {
     TransactionStarted {
         txn_id: TxnId,
     },
+    /// `sequence` orders this store's commits: a write commit takes the next number, and a
+    /// read-only one answers the number of the last write commit before it.
     TransactionCommitted {
         txn_id: TxnId,
+        sequence: u64,
     },
     TransactionAborted {
         txn_id: TxnId,
@@ -523,13 +500,13 @@ pub enum NetEvent {
     /// The last contact of each asked peer this node saw, in unix milliseconds.
     PeerContacts(std::collections::BTreeMap<NodeId, u64>),
     /// This node's id, or `None` on a node without a net handle.
-    LocalNode(Option<crate::NodeId>),
+    LocalNode(Option<crate::id::NodeId>),
     /// The realm this node serves, `None` without a network.
     LocalRealm(Option<crate::structs::identity::realm::RealmId>),
     /// Whether the issuer key is a valid public key; `false` also when it went unchecked.
     IssuerKey(bool),
     /// This node's id and the holders its watch interest matches; `None` without a net handle.
-    WatchHolders(Option<(crate::NodeId, Vec<crate::NodeId>)>),
+    WatchHolders(Option<(crate::id::NodeId, Vec<crate::id::NodeId>)>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
     /// Whether the peer set follows the configuration, or why it does not.
@@ -565,7 +542,7 @@ pub enum NetEvent {
     TopicPeers(Result<(), TopicPeerError>),
     /// The asked peers a topic lacks, `None` without the topic's state here, or why it is
     /// unreadable.
-    MissingTopicPeers(Result<Option<Vec<crate::NodeId>>, String>),
+    MissingTopicPeers(Result<Option<Vec<crate::id::NodeId>>, String>),
     ConfigCatchUp(CatchUpEvent),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
@@ -718,7 +695,7 @@ pub enum VaultSignEvent {
 /// whose set names this node as publisher.
 #[derive(Debug, PartialEq)]
 pub enum SnapshotSignEvent {
-    Signed(Box<crate::structs::storage::distribution::SignedSnapshot>),
+    Signed(Box<crate::structs::storage::distribution::snapshot::SignedSnapshot>),
     Unavailable(String),
 }
 
@@ -726,7 +703,7 @@ pub enum SnapshotSignEvent {
 /// that names this node as signer.
 #[derive(Debug, PartialEq)]
 pub enum StatementSignEvent {
-    Signed(Box<crate::structs::storage::distribution::SignedStatement>),
+    Signed(Box<crate::structs::storage::distribution::statement::SignedStatement>),
     Unavailable(String),
 }
 
@@ -734,7 +711,7 @@ pub enum StatementSignEvent {
 /// that names this node as publisher.
 #[derive(Debug, PartialEq)]
 pub enum ExecutionSignEvent {
-    Signed(Box<crate::structs::execution::job::JobRecordEnvelope>),
+    Signed(Box<crate::structs::execution::job::family::JobRecordEnvelope>),
     Unavailable(String),
 }
 
@@ -1054,6 +1031,7 @@ impl Event {
                     BucketExists,
                     BucketDeleted,
                     Remote,
+                    StreamTooLarge,
                 }
             ),
             Event::StagingSource(event) => variant_label!(
@@ -1149,13 +1127,9 @@ impl Event {
                     GroupWritten,
                     DepthLimitExceeded,
                     AuthorizationResult,
-                    RealmNodesResult,
                     DocumentSyncResult,
                     SourceConnectorResolved,
                     VersionAccessResolved,
-                    ReplicationItemResult,
-                    ReplicationTransferResult,
-                    ReplicationApplyResult,
                     LiveReplicationQueued,
                     RefreshQueued,
                     BucketCreated,
@@ -1165,11 +1139,6 @@ impl Event {
                     TokenRevoked,
                     UserUpdated,
                     VaultHeld,
-                    KeyRequestsOpened,
-                    KeyRequestsFailed,
-                    KeysLooked,
-                    CopySealed,
-                    CopyWoken,
                     NotificationsFailed,
                 }
             ),

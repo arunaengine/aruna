@@ -7,14 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::protocol::{
+    MAX_MESSAGE_SIZE, METADATA_IO_TIMEOUT, MetadataTransportMessage, POSTCARD_VARIANT_BYTES,
+    check_header, check_variant, decode_frame, encode_frame, transport_message_kind, variant_read,
+};
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_net::streams::BiStream;
 use aruna_operations::metadata::audit::AUDIT_DEADLINE_SECS;
-use aruna_operations::metadata::protocol::{
-    MAX_MESSAGE_SIZE, METADATA_IO_TIMEOUT, MetadataTransportMessage, POSTCARD_VARIANT_BYTES,
-    check_header, check_variant, decode_frame, encode_frame, variant_read,
-};
-use aruna_operations::metadata::transport_message_kind;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, timeout, timeout_at};
@@ -168,15 +167,15 @@ pub(crate) async fn write_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::audit::{AuditPageEntry, AuditPageResponse};
+    use aruna_core::metadata::protocol::{
+        AUDIT_FRAME, AUDIT_REQUEST_VARIANT, INBOUND_FRAME_BYTES, STANDARD_FRAME, audit_frame_cap,
+    };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
-    use aruna_operations::metadata::protocol::{
-        AUDIT_FRAME, AUDIT_REQUEST_VARIANT, INBOUND_FRAME_BYTES, STANDARD_FRAME, audit_frame_cap,
-    };
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     async fn read_capped(

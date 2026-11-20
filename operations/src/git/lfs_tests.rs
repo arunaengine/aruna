@@ -75,7 +75,7 @@ fn unknown_group_reads() {
     assert_eq!(write.first(), Err(GitError::Invalid));
     let mut read = PermitObjectOperation::new(&auth(), &object, Permission::READ);
     read.first().unwrap();
-    let refused = BaoReadError::Refused(crate::replication::protocol::BaoReadRefusal::NotFound);
+    let refused = BaoReadError::Refused(aruna_core::replication_protocol::BaoReadRefusal::NotFound);
     let answer = read.next(child(Err::<BaoReadOutput, _>(refused)));
     assert_eq!(answer, Err(GitError::NotFound));
 }

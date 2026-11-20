@@ -5,10 +5,13 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionReceipt, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
+use aruna_core::structs::execution::job::family::{
+    EffectiveResources, ExecutionReceipt, JobFamilyRecord, JobRecordBody, JobRecordEnvelope,
     JobRecordKind, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::record_keys::{alias_key, record_key};
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
 
@@ -18,8 +21,6 @@ use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::tests::records::Family;
-use aruna_core::structs::execution::job::record_keys::{alias_key, record_key};
-use aruna_core::structs::execution::job::record_rows::to_bytes;
 
 fn fixture() -> Family {
     Family::new([5u8; 32])

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::id_mint::IdMint;
+use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, HashSet};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -11,9 +12,10 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+    WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
+    watch_resource_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -31,25 +33,24 @@ use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluators};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::auth::request_authorization::{AuthorizeOperation, GroupRulesOperation};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use crate::distribution::resolve::{
     MAX_CONTENT_VERSIONS, ResolveError, content_versions, indexed_key,
 };
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{QuotaOperation, RoutingInputsError};
-use crate::notifications::watch::origin::EmitEventOperation;
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::{BaoReadError, IncomingBaoOperation, IncomingBaoResult};
-use crate::replication::locations::{LocalSummary, LocationSummaryError, LocationSummaryOperation};
-use crate::replication::protocol::{
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::local::{LocalSummary, LocationSummaryOperation};
+use crate::s3::bucket::write_guard::{BucketGuardError, BucketGuardOperation};
+use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::replication_protocol::{
     BaoReadRequest, BaoReadTarget, LocationSummaryRequest, VersionReplicationManifest,
     VersionReplicationMessage,
 };
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::bucket_guard::{BucketGuardError, BucketGuardOperation};
-use crate::staging::offered_directory::OfferedDirectoryError;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 type StreamTurn = Result<Next<()>, IoError>;
 type ManifestPaths = (Option<String>, Option<String>);
@@ -413,13 +414,20 @@ impl Operation for AcceptVersionOperation {
             },
             AcceptStep::Incoming => {
                 match result.child::<IncomingVersionResult, IncomingVersionError>()? {
-                    Ok(applied) => match self.watch_event(&applied) {
-                        Some(event) => {
-                            self.step = AcceptStep::Emit;
-                            Ok(Next::Call(IoCall::child(EmitEventOperation::new(event))))
+                    Ok(applied) => {
+                        let entry = self.watch_event(&applied).as_ref().map(watch_event_entry);
+                        match entry {
+                            Some(Ok(entry)) => {
+                                self.step = AcceptStep::Emit;
+                                Ok(Next::Call(outside_call(IoCall::Write(vec![entry]))))
+                            }
+                            Some(Err(error)) => {
+                                warn!(%error, "A replicated watch event was not queued");
+                                Ok(Next::Done(()))
+                            }
+                            None => Ok(Next::Done(())),
                         }
-                        None => Ok(Next::Done(())),
-                    },
+                    }
                     Err(error) => {
                         error!(error = ?error, "Failed to process inbound version replication stream");
                         self.refuse()
@@ -427,7 +435,16 @@ impl Operation for AcceptVersionOperation {
                 }
             }
             // Failures only warn inside the operation.
-            AcceptStep::Emit => Ok(Next::Done(())),
+            // A failed queue write only warns, as a failed emission did.
+            AcceptStep::Emit => {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
+                    warn!(%error, "A replicated watch event was not queued");
+                }
+                Ok(Next::Then {
+                    output: (),
+                    calls: vec![IoCall::from(schedule_watch_drain())],
+                })
+            }
             AcceptStep::Close => closed(result),
         }
     }
@@ -797,9 +814,9 @@ impl Operation for ManifestPolicyOperation {
                 // Denied like a missing policy, so the sender stops and no destination is
                 // created. An unbound folder stays `Deleting` until its row is gone.
                 let guard = result.child::<(), BucketGuardError>()?;
-                match guard.map_err(OfferedDirectoryError::from) {
+                match guard {
                     Ok(()) => {}
-                    Err(OfferedDirectoryError::ReadOnly(_)) => return Ok(Next::Done((None, None))),
+                    Err(BucketGuardError::ReadOnly(_)) => return Ok(Next::Done((None, None))),
                     Err(error) => return Err(policy_failed(error)),
                 }
                 let bucket = GetBucketOperation::new(self.manifest.bucket.clone());

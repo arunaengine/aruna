@@ -6,15 +6,14 @@
 #[path = "persistent_id_forward.rs"]
 pub mod forward;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_retry};
-use aruna_core::rows::{read_row, value};
-use aruna_core::structs::PersistentIdMapping;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::persistent_id_key;
+use aruna_core::structs::persistent_id::{PersistentIdMapping, persistent_id_key};
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use ulid::Ulid;
 
@@ -23,7 +22,7 @@ use crate::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route
 use crate::metadata::pid_transition::{PidOutcome, PidTransition, PidTransitionOperation};
 use crate::metadata::secondary_ids::{AddIdentifiersInput, AddIdentifiersOperation};
 use crate::realm::load_config::config_unavailable;
-use crate::sync::outbox_record::schedule_drain_effect;
+use crate::sync::outbox::record::schedule_drain_effect;
 
 /// Reads one document's persistent identifier mapping, if it has one.
 #[derive(Debug, PartialEq)]
@@ -50,7 +49,8 @@ impl Operation for MappingReadOperation {
         &mut self,
         result: IoResult,
     ) -> Result<Next<Option<PersistentIdMapping>>, PersistentIdError> {
-        let mapping = value(result)?
+        let mapping = result
+            .value()?
             .map(|bytes| PersistentIdMapping::from_bytes(bytes.as_ref()))
             .transpose()
             .map_err(PersistentIdError::Conversion)?;
@@ -222,8 +222,8 @@ impl Operation for PidChangeOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::handle::Handle;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
 
     async fn change(
@@ -281,10 +281,10 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
     use aruna_core::storage_entries::registry_write_entries;
-    use aruna_core::structs::PersistentIdStatus;
-    use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::persistent_id::PersistentIdStatus;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord,
@@ -298,15 +298,15 @@ mod tests {
     }
 
     fn context_at(path: &str) -> DriverContext {
-        crate::testing::path_context(path)
+        aruna_drivers::testing::path_context(path)
     }
 
     fn realm() -> RealmId {
         RealmId([3; 32])
     }
 
-    fn user() -> aruna_core::UserId {
-        aruna_core::UserId::local(Ulid::from_bytes([2; 16]), realm())
+    fn user() -> aruna_core::user::id::UserId {
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([2; 16]), realm())
     }
 
     fn record(document_id: Ulid) -> MetadataRegistryRecord {
@@ -356,12 +356,12 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&None, 1),
+            mapping_revision(&None, Ulid::generate(), 1),
         );
         match ctx
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
-                writes: transition_entries(&None, &mapping).unwrap(),
+                writes: transition_entries(&None, &mapping, Ulid::generate()).unwrap(),
                 txn_id: None,
             }))
             .await
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(read_mapping(&ctx, id).await.unwrap().unwrap(), mapping);
     }
 
-    fn node() -> aruna_core::NodeId {
+    fn node() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[1; 32]).public()
     }
 
@@ -576,8 +576,8 @@ mod tests {
         // resolved the old holders must not commit its outbox row afterwards.
         let (ctx, _dir) = context();
         let config = activated_config();
-        use aruna_core::StructuredId;
-        let document_id = aruna_core::MetaResourceId::from_parts(
+        use aruna_core::structured_id::StructuredId;
+        let document_id = aruna_core::structured_id::MetaResourceId::from_parts(
             13,
             aruna_core::structured_id::PlacementHandle::new(
                 aruna_core::structs::placement::record::METADATA_HANDLE,
@@ -599,9 +599,11 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&Some(route.clone()), 1),
+            mapping_revision(&Some(route.clone()), Ulid::generate(), 1),
         );
-        let writes = transition_entries(&Some(route.clone()), &mapping).expect("entries build");
+        let outbox_id = Ulid::generate();
+        let writes = transition_entries(&Some(route.clone()), &mapping, outbox_id);
+        let writes = writes.expect("entries build");
         assert_eq!(outbox_row(&writes).generation, 1);
 
         assert!(fence_open(&ctx, &route).await);
@@ -644,7 +646,7 @@ mod tests {
             JobId::from_bytes([7; 16]),
             true,
             record(document_id).permission_path,
-            mapping_revision(&None, 1),
+            mapping_revision(&None, Ulid::generate(), 1),
         )
     }
 

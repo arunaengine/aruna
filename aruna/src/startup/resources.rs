@@ -6,35 +6,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::inbound::initialize_net_holder;
-use crate::tasks::incoming::{TaskQueues, install_task_queues};
+use crate::tasks::incoming::TaskQueues;
+use crate::tasks::incoming::restore::install_task_queues;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
-use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
-use aruna_core::NodeId;
+use aruna_blob::blob::registry::BackendRegistry;
+use aruna_blob::blob::{BlobHandle, BlobHandler};
 use aruna_core::egress::EgressPolicy;
+use aruna_core::id::NodeId;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::{GraphHandle, GraphOptions};
-use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::distribution::sharding::begin_range_rebuilds;
+use aruna_net::NetHandle;
+use aruna_net::config::NetConfig;
+use aruna_operations::groups::deletion::coordinator::InstallOnboardingOperation;
 use aruna_operations::metadata::projection::{DEFAULT_SKEW_MS, store_clock_skew};
-use aruna_operations::metadata::provenance::ForgetSpoolOperation;
+use aruna_operations::metadata::provenance::export::ForgetSpoolOperation;
 use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::usage_publish::PublishUsageOperation;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::shard::recovery::RecoveryStatus;
-use aruna_storage::FjallPersistPolicy;
+use aruna_operations::transfer::sharding::begin_range_rebuilds;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
-use crate::config::{Config, open_storage, resolve_config};
-use crate::plugin_host::plugin_work::PluginWorkHandler;
-use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
+use aruna_config::settings::Settings;
+use aruna_config::{Config, open_storage, resolve_config};
 
 /// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
 const RECORD_LIMITS: aruna_drivers::recorder::RecordLimits =
@@ -69,7 +72,7 @@ pub struct NodeResources {
 /// The resources acquired so far. Infallible ownership is created up front;
 /// every fallible acquisition assigns its resource before the next step runs.
 struct Acquired {
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     shutdown: Shutdown,
@@ -88,9 +91,11 @@ struct Acquired {
 }
 
 impl Acquired {
-    fn new(storage_handle: aruna_storage::StorageHandle, task_handle: TaskHandle) -> Self {
+    fn new(
+        storage_handle: aruna_storage::storage::handle::StorageHandle,
+        task_handle: TaskHandle,
+    ) -> Self {
         let jobs_runtime = JobsRuntime::new_paused();
-        jobs_runtime.register_handler(Arc::new(PluginWorkHandler));
         Self {
             storage_handle,
             task_handle,
@@ -249,7 +254,7 @@ pub(crate) async fn acquire(
     }
     // Parsing operator settings is pure; the store is the first owned
     // resource, established before identity and enrollment I/O.
-    let settings = crate::settings::read_settings()?;
+    let settings = aruna_config::settings::read_settings()?;
     if settings.event_recording {
         aruna_drivers::recorder::enable(RECORD_LIMITS);
     }
@@ -274,7 +279,7 @@ pub(crate) async fn acquire(
 /// a partial one is a typed error; `on_drain` arms escalation before each drain.
 pub(crate) async fn acquire_with_storage(
     settings: Settings,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     stop: &tokio_util::sync::CancellationToken,
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
@@ -332,7 +337,7 @@ pub(crate) async fn acquire_with_storage(
 #[cfg(test)]
 pub(crate) async fn acquire_resources(
     config: Config,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<NodeResources, Box<dyn std::error::Error>> {
@@ -372,7 +377,7 @@ async fn fill(
     );
     acquired
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::derive(
+        .open_vault(aruna_core::node::vault::NodeVaultKey::derive(
             &config.node_state.net_secret_key,
         ));
     // Only holders of the realm signing key derive the realm keys; storage opens with them.
@@ -394,7 +399,7 @@ async fn fill(
         .map_err(|error| std::io::Error::other(error.to_string()))?;
     if matches!(
         config.startup_mode,
-        crate::config::StartupMode::JoinRealm {
+        aruna_config::StartupMode::JoinRealm {
             phase: aruna_core::onboarding::OnboardingPhase::Bootstrapped
         }
     ) {
@@ -416,12 +421,8 @@ async fn fill(
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
-        let install = aruna_operations::groups::deletion::InstallOnboardingOperation::new(
-            &ticket,
-            config.realm_id,
-            config.node_id,
-            now,
-        );
+        let install =
+            InstallOnboardingOperation::new(&ticket, config.realm_id, config.node_id, now);
         aruna_drivers::driver::drive(install, &context).await?;
         stopped(stop)?;
     }
@@ -481,7 +482,7 @@ async fn fill(
 
     // Compute settings are collected once from the explicit process source at
     // the resource boundary, then passed into backend construction.
-    let compute_settings = crate::compute_setup::collect(&crate::settings::ProcessEnv)
+    let compute_settings = crate::compute_setup::collect(&aruna_config::settings::ProcessEnv)
         .map_err(std::io::Error::other)?;
     let compute = build_registry(config, &compute_settings)
         .await
@@ -720,11 +721,11 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
     use aruna_drivers::testing::test_context;
     use aruna_operations::node::counter_check::CounterCheckError;
-    use aruna_storage::StorageHandle;
+    use aruna_storage::storage::handle::StorageHandle;
     use tempfile::tempdir;
 
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
-        aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
             .expect("storage opens")
     }
 
@@ -996,8 +997,8 @@ mod tests {
     // subset: every later stage is absent and the store lock is given back.
     #[tokio::test]
     async fn stage_failure_releases() {
-        use crate::config::resolve_settings;
-        use crate::settings::read_settings_from;
+        use aruna_config::resolve_settings;
+        use aruna_config::settings::read_settings_from;
 
         let stages = [
             StartupStage::Net,
@@ -1045,7 +1046,7 @@ mod tests {
             );
 
             // Cleanup released every store handle: reopening the same root works.
-            let reopened = aruna_storage::FjallStorage::open(&path);
+            let reopened = aruna_storage::storage::worker::FjallStorage::open(&path);
             assert!(
                 reopened.is_ok(),
                 "{stage:?}: storage stayed locked after cleanup: {:?}",
@@ -1058,7 +1059,7 @@ mod tests {
     // generating, or persisting an identity or sending enrollment traffic.
     #[tokio::test]
     async fn cancelled_startup_skips() {
-        use crate::settings::read_settings_from;
+        use aruna_config::settings::read_settings_from;
 
         let temp = tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
@@ -1074,7 +1075,7 @@ mod tests {
         .into_iter()
         .collect();
         let settings = read_settings_from(&map).expect("settings parse");
-        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let storage = aruna_config::open_storage(&settings).expect("storage opens");
         let task_handle = TaskHandle::new();
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
@@ -1091,9 +1092,9 @@ mod tests {
         .expect("an accepted stop is not a failure");
         assert!(outcome.is_none());
 
-        let reopened =
-            aruna_storage::FjallStorage::open(&path).expect("cleanup released the store");
-        let identity = crate::identity::IdentityStore::from_storage(reopened);
+        let reopened = aruna_storage::storage::worker::FjallStorage::open(&path)
+            .expect("cleanup released the store");
+        let identity = aruna_config::identity::IdentityStore::from_storage(reopened);
         assert!(
             identity.load().await.unwrap().is_none(),
             "a pre-cancelled startup must not generate or persist an identity"

@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
-use crate::{NodeId, UserId};
+use crate::id::NodeId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 

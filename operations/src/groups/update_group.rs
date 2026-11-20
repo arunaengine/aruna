@@ -10,8 +10,9 @@ use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, DISPLAY_NAME_PATH};
-use aruna_core::rows::{done, values};
+use aruna_core::reducer::paths::DISPLAY_NAME_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -26,7 +27,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -408,14 +409,14 @@ impl Operation for GroupUpdate {
                 self.emit_write_state(group, reducer, config)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.fence_or_finish()
             }
             Stage::Fence => {
@@ -446,7 +447,6 @@ fn overlay_reducer_name(group: &mut Group, reducer_state: &AdminDocumentState) {
 #[cfg(test)]
 mod pure_tests {
     use super::{GroupUpdate, UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
@@ -461,6 +461,7 @@ mod pure_tests {
     use aruna_core::structs::identity::group::Group;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::GroupId;
+    use aruna_core::user::id::UserId;
     use byteview::ByteView;
     use ulid::Ulid;
 

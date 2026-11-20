@@ -7,24 +7,27 @@ use super::families::exact;
 use super::removals::outbox_record;
 use super::session_refs::{self, Layout, SESSION_REF};
 use crate::explorer::ExplorerError;
-use aruna_core::NodeId;
 use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeReservationSnapshot, JobReservationRecord,
 };
 use aruna_core::compute::{ExecutorAvailability, ResourceEnvelope};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
+use aruna_core::id::NodeId;
 use aruna_core::scheduling::{PlannedInput, RejectionVerdict, TargetScore};
-use aruna_core::structs::execution::job::{
-    JobId, JobRecord, LaunchRecord, LogicalJobSpec, PageManifest, SubmissionClaim, SubmissionId,
-    WitnessBudgetRecord,
+use aruna_core::structs::execution::job::family::{
+    LogicalJobSpec, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::launch::LaunchRecord;
+use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::structs::execution::job::pages::PageManifest;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization,
 };
-use aruna_operations::jobs::lifecycle::witness_arm::WitnessExplain;
+use aruna_operations::jobs::lifecycle::witness::arm::WitnessExplain;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};

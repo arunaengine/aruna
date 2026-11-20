@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{ShardManifest, ShardTransportMessage};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::placement::{bucket_membership, resolve_shard_holders};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -25,7 +25,7 @@ fn reject(reason: String) -> Result<Next<ManifestAnswer>, IoError> {
 }
 
 /// Serves one manifest request after checking the realm, the peer and this node's holdership.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ServeManifestOperation {
     local: (NodeId, RealmId),
     peer: NodeId,

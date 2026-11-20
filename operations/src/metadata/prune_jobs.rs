@@ -8,7 +8,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PRUNE_JOB_KEYSPACE;
 use aruna_core::metadata::GraphPruneRecord;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::{graph_prune_entry, graph_prune_key};
 use aruna_core::types::{Key, KeySpace, Value};
 
@@ -157,14 +157,14 @@ impl Operation for DuePruneOperation {
         match self.step {
             Step::Scan => self.scanned(result),
             Step::Write => {
-                done(result)?;
+                result.done()?;
                 self.step = Step::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Step::Delete => {
-                done(result)?;
+                result.done()?;
                 let unfinished = IoError::Unfinished;
                 Ok(Next::Done(self.due.take().ok_or(unfinished)?))
             }
@@ -222,7 +222,7 @@ impl Operation for RescheduleOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
-        done(result)?;
+        result.done()?;
         if self.written {
             return Ok(Next::Done(()));
         }
@@ -261,11 +261,10 @@ mod call_tests {
         (PRUNE_JOB_KEYSPACE.to_string(), Key::from(key.to_vec()))
     }
 
+    type Scanned = (Vec<(KeySpace, Key, Value)>, Vec<(KeySpace, Key)>, DuePrune);
+
     /// Scans `rows` as one page and returns the repair writes, deletes and the outcome.
-    fn scan(
-        rows: Vec<(Key, Value)>,
-        limit: usize,
-    ) -> (Vec<(KeySpace, Key, Value)>, Vec<(KeySpace, Key)>, DuePrune) {
+    fn scan(rows: Vec<(Key, Value)>, limit: usize) -> Scanned {
         let mut operation = DuePruneOperation::new(NOW_MS, limit);
         operation.first().unwrap();
         let page = IoResult::Page { rows, next: None };
@@ -366,8 +365,13 @@ mod call_tests {
     fn reschedule_moves_job() {
         let failed = job("urn:graph", 1, 0);
         let old_key = graph_prune_key(&failed).to_vec();
-        let mut operation =
-            RescheduleOperation::new(&[old_key.clone()], &failed, "down".into(), NOW_MS).unwrap();
+        let mut operation = RescheduleOperation::new(
+            std::slice::from_ref(&old_key),
+            &failed,
+            "down".into(),
+            NOW_MS,
+        )
+        .unwrap();
         assert_eq!(
             operation.transaction(),
             aruna_core::operation::TransactionMode::Write

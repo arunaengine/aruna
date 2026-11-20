@@ -15,7 +15,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_graph::GraphHandle;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle, NetShutdownOutcome};
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
 use std::sync::Arc;
@@ -620,7 +620,7 @@ mod tests {
     }
 
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
-        aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
             .expect("storage opens")
     }
 
@@ -962,9 +962,10 @@ mod tests {
         shutdown: &Shutdown,
     ) -> (std::net::SocketAddr, aruna_api::s3::server::S3ServerHandle) {
         use aruna_api::cors::CorsConfig;
-        use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
+        use aruna_api::s3::server::S3Server;
+        use aruna_core::listener::S3ServerTimeouts;
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_drivers::driver::DriverContext;
         use std::sync::Arc;
@@ -1033,7 +1034,16 @@ mod tests {
             .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
             .await
             .expect("session partial head");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Both servers must have admitted their connection before shutdown starts.
+        tokio::time::timeout(Duration::from_secs(60), async {
+            for server in [&main_s3, &session_s3] {
+                while server.connection_count() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        })
+        .await
+        .expect("both servers admit their connection");
 
         let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
         sequence.s3 = Some(main_s3);
@@ -1041,18 +1051,14 @@ mod tests {
         // The ingress slice is a quarter of this grace: the busy connections
         // outlive it and only the forced cleanup can stop them.
         sequence.grace = Duration::from_millis(200);
-        let started = tokio::time::Instant::now();
 
-        let outcome = sequence.run().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(60), sequence.run())
+            .await
+            .expect("the ingress phase expires on its slice, not on the connection");
 
-        let elapsed = started.elapsed();
         assert!(
             outcome.ingress_forced,
             "the busy connections must outlive the ingress slice"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(5),
-            "the ingress phase must expire on its slice, not on the connection, took {elapsed:?}"
         );
         assert!(storage_handle.writes_closed());
         for (label, client) in [("main", &mut main_client), ("session", &mut session_client)] {

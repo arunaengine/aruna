@@ -7,25 +7,26 @@ use std::collections::VecDeque;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, outside_answer, outside_call, read_row, value};
+use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntryState, FolderMode, FolderState, SyncActionRecord,
     SyncBase, SyncedFolder, WriteGuard,
 };
 use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::device::sync_status::ArmTimerOperation;
 
 use super::download::{Blob, FetchError, FetchRemoteOperation};
-use super::folders::{FolderError, list_entries, read_bound};
+use super::folders::FolderError;
 use super::materialize::{
     MaterializeEntryOperation, MaterializeError, MaterializeInput, MaterializeOutcome,
 };
@@ -33,6 +34,7 @@ use super::remove::RemoveEntryOperation;
 use super::repository::{
     SyncUpload, UploadState, action_entry, base_entry, base_key, upload_entry,
 };
+use crate::device::sync::folders::reads::{list_entries, read_bound};
 
 /// The identity of the bytes the owner acted on. A replace applies to exactly
 /// these bytes or to nothing.
@@ -282,7 +284,7 @@ fn write_call(rows: Vec<(String, Key, aruna_core::types::Value)>) -> IoCall {
 }
 
 fn row_written(result: IoResult) -> Result<(), ActionError> {
-    (outside_answer(result).and_then(done)).map_err(|_| ActionError::Unavailable)
+    (outside_answer(result).and_then(IoResult::done)).map_err(|_| ActionError::Unavailable)
 }
 
 /// What the pending call of an action on one entry answers.
@@ -480,7 +482,10 @@ impl Operation for EntryActionOperation {
     fn next(&mut self, result: IoResult) -> EntryTurn {
         match self.step {
             EntryStep::Base => {
-                let row = outside_answer(result).and_then(value).ok().flatten();
+                let row = outside_answer(result)
+                    .and_then(IoResult::value)
+                    .ok()
+                    .flatten();
                 let base = row.and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
                 self.decide(base.ok_or(ActionError::NotFound)?)
             }
@@ -572,7 +577,7 @@ mod operation_tests;
 #[cfg(test)]
 mod pure_tests {
     use super::queued_upload;
-    use aruna_core::structs::{EntrySide, EntryState, SyncBase};
+    use aruna_core::structs::synced_folder::{EntrySide, EntryState, SyncBase};
     use ulid::Ulid;
 
     fn base(local: Option<EntrySide>) -> SyncBase {

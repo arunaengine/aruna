@@ -14,14 +14,14 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::audit::{
     AUDIT_PAGE_LIMIT, AUDIT_PAGE_SIZE, AuditAggregate, ListAuditError, ListAuditOperation,
     ListAuditRequest, LocalPageOperation, decode_cursor,
 };
-use crate::metadata::protocol::MetadataReadError;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::MetadataReadError;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 #[derive(Debug, PartialEq)]
 enum ListStage {
@@ -298,8 +298,8 @@ pub(super) fn audit_member(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn realm() -> RealmId {

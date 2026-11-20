@@ -12,8 +12,9 @@ use serde_json::Value;
 use super::workspace::{ENTITY, PART, prefix, row_name};
 use super::{
     Awaiting, CrateFile, ExportState, GRAPH_END, Hop, PARTS_END, ProvenanceCrate, Target,
-    Workspace, entity_piece, part_piece,
+    entity_piece, part_piece,
 };
+use crate::metadata::provenance::workspace::Workspace;
 
 /// The reason a walk ends when the caller's credential ended.
 const REVOKED: &str = "the token expired or was revoked";

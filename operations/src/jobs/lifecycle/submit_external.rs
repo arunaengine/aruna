@@ -5,23 +5,24 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{ExecutionSpec, PageManifest, WorkspaceMode};
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::WorkspaceMode;
+use aruna_core::structs::execution::job::pages::PageManifest;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::LabelMatch;
+use aruna_core::user::id::UserId;
 
-use super::admit_here::{
+use super::admit::here::{
     AcceptedSubmission, AdmitHereOperation, LocalAdmission, placement_failure,
 };
 use super::advertised::{Advertised, AdvertisementsOperation};
 use super::forward::ForwardSubmissionOperation;
-use super::ids::{self, RequestIdentity, SubmissionRequest, SubmissionScope, store_workspace};
 use super::input_walk::InputCaller;
 use super::plan::missing_label;
 use super::resolve_inputs::{ResolveInputsOperation, ResolveScope, ResolvedInputs};
@@ -29,8 +30,11 @@ use super::submission_rules::{caller_of, family_view, is_device, pin_outputs, re
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{PageReadError, StoreEntriesOperation};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::submit::{SubmitJobError, mint_configured_job};
-use crate::jobs::submit_execution::validate_execution;
+use crate::jobs::submit::execution::validate_execution;
+use aruna_core::job_request::{
+    self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError, mint_configured_job,
+    store_workspace,
+};
 
 /// This node as a submission sees it: its identity, its clock and its fresh heartbeats.
 #[derive(Clone, Debug, PartialEq)]
@@ -285,7 +289,7 @@ impl Operation for SubmitExternalOperation {
         validate_execution(&mut submission.spec, mode, bucket.as_deref())?;
         store_workspace(&mut submission.spec, mode, bucket)
             .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-        self.labels = ids::required_labels(&self.submission.spec)
+        self.labels = job_request::required_labels(&self.submission.spec)
             .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
         let read = GetConfigOperation::new(self.node()?.realm_id);
         Ok(Next::Call(IoCall::child(read)))
@@ -414,7 +418,7 @@ mod tests {
 
     // Only a complete read proves that no executor carries a required label.
     #[test]
-    fn label_needs_full_read() {
+    fn label_reads_fully() {
         let config = Family::new([4; 32]).config;
         let answer = |unread| {
             let mut submit = operation();

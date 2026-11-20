@@ -5,25 +5,27 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugins::{ArtifactBytes, Chunk, MemoryPermit, PublishedPlugin};
 use aruna_core::realm_vault::FetchScope;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
+use bytes::Bytes;
 use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::copies::{Assembled, reserve_call, reserved};
-use super::copy_rows::{
-    CopyTotal, KeepChunk, ReadChunk, ReadLocal, SweepCopies, chunk_count, chunk_fits,
+use super::copy::rows::{
+    CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies, chunk_count, chunk_fits,
+    kept_digests,
 };
 use super::peer::{ask_peer, peer_answer};
 use super::rows::StoreError;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ArtifactError {
@@ -72,7 +74,7 @@ pub fn managers(config: &RealmConfigDocument) -> impl Iterator<Item = NodeId> + 
         .filter_map(|node| node.node_id.parse::<NodeId>().ok())
 }
 
-/// A checked artifact and whether it came from another node, so this node should keep it.
+/// A checked artifact and whether it came from another node; such a copy is kept here first.
 #[derive(Debug, PartialEq)]
 pub struct FetchedArtifact {
     pub copy: Assembled,
@@ -99,8 +101,22 @@ impl PartialEq for Arriving {
     }
 }
 
+/// A fetched, checked copy while this node keeps it, with its memory.
+#[derive(PartialEq)]
+struct Keeping {
+    bytes: Bytes,
+    memory: MemoryPermit,
+}
+
+impl std::fmt::Debug for Keeping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Keeping({} bytes)", self.bytes.len())
+    }
+}
+
 /// The published artifact with `digest`: this node's copy, else one from a management node, each
-/// chunk placed and sized exactly and the whole checked. The answer holds the bytes' memory.
+/// chunk placed and sized exactly, the whole checked and kept here. The answer holds the bytes'
+/// memory.
 #[derive(Debug, PartialEq)]
 pub struct FetchArtifact {
     plugin: PublishedPlugin,
@@ -111,6 +127,10 @@ pub struct FetchArtifact {
     arriving: Option<Arriving>,
     last: String,
     local_read: bool,
+    /// The digests the realm keeps, which bound a fresh copy kept here.
+    kept: BTreeSet<String>,
+    now_ms: u64,
+    storing: Option<Keeping>,
 }
 
 impl FetchArtifact {
@@ -132,6 +152,9 @@ impl FetchArtifact {
             arriving: None,
             last: "the realm has no other management node".to_string(),
             local_read: false,
+            kept: kept_digests(config),
+            now_ms: 0,
+            storing: None,
         })
     }
 
@@ -166,7 +189,7 @@ impl FetchArtifact {
         chunk: Chunk,
     ) -> Result<Next<FetchedArtifact>, ArtifactError> {
         let index = self.arriving.as_ref().map_or(0, |arriving| {
-            (arriving.bytes.len() as u64).div_ceil(super::copy_rows::CHUNK as u64) as u32
+            (arriving.bytes.len() as u64).div_ceil(super::copy::rows::CHUNK as u64) as u32
         });
         let placed = chunk.index == index && chunk.digest == self.plugin.digest;
         let same = (self.arriving.as_ref()).is_none_or(|arriving| arriving.total == chunk.total);
@@ -209,10 +232,13 @@ impl FetchArtifact {
         }
         let Arriving { bytes, memory, .. } = self.arriving.take().ok_or(IoError::Unfinished)?;
         match check_published(&bytes, &self.plugin) {
-            Ok(()) => Ok(Next::Done(FetchedArtifact {
-                copy: Assembled::new(bytes, memory),
-                fresh: true,
-            })),
+            Ok(()) => {
+                let (bytes, kept) = (Bytes::from(bytes), std::mem::take(&mut self.kept));
+                let digest = &self.plugin.digest;
+                let store = StoreCopy::keeping(kept, digest, bytes.clone(), self.now_ms);
+                self.storing = Some(Keeping { bytes, memory });
+                Ok(Next::Call(IoCall::child(store)))
+            }
             Err(error) => {
                 self.last = format!("{node}: {error}");
                 self.next_peer()
@@ -224,6 +250,10 @@ impl FetchArtifact {
 impl Operation for FetchArtifact {
     type Output = FetchedArtifact;
     type Error = ArtifactError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
 
     fn first(&mut self) -> Result<Next<FetchedArtifact>, ArtifactError> {
         Ok(Next::Call(IoCall::child(ReadLocal::new(
@@ -242,6 +272,11 @@ impl Operation for FetchArtifact {
                 return Ok(Next::Done(FetchedArtifact { copy, fresh }));
             }
             return self.next_peer();
+        }
+        if let Some(Keeping { bytes, memory }) = self.storing.take() {
+            result.child::<(), ArtifactError>()??;
+            let copy = Assembled::new(Vec::from(bytes), memory);
+            return Ok(Next::Done(FetchedArtifact { copy, fresh: true }));
         }
         if self.reserving.is_some() {
             return self.reserved_first(result);

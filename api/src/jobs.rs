@@ -6,28 +6,32 @@ use std::str::FromStr;
 
 use crate::job_service::read_owned_job;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
 use aruna_core::compute::session::{SessionAnswer, SessionError, SessionRequest};
 use aruna_core::id::NodeId;
+use aruna_core::job_request::{SubmissionScope, SubmitJobError};
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
-    InputSource, JobId, JobRecord, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputSelection, WorkspaceMode, WorkspaceOutput,
+    InputSource, OutputDestination, OutputSelection, WorkspaceOutput,
 };
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_core::user::id::UserId;
 use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget, InputMode as CommandInputMode, SubmitExecutionCommand,
     WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
+use aruna_operations::jobs::lifecycle::admit::here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::family_reads::{FamilyReportOperation, SessionJobOperation};
-use aruna_operations::jobs::lifecycle::ids::SubmissionScope;
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
@@ -37,8 +41,6 @@ use aruna_operations::jobs::local_run::{
 use aruna_operations::jobs::node_inputs::ingress_node;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::session::SessionOperation;
-use aruna_operations::jobs::submit::SubmitJobError;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use ulid::Ulid;
 
 use crate::auth::{ValidatedBearer, require_owner, require_unrestricted_auth};
@@ -46,7 +48,6 @@ use crate::error::ServerError;
 use crate::error::ServerResult;
 use crate::server::state::ServerState;
 use aruna_core::jobs::JobStatusView;
-use aruna_core::structs::execution::job::KeyWait;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::report::FamilyReport;
 use serde::Deserialize;
@@ -205,7 +206,7 @@ pub(crate) async fn admit_execution(
                 .map(|bearer| bearer.expires_at_secs().saturating_mul(1_000)),
         )
         .map_err(|error| JobRequestError::BadRequestMessage(error.to_string()))?;
-    if let Some(key) = aruna_core::structs::execution::job::plugin_tag(&command.tags) {
+    if let Some(key) = aruna_core::structs::execution::job::input::plugin_tag(&command.tags) {
         return Err(JobRequestError::BadRequestMessage(format!(
             "tag `{key}` is reserved for plugin tasks"
         )));
@@ -1021,7 +1022,7 @@ pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
 }
 
 pub(crate) fn output_response(
-    output: &aruna_core::structs::execution::job::OutputObject,
+    output: &aruna_core::structs::execution::job::local::OutputObject,
     endpoint_url: Option<&String>,
 ) -> JobOutputResponse {
     JobOutputResponse {

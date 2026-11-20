@@ -6,7 +6,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
-use aruna_core::node_vault::{NodeVaultKey, VaultEntry};
+use aruna_core::node::vault::{NodeVaultKey, VaultEntry};
 
 use super::sealing::fresh_nonce;
 
@@ -83,10 +83,11 @@ pub(super) fn vault_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FjallStorage, StorageHandle};
+    use crate::storage::handle::StorageHandle;
+    use crate::storage::worker::FjallStorage;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::events::Event;
-    use aruna_core::node_vault::VaultPurpose;
+    use aruna_core::node::vault::VaultPurpose;
     use aruna_core::types::{TxnId, Value};
     use ulid::Ulid;
 
@@ -282,7 +283,7 @@ mod tests {
             entry,
             revision: Ulid::from_bytes([6; 16]),
             sealed: vec![0; 40],
-            changed_by: aruna_core::UserId::local(Ulid::from_bytes([7; 16]), realm_id),
+            changed_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([7; 16]), realm_id),
             changed_at_ms: 1,
         };
         let effect = StorageEffect::RealmOpen(Box::new(RealmSealed::Record { realm_id, record }));

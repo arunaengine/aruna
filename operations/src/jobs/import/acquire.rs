@@ -9,7 +9,7 @@ use aruna_core::events::{BlobEvent, Event};
 use aruna_core::jobs::{ByteStream, JobEffect, JobEvent};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::repository::RepositoryPull;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::input::{
     ImportRoCrateSource, RoCrateMediaType, RoCrateUploadRecord,
 };
 use aruna_core::structs::identity::auth::Permission;
@@ -17,7 +17,7 @@ use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, object_permission_path};
 use ulid::Ulid;
 
-use super::upload::{ClaimUploadOperation, UploadClaimError};
+use super::upload::ClaimUploadOperation;
 use super::{
     ImportFailure, ImportInput, ImportRun, bucket_call, bucket_result, classify_blob, classify_get,
     classify_read, hidden_delete, job_call, permission_call, permission_result, precheck_size,
@@ -25,7 +25,7 @@ use super::{
     unexpected,
 };
 use crate::harvest::read_connector::ConnectorView;
-use crate::jobs::export::CrateJsonOperation;
+use crate::jobs::export::snapshot::CrateJsonOperation;
 use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::import::{AcquireOperation, AcquireRequest, Acquired};
 use crate::jobs::repository::pull::PullProgress;
@@ -34,6 +34,7 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation,
 use crate::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
+use aruna_core::job_request::UploadClaimError;
 
 /// What acquiring a source leaves.
 #[derive(Debug, PartialEq)]

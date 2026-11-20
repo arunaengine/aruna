@@ -6,20 +6,20 @@
 #![deny(unsafe_code)]
 #![recursion_limit = "256"]
 
-mod config;
-mod connection_pool;
+pub mod config;
+pub mod connection_pool;
 mod connectivity;
 mod construction;
 pub mod contacts;
 pub mod device_limits;
 pub mod dht;
 mod discovery;
-pub(crate) mod document_sync;
+pub mod document_sync;
 mod effect_handlers;
 pub mod error;
 mod eviction;
 pub mod frames;
-mod heartbeat;
+pub mod heartbeat;
 pub mod issuer_keys;
 pub mod job_control;
 pub mod notification;
@@ -40,7 +40,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
@@ -51,9 +50,10 @@ use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::execution::notification_watch::{WatchInterestEntry, WatchInterestTable};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::info::{NetState, NetworkDiagnosticsState};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{NetState, NetworkDiagnosticsState};
-use aruna_storage::StorageHandle;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};
@@ -64,16 +64,13 @@ use tokio_util::task::TaskTracker;
 use tracing::{Span, debug, warn};
 use ulid::Ulid;
 
-pub use ::irokle::net::IrohRuntimeConfig;
-pub use config::{
-    DiscoveryMethod, NetConfig, RelayMethod, format_endpoint_config, parse_endpoint_config,
-};
-pub use connection_pool::{Monitor, PoolCounts};
-pub use dht::DhtHandle;
-pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
-pub use error::{NetError, Result};
-pub use heartbeat::HeartbeatSlot;
-pub use streams::StreamsService;
+use config::{DiscoveryMethod, RelayMethod};
+use connection_pool::{Monitor, PoolCounts};
+use dht::handle::DhtHandle;
+use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
+use error::{NetError, Result};
+use heartbeat::HeartbeatSlot;
+use streams::StreamsService;
 
 use connection_pool::ConnectionPool;
 use connectivity::{
@@ -212,7 +209,7 @@ impl NetHandle {
     /// Signs a member statement when it names this node; see the `StatementSign` effect.
     pub fn sign_statement(
         &self,
-        claim: aruna_core::structs::storage::distribution::StatementClaim,
+        claim: aruna_core::structs::storage::distribution::statement::StatementClaim,
     ) -> aruna_core::events::StatementSignEvent {
         effect_handlers::sign_statement(self.inner.endpoint.secret_key(), claim)
     }

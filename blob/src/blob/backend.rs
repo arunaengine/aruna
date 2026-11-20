@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN, PARTS_PREFIX};
 use aruna_core::types::TxnId;
-use aruna_storage::storage::TransactionOwner;
+use aruna_storage::storage::owner::TransactionOwner;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;
@@ -461,9 +461,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -593,9 +593,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -929,9 +929,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
                 Ok(())
@@ -1036,9 +1036,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
                 Ok(ReleaseUpdate::Applied)
@@ -1262,9 +1262,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await;
         match event {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -1616,7 +1616,7 @@ mod split_tests {
             backend_path: backend_path.to_string(),
             ulid: Ulid::nil(),
             format: StoredFormat::default(),
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
             partial: false,

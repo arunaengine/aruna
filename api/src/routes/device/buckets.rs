@@ -20,7 +20,8 @@ use crate::server::state::ServerState;
 use aruna_core::id::NodeId;
 use aruna_core::structs::storage::group_backend::valid_bucket;
 use aruna_drivers::driver::drive;
-use aruna_operations::device::sync::folders::{RealmBucketInput, create_realm_bucket};
+use aruna_operations::device::sync::folders::RealmBucketInput;
+use aruna_operations::device::sync::folders::bind::create_realm_bucket;
 
 use super::folders::map_folder_error;
 

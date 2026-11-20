@@ -5,8 +5,8 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
-use aruna_core::structs::execution::job::{KeyWait, key_wait_key};
+use aruna_core::rows::values;
+use aruna_core::structs::execution::job::key_wait::{KeyWait, key_wait_key};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
 use super::mutation::{MutateJobCalls, NoGuard, forward};
@@ -90,7 +90,7 @@ where
 
     fn next(&mut self, result: IoResult) -> Result<Next<AwaitOutcome>, JobMutationError> {
         if let Some(record) = self.parked.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(AwaitOutcome::Parked(record)));
         }
         let record = match self.calls.next(result)? {
@@ -202,7 +202,7 @@ impl Operation for SatisfyWaitOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, JobMutationError> {
         match self.step {
             WaitStep::DeleteRow => {
-                done(result)?;
+                result.done()?;
                 self.step = WaitStep::ReadList;
                 let row = (KEY_WAIT_KEYSPACE.to_string(), job_wait_key(self.job_id));
                 Ok(Next::Call(IoCall::Read(vec![row])))
@@ -235,7 +235,7 @@ impl Operation for SatisfyWaitOperation {
                 }
             }
             WaitStep::Store => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.woken))
             }
         }

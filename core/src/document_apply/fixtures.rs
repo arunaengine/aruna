@@ -10,7 +10,6 @@ use ulid::Ulid;
 
 use super::ApplyError;
 use super::validate::{ConfigSnapshot, ValidateAdminPlan};
-use crate::UserId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -20,12 +19,13 @@ use crate::document::{BatchEvent, DocumentEvent, DocumentTarget};
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
+use crate::user::id::UserId;
 
 pub(super) fn realm() -> RealmId {
     RealmId::from_bytes([1; 32])
 }
 
-pub(super) fn node() -> crate::NodeId {
+pub(super) fn node() -> crate::id::NodeId {
     iroh::SecretKey::from_bytes(&[2; 32]).public()
 }
 

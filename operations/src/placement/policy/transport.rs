@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::{
@@ -15,7 +15,7 @@ use aruna_core::types::Value;
 use tracing::warn;
 
 use crate::document_repository::read_row;
-use crate::metadata::protocol::MetadataReadError;
+use aruna_core::metadata::protocol::MetadataReadError;
 
 /// The answer a peer gets: the stored document, none, or why it is refused.
 pub type PolicyAnswer = Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError>;

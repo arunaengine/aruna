@@ -83,7 +83,9 @@ impl Operation for ReadSourceOperation {
     fn first(&mut self) -> Result<Next<ReadSourceResult>, ReadSourceError> {
         let (group, connector) = (self.input.group_id, self.input.connector_id);
         let path = self.input.source_path.clone();
-        Ok(Next::Call(super::resolve_call(group, connector, path)))
+        Ok(Next::Call(crate::connectors::resolver::resolve_call(
+            group, connector, path,
+        )))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ReadSourceResult>, ReadSourceError> {
@@ -108,11 +110,11 @@ impl Operation for ReadSourceOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::staging::{
-        create_http_connector, sample_connector, sample_resolved_connector, setup_driver_context,
-    };
     use aruna_core::structs::execution::source_access::ResolvedSourceConnector;
     use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, sample_connector, sample_resolved_connector, setup_driver_context,
+    };
     use futures_util::{StreamExt, stream};
     use std::time::SystemTime;
 

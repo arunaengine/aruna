@@ -5,13 +5,13 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::heartbeat::{
     HeartbeatEffect, HeartbeatEvent, INFO_PUBLISH_INTERVAL, NodeHeartbeat,
 };
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::Value;
@@ -141,7 +141,7 @@ impl Operation for SendHeartbeatOperation {
 
 /// Keeps one heartbeat frame `peer` sent when it decodes, names this node's realm, and is newer
 /// than the held one of a sync peer. Every refusal is only logged.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReceiveHeartbeatOperation {
     peer: NodeId,
     realm_id: RealmId,

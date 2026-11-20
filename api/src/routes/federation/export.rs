@@ -8,25 +8,26 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 
 use crate::job_service::{read_artifact_routed, read_owned_job, submit_export_job};
 use crate::jobs::job_urls;
-use crate::metadata::{SubmitExportResponse, load_document_record, parse_document_id};
+use crate::metadata::model::SubmitExportResponse;
+use crate::metadata::{load_document_record, parse_document_id};
 use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
-use aruna_core::structs::execution::job::{
-    ExportRoCrateSpec, ExportSelection, JobId, JobPayload, JobState,
-};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ExportRoCrateSpec, ExportSelection, JobPayload};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::transfer::{
     ExportGrant, GrantError, ImportIntent, TransferError, check_remote, intent_digest,
 };
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::federation::grant::{
+use aruna_operations::federation::import::header_value;
+use aruna_operations::jobs::export::consent::UnheldBucketOperation;
+use aruna_operations::jobs::export::grant::{
     AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
     RevokeGrantOperation, export_access,
 };
-use aruna_operations::federation::import::header_value;
-use aruna_operations::jobs::export::{CrateJsonOperation, UnheldBucketOperation};
+use aruna_operations::jobs::export::snapshot::CrateJsonOperation;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -71,7 +72,7 @@ pub struct FederatedExportRequest {
     pub files: Vec<String>,
 }
 
-pub(crate) use aruna_operations::federation::import::GRANT_HEADER;
+use aruna_operations::federation::import::GRANT_HEADER;
 /// Header carrying a signed import intent as unpadded base64url JSON.
 pub(crate) const INTENT_HEADER: &str = "x-aruna-import-intent";
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -368,7 +369,7 @@ pub async fn delete_grant(
 async fn check_holder(
     context: &Arc<DriverContext>,
     spec: &ExportRoCrateSpec,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> Result<(), GrantError> {
     let (auth, limit) = (&spec.auth_context, spec.limits.metadata_bytes);
     let local = context.net_handle.as_ref().map(|net| net.node_id());

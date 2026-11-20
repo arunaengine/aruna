@@ -8,30 +8,33 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::job_service::{
-    ArtifactLookup, JobReportLookup, OwnedArtifact, RoutedCancelOutcome, cancel_job_routed,
-    delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
-    resolve_job_owner,
+    cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
+    read_report_routed, resolve_job_owner,
 };
 use crate::jobs::family_report;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::JobKind;
-use aruna_core::node_state::ReadInfoOperation;
-use aruna_core::structs::execution::job::{
-    CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
+use aruna_core::node::state::ReadInfoOperation;
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::execution::job::identity::{JobId, SYSTEM_ENTRY_PREFIX};
+use aruna_core::structs::execution::job::input::{
+    CompositionError, ExportReportRow, ImportReportRow,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_drivers::driver::drive;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::federation::grant::AdmitGrantOperation;
 use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
+use aruna_operations::jobs::export::grant::AdmitGrantOperation;
+use aruna_operations::jobs::job::artifacts::{ArtifactLookup, OwnedArtifact};
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::job::reports::JobReportLookup;
 use aruna_operations::jobs::local_run::LocalExecutionError;
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header::{
@@ -475,10 +478,8 @@ fn encode_report_cursor(
         .transpose()
 }
 
-pub(crate) fn map_submit_error(
-    error: aruna_operations::jobs::submit::SubmitJobError,
-) -> ServerError {
-    use aruna_operations::jobs::submit::SubmitJobError;
+pub(crate) fn map_submit_error(error: aruna_core::job_request::SubmitJobError) -> ServerError {
+    use aruna_core::job_request::SubmitJobError;
     match error {
         SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::JobPlanConflict(
             format!("idempotency key already bound to job {existing_job_id}"),
@@ -507,7 +508,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason(moving.to_string())
         }
         SubmitJobError::Upload(error) => {
-            use aruna_operations::jobs::import::upload::UploadClaimError;
+            use aruna_core::job_request::UploadClaimError;
             match error {
                 UploadClaimError::NotFound => ServerError::NotFound,
                 UploadClaimError::WrongOwner => ServerError::Forbidden,
@@ -1155,7 +1156,9 @@ fn decode_report_row(
             serde_json::to_value(row)
         }
         JobKind::Execution => {
-            use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
+            use aruna_core::structs::execution::job::input::{
+                SessionReportDetail, SessionReportRow,
+            };
 
             let row: SessionReportRow = postcard::from_bytes(value)
                 .map_err(|error| ServerError::InternalError(error.into()))?;
@@ -1298,7 +1301,7 @@ pub async fn get_job_report(
         &state.get_ctx(),
         &auth,
         job_id,
-        crate::job_service::ReportQuery {
+        aruna_operations::jobs::job::reports::ReportQuery {
             expected_digest,
             last_key,
             limit,

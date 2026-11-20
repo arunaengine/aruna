@@ -14,10 +14,9 @@ use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, InstallEntry, decode_reducer_state,
-};
-use aruna_core::rows::{done, values};
+use aruna_core::reducer::targets::InstallEntry;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -31,7 +30,7 @@ use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::service_account::group_admin_path;
@@ -317,14 +316,14 @@ impl Operation for InstallEntryOperation {
                 Ok(Next::Call(self.write(document, state)?))
             }
             Phase::Write { stale } => {
-                done(result)?;
+                result.done()?;
                 match stale.is_empty() {
                     true => Ok(self.finish()),
                     false => Ok(Next::Call(IoCall::Delete(stale))),
                 }
             }
             Phase::DeleteConflicts => {
-                done(result)?;
+                result.done()?;
                 Ok(self.finish())
             }
         }

@@ -25,10 +25,10 @@ use super::metadata::{
     split_due,
 };
 use crate::queue_backoff::{due_after, min_due_at, retry_delay_ms};
-use crate::replication::queue::schedule_blob_drain;
 use crate::s3::object::refresh_mint::{MintError, MintSuccessorOperation};
 use crate::s3::object::refresh_observe::{ObserveError, ObserveSourceOperation};
 use crate::s3::usage::schedule_snapshot_publish;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 
 const REFRESH_SCAN_PAGE: usize = 512;
 
@@ -425,7 +425,7 @@ impl Operation for SettleJob {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DrainState {
     ReadDue,
     ReadJob(Key),
@@ -436,7 +436,7 @@ enum DrainState {
 
 /// Runs one batch of due refreshes: walks a page of the due index in due order with a point read
 /// per row, refreshes each job and settles it, rescheduling the ones that failed.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainRefreshOperation {
     state: DrainState,
     started_ms: u64,
@@ -653,7 +653,10 @@ mod tests {
     use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
-        crate::tests::staging::sized_source(content_length, Some(format!("etag-{content_length}")))
+        aruna_test_support::staging::sized_source(
+            content_length,
+            Some(format!("etag-{content_length}")),
+        )
     }
 
     fn refresh(metadata: Option<SourceMetadata>, seconds: u64) -> ReferenceRefresh {

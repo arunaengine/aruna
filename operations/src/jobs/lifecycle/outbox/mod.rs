@@ -18,16 +18,17 @@ use aruna_core::events::{
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_OUTBOX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordKey};
+use aruna_core::structs::execution::job::family::{JobFamilyRecord, JobRecordKey};
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, to_bytes};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
-use aruna_core::structs::execution::job::record_keys::record_key;
-use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, to_bytes};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// Records one drain pass delivers before it re-arms.
 pub const OUTBOX_DRAIN_BATCH: usize = 32;
@@ -233,7 +234,7 @@ impl PublishRecordOperation {
                 }
                 Ok(other) => warn!(
                     peer = %holder,
-                    reply = crate::metadata::transport_message_kind(&other),
+                    reply = aruna_core::metadata::protocol::transport_message_kind(&other),
                     "Unexpected job record publish reply"
                 ),
                 Err(error) => {
@@ -355,7 +356,9 @@ mod tests {
     fn config(family: &Family, holders: Vec<NodeId>) -> PublishRecordConfig {
         let envelope = family.sign(
             &family.holder,
-            aruna_core::structs::execution::job::JobFamilyRecord::Spec(Box::new(family.spec())),
+            aruna_core::structs::execution::job::family::JobFamilyRecord::Spec(Box::new(
+                family.spec(),
+            )),
         );
         let key = envelope.key();
         PublishRecordConfig {

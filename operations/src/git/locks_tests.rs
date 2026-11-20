@@ -20,7 +20,7 @@ fn opened() -> IoResult {
     child(Ok::<_, GitError>((dataset(), repository)))
 }
 
-fn record(lock: Ulid, path: &str, user: aruna_core::UserId) -> GitRecord {
+fn record(lock: Ulid, path: &str, user: aruna_core::user::id::UserId) -> GitRecord {
     GitRecord {
         event_id: lock,
         realm_id: realm(),
@@ -37,8 +37,8 @@ fn record(lock: Ulid, path: &str, user: aruna_core::UserId) -> GitRecord {
     }
 }
 
-fn other_user() -> aruna_core::UserId {
-    aruna_core::UserId::new(Ulid::from_bytes([8; 16]), realm())
+fn other_user() -> aruna_core::user::id::UserId {
+    aruna_core::user::id::UserId::new(Ulid::from_bytes([8; 16]), realm())
 }
 
 fn creating(path: &str) -> CreateLockOperation {

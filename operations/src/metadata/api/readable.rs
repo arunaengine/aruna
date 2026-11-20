@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -16,8 +15,8 @@ use aruna_core::types::GroupId;
 use super::MetadataApiError;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Whether the caller may read `record`: the realm and group policies, and for a private record
 /// the caller's read permission on its path. Every denial reads as not found, so read-by-id is
@@ -114,7 +113,7 @@ impl Operation for RecordReadableOperation {
             let elapsed = self.now_ms.saturating_sub(self.started_ms);
             record_stage("permission", Duration::from_millis(elapsed));
         }
-        let mut values = all_values(result)?;
+        let mut values = result.values()?;
         if let Some(check) = self.check.as_ref() {
             let rules = check.reads().map_err(permission_error)?.len();
             let policies = values.split_off(rules.min(values.len()));
@@ -210,7 +209,7 @@ impl Operation for PathPermissionOperation {
         }
         let elapsed = self.now_ms.saturating_sub(self.started_ms);
         record_stage("permission", Duration::from_millis(elapsed));
-        let mut values = all_values(result)?;
+        let mut values = result.values()?;
         let rules = self.check.reads().map_err(path_error)?.len();
         let policies = values.split_off(rules.min(values.len()));
         if !self.check.allowed(values).map_err(path_error)? {
@@ -226,7 +225,7 @@ impl Operation for PathPermissionOperation {
 #[cfg(test)]
 mod call_tests {
     use super::*;
-    use aruna_core::UserId;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn record(public: bool) -> MetadataRegistryRecord {

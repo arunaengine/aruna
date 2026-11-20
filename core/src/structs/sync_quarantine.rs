@@ -3,12 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
-
 #[cfg(test)]
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{DocumentEvent, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
 use crate::types::{Key, KeySpace, Value};
 use byteview::ByteView;
@@ -408,12 +407,12 @@ pub fn quarantine_row_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UserId;
     use crate::admin_documents::{AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation};
     use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use crate::structs::identity::auth::Actor;
     use crate::structs::identity::realm::RealmId;
     use crate::structs::placement::record::PlacementRef;
+    use crate::user::id::UserId;
 
     fn node() -> NodeId {
         NodeId::from_bytes(&[1u8; 32]).unwrap()

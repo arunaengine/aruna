@@ -7,12 +7,12 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{Delivery, ResponseExposure};
 
 use super::*;
-use crate::plugins::bound::tests::{ORIGIN, bound, edit_config, secret};
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::tests::child_result;
-#[allow(unused_imports)]
-pub(crate) use crate::plugins::test_support::edit_rules;
+use crate::plugins::test_support::edit_rules;
+use crate::plugins::test_support::{install_as, install_request};
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::{ORIGIN, bound, edit_config, secret};
 
 fn rule(consumer: &SecretConsumer, response: ResponseExposure) -> UseRule {
     UseRule {
@@ -213,12 +213,12 @@ async fn installs_with_secrets() {
         "permissions": { "required": ["metadata.read"], "optional": ["secrets.value"] }
     });
     let digest = fixture.publish("0.4.0", "aa", features).await;
-    let mut request = fixture.request(None);
+    let mut request = install_request(&fixture, None);
     request.version = Some(digest);
     request.secrets = [("api_key", "group:api-key"), ("hook_key", "group:hook-key")]
         .map(|(slot, secret)| (slot.to_string(), secret.to_string()))
         .into();
-    let install = fixture.install(&request).await.unwrap();
+    let install = install_as(&fixture, &request).await.unwrap();
     assert_eq!(
         install.state,
         aruna_core::plugin_installs::InstallState::Active
@@ -246,9 +246,9 @@ async fn installs_with_secrets() {
     // Container work installs within the group's per-job limits.
     let jobs = serde_json::json!({ "permissions": { "required": ["jobs.run"] } });
     let digest = fixture.publish("0.5.0", "bb", jobs).await;
-    let mut request = fixture.request(None);
+    let mut request = install_request(&fixture, None);
     request.version = Some(digest);
-    let installed = fixture.install(&request).await;
+    let installed = install_as(&fixture, &request).await;
     assert!(installed.is_ok(), "{installed:?}");
 }
 

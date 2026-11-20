@@ -5,7 +5,7 @@
 
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentDot, NodeInterval};
 use aruna_core::calls::ChildOutcome;
-use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::execution::job::family::EffectiveResources;
 use ulid::Ulid;
 
 use super::*;

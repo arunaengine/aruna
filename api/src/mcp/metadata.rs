@@ -9,12 +9,13 @@ use super::{
     parse_ulid, request_auth, server_error, tool_extras,
 };
 use crate::lookup::actor;
+use aruna_core::metadata::api::{CreateDocumentPayload, RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
 use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
-use aruna_operations::metadata::api::export_types::{ExportMetadataRequest, RoCrateExportView};
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
 use aruna_operations::metadata::api::read::query_metadata;
 use aruna_operations::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
@@ -22,11 +23,9 @@ use aruna_operations::metadata::api::read_types::{
 use aruna_operations::metadata::api::realm_search::search_metadata;
 use aruna_operations::metadata::api::references::ReferencesOperation;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
-use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
-use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -159,7 +158,7 @@ impl McpServer {
         let response = crate::metadata::run_document_list(
             &self.state,
             Some(auth.clone()),
-            crate::metadata::ListMetadataQuery {
+            crate::metadata::model::ListMetadataQuery {
                 group_id: None,
                 path_prefix: Some("profiles/".to_string()),
                 include: Some("summary".to_string()),
@@ -287,7 +286,7 @@ impl McpServer {
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(search_error)?;
-        let response = crate::metadata::SearchResultsResponse {
+        let response = crate::metadata::model::SearchResultsResponse {
             hits: result
                 .hits
                 .into_iter()
@@ -361,7 +360,7 @@ impl McpServer {
             .await
             .map_err(crate::metadata::map_metadata_error)
             .map_err(server_error)?;
-        let response = crate::metadata::ProfilePreviewResponse::from(preview);
+        let response = crate::metadata::model::ProfilePreviewResponse::from(preview);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -413,7 +412,7 @@ impl McpServer {
         )
         .await
         .ok();
-        let summary = crate::metadata::MetadataDocumentSummary::from(&record);
+        let summary = crate::metadata::model::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -463,7 +462,7 @@ impl McpServer {
         .await
         .map_err(crate::metadata::map_write_error)
         .map_err(update_error)?;
-        let summary = crate::metadata::MetadataDocumentSummary::from(&updated);
+        let summary = crate::metadata::model::MetadataDocumentSummary::from(&updated);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -717,7 +716,7 @@ async fn metadata_probe(
     server: &McpServer,
     auth: &AuthContext,
     _tool: &str,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, Permission::READ, extras)
         .await
@@ -733,7 +732,7 @@ async fn authorize_summary(
     auth: &AuthContext,
     (group_id, path): (&str, &str),
     (document_id, public): (&str, bool),
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     let group_id = crate::auth::parse_group_id(group_id).map_err(server_error)?;
     let document_id = crate::metadata::parse_document_id(document_id).map_err(server_error)?;
@@ -753,7 +752,7 @@ async fn authorize_document(
     server: &McpServer,
     auth: &AuthContext,
     document: (&str, bool),
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let (context, realm_id) = (server.state.get_ctx(), server.state.get_realm_id());
     drive(
@@ -779,8 +778,8 @@ pub(crate) async fn load_raw(
     authorize_document(server, auth, document, tool_extras(tool, input)?)
         .await
         .map_err(document_error)?;
-    let params = crate::metadata::RoCrateExportParams {
-        view: Some(crate::metadata::MetadataRoCrateView::Raw),
+    let params = crate::metadata::model::RoCrateExportParams {
+        view: Some(crate::metadata::model::MetadataRoCrateView::Raw),
         limit: None,
         offset: None,
         after: None,
@@ -814,7 +813,7 @@ pub(crate) async fn load_raw(
     let response = crate::metadata::map_export_response(
         export,
         &params,
-        crate::metadata::MetadataRoCrateView::Raw,
+        crate::metadata::model::MetadataRoCrateView::Raw,
     )
     .map_err(server_error)?;
     Ok((
@@ -1041,14 +1040,15 @@ mod authorization_tests {
         seed_group_docs, seed_realm_auth, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::metadata::api::CreateDocumentPayload;
     use aruna_core::structs::identity::auth::{
         Actor, NodeCapabilities, PathRestriction, Permission,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::metadata::create_document::CreateDocumentPayload;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
@@ -1114,7 +1114,7 @@ mod authorization_tests {
         .await
         .unwrap();
         let node_id = net.node_id();
-        let user_id = aruna_core::UserId::local(Ulid::from_parts(3, 3), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::from_parts(3, 3), realm_id);
         let actor = Actor {
             node_id,
             user_id,
@@ -1190,7 +1190,10 @@ mod authorization_tests {
 
     fn stranger(fixture: &Fixture) -> AuthContext {
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_parts(5, 5), fixture.auth.realm_id),
+            user_id: aruna_core::user::id::UserId::local(
+                Ulid::from_parts(5, 5),
+                fixture.auth.realm_id,
+            ),
             realm_id: fixture.auth.realm_id,
             path_restrictions: None,
             session: None,
@@ -1199,15 +1202,15 @@ mod authorization_tests {
 
     async fn drain_metadata_background(state: &ServerState) {
         let ctx = state.get_ctx();
-        let drained = aruna_operations::testing::drain_projection_queue(ctx.as_ref())
+        let drained = aruna_test_support::projection::drain_projection_queue(ctx.as_ref())
             .await
             .unwrap();
         if drained.markers_examined == 0 {
-            aruna_operations::testing::replay_event_log(ctx.as_ref())
+            aruna_test_support::projection::replay_event_log(ctx.as_ref())
                 .await
                 .unwrap();
         }
-        aruna_operations::testing::process_materialization_batch(ctx.as_ref())
+        aruna_test_support::metadata::process_materialization_batch(ctx.as_ref())
             .await
             .unwrap();
         // A text search sees only committed index updates.

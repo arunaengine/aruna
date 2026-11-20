@@ -9,6 +9,7 @@ use tracing::warn;
 use super::batch::{ApplyBatchOperation, BatchOutcome};
 use super::create::{CreateBatchOutcome, CreateBatchPlan, PendingCreateApply};
 use super::distribution::RetryParkedPlan;
+use super::followups::FollowUpNode;
 use super::overflow::{ReplayOverflowOperation, overflow_key};
 use super::quarantine::CursorEvidencePlan;
 use super::reads::dependency_available;
@@ -20,16 +21,18 @@ use crate::deferred_topics::{
     remove_deferred_topic,
 };
 use crate::document::{
-    DocumentEffect, DocumentNetEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
+    AppliedStep, DocumentEffect, DocumentNetEvent, DocumentReconcileResult, DocumentTarget,
+    ReconcileBatch,
 };
 use crate::effects::{Effect, NetEffect};
 use crate::events::{Event, NetEvent};
+use crate::id::NodeId;
 use crate::keyspaces::APPLIED_OPS_KEYSPACE;
 use crate::operation::{HoldScope, Operation, TransactionMode};
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
-use crate::rows::{done, event, read_row, value};
-use crate::structs::SyncRejection;
+use crate::rows::read_row;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::sync_quarantine::SyncRejection;
 use crate::types::{Key, Value};
 
 type DeferredTopics = BTreeMap<DocumentSyncDependency, BTreeSet<irokle::TopicId>>;
@@ -141,6 +144,8 @@ pub struct ReconcileTopicsOperation {
     cursor_writes: Vec<(irokle::TopicId, Row)>,
     rejections: Vec<SyncRejection>,
     saved_deferred: Vec<u8>,
+    /// The node whose drain runs the follow-ups of what the pass applies, when it queues them.
+    followups: Option<FollowUpNode>,
     stage: Stage,
 }
 
@@ -158,8 +163,21 @@ impl ReconcileTopicsOperation {
             cursor_writes: Vec::new(),
             rejections: Vec::new(),
             saved_deferred: Vec::new(),
+            followups: None,
             stage: Stage::Planning,
         }
+    }
+
+    /// Also stores the follow-ups of each apply from `from` on for `node_id`'s drain, in the
+    /// apply's own transaction, so a replay that skips an applied event still finds them.
+    pub fn queuing_followups(mut self, node_id: NodeId, from: AppliedStep) -> Self {
+        let realm_id = self.realm_id;
+        self.followups = Some(FollowUpNode {
+            node_id,
+            realm_id,
+            from,
+        });
+        self
     }
 
     /// Also reloads the realm's peers when the pass applied a realm config.
@@ -203,7 +221,8 @@ impl ReconcileTopicsOperation {
             rejections,
             events,
         } = batch;
-        let apply = ApplyBatchOperation::new(topic_id, self.realm_id, events, rejections);
+        let apply = ApplyBatchOperation::new(topic_id, self.realm_id, events, rejections)
+            .queuing(self.followups);
         let cursor = BatchCursor {
             topic_id,
             key: cursor_key,
@@ -298,7 +317,8 @@ impl ReconcileTopicsOperation {
             std::mem::take(&mut self.pending_creates),
             std::mem::take(&mut self.cursor_writes),
             std::mem::take(&mut self.rejections),
-        )?;
+        )?
+        .queuing(self.followups);
         self.call(Stage::ApplyingCreates, plan_call(plan))
     }
 
@@ -346,7 +366,7 @@ pub(super) fn net_answer(
     result: IoResult,
     expected: &'static str,
 ) -> Result<DocumentNetEvent, ApplyError> {
-    match event(result)? {
+    match result.event()? {
         Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
             Err(ApplyError::Failed(error))
         }
@@ -378,7 +398,7 @@ impl Operation for ReconcileTopicsOperation {
                 self.next_topic()
             }
             Stage::ReadingCursor(topic) => {
-                let stored_cursor = value(result)?;
+                let stored_cursor = result.value()?;
                 self.net_call(
                     Stage::LoadingBatch(topic),
                     DocumentEffect::ReconcileBatch {
@@ -407,7 +427,7 @@ impl Operation for ReconcileTopicsOperation {
             }
             Stage::CheckingOverflow(cursor, outcome) => {
                 // An earlier checkpoint is kept.
-                if value(result)?.is_some() {
+                if result.value()?.is_some() {
                     return self.settle(cursor, *outcome);
                 }
                 let row = (
@@ -421,11 +441,11 @@ impl Operation for ReconcileTopicsOperation {
                 )
             }
             Stage::RecordingOverflow(cursor, outcome) => {
-                done(result)?;
+                result.done()?;
                 self.settle(cursor, *outcome)
             }
             Stage::WritingCursor(topic, satisfied) => {
-                done(result)?;
+                result.done()?;
                 self.topic_done(topic, satisfied)
             }
             Stage::WritingEvidence(topic, satisfied) => {
@@ -436,7 +456,7 @@ impl Operation for ReconcileTopicsOperation {
                 self.topic_done(topic, satisfied)
             }
             Stage::SavingDeferred => {
-                done(result)?;
+                result.done()?;
                 self.apply_creates()
             }
             Stage::ApplyingCreates => {
@@ -444,7 +464,7 @@ impl Operation for ReconcileTopicsOperation {
                 self.on_creates(outcome)
             }
             Stage::SavingUpdated => {
-                done(result)?;
+                result.done()?;
                 self.retry_parked()
             }
             Stage::RetryingParked => {

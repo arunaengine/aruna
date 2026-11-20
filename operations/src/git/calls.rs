@@ -4,20 +4,19 @@
 
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::git::{GitAnswer, GitCall, GitEffect, GitEvent, GitRequest, PushProof, Refs};
 use aruna_core::git_state::{Ancestry, Projection, ProjectionInputs};
 use aruna_core::metadata::MetadataEvent;
-use aruna_core::operation::{Operation, Runnable, SubOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, SubOperation, boxed_suboperation};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use ulid::Ulid;
 
 use super::GitError;
 use super::objects::Blob;
-pub(super) use crate::metadata::deletion_guard::metadata_call;
 
 fn store_call(call: GitCall) -> IoCall {
     IoCall::from(Effect::Git(Box::new(call)))
@@ -87,10 +86,9 @@ pub(super) fn metadata_event(result: IoResult) -> Result<MetadataEvent, GitError
 }
 
 /// `operation` as a child whose outcome comes back in [`Event::Child`].
-fn boxed_child<O, K>(operation: O) -> Box<dyn SubOperation>
+fn boxed_child<O>(operation: O) -> Box<dyn SubOperation>
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: PartialEq + 'static,
     O::Error: PartialEq + 'static,
 {
@@ -98,10 +96,9 @@ where
 }
 
 /// One group member that runs `operation` as a child.
-pub(super) fn child_member<O, K>(operation: O) -> Effect
+pub(super) fn child_member<O>(operation: O) -> Effect
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: PartialEq + 'static,
     O::Error: PartialEq + 'static,
 {
@@ -239,10 +236,9 @@ pub(super) fn refresh_once_call(document_id: Ulid, child: Box<dyn SubOperation>)
 }
 
 /// Runs `operation` under its own stage timers.
-pub(super) fn timed_call<O, K>(operation: O) -> IoCall
+pub(super) fn timed_call<O>(operation: O) -> IoCall
 where
-    O: Runnable<K> + 'static,
-    K: 'static,
+    O: Operation + 'static,
     O::Output: PartialEq + 'static,
     O::Error: PartialEq + 'static,
 {

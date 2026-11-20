@@ -14,27 +14,18 @@ pub mod package;
 #[cfg(feature = "runtime")]
 pub mod broker;
 #[cfg(feature = "runtime")]
-mod host;
+pub mod host;
 #[cfg(feature = "runtime")]
 mod imports;
 #[cfg(feature = "runtime")]
 pub mod limits;
 #[cfg(feature = "runtime")]
-mod runtime;
+pub mod runtime;
 #[cfg(feature = "runtime")]
-mod supervisor;
+pub mod supervisor;
 #[cfg(feature = "runtime")]
 mod values;
 
-#[cfg(feature = "runtime")]
-pub use host::Limit;
-#[cfg(feature = "runtime")]
-pub use host::wit::aruna::plugin::types::{
-    Failure, FailureKind, Field, Trigger, WatchEvent, WebhookDelivery, WebhookRequest,
-};
-#[cfg(feature = "runtime")]
-pub use runtime::{CompileError, Compiled, Invocation, InvokeError, Runtime};
-#[cfg(feature = "runtime")]
-pub use supervisor::Supervisor;
+// The runtime's calls take this token; plugin test crates name it without depending on tokio-util.
 #[cfg(feature = "runtime")]
 pub use tokio_util::sync::CancellationToken;

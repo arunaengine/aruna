@@ -11,13 +11,12 @@ use crate::routes::federation::AcceptedRealmsSetting;
 use crate::routes::node_names::CoordinatesBody;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
 use aruna_core::heartbeat::seen_recently;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::placement::transition::transition_health;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
@@ -27,14 +26,16 @@ use aruna_core::structs::placement::record::PlacementScope;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
-use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
+use aruna_operations::device_node::realm_documents::{
+    installed_displays, installed_management_urls,
+};
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::federation::totals::DataTotalsOperation;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
 use aruna_operations::node::contacts::PeerContactsOperation;
-use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
 use aruna_operations::placement::mutation::PlacementMutationOperation;
 use aruna_operations::placement::provision::ProvisionBindingOperation;
@@ -47,6 +48,7 @@ use aruna_operations::realm::mutate_placement::{
 use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
 use aruna_operations::relay::targets::management_node_urls;
+use aruna_operations::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::s3::usage::LoadCountersOperation;
 use aruna_wire::info::{
     AddressStatus, BackendStatus, BlobServiceStatus, ConnectionAddressInfo, DatabaseServiceStatus,
@@ -701,17 +703,17 @@ fn parse_subject(value: &str) -> ServerResult<Vec<u8>> {
         .map_err(|_| ServerError::BadRequestReason("subject must be valid hex".to_string()))
 }
 
-fn parse_node_id(value: &str) -> ServerResult<aruna_core::NodeId> {
+fn parse_node_id(value: &str) -> ServerResult<aruna_core::id::NodeId> {
     value
-        .parse::<aruna_core::NodeId>()
+        .parse::<aruna_core::id::NodeId>()
         .map_err(|_| ServerError::BadRequestReason(format!("invalid node_id: {value}")))
 }
 
-fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_core::NodeId>> {
+fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_core::id::NodeId>> {
     values
         .into_iter()
         .map(|value| {
-            value.parse::<aruna_core::NodeId>().map_err(|_| {
+            value.parse::<aruna_core::id::NodeId>().map_err(|_| {
                 ServerError::BadRequestReason(format!("invalid node id in {field}: {value}"))
             })
         })
@@ -1320,9 +1322,9 @@ pub(crate) async fn run_realm_info(
 async fn peer_contacts(
     state: &ServerState,
     config: &RealmConfigDocument,
-) -> BTreeMap<aruna_core::NodeId, u64> {
+) -> BTreeMap<aruna_core::id::NodeId, u64> {
     let peers = (config.nodes.iter())
-        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .filter_map(|node| node.node_id.parse::<aruna_core::id::NodeId>().ok())
         .collect();
     drive(PeerContactsOperation::new(peers), &state.get_ctx())
         .await
@@ -1387,7 +1389,7 @@ fn public_nodes(
     state: &ServerState,
     config: &RealmConfigDocument,
     node_info_docs: &BTreeMap<
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
     own_url: Option<&str>,
@@ -1397,7 +1399,7 @@ fn public_nodes(
         .nodes
         .iter()
         .filter(|node| !matches!(node.kind, RealmNodeKind::User { .. }))
-        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .filter_map(|node| node.node_id.parse::<aruna_core::id::NodeId>().ok())
         .filter_map(|node_id| {
             let published = node_info_docs
                 .get(&node_id)
@@ -1419,7 +1421,7 @@ fn management_urls(
     state: &ServerState,
     config: &RealmConfigDocument,
     node_info_docs: &BTreeMap<
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
     own_url: Option<&str>,
@@ -1449,8 +1451,8 @@ fn management_urls(
 pub(crate) async fn load_node_documents(
     state: &ServerState,
     config: &RealmConfigDocument,
-) -> BTreeMap<aruna_core::NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument> {
-    let node_ids: Vec<aruna_core::NodeId> = config
+) -> BTreeMap<aruna_core::id::NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument> {
+    let node_ids: Vec<aruna_core::id::NodeId> = config
         .nodes
         .iter()
         .filter_map(|node| node.node_id.parse().ok())
@@ -2292,12 +2294,12 @@ pub async fn get_usage(
 fn map_realm_nodes(
     state: &ServerState,
     config: &RealmConfigDocument,
-    present_nodes: HashSet<aruna_core::NodeId>,
+    present_nodes: HashSet<aruna_core::id::NodeId>,
     node_info_docs: BTreeMap<
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
-    contacts: &BTreeMap<aruna_core::NodeId, u64>,
+    contacts: &BTreeMap<aruna_core::id::NodeId, u64>,
     names: &NodeDisplays,
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {
@@ -2307,7 +2309,7 @@ fn map_realm_nodes(
         .nodes
         .iter()
         .map(|node| {
-            let parsed = node.node_id.parse::<aruna_core::NodeId>().ok();
+            let parsed = node.node_id.parse::<aruna_core::id::NodeId>().ok();
             let is_current = node.node_id == current_node.to_string();
             let kind = NodeKindInfo::from(&node.kind);
             // A device publishes no realm presence, so presence carries no
@@ -2368,8 +2370,8 @@ fn map_realm_nodes(
 /// only the local node stays present until a fresh lookup confirms the rest.
 fn presence_nodes(
     presence: RealmPresence,
-    local: aruna_core::NodeId,
-) -> HashSet<aruna_core::NodeId> {
+    local: aruna_core::id::NodeId,
+) -> HashSet<aruna_core::id::NodeId> {
     if presence.is_stale() {
         return HashSet::from([local]);
     }
@@ -2378,7 +2380,7 @@ fn presence_nodes(
     nodes
 }
 
-async fn load_realm_presence(state: &ServerState) -> HashSet<aruna_core::NodeId> {
+async fn load_realm_presence(state: &ServerState) -> HashSet<aruna_core::id::NodeId> {
     // A realm with offline nodes must degrade to local-only presence rather
     // than stall the dashboard.
     let discovery = tokio::time::timeout(
@@ -2441,7 +2443,7 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
 /// request from the maintained counters, not from the store itself.
 async fn backend_statuses(
     state: &ServerState,
-    backends: Vec<aruna_core::structs::BackendState>,
+    backends: Vec<aruna_core::structs::info::BackendState>,
 ) -> Vec<BackendStatus> {
     let context = state.get_ctx();
     let mut statuses = Vec::with_capacity(backends.len());
@@ -2697,7 +2699,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
 /// Maps a live peer connection to its wire form. `last_error` leaks internal
 /// diagnostics, so it is populated for realm config admins only.
 fn map_peer_connection(
-    peer: &aruna_core::structs::PeerConnectionState,
+    peer: &aruna_core::structs::info::PeerConnectionState,
     admin: bool,
 ) -> PeerConnectionInfo {
     PeerConnectionInfo {

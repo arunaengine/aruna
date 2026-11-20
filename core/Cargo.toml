@@ -12,7 +12,7 @@ rust-version.workspace = true
 
 [features]
 # Shared operation test helpers; only other crates' dev-dependencies enable it.
-test-hooks = []
+test-hooks = ["dep:getrandom"]
 
 [dependencies]
 aruna-kpabe = { workspace = true }
@@ -46,7 +46,7 @@ futures = { workspace = true }
 prometheus-client = { workspace = true }
 ed25519-dalek = { workspace = true }
 url = { workspace = true, features = ["serde"] }
-getrandom = { workspace = true }
+getrandom = { workspace = true, optional = true }
 cel-interpreter = { workspace = true }
 globset = { workspace = true }
 opentelemetry = { workspace = true }
@@ -67,4 +67,6 @@ argon2 = { workspace = true }
 x25519-dalek = { workspace = true }
 
 [dev-dependencies]
+getrandom = { workspace = true }
 proptest = { workspace = true }
+tracing-subscriber = { workspace = true }

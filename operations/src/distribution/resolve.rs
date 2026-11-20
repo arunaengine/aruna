@@ -10,28 +10,30 @@ use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     CONTENT_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::distribution::inventory::{
     IndexEntry, Position, content_prefix, index_key,
 };
-use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionSnapshot, DistributionView, MemberState, MetadataCoverage, SetHint,
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView,
 };
+use aruna_core::structs::storage::distribution::{DataStrategy, MemberState, MetadataCoverage};
 use aruna_core::types::Key;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::distribution::counts::MAX_SETS;
 use crate::distribution::version_key::{MemberAnswer, VersionKeyError, VersionKeyOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::identity::realm::NodeRealm;
 
 /// At most this many candidate sets are looked at for one id.
@@ -295,7 +297,7 @@ impl Operation for IndexedKeyOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<String>>, ResolveError> {
-        let Some(stored) = value(result)? else {
+        let Some(stored) = result.value()? else {
             return Ok(Next::Done(None));
         };
         let entry = IndexEntry::from_bytes(&stored).map_err(failed)?;

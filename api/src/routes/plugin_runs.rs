@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunTrigger};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, PluginAudit};
@@ -1110,13 +1110,13 @@ mod tests {
     use crate::tests::routes::{
         seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
     };
-    use aruna_core::UserId;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::plugin_installs::InstallState;
     use aruna_core::plugin_runs::RunState;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_operations::plugins::runs::{admit, save_run};
@@ -1301,16 +1301,18 @@ mod tests {
     #[tokio::test]
     async fn lists_work_state() {
         // The receiver lists its work with the state of each job, to the group's admins only.
-        use crate::job_test_calls::insert_job;
-        use aruna_core::structs::execution::job::{
-            JobId, JobPayload, JobRecord, JobState, PluginWorkAction, PluginWorkSpec,
+        use aruna_core::structs::execution::job::identity::{JobId, JobState};
+        use aruna_core::structs::execution::job::input::{
+            JobPayload, PluginWorkAction, PluginWorkSpec,
         };
+        use aruna_core::structs::execution::job::local::JobRecord;
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
         use aruna_drivers::driver::drive;
         use aruna_operations::plugins::work::{
             Identity, WorkChange, WorkRow, reserve, update_work,
         };
+        use aruna_test_support::jobs::insert_job;
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();

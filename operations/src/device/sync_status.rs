@@ -12,7 +12,7 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{DEVICE_INTAKE_KEYSPACE, SYNC_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
-use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Value};
 use byteview::ByteView;
@@ -26,12 +26,12 @@ use super::replica::{
     DocumentState, ReplicaRecord, ReplicaScanError, ReplicaState, document_state,
 };
 use super::replica_store::list_replicas;
-use super::scan_rows::{ScanRowsError, ScanRowsOperation};
 use super::sync::folders::FolderError;
 use super::sync::folders::reads::{folder_bases, list_folders, list_transfers};
 use super::sync::outbox::RequeueUploadsOperation;
 use super::sync::repository::SyncUpload;
-use super::sync_note::{DeviceSyncState, sync_state_key};
+use crate::device_node::scan_rows::{ScanRowsError, ScanRowsOperation};
+use crate::device_node::sync_note::{DeviceSyncState, sync_state_key};
 
 /// One selected document in the Sync view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -546,13 +546,13 @@ mod tests {
     use super::*;
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
-    use crate::device::sync_note::{NoteSyncOperation, SyncNote};
-    use aruna_core::UserId;
+    use crate::device_node::sync_note::{NoteSyncOperation, SyncNote};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::structs::synced_folder::{FolderMode, RemoteBinding};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::sync::Arc;
 
@@ -607,7 +607,7 @@ mod tests {
 
     fn base(synced: bool, entry: EntryState) -> SyncBase {
         SyncBase {
-            synced: synced.then(|| aruna_core::structs::SyncedBytes {
+            synced: synced.then(|| aruna_core::structs::synced_folder::SyncedBytes {
                 fingerprint: "f".to_string(),
                 blake3: [6u8; 32],
                 size: 1,
@@ -685,9 +685,11 @@ mod tests {
     #[tokio::test]
     async fn runs_pending_beat() {
         // A device always has its folder beat pending, so an explicit run must move it to now.
-        use crate::testing::RecordingTaskHandler;
+        use aruna_drivers::testing::RecordingTaskHandler;
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let (seen, mut fired) = tokio::sync::mpsc::channel(16);
         let task = aruna_tasks::TaskHandle::new();
         task.set_inbound_handler(Arc::new(RecordingTaskHandler { seen }))
@@ -730,7 +732,9 @@ mod tests {
     async fn drops_failed_contact() {
         // The first failed attempt shows the realm as unreachable; the next answer restores it.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -769,7 +773,9 @@ mod tests {
     async fn retries_explicit_sync() {
         // An owner-requested run re-arms retryable failures only.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

@@ -3,28 +3,29 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::group::{BackendClaim, GroupHold};
-use super::{BackendRegistry, BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
+use super::registry::BackendRegistry;
+use super::{BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
 use crate::native;
 use crate::opendal::init_operator;
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, LocalFileEffect, StagingSourceEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::native_reference::is_native;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::info::{BackendState, BlobState, Status};
 use aruna_core::structs::storage::blob::BackendConfig;
 use aruna_core::structs::storage::encryption::{BucketKeyError, generate_key, seal_copies};
 use aruna_core::structs::storage::multipart::MultipartPartKey;
-use aruna_core::structs::{BackendState, BlobState, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
@@ -183,15 +184,28 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
     )
 }
 
-/// The bytes of `blob`, read to its end.
+/// The bytes of `blob`, read to its end. A chunk past `limit` is refused before it is copied.
 async fn collect_stream(
     mut blob: BackendStream<Result<Bytes, StreamError>>,
-) -> Result<Vec<u8>, String> {
+    limit: Option<u64>,
+) -> BlobEvent {
     let mut bytes = Vec::new();
     while let Some(chunk) = futures::StreamExt::next(&mut blob).await {
-        bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+        match chunk {
+            Ok(chunk) => {
+                let size = bytes.len().saturating_add(chunk.len()) as u64;
+                if let Some(limit) = limit.filter(|limit| size > *limit) {
+                    return BlobEvent::StreamTooLarge { limit };
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Err(error) => {
+                let bytes = Err(error.to_string());
+                return BlobEvent::StreamCollected { bytes };
+            }
+        }
     }
-    Ok(bytes)
+    BlobEvent::StreamCollected { bytes: Ok(bytes) }
 }
 
 /// Tracks one in-flight blob mutation so `drain_writes` can wait for it.
@@ -286,6 +300,11 @@ impl BlobHandle {
 
     pub fn git(&self) -> Option<&crate::git::GitStore> {
         self.handler.git.get().map(Arc::as_ref)
+    }
+
+    /// The installed Git store, shared with holders that outlive this handle.
+    pub fn git_store(&self) -> Option<Arc<crate::git::GitStore>> {
+        self.handler.git.get().cloned()
     }
 
     /// Closes the blob write path before storage is closed. Mutations that
@@ -856,9 +875,7 @@ impl BlobHandler {
             BlobEffect::ReadHeld { backend_path } => BlobEvent::ReadHeld {
                 held: self.read_pins.held(&backend_path),
             },
-            BlobEffect::CollectStream { blob } => BlobEvent::StreamCollected {
-                bytes: collect_stream(blob).await,
-            },
+            BlobEffect::CollectStream { blob, limit } => collect_stream(blob, limit).await,
             BlobEffect::ReconcileReservation { location } => {
                 match Box::pin(self.reconcile_reservation(location)).await {
                     Ok(done) => BlobEvent::ReservationReconciled { done },
@@ -1386,4 +1403,31 @@ impl BlobHandler {
 
 fn source_error(error: StagingSourceError) -> StagingSourceEvent {
     StagingSourceEvent::Error { error }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunks(sizes: &[usize]) -> BackendStream<Result<Bytes, StreamError>> {
+        let parts: Vec<Result<Bytes, std::io::Error>> = (sizes.iter())
+            .map(|size| Ok(Bytes::from(vec![7u8; *size])))
+            .collect();
+        BackendStream::new(futures::stream::iter(parts))
+    }
+
+    #[tokio::test]
+    async fn collect_stops_early() {
+        let whole = collect_stream(chunks(&[3, 3]), Some(6)).await;
+        let bytes = Ok(vec![7u8; 6]);
+        assert_eq!(whole, BlobEvent::StreamCollected { bytes });
+        let cut = collect_stream(chunks(&[3, 3, 3]), Some(5)).await;
+        assert_eq!(cut, BlobEvent::StreamTooLarge { limit: 5 });
+        let open = collect_stream(chunks(&[4, 4]), None).await;
+        let bytes = Ok(vec![7u8; 8]);
+        assert_eq!(open, BlobEvent::StreamCollected { bytes });
+        // One chunk far past the limit is refused as it arrives.
+        let large = collect_stream(chunks(&[2, 1 << 20]), Some(5)).await;
+        assert_eq!(large, BlobEvent::StreamTooLarge { limit: 5 });
+    }
 }

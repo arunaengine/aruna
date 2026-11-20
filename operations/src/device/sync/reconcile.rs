@@ -10,9 +10,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, LocalFileEvent};
 use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::execution::offered_directory::fingerprint_complete;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     EntrySide, EntryState, Observed, PendingMark, RemoteHead, SyncAction, SyncBase, SyncedBytes,
     SyncedFolder, WriteGuard, decide,
 };
@@ -113,7 +112,7 @@ impl Operation for CommitRowsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ReconcileError> {
-        done(result)?;
+        result.done()?;
         Ok(match self.deletes.take() {
             Some(deletes) => Next::Call(IoCall::Delete(deletes)),
             None => Next::Done(()),
@@ -702,11 +701,11 @@ impl ReconcileFolderOperation {
 #[cfg(test)]
 pub(super) mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::offered_directory::FileStat;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderMode, FolderState, RemoteBinding};
+    use aruna_core::structs::synced_folder::{FolderMode, FolderState, RemoteBinding};
+    use aruna_core::user::id::UserId;
     use byteview::ByteView;
 
     pub(crate) fn folder() -> SyncedFolder {
@@ -717,7 +716,7 @@ pub(super) mod pure_tests {
             local_bucket: "folder-x".to_string(),
             group_id: Ulid::from_bytes([2u8; 16]),
             remote: RemoteBinding {
-                node_id: aruna_core::NodeId::from_bytes(&[3u8; 32]).expect("node id"),
+                node_id: aruna_core::id::NodeId::from_bytes(&[3u8; 32]).expect("node id"),
                 bucket: "lab".to_string(),
                 prefix: String::new(),
             },

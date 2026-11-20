@@ -3,12 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::structs::execution::job::record_keys::record_key;
-use aruna_core::structs::execution::job::record_rows::to_bytes;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     CancelAuthority, ExpiryReason, JobFamilyRecord, JobRecordEnvelope, JobRecordKind,
     PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 use aruna_core::types::{Key, Value};
 use aruna_drivers::driver::{DriverContext, drive};
 

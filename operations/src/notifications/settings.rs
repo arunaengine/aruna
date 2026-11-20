@@ -5,29 +5,29 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
+use aruna_core::id::NodeId;
+use aruna_core::jobs::JobRunOutcome;
 use aruna_core::operation::Operation;
 use aruna_core::outbound::{
     BackoffChange, BackoffRequest, OutboundEffect, OutboundEvent, StoredBackoff,
 };
-use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use tracing::warn;
 
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, decode_message, encode_message,
-};
 use crate::notifications::setting_rows::{ReadSettingOperation, SettingError};
 use crate::notifications::unexpected_event;
 use crate::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// The first delay after no management node opened a secret; it doubles up to `BACKOFF_CAP_MS`.
 pub const BACKOFF_START_MS: u64 = 30_000;
@@ -85,6 +85,27 @@ pub enum DeliveryOutcome {
     Failed(JobError),
     /// Runs again after the delay without spending an attempt.
     DeferredFor(JobError, Duration),
+}
+
+impl DeliveryOutcome {
+    /// A node without a metadata transport cannot open secrets, so the job waits without
+    /// spending an attempt.
+    pub fn unavailable() -> Self {
+        Self::DeferredFor(
+            JobError::retryable("the metadata transport is unavailable"),
+            Duration::from_millis(BACKOFF_START_MS),
+        )
+    }
+}
+
+/// How the job runtime takes the end of a delivery run; a failed run may pass on a retry.
+pub fn delivery_outcome(result: Result<DeliveryOutcome, IoError>) -> JobRunOutcome {
+    match result {
+        Ok(DeliveryOutcome::Succeeded(payload)) => JobRunOutcome::Succeeded(payload),
+        Ok(DeliveryOutcome::Failed(error)) => JobRunOutcome::Failed(error),
+        Ok(DeliveryOutcome::DeferredFor(error, delay)) => JobRunOutcome::DeferredFor(error, delay),
+        Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
+    }
 }
 
 /// Where the delivery decision waits.
@@ -272,7 +293,7 @@ impl Operation for DeliveryOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
-        match self.state.clone() {
+        match std::mem::take(&mut self.state) {
             DeliveryState::Setting => {
                 let failed = match result.child::<Option<Vec<u8>>, SettingError>()? {
                     Ok(None) => return Ok(Next::Done(Delivery::Skip)),
@@ -296,7 +317,8 @@ impl Operation for DeliveryOperation {
                 stored_backoff(result)?;
                 self.wait(until_ms, reason)
             }
-            DeliveryState::Open { .. } => {
+            open @ DeliveryState::Open { .. } => {
+                self.state = open;
                 let node = self.asked_node().ok_or(IoError::Unfinished)?;
                 let answer = match result {
                     IoResult::Child(_) => {

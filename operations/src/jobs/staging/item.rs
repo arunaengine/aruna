@@ -5,11 +5,11 @@
 
 use std::time::{Duration, SystemTime};
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::execution::job::{StagingJobCheckpoint, StagingJobItem};
+use aruna_core::structs::execution::job::input::{StagingJobCheckpoint, StagingJobItem};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -23,10 +23,7 @@ use super::walk::{
 use super::{ItemFailure, PageFailure, StagingRun, pinned};
 use crate::auth::permission_rules::PermissionRules;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::replication::queue::{
-    BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
-};
-use crate::staging::reference::{
+use crate::s3::object::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
     MaterializeReferenceResult,
 };
@@ -35,6 +32,7 @@ use crate::staging::snapshot::{
     StageSnapshotOperation,
 };
 use aruna_core::errors::AuthorizationError;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 
 /// The answer of a child that fails with anything printable, as a system failure.
 fn system<T: 'static, E: ToString + 'static>(result: IoResult) -> Result<T, ItemFailure> {
@@ -230,7 +228,7 @@ impl Operation for StageItemOperation {
                 Ok(self.replicate(size, version_id))
             }
             StageStep::Replicate(size) => {
-                if let Err(error) = result.child::<QueueBlobResult, BlobQueueError>()? {
+                if let Err(error) = result.child::<bool, IoError>()? {
                     warn!(
                         bucket = %spec.bucket,
                         key = %self.target_key,

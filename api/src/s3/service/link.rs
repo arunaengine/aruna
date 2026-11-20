@@ -3,23 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::credential_job_id;
+use aruna_core::structs::execution::job::local::credential_job_id;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::link::LinkTarget;
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_drivers::driver::drive;
 use aruna_drivers::position::seal_cursor;
-use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::link::{
     AuthorizeTargetOperation, CreateLinkOperation, HeadTargetOperation, LinkCaller, LinkError,
     LinkNode, LinkSource, ReadTargetOperation, TargetVisibleOperation,
 };
-use aruna_operations::s3::object::versions::{
-    ListVersionsInput, ListVersionsItem, ListVersionsOperation, ListVersionsResult,
-};
+use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
 use aruna_operations::s3::object::visible::SCAN_BUDGET;
 use s3s::dto::{ETag, ETagCondition, GetObjectOutput, StreamingBlob};
 use s3s::{S3Response, S3Result, s3_error};
@@ -126,12 +124,7 @@ impl ArunaS3Service {
             .map(object_range_request)
             .map(|range| range.resolve(recorded.content_length))
             .transpose()
-            .map_err(|error| match error {
-                GetObjectError::InvalidRange => {
-                    s3_error!(InvalidRange, "The requested range is not satisfiable")
-                }
-                _ => s3_error!(InvalidArgument, "The range is invalid"),
-            })?;
+            .map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
         let asked = resolved.as_ref().map(|resolved| resolved.range.clone());
         let read = ReadTargetOperation::new(&caller, &target, self.link_node(), asked);
         let blob = drive(read, &self.state).await.map_err(link_error)?;

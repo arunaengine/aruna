@@ -25,9 +25,8 @@ use serde::{Deserialize, Serialize};
 use tracing::trace;
 use ulid::Ulid;
 
-use super::call_results::page_rows;
-use super::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 use crate::forward::fetch::read_answer;
+use aruna_core::metadata::protocol::{MetadataTransportMessage, encode_message, metadata_request};
 use aruna_core::placement::selector::select_top_peers;
 
 pub const AUDIT_PAGE_LIMIT: usize = MAX_AUDIT_RECORDS;
@@ -240,7 +239,7 @@ impl Operation for LocalPageOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AuditPageResponse>, ListAuditError> {
-        let (values, next) = page_rows(result)?;
+        let (values, next) = result.page()?;
         Ok(Next::Done(parse_audit_page(values, next, &self.request())?))
     }
 }
@@ -581,15 +580,14 @@ mod tests {
         select_peers,
     };
     use crate::metadata::audit_entry::{admin_refusal, audit_member};
-    use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{audit_entry, metadata_audit_key};
-    use aruna_core::UserId;
     use aruna_core::audit::AUDIT_KEY_BYTES;
     use aruna_core::audit::{AuditPageBatch, AuditPageRequest};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{MetadataAnswer, NetEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::metadata::AuthToken;
+    use aruna_core::metadata::protocol::MetadataReadError;
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -600,8 +598,9 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::{
         MetadataAuditOperation, MetadataAuditRecord,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::DriverContext;
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -1375,7 +1374,7 @@ mod tests {
             &auth,
             &path,
             &aruna_core::structs::identity::auth::Permission::WRITE,
-            crate::auth::request_policy::PolicyRequestExtras::rest(),
+            aruna_core::request_policy::PolicyRequestExtras::rest(),
         );
         let result = aruna_drivers::driver::drive(check, &context)
             .await
@@ -1485,7 +1484,7 @@ mod tests {
             (second_doc, Ulid::from_bytes([8u8; 16])),
         ] {
             let row = audit_entry(&record(group_id, document_id, realm_id), audit_id).unwrap();
-            crate::testing::write_entries(&context.storage_handle, vec![row]).await;
+            aruna_drivers::testing::write_entries(&context.storage_handle, vec![row]).await;
         }
 
         let first = aruna_drivers::driver::drive(

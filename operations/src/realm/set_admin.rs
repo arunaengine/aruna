@@ -6,7 +6,6 @@
 use aruna_core::id_mint::IdMint;
 use std::collections::HashSet;
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget, roles_narrowed};
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
@@ -15,13 +14,13 @@ use aruna_core::events::Event;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 
@@ -30,7 +29,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::auth::epoch_due::DueMarks;
 use crate::realm::assign_role::should_seed_role;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -373,14 +372,14 @@ impl Operation for SetAdminWrite {
                 self.emit_write(config.as_ref(), auth.as_ref(), reducer.as_ref())
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.after_writes()
             }
             Stage::Marks => match self.marks.next(result, true) {

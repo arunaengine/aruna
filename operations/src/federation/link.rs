@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
@@ -20,6 +19,7 @@ use aruna_core::rows::values;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
@@ -423,7 +423,6 @@ mod tests {
     };
     use aruna_core::handoff::secret_nonce;
     use aruna_core::operation::{Operation, TransactionMode};
-    use aruna_core::rows::done;
     use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_secs;
@@ -518,15 +517,17 @@ mod tests {
     }
 
     async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     /// Two active local accounts and a realm that admits logins of every realm.
     async fn context() -> (TempDir, DriverContext) {
         let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -749,7 +750,7 @@ mod tests {
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<()>, UpdateUserError> {
-            done(result)?;
+            result.done()?;
             Ok(Next::Done(()))
         }
     }

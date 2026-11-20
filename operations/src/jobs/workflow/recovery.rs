@@ -12,7 +12,7 @@ use aruna_core::compute::{
 use aruna_core::events::Event;
 use aruna_core::jobs::JobEvent;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{AttemptControl, JobError, JobRecord};
+use aruna_core::structs::execution::job::local::{AttemptControl, JobError, JobRecord};
 use tracing::warn;
 
 use super::attempt::{AttemptScope, stops_call};

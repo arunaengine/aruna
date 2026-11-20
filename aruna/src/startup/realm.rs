@@ -4,16 +4,16 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
-use aruna_operations::device::realm_documents::fetch_realm_documents;
+use aruna_operations::device_node::realm_documents::fetch_realm_documents;
 use aruna_operations::metadata::projection::{MetadataProjectionError, ReplayPageOperation};
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -25,9 +25,9 @@ use crate::bootstrap::{
     ensure_onboarding_secret, fetch_core_documents, prepare_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use crate::config::{Config, StartupMode};
-use crate::identity::{mark_onboarding_phase, mark_state_complete};
 use crate::startup::federation::register_default;
+use aruna_config::identity::{mark_onboarding_phase, mark_state_complete};
+use aruna_config::{Config, StartupMode};
 
 pub(crate) struct CoreAnnouncement {
     pub(crate) documents: Vec<DocumentTarget>,
@@ -323,13 +323,13 @@ async fn provision_realm(
 /// placement map before it serves anything. A changed subject blocks governed
 /// serving until the local inventory has been revalidated under it.
 async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    let mode = aruna_operations::placement::policy::SubjectScanMode::Revalidate(
+    let mode = aruna_operations::placement::policy::subject::SubjectScanMode::Revalidate(
         aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
     );
-    let sync = aruna_operations::placement::policy::SubjectSyncOperation::new(
+    let sync = aruna_operations::placement::policy::reconcile::SubjectSyncOperation::new(
         config.realm_id,
         config.node_id,
-        aruna_operations::placement::policy::SubjectTrigger::Reconcile(mode),
+        aruna_operations::placement::policy::reconcile::SubjectTrigger::Reconcile(mode),
         aruna_clock::unix_timestamp_millis(),
     );
     aruna_drivers::driver::drive(sync, ctx)
@@ -350,10 +350,32 @@ async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), Stri
         .map_err(|error| error.to_string())
 }
 
+/// Replays the event log one page at a time, checking `should_continue` before each page. A
+/// stop accepted during a large replay ends at a page boundary with every completed page
+/// projected, so no in-flight projection step is abandoned.
+async fn replay_until_stopped(
+    context: &DriverContext,
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<usize, MetadataProjectionError> {
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut after = None;
+    let mut projected = 0usize;
+    while should_continue() {
+        let page = ReplayPageOperation::new(after, local_node);
+        let (count, next) = drive(page, context).await?;
+        projected = projected.saturating_add(count);
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    Ok(projected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 
     // A stop accepted before preparation starts must return cleanly without
     // touching storage or the network, so the caller can release the acquired
@@ -375,8 +397,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (config, storage) = crate::config::resolve_settings(
-            crate::settings::read_settings_from(&map).expect("settings parse"),
+        let (config, storage) = aruna_config::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await
         .expect("settings resolve");
@@ -410,26 +432,4 @@ mod tests {
         assert!(matches!(result, Ok(None)));
         net.shutdown().await;
     }
-}
-
-/// Replays the event log one page at a time, checking `should_continue` before each page. A
-/// stop accepted during a large replay ends at a page boundary with every completed page
-/// projected, so no in-flight projection step is abandoned.
-async fn replay_until_stopped(
-    context: &DriverContext,
-    mut should_continue: impl FnMut() -> bool,
-) -> Result<usize, MetadataProjectionError> {
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut after = None;
-    let mut projected = 0usize;
-    while should_continue() {
-        let page = ReplayPageOperation::new(after, local_node);
-        let (count, next) = drive(page, context).await?;
-        projected = projected.saturating_add(count);
-        match next {
-            Some(next) => after = Some(next),
-            None => break,
-        }
-    }
-    Ok(projected)
 }

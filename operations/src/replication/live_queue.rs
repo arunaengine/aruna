@@ -2,14 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::Operation;
+use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+    WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
+    watch_resource_path,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
@@ -17,8 +19,7 @@ use aruna_core::types::GroupId;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::queue::{BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult};
-use crate::notifications::watch::origin::EmitWatchOperation;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 
 /// A committed put, as its live replication and its watchers need it.
 #[derive(Clone, Debug, PartialEq)]
@@ -40,8 +41,8 @@ enum PutStep {
     Emit,
 }
 
-/// Best effort after a committed put: queues live replication, then tells the watchers. Every
-/// failure only warns, since the durable obligation remains for repair.
+/// Best effort after a committed put: queues live replication, then queues the watch event when
+/// anyone watches. Every failure only warns, since the durable obligation remains for repair.
 #[derive(Debug, PartialEq)]
 pub struct CompletePutOperation {
     now_ms: u64,
@@ -85,9 +86,9 @@ impl CompletePutOperation {
                 });
             }
         };
-        let Some((local, holders)) = route else {
+        if route.is_none() {
             return Ok(Next::Done(()));
-        };
+        }
         let event_id = self.ids.mint(self.now_ms);
         let input = &self.input;
         let event = WatchEvent {
@@ -106,8 +107,13 @@ impl CompletePutOperation {
             },
         };
         self.step = PutStep::Emit;
-        let emit = EmitWatchOperation::new(event, local, holders);
-        Ok(Next::Call(IoCall::child(emit)))
+        match watch_event_entry(&event) {
+            Ok(entry) => Ok(Next::Call(outside_call(IoCall::Write(vec![entry])))),
+            Err(error) => {
+                warn!(%error, "The upload watch event could not be queued");
+                Ok(Next::Done(()))
+            }
+        }
     }
 }
 
@@ -137,9 +143,13 @@ impl Operation for CompletePutOperation {
             }
             PutStep::Holders => self.emit(result.event()?),
             PutStep::Emit => {
-                // Every failure is logged inside the emission.
-                let _ = result.child::<(), IoError>()?;
-                Ok(Next::Done(()))
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
+                    warn!(%error, "The upload watch event could not be queued");
+                }
+                Ok(Next::Then {
+                    output: (),
+                    calls: vec![IoCall::from(schedule_watch_drain())],
+                })
             }
         }
     }
@@ -154,7 +164,8 @@ impl Operation for CompletePutOperation {
 }
 
 /// Queues continuous sync for one committed version or delete marker and wakes the drain. A
-/// failure only warns, since the durable obligation remains for repair.
+/// failure only warns, since the durable obligation remains for repair; the queue itself warns
+/// about an unset drain timer.
 #[derive(Debug, PartialEq)]
 pub struct QueueLiveOperation {
     input: LiveVersionInput,
@@ -178,21 +189,15 @@ impl Operation for QueueLiveOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
         let input = &self.input;
         let (bucket, key, version_id) = (&input.bucket, &input.key, input.version_id);
-        match result.child::<QueueBlobResult, BlobQueueError>()? {
-            Ok(queued) if queued.queued > 0 && !queued.scheduled => {
-                warn!(bucket, key, version_id = %version_id, queued = queued.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    bucket,
-                    key,
-                    version_id = %version_id,
-                    delete_marker = input.delete_marker,
-                    "Failed to queue live replication after committed write; durable obligation remains for repair"
-                );
-            }
+        if let Err(error) = result.child::<bool, IoError>()? {
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker = input.delete_marker,
+                "Failed to queue live replication after committed write; durable obligation remains for repair"
+            );
         }
         Ok(Next::Done(()))
     }
@@ -201,9 +206,9 @@ impl Operation for QueueLiveOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
+    use aruna_core::user::id::UserId;
 
     fn realm() -> RealmId {
         RealmId::from_bytes([1; 32])
@@ -253,12 +258,18 @@ mod tests {
         operation
     }
 
+    // A watched put queues its event, then arms the drain after the write.
     #[test]
-    fn put_emits_watch() {
+    fn put_queues_watch() {
         let mut operation = asking();
         let turn = operation.next(holders(Some((node(1), vec![node(2)]))));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
-        assert_eq!(operation.next(done()), Ok(Next::Done(())));
+        let armed = Ok(Next::Then {
+            output: (),
+            calls: vec![IoCall::from(schedule_watch_drain())],
+        });
+        let written = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(IoResult::Done)));
+        assert_eq!(operation.next(written), armed);
     }
 
     #[test]
@@ -287,17 +298,14 @@ mod tests {
     #[test]
     fn queue_failure_warns() {
         // The committed write stands, so the failure ends in a warning only.
-        let failed = Err::<QueueBlobResult, _>(BlobQueueError::Storage(StorageError::Timeout));
+        let failed = Err::<bool, _>(IoError::Storage(StorageError::Timeout));
         let turn = queueing().next(IoResult::Child(ChildOutcome::new(failed)));
         assert_eq!(turn, Ok(Next::Done(())));
     }
 
     #[test]
     fn queue_ends_done() {
-        let queued = Ok::<_, BlobQueueError>(QueueBlobResult {
-            queued: 1,
-            scheduled: true,
-        });
+        let queued = Ok::<_, IoError>(true);
         let turn = queueing().next(IoResult::Child(ChildOutcome::new(queued)));
         assert_eq!(turn, Ok(Next::Done(())));
     }

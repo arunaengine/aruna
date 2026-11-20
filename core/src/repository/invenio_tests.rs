@@ -11,11 +11,12 @@ use crate::structs::secondary_id::{SecondaryIdKind, SecondaryIdentifier};
 #[test]
 fn binds_repository_login() {
     use crate::credential_encryption::CredentialEncryptionKey;
-    use crate::structs::execution::job::{ExportRoCrateSpec, JobPayload, RoCrateLimits};
+    use crate::structs::execution::job::input::{ExportRoCrateSpec, JobPayload, RoCrateLimits};
     use crate::structs::identity::auth::AuthContext;
     use crate::structs::identity::realm::RealmId;
     let key = CredentialEncryptionKey::derive(&[1; 32]);
-    let user = crate::UserId::local(Ulid::from_bytes([2; 16]), RealmId::from_bytes([3; 32]));
+    let user =
+        crate::user::id::UserId::local(Ulid::from_bytes([2; 16]), RealmId::from_bytes([3; 32]));
     let group = Ulid::from_bytes([4; 16]);
     let connector = Ulid::from_bytes([5; 16]);
     let endpoint = "https://zenodo.org/api/";
@@ -38,7 +39,7 @@ fn binds_repository_login() {
         credential
             .open(
                 &key,
-                crate::UserId::nil(user.realm_id),
+                crate::user::id::UserId::nil(user.realm_id),
                 group,
                 connector,
                 endpoint

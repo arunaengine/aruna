@@ -4,7 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use crate::storage::{ImportKeyspaceState, ensure_target_path};
+use crate::storage::{
+    ImportKeyspaceState, ensure_target_path, keyspace_name, publish_dir, staging_dir, sync_dir,
+    sync_tree,
+};
 use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
 use aruna_core::structs::storage::broken::StorageCheck;
 use aruna_storage::snapshot::{GIT_KEYSPACE, PREFIXES};
@@ -17,9 +20,7 @@ use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use {
     aruna_storage::snapshot::BACKUP_SOCKET,
-    std::fs::OpenOptions,
-    std::io::{BufWriter, Write},
-    std::os::unix::fs::OpenOptionsExt,
+    std::io::{BufWriter, ErrorKind, Write},
     std::os::unix::net::UnixStream,
 };
 
@@ -60,32 +61,32 @@ pub async fn restore(backup_path: String, target_path: String) -> Result<(), Cli
     Ok(())
 }
 
-/// Copies the node's backup stream to `<target>.partial`, checks the whole file and only then
-/// moves it to `target`, so `target` never holds a cut-off backup. Only the owner may read it.
+/// Copies the node's backup stream to an owner-only temporary file beside `target`, checks the
+/// whole file and only then publishes it as `target`, never over a file created meanwhile.
 #[cfg(unix)]
 pub fn backup_file(socket: &Path, target: &Path) -> Result<(u64, SnapshotStats), SnapshotError> {
     if target.exists() {
         return Err(SnapshotError::SnapshotPathExists(target.to_path_buf()));
     }
-    let mut partial = target.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&partial)?;
-    let result = receive_backup(socket, file, &partial);
-    match result {
-        Ok(done) => {
-            std::fs::rename(&partial, target)?;
-            Ok(done)
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    // Every error drops the temporary file, which removes it.
+    let partial = tempfile::Builder::new()
+        .prefix(".backup-")
+        .suffix(".partial")
+        .tempfile_in(dir)?;
+    let done = receive_backup(socket, partial.as_file().try_clone()?, partial.path())?;
+    match partial.persist_noclobber(target) {
+        Ok(_) => {}
+        Err(failed) if failed.error.kind() == ErrorKind::AlreadyExists => {
+            return Err(SnapshotError::SnapshotPathExists(target.to_path_buf()));
         }
-        Err(error) => {
-            let _ = std::fs::remove_file(&partial);
-            Err(error)
-        }
+        Err(failed) => return Err(failed.error.into()),
     }
+    File::open(dir)?.sync_all()?;
+    Ok(done)
 }
 
 #[cfg(unix)]
@@ -100,27 +101,21 @@ fn receive_backup(
     writer.flush()?;
     writer.get_ref().sync_all()?;
     let mut reader = SnapshotReader::new(BufReader::new(File::open(partial)?))?;
-    while reader.next_record()?.is_some() {}
+    while reader.next_with(|_| Ok(Some(std::io::sink())))?.is_some() {}
     Ok((bytes, reader.stats()))
 }
 
-/// Builds a new storage directory from a backup: the node database at `target`, document sync
-/// in `document-sync`, the metadata store in `craqle/store` and the Git repositories in `git`.
-/// It is built in `<target>.partial` and moved to `target` only after the whole file checked.
+/// Builds a new storage directory from a backup: the node database at `target`, `document-sync`,
+/// `craqle/store` and `git`. It grows in an owner-only staging folder beside `target`, uniquely
+/// named so a crashed restore blocks no other, and is published once the whole file checked.
 pub fn restore_backup(backup: &Path, target: &Path) -> Result<SnapshotStats, SnapshotError> {
     ensure_target_path(target)?;
-    let mut partial = target.as_os_str().to_owned();
-    partial.push(".partial");
-    let partial = PathBuf::from(partial);
-    ensure_target_path(&partial)?;
     let mut reader = SnapshotReader::new(BufReader::new(File::open(backup)?))?;
-    std::fs::create_dir(&partial)?;
-    let restored = restore_into(&mut reader, &partial)
-        .and_then(|()| std::fs::rename(&partial, target).map_err(SnapshotError::from));
-    if let Err(error) = restored {
-        let _ = std::fs::remove_dir_all(&partial);
-        return Err(error);
-    }
+    // Every error drops the staging directory, which removes it.
+    let staging = staging_dir(target)?;
+    restore_into(&mut reader, staging.path())?;
+    publish_dir(staging.path(), target)?;
+    let _published = staging.keep();
     Ok(reader.stats())
 }
 
@@ -133,15 +128,26 @@ fn restore_into(
     let git_root = target.join("git");
     let mut section = None;
 
-    while let Some(record) = reader.next_record()? {
+    loop {
+        // Git files stream to disk; store entries are held, as Fjall takes whole values.
+        let git = matches!(section, Some(Section::Git));
+        let record = reader.next_with(|key| {
+            if git {
+                git_file(&git_root, key)
+            } else {
+                Ok(None)
+            }
+        })?;
+        let Some(record) = record else {
+            break;
+        };
         match record {
             SnapshotRecord::Keyspace(name) => section = Some(open_section(&databases, &name)?),
             SnapshotRecord::Entry { key, value } => match section.as_mut() {
                 Some(Section::Store(index, state)) => {
                     state.insert(&databases[*index], key, value)?
                 }
-                Some(Section::Git) => write_git(&git_root, &key, &value)?,
-                None => {}
+                Some(Section::Git) | None => {}
             },
             SnapshotRecord::EndKeyspace => {
                 if let Some(Section::Store(_, mut state)) = section.take() {
@@ -154,6 +160,11 @@ fn restore_into(
     for database in &databases {
         database.persist(PersistMode::SyncAll)?;
     }
+    // The Git files were only written; they must be durable before the restore is published.
+    if git_root.exists() {
+        sync_tree(&git_root)?;
+    }
+    sync_dir(target)?;
     Ok(())
 }
 
@@ -210,11 +221,7 @@ fn open_section(
     }
     for (index, prefix) in PREFIXES.iter().enumerate() {
         if let Some(keyspace) = name.strip_prefix(prefix) {
-            if keyspace.is_empty() || keyspace.len() > usize::from(u8::MAX) {
-                return Err(SnapshotError::InvalidStructure(
-                    "invalid keyspace name in backup",
-                ));
-            }
+            let keyspace = keyspace_name(keyspace)?;
             let keyspace = databases[index].keyspace(keyspace, KeyspaceCreateOptions::default)?;
             return Ok(Section::Store(index, ImportKeyspaceState::new(keyspace)));
         }
@@ -224,8 +231,35 @@ fn open_section(
     ))
 }
 
-/// Writes one Git entry below `root`; a key ending in `/` is a directory.
-fn write_git(root: &Path, key: &[u8], value: &[u8]) -> Result<(), SnapshotError> {
+/// Where a Git entry's value goes: a file, or nowhere for a directory, whose value is empty.
+enum GitValue {
+    File(File),
+    Directory,
+}
+
+impl std::io::Write for GitValue {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => std::io::Write::write(file, bytes),
+            Self::Directory if bytes.is_empty() => Ok(0),
+            Self::Directory => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "a Git directory entry in the backup has a value",
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::File(file) => std::io::Write::flush(file),
+            Self::Directory => Ok(()),
+        }
+    }
+}
+
+/// Makes one Git entry below `root` and opens where its value goes; a key ending in `/` is a
+/// directory.
+fn git_file(root: &Path, key: &[u8]) -> Result<Option<GitValue>, SnapshotError> {
     let relative = std::str::from_utf8(key)
         .map_err(|_| SnapshotError::InvalidStructure("non UTF-8 Git path in backup"))?;
     let path = Path::new(relative);
@@ -235,13 +269,12 @@ fn write_git(root: &Path, key: &[u8], value: &[u8]) -> Result<(), SnapshotError>
     let path = root.join(path);
     if relative.ends_with('/') {
         std::fs::create_dir_all(path)?;
-        return Ok(());
+        return Ok(Some(GitValue::Directory));
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, value)?;
-    Ok(())
+    Ok(Some(GitValue::File(File::create(path)?)))
 }
 
 #[cfg(test)]
@@ -302,6 +335,7 @@ mod tests {
             sync: source.sync.inner().clone(),
             metadata: source.metadata.store_database(),
             git_root: root.join("git"),
+            git: None,
         };
         let mut bytes = Vec::new();
         write_backup(&mut bytes, &sources, 11).unwrap();
@@ -332,7 +366,7 @@ mod tests {
         let stats = restore_backup(&file, &target).unwrap();
         assert_eq!(stats.created_unix_seconds, 11);
 
-        assert!(!dir.path().join("restored.partial").exists());
+        assert!(!staging_left(dir.path()), "no staging directory is left");
         let main = OptimisticTxDatabase::builder(&target).open().unwrap();
         assert_eq!(read_test_value(main.inner()), b"main");
         let queued = read_value(main.inner(), CHECK_QUEUE_KEYSPACE, "photos");
@@ -401,6 +435,93 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn keeps_raced_target() {
+        use super::{SnapshotError, backup_file};
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        let bytes = backup_bytes(&source_root, &open_source(&source_root));
+        let socket = dir.path().join("backup.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let target = dir.path().join("raced.backup");
+        let result = std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let (mut stream, _) = listener.accept().unwrap();
+                // Another writer takes the destination while the backup is received.
+                std::fs::write(&target, "kept").unwrap();
+                stream.write_all(&bytes).unwrap();
+            });
+            let result = backup_file(&socket, &target);
+            server.join().unwrap();
+            result
+        });
+        assert!(matches!(result, Err(SnapshotError::SnapshotPathExists(_))));
+        assert_eq!(std::fs::read(&target).unwrap(), b"kept");
+        let names: Vec<_> = (std::fs::read_dir(dir.path()).unwrap())
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".partial")),
+            "{names:?}"
+        );
+    }
+
+    /// Whether a restore left a staging directory in `dir`.
+    fn staging_left(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().any(|entry| {
+            let name = entry.unwrap().file_name();
+            name.to_string_lossy().starts_with(".restore-")
+        })
+    }
+
+    // A target that appeared after the check survives, a crashed restore's leftover blocks
+    // nothing, and the restored directory stays owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn restore_never_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir(&staging).unwrap();
+        let raced = dir.path().join("raced");
+        std::fs::create_dir(&raced).unwrap();
+        let refused = crate::storage::publish_dir(&staging, &raced);
+        assert!(matches!(
+            refused,
+            Err(super::SnapshotError::TargetPathExists(_))
+        ));
+        assert!(staging.is_dir() && raced.is_dir());
+
+        let source_root = dir.path().join("source");
+        let bytes = backup_bytes(&source_root, &open_source(&source_root));
+        let file = dir.path().join("node.backup");
+        std::fs::write(&file, bytes).unwrap();
+        let target = dir.path().join("restored");
+        std::fs::create_dir(dir.path().join("restored.partial")).unwrap();
+        restore_backup(&file, &target).unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    // A directory entry carries no bytes; one with a value is refused before it is buffered.
+    #[test]
+    fn git_directory_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SnapshotWriter::new(Vec::new(), 11).unwrap();
+        writer.begin_keyspace(GIT_KEYSPACE).unwrap();
+        writer.entry(b"one.git/", b"unexpected").unwrap();
+        writer.end_keyspace().unwrap();
+        let file = dir.path().join("dir.backup");
+        std::fs::write(&file, writer.finish().unwrap().0).unwrap();
+        let restored = restore_backup(&file, &dir.path().join("restored"));
+        assert!(restored.is_err());
+        assert!(!staging_left(dir.path()));
+    }
+
     #[test]
     fn rejects_unsafe_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -429,6 +550,6 @@ mod tests {
         let target = dir.path().join("restored");
         assert!(restore_backup(&file, &target).is_err());
         assert!(!target.exists());
-        assert!(!dir.path().join("restored.partial").exists());
+        assert!(!staging_left(dir.path()), "no staging directory is left");
     }
 }

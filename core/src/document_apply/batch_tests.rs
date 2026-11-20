@@ -10,7 +10,7 @@ use super::super::fixtures::{
 };
 use super::*;
 use crate::calls::IoError;
-use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+use crate::document::{AppliedStep, DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use crate::events::{Event, NetEvent};
 
 type Answer = Result<Next<BatchOutcome>, ApplyError>;
@@ -82,6 +82,31 @@ fn identity() -> SyncQuarantineIdentity {
         actor: actor(),
         actor_seq: 1,
     }
+}
+
+// A batch that queues follow-ups runs each apply with its follow-up row, keyed by the event.
+#[test]
+fn queued_apply_event() {
+    let event = upsert(config_target());
+    let followups = FollowUpNode {
+        node_id: node(),
+        realm_id: realm(),
+        from: AppliedStep::Usage,
+    };
+    let mut batch = operation(vec![event.clone()]).queuing(Some(followups));
+    let plan = ApplyEventPlan {
+        topic_id: config_topic(),
+        actor_id: actor(),
+        realm_id: realm(),
+        identity: identity(),
+        event,
+    };
+    let queued = QueuedApply {
+        plan,
+        node: followups,
+        identity: identity(),
+    };
+    assert_eq!(batch.first(), Ok(Next::Call(plan_call(queued))));
 }
 
 #[test]

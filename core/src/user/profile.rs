@@ -56,8 +56,8 @@ impl User {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UserId;
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
     use ulid::Ulid;
 
     #[test]

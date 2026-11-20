@@ -138,7 +138,7 @@ mod tests {
     /// A writes run for foo/ that reads foo/ but not foo/private/, with a CEL deny on foo/tmp/x.
     fn listing() -> KeyOperation {
         let realm_id = RealmId([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let auth = AuthContext {
             user_id: user,

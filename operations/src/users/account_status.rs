@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
@@ -11,12 +10,12 @@ use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::rows::done;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::{GroupId, Value};
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, STOPPED_BY_INSTALL};
 use byteview::ByteView;
 use std::collections::HashMap;
@@ -335,7 +334,7 @@ impl Operation for AccountStatusOperation {
             IoResult::Values(values) if self.administrator.is_none() => self.authorize(values),
             IoResult::Event(event) => self.answered(*event),
             result => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(()))
             }
         }

@@ -5,11 +5,11 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentTarget, shard_topic_id};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::placement::{resolve_shard_holders, shard_subject_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementRef};
@@ -17,7 +17,7 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_net::NetHandle;
 use aruna_operations::shard::recovery::RecoveryStop;
 use aruna_operations::shard::restore::RestorePassOperation;
-use aruna_operations::shard::restore_plan::{ShardRestoreCursor, ShardRestorePass};
+use aruna_operations::shard::restore::plan::{ShardRestoreCursor, ShardRestorePass};
 use irokle::oplog::Oplog;
 use irokle::storage::Storage;
 use irokle::{ReplicationPolicy, TopicGenesis};

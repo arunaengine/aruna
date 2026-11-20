@@ -7,12 +7,14 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::rows::PrefixPages;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
-use crate::onboarding::create_secret::{secret_pages, secret_record_key};
+use crate::onboarding::create_secret::{
+    expiry_entry, secret_expiry_key, secret_pages, secret_record_key,
+};
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -95,6 +97,7 @@ impl RecoverInitialOperation {
                 ByteView::from(value),
             ),
             state,
+            expiry_entry(&self.input.record),
         ])
     }
 
@@ -150,6 +153,8 @@ impl RecoverInitialOperation {
                     ONBOARDING_KEYSPACE.to_string(),
                     secret_state_key(record.enrollment_id),
                 ));
+                let expiry = secret_expiry_key(record.expires_at, record.enrollment_id);
+                deletes.push((ONBOARDING_KEYSPACE.to_string(), expiry));
             }
         }
         if deletes.is_empty() {
@@ -182,11 +187,11 @@ impl Operation for RecoverInitialOperation {
                 self.handle_states(values)
             }
             Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.write_replacement()
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.input.record.clone()))
             }
         }
@@ -208,7 +213,7 @@ mod tests {
     use ulid::Ulid;
 
     fn context_at(path: &str) -> DriverContext {
-        crate::testing::path_context(path)
+        aruna_drivers::testing::path_context(path)
     }
 
     fn admin_record(secret_hash: &str) -> OnboardingSecretRecord {
@@ -294,7 +299,8 @@ mod tests {
     #[tokio::test]
     async fn replaces_unclaimed_admin() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -382,7 +388,10 @@ mod tests {
             replacement
         );
 
-        let entries = drive(ListSecretsOperation::new(), &context).await.unwrap();
+        let entries = drive(ListSecretsOperation::new(None), &context)
+            .await
+            .unwrap();
+        let entries = entries.entries;
         assert!(entries.iter().all(|entry| {
             entry.record.enrollment_id != old_id && entry.record.enrollment_id != other_old_id
         }));

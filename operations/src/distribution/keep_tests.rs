@@ -12,7 +12,7 @@ use aruna_core::structs::storage::distribution::on_use::{
 };
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_drivers::driver::drive;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -56,9 +56,15 @@ fn cached(seed: u8, size: u64, capacity: u64) -> KeptCopy {
 
 /// An attachment of member `seed` of the stored two-shard record.
 async fn attached(handle: &StorageHandle, seed: u8) -> KeptCopy {
-    use crate::distribution::test_record::{member, record, store_record};
+    use crate::distribution::test_record::{member, record};
     let (snapshot, bytes) = record(true);
-    store_record(handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     KeptCopy {
         kind: KeptKind::Attachment,
         set_id: snapshot.set_id(),

@@ -5,22 +5,22 @@
 mod enumerate;
 pub mod envelope;
 mod epoch;
-mod member;
-mod reissue;
+pub mod member;
+pub mod reissue;
 mod requests;
 mod snapshot;
 
-use crate::distribution::inventory::{StagedCall, outside_answer};
-use crate::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_core::NodeId;
+use crate::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, VaultQuery};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::*;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{all_values, done, event, page, values};
+use aruna_core::rows::{StagedCall, outside_answer, values};
+use aruna_core::structs::execution::notification;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::user::vault::{UserKeyRecord, VaultRecords};
 use aruna_core::structs::storage::abe::{AbeEffect, AbeError, AbeEvent, AbeParameters};
@@ -30,8 +30,6 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, EncryptionMode,
 };
 use aruna_core::types::{Key, Value};
-pub use member::MemberKeysOperation;
-pub use reissue::ReissueOperation;
 use snapshot::Snapshot;
 use thiserror::Error;
 use ulid::Ulid;
@@ -43,7 +41,7 @@ pub enum KeyAction {
     Grants(Option<Vec<u8>>),
     Publish(KeyGrant),
     /// Opens requests for a member's direct read scopes after a role grant by the caller.
-    Member(aruna_core::UserId),
+    Member(aruna_core::user::id::UserId),
     /// Opens requests of the caller's new credential, sealed to its token key and narrowed by
     /// its path restrictions.
     Token {
@@ -76,6 +74,9 @@ pub enum KeyError {
     Abe(#[from] AbeError),
     #[error("the bucket or key request was not found")]
     Missing,
+    /// A record the request needs is not on this node yet; unlike `Missing`, the bucket exists.
+    #[error("a record the key request needs is not on this node yet")]
+    Unprepared,
     #[error("access to the encryption record is denied")]
     Denied,
     #[error("encryption storage is unavailable")]
@@ -118,6 +119,7 @@ enum State {
     Issue,
     Count,
     Holders,
+    HolderWrite,
     Cleanup,
     Write,
     Heads,
@@ -150,6 +152,12 @@ pub struct KeyOperation {
     more: bool,
     fresh: bool,
     notify: bool,
+    /// The holders told of this request, and the holder page that follows the one written.
+    notified: std::collections::BTreeSet<aruna_core::user::id::UserId>,
+    holder_next: Option<Key>,
+    /// The role holders still to tell, in bounded chunks before the explicit holder pages.
+    role_holders: std::collections::VecDeque<aruna_core::user::id::UserId>,
+    explicit_started: bool,
     quiet: bool,
     managed: bool,
     result: Option<KeyResult>,
@@ -187,6 +195,10 @@ impl KeyOperation {
             more: false,
             fresh: false,
             notify: false,
+            notified: Default::default(),
+            holder_next: None,
+            role_holders: Default::default(),
+            explicit_started: false,
             quiet: false,
             managed: false,
             result: None,
@@ -213,11 +225,14 @@ impl KeyOperation {
             .max_by_key(|k| (k.created_at_ms, k.record_id))
     }
     fn settings_read(&mut self, value: Option<Value>) -> KeyTurn {
-        let settings = BucketEncryption::from_row(value.as_deref()).ok();
-        let Some(key) = settings.as_ref().and_then(|s| s.active_key()) else {
+        // Settings that do not decode or validate fail; only decoded ones without a key need none.
+        let Ok(settings) = BucketEncryption::from_row(value.as_deref()) else {
+            return self.fail(AbeError::Context);
+        };
+        let Some(key) = settings.active_key() else {
             return self.fail(KeyError::Missing);
         };
-        self.managed = settings.is_some_and(|s| s.mode == EncryptionMode::NodeManaged);
+        self.managed = settings.mode == EncryptionMode::NodeManaged;
         if let KeyAction::Publish(grant) = &self.action
             && grant.context.request.parameters.key != key
         {
@@ -404,7 +419,7 @@ impl KeyOperation {
             return self.next_scope();
         }
         let output = self.result.take().ok_or(AbeError::Context)?;
-        let drain = crate::notifications::outbox_record::schedule_drain_effect();
+        let drain = notification::schedule_drain_effect();
         let drain = self.notify.then(|| IoCall::Effect(Box::new(drain)));
         let calls: Vec<IoCall> = drain.into_iter().chain(self.walk()).collect();
         if calls.is_empty() {
@@ -457,8 +472,12 @@ impl Operation for KeyOperation {
         match self.state {
             State::Bucket => {
                 let [value] = values::<1>(result)?;
-                let Some(info) = value.as_ref().and_then(|v| BucketInfo::from_bytes(v).ok()) else {
+                // Only an absent bucket is `Missing`; one that does not decode fails.
+                let Some(value) = value else {
                     return self.fail(KeyError::Missing);
+                };
+                let Ok(info) = BucketInfo::from_bytes(&value) else {
+                    return self.fail(AbeError::Context);
                 };
                 self.info = Some(info);
                 self.state = State::Settings;
@@ -469,7 +488,7 @@ impl Operation for KeyOperation {
                 self.settings_read(value)
             }
             State::Snapshot => {
-                self.snapshot_read(all_values(result)?)?;
+                self.snapshot_read(result.values()?)?;
                 if matches!(self.action, KeyAction::Open(_)) {
                     return self.records();
                 }
@@ -484,7 +503,7 @@ impl Operation for KeyOperation {
                 self.prepare()
             }
             State::Unlock => {
-                let Event::Blob(BlobEvent::KeyStatus { generations }) = event(result)? else {
+                let Event::Blob(BlobEvent::KeyStatus { generations }) = result.event()? else {
                     return self.fail(AbeError::Context);
                 };
                 let key = self.snapshot.as_ref().map(|s| s.parameters.key);
@@ -503,17 +522,21 @@ impl Operation for KeyOperation {
                 let [value] = values::<1>(result)?;
                 self.existing_read(value)
             }
-            State::Reuse => self.reuse_read(page(result)?.0),
-            State::Count => self.count_read(page(result)?.0),
-            State::Holders => self.notify_holders(page(result)?.0),
-            State::Issue => self.issue_read(event(result)?),
+            State::Reuse => self.reuse_read(result.page()?.0),
+            State::Count => self.count_read(result.page()?.0),
+            State::Holders => self.holders_read(result.page()?),
+            State::HolderWrite => {
+                result.done()?;
+                self.holders_written()
+            }
+            State::Issue => self.issue_read(result.event()?),
             State::Cleanup | State::Write => {
-                done(result)?;
+                result.done()?;
                 self.flush()
             }
-            State::Heads => self.heads_read(page(outside_answer(result)?)?.0),
-            State::Writes => self.writes_read(all_values(outside_answer(result)?)?),
-            State::Envelopes => self.envelopes_read(all_values(outside_answer(result)?)?),
+            State::Heads => self.heads_read(outside_answer(result)?.page()?.0),
+            State::Writes => self.writes_read(outside_answer(result)?.values()?),
+            State::Envelopes => self.envelopes_read(outside_answer(result)?.values()?),
         }
     }
 }
@@ -530,7 +553,8 @@ mod tests {
     #[test]
     fn foreign_user_starts() {
         // A federated user served by realm 1 requests keys there under the ordinary checks.
-        let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let foreign =
+            aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
         let auth = AuthContext {
             user_id: foreign,
             realm_id: RealmId([1; 32]),
@@ -542,6 +566,187 @@ mod tests {
         let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
         assert_eq!(operation.transaction(), TransactionMode::Write);
         assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    }
+
+    #[test]
+    fn unreadable_rows_fail() {
+        // A stored bucket or settings row that does not decode is an error, never a skip.
+        let realm_id = RealmId([1; 32]);
+        let user_id = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let action = KeyAction::Member(user_id);
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        operation.first().unwrap();
+        let garbage = || IoResult::Values(vec![Some(Value::from(vec![0xff; 3]))]);
+        assert_eq!(
+            operation.next(garbage()),
+            Err(KeyError::Abe(AbeError::Context))
+        );
+        operation.state = State::Settings;
+        let unreadable = operation.settings_read(Some(Value::from(vec![0xff; 3])));
+        assert_eq!(unreadable, Err(KeyError::Abe(AbeError::Context)));
+        let absent = IoResult::Values(vec![None]);
+        operation.state = State::Bucket;
+        assert_eq!(operation.next(absent), Err(KeyError::Missing));
+    }
+
+    #[test]
+    fn missing_records_unprepared() {
+        // An absent authorization, parameter or epoch row is no vanished bucket.
+        let realm_id = RealmId([1; 32]);
+        let user_id = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let action = KeyAction::Member(user_id);
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        let mut values = vec![None; 8];
+        values[7] = Some(Value::from(b"user".to_vec()));
+        assert_eq!(operation.snapshot_read(values), Err(KeyError::Unprepared));
+    }
+
+    /// A request of user 5 in realm 1 for a bucket whose snapshot names `holders`.
+    fn holder_fixture(
+        holders: std::collections::BTreeSet<aruna_core::user::id::UserId>,
+    ) -> KeyOperation {
+        let realm_id = RealmId([1; 32]);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let auth = AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        operation.info = Some(BucketInfo {
+            group_id: Ulid::from_bytes([8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: None,
+        });
+        operation.snapshot = Some(Snapshot {
+            parameters: AbeParameters {
+                realm_id,
+                node_id: node,
+                key: BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1),
+                fingerprint: [7; 32],
+                parameters: vec![9; 3],
+            },
+            epoch: 1,
+            revisions: Vec::new(),
+            rules: PermissionRules::from_roles(Vec::new(), None).unwrap(),
+            holder: false,
+            holders,
+            policies: false,
+            due: false,
+            checks: Default::default(),
+        });
+        operation
+    }
+
+    #[test]
+    fn role_holders_chunked() {
+        // Many role holders are told in bounded writes before the explicit holder pages.
+        let realm_id = RealmId([1; 32]);
+        let holders = (0..300u128)
+            .map(|n| aruna_core::user::id::UserId::new(Ulid::from_parts(1, n), realm_id))
+            .collect();
+        let mut operation = holder_fixture(holders);
+        let Some(Ok(Next::Call(IoCall::Write(first)))) = operation.holders() else {
+            panic!("expected the first chunk");
+        };
+        assert_eq!(first.len(), requests::HOLDER_PAGE);
+        let Ok(Next::Call(IoCall::Write(rest))) = operation.next(IoResult::Done) else {
+            panic!("expected the rest of the role holders");
+        };
+        assert_eq!(rest.len(), 300 - requests::HOLDER_PAGE);
+        let turn = operation.next(IoResult::Done);
+        assert!(
+            matches!(turn, Ok(Next::Call(IoCall::Page { .. }))),
+            "then the explicit pages"
+        );
+    }
+
+    #[test]
+    fn holders_told_paged() {
+        // A holder page writes its own notices before the next page is read.
+        let realm_id = RealmId([1; 32]);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let holder = aruna_core::user::id::UserId::new(Ulid::from_bytes([6; 16]), realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let auth = AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        let bucket_id = Ulid::from_bytes([4; 16]);
+        operation.info = Some(BucketInfo {
+            group_id: Ulid::from_bytes([8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: None,
+        });
+        operation.snapshot = Some(Snapshot {
+            parameters: AbeParameters {
+                realm_id,
+                node_id: node,
+                key: BucketKeyRef::new(bucket_id, 1),
+                fingerprint: [7; 32],
+                parameters: vec![9; 3],
+            },
+            epoch: 1,
+            revisions: Vec::new(),
+            rules: PermissionRules::from_roles(Vec::new(), None).unwrap(),
+            holder: false,
+            holders: Default::default(),
+            policies: false,
+            due: false,
+            checks: Default::default(),
+        });
+        let row = aruna_core::structs::storage::encryption::BucketHolder {
+            bucket_id,
+            user_id: holder,
+            origin: aruna_core::structs::storage::encryption::HolderOrigin::Explicit,
+            state: aruna_core::structs::storage::encryption::GrantState::Ready,
+            granted_by: user,
+            granted_at_ms: 1,
+        };
+        let page = vec![(Key::from(row.key()), Value::from(row.to_bytes().unwrap()))];
+        let next = Some(Key::from(row.key()));
+        let Ok(Next::Call(IoCall::Write(notices))) = operation.holders_read((page, next)) else {
+            panic!("expected the page's notices");
+        };
+        assert_eq!(notices.len(), 1);
+        let turn = operation.next(IoResult::Done);
+        assert!(
+            matches!(turn, Ok(Next::Call(IoCall::Page { .. }))),
+            "then the next page"
+        );
     }
 
     #[test]
@@ -561,7 +766,7 @@ mod tests {
     #[test]
     fn due_refuses_grant() {
         let realm_id = RealmId([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let info = BucketInfo {
             group_id: Ulid::from_bytes([8; 16]),
@@ -653,7 +858,7 @@ mod tests {
     /// A token run at epoch 3 whose snapshot admits READ on `pattern`, and its foo/ request.
     fn merge_fixture(pattern: &str) -> (KeyOperation, KeyRequest) {
         let realm_id = RealmId([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let group_id = Ulid::from_bytes([8; 16]);
         let key = BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1);
@@ -837,7 +1042,7 @@ mod tests {
         };
         use aruna_core::structs::identity::user::User;
         let realm_id = RealmId([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let actor = aruna_core::structs::identity::auth::Actor {
             node_id: node,
@@ -876,7 +1081,7 @@ mod tests {
             rows.into_iter().map(|v| v.map(Value::from)).collect()
         };
         let snapshot = |action: KeyAction,
-                        caller: aruna_core::UserId,
+                        caller: aruna_core::user::id::UserId,
                         account: Option<&User>,
                         config: &RealmConfigDocument| {
             let auth = AuthContext {
@@ -941,7 +1146,8 @@ mod tests {
             Err(KeyError::Denied)
         );
 
-        let foreign = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
+        let foreign =
+            aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), RealmId([9; 32]));
         let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
         assert_eq!(snapshot(request.clone(), foreign, None, &config), Ok(()));
         let missing = snapshot(request.clone(), user, None, &config);

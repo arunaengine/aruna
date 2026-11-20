@@ -4,16 +4,16 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentEvictedDocument;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::task::TaskKey;
 use tracing::warn;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
 

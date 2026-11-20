@@ -20,14 +20,14 @@ mod kubernetes;
 #[cfg(all(feature = "slurm", unix))]
 mod slurm;
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::compute::ResourceEnvelope;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-use crate::config::Config;
+use aruna_config::Config;
 
 /// Why a selected compute backend could not be built. The categories stay
 /// distinct so an invalid configuration is never silently treated as
@@ -68,7 +68,7 @@ pub(super) fn optional_tolerates(error: &ComputeBuildError) -> bool {
 
 /// One built backend with the endpoint its tasks reach this node's S3 at; the caller names it.
 pub(super) type BuiltBackend = (
-    Arc<dyn aruna_compute::ExecutorBackend>,
+    Arc<dyn aruna_compute::executor::ExecutorBackend>,
     aruna_compute::registry::WorkspaceEndpoint,
 );
 
@@ -127,7 +127,7 @@ pub(super) struct KubernetesSettings {
     /// KubeDAL driver for run input views and session data, which mount through this node's gateway.
     pub(super) kubedal_driver: Option<String>,
     /// KubeDAL worker cache for cached run inputs, set by its scope.
-    pub(super) kubedal_cache: Option<aruna_compute::KubedalCache>,
+    pub(super) kubedal_cache: Option<aruna_compute::executor::config::KubedalCache>,
     /// The node's S3 endpoint as task pods reach it, used for their S3 env instead of the
     /// public one.
     pub(super) session_endpoint: Option<String>,
@@ -173,7 +173,9 @@ impl ComputeSettings {
 /// Collects the typed compute settings once from one explicit operator-input
 /// source. Production passes the process environment at the resource boundary;
 /// tests pass a map.
-pub(crate) fn collect(env: &dyn crate::settings::SettingsEnv) -> Result<ComputeSettings, String> {
+pub(crate) fn collect(
+    env: &dyn aruna_config::settings::SettingsEnv,
+) -> Result<ComputeSettings, String> {
     settings::collect(env).map_err(compute_error_message)
 }
 

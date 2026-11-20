@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
-use aruna_core::structs::execution::job::ExecutionSpec;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
 
 use super::super::fixtures::{BUCKET, child, compute, facts, is_child, node, realm, record, spec};
 use super::*;
@@ -223,7 +223,7 @@ fn failures_end_preparation() {
 }
 
 fn task_spec() -> ExecutionSpec {
-    use aruna_core::structs::execution::job::{
+    use aruna_core::structs::execution::job::input::{
         OutputDestination, OutputSelection, PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG,
     };
     let mut spec = spec();
@@ -258,7 +258,7 @@ fn task_checked_again() {
     let refused = prepare.next(none).unwrap_err();
     assert_eq!(
         refused.kind,
-        aruna_core::structs::execution::job::JobErrorKind::Permanent
+        aruna_core::structs::execution::job::local::JobErrorKind::Permanent
     );
 
     let mut pending = prepare_of(task_spec(), record(), "", false);
@@ -267,7 +267,7 @@ fn task_checked_again() {
     let retried = pending.next(answer).unwrap_err();
     assert_eq!(
         retried.kind,
-        aruna_core::structs::execution::job::JobErrorKind::Retryable
+        aruna_core::structs::execution::job::local::JobErrorKind::Retryable
     );
     pending.step = PrepareStep::TaskAdmit;
     let admitted = child(Ok::<_, ScreenError>(

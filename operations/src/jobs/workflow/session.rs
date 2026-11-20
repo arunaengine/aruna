@@ -14,10 +14,11 @@ use aruna_core::compute::session::{
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobError, JobId, JobRecord, JobResultPayload, SessionReportDetail,
-    SessionReportRow,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, SessionReportDetail, SessionReportRow,
 };
+use aruna_core::structs::execution::job::local::{JobError, JobRecord, JobResultPayload};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::compute_config::IDLE_AFTER_MS;
 use tracing::warn;

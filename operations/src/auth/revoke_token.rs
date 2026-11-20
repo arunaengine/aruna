@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::{
     revocation_live, revocation_retained, user_cutoff_expiry, user_cutoff_hash,
@@ -14,23 +13,23 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
-};
-use aruna_core::rows::{PrefixPages, done};
+use aruna_core::reducer::revocation::REVOCATIONS_PER_ORIGIN;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, RevocationIndex};
+use aruna_core::rows::PrefixPages;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::epoch_due::DueMarks;
-use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{admin_outbox_prefix, revocation_index_entry};
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -370,16 +369,16 @@ impl Revocation {
                 self.finish_capacity()
             }
             Stage::PendingDelete => {
-                done(result)?;
+                result.done()?;
                 self.after_capacity()
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::StaleDelete;
                 Ok(Some(IoCall::Delete(std::mem::take(&mut self.deletes))))
             }
             Stage::Write | Stage::StaleDelete => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Done;
                 Ok(None)
             }
@@ -669,8 +668,7 @@ mod tests {
     };
     use crate::document_repository::GetConfigOperation;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::sync::outbox_record::admin_outbox_prefix;
-    use aruna_core::UserId;
+    use crate::sync::outbox::record::admin_outbox_prefix;
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_TOKEN_LIFETIME;
     use aruna_core::auth::bearer_token_hash;
@@ -684,8 +682,9 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;

@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
-use crate::placement::policy::PolicyGateError;
+use crate::placement::policy::gate::PolicyGateError;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
 use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 use crate::s3::write_cleanup::{ReleaseWrite, RollbackWrite};
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -31,6 +30,7 @@ use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, PartPiece, content_offset,
 };
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -1161,7 +1161,7 @@ mod test {
     async fn missing_upload_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

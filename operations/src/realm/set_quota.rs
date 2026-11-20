@@ -13,9 +13,8 @@ use aruna_core::events::Event;
 #[cfg(test)]
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
-};
+use aruna_core::reducer::paths::{CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 #[cfg(test)]
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::storage_entries::{
@@ -32,7 +31,7 @@ use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::mutate_placement::is_management;
 use crate::realm::write_stage::{WriteStage, WriteStep};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::placement::target_placement_ref;
@@ -400,14 +399,14 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
-    use crate::testing::path_context;
-    use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::structs::identity::realm::{
         GroupQuotaOverride, RealmConfigDocument, RealmId, RealmNodeKind, UserCapOverride,
     };
     use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -851,14 +850,14 @@ mod tests {
             AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget,
         };
 
-        fn node(seed: u8) -> aruna_core::NodeId {
+        fn node(seed: u8) -> aruna_core::id::NodeId {
             iroh::SecretKey::from_bytes(&[seed; 32]).public()
         }
 
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let mut state = AdminDocumentState::new(target.clone());
         let quota_event =
-            |seed: u8, origin: aruna_core::NodeId, quota: QuotaConfig| AdminDocumentEvent {
+            |seed: u8, origin: aruna_core::id::NodeId, quota: QuotaConfig| AdminDocumentEvent {
                 event_id: Ulid::from_bytes([seed; 16]),
                 target: target.clone(),
                 origin_node_id: origin,

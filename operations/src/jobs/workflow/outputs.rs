@@ -16,9 +16,12 @@ use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEffect, JobEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
-    AttemptControl, ExecutionSpec, JobError, JobRecord, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputObject, OutputSelection,
+use aruna_core::structs::execution::job::family::MAX_EXECUTION_OUTPUTS;
+use aruna_core::structs::execution::job::input::{
+    ExecutionSpec, OutputDestination, OutputSelection,
+};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, JobError, JobRecord, OutputObject,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -48,7 +51,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::groups::routing::{BucketRules, QuotaOperation, RoutingInputsError, SnapshotOperation};
 use crate::jobs::store::job_calls::reserve_output_commits;
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
 use crate::replication::managed_read::LocalUserOperation;
 use crate::replication::source_rules::SourceAuthOperation;
@@ -58,13 +61,13 @@ use crate::replication::version_replication::{
 };
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// What an output capture works with.
 #[derive(Clone, Debug, PartialEq)]

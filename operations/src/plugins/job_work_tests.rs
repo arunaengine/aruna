@@ -3,15 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::OutputObject;
-
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::install::tests::Fixture;
 use crate::plugins::submit::WorkRequest;
-use crate::plugins::submit::tests::{ready, request, scope};
-use crate::plugins::work::tests::edit_work;
+use crate::plugins::test_support::{edit_work, request, scope};
 use crate::plugins::work::{FinalState, WorkState};
+use aruna_core::structs::execution::job::local::OutputObject;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::ready;
 
 fn output(node: NodeId, key: &str) -> OutputObject {
     OutputObject {
@@ -87,7 +86,8 @@ async fn status_from_row() {
     }
     // A reinstall under the same id has another account and does not see the job.
     let mut other = install.clone();
-    other.account = aruna_core::UserId::local(Ulid::from_parts(6, 6), fixture.actor.realm_id);
+    other.account =
+        aruna_core::user::id::UserId::local(Ulid::from_parts(6, 6), fixture.actor.realm_id);
     let foreign = job_status(&fixture.ctx, (&other, local), &id.to_string()).await;
     assert_eq!(
         foreign.map(drop).map_err(|e| e.kind),
@@ -119,7 +119,7 @@ async fn cancel_stops_job() {
 }
 
 mod operations {
-    use aruna_core::structs::execution::job::JobRecord;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use serde_json::json;
 
     use super::*;

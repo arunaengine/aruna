@@ -100,7 +100,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::{TxnId, Value};
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -209,7 +209,7 @@ mod tests {
             1,
         );
         let row = graph_lifecycle_entry(&lifecycle).unwrap();
-        crate::testing::write_entries(&storage_handle, vec![row]).await;
+        aruna_drivers::testing::write_entries(&storage_handle, vec![row]).await;
 
         let context = DriverContext {
             storage_handle,

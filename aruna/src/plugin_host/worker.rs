@@ -4,18 +4,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{EVENTS_QUEUED, PluginRun, RunTrigger};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::{
-    CancellationToken, FailureKind, Field, Invocation, InvokeError, Supervisor, Trigger,
-    WatchEvent, WebhookDelivery, WebhookRequest,
+use aruna_plugins::CancellationToken;
+use aruna_plugins::host::wit::aruna::plugin::types::{
+    FailureKind, Field, Trigger, WatchEvent, WebhookDelivery, WebhookRequest,
 };
+use aruna_plugins::limits::{Limits, RuntimeConfig};
+use aruna_plugins::runtime::{Invocation, InvokeError};
+use aruna_plugins::supervisor::Supervisor;
 use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
@@ -43,13 +45,15 @@ use aruna_operations::plugins::matcher::MatchJournal;
 use aruna_operations::plugins::prune::{PruneAudit, prune_hooks};
 use aruna_operations::plugins::replay::{PlanReplays, RunReplays};
 use aruna_operations::plugins::runs::{Ended, PruneRuns, TICK};
-use aruna_operations::plugins::task_cancel::CancelOrphans;
-use aruna_operations::plugins::task_pass::SettleTasks;
+use aruna_operations::plugins::task::cancel::CancelOrphans;
+use aruna_operations::plugins::task::pass::SettleTasks;
 use aruna_operations::plugins::waiting::RecheckWaiting;
 use aruna_operations::plugins::work::prune_work;
 
 /// How often the worker rechecks the events waiting for their install record or account.
 const RECHECK_MS: u64 = 10 * 1000;
+/// Journal pages all replays read together in one tick, before due runs are claimed.
+const REPLAY_PAGES: usize = 16;
 /// How often the worker prunes runs that ended before the retention period.
 const PRUNE_MS: u64 = 3600 * 1000;
 /// How often the worker keeps the summaries of finished plugin work.
@@ -65,6 +69,10 @@ pub struct Worker {
     backoff: tokio::sync::Mutex<Backoff>,
     /// When the waiting events were last rechecked.
     rechecked: AtomicU64,
+    /// A replay has more pages than the last tick read, so the next tick comes at once.
+    replaying: AtomicBool,
+    /// The replay key the next tick's replays start after.
+    replay_after: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 impl Worker {
@@ -92,12 +100,16 @@ impl Worker {
             supervisor,
             backoff: tokio::sync::Mutex::default(),
             rechecked: AtomicU64::new(0),
+            replaying: AtomicBool::new(false),
+            replay_after: std::sync::Mutex::new(None),
         }))
     }
 
     /// Queues due timer occurrences, then starts the due runs of the active installs this node
     /// receives, at most `RUNS_PARALLEL` per install. A `running` run no task runs starts again.
     pub async fn claim(self: &Arc<Self>, now_ms: u64) -> Result<usize, String> {
+        // Only a replay pass that ends with pages left asks for the next tick at once.
+        self.replaying.store(false, Ordering::Relaxed);
         if self.supervisor.stopping() {
             return Ok(0);
         }
@@ -117,9 +129,22 @@ impl Worker {
         if let Err(error) = drive(matched, &self.ctx).await {
             warn!(%error, "Could not match plugin events to installs");
         }
-        let replays = RunReplays::new(now_ms, (JOURNAL_PAGE, usize::MAX));
-        if let Err(error) = drive(replays, &self.ctx).await {
-            warn!(%error, "Could not replay plugin events");
+        let after = (self.replay_after.lock()).map_or(None, |after| after.clone());
+        let replays = RunReplays::new(now_ms, (JOURNAL_PAGE, REPLAY_PAGES), after);
+        match drive(replays, &self.ctx).await {
+            Ok(replayed) => {
+                if replayed.failed > 0 {
+                    warn!(
+                        failed = replayed.failed,
+                        "Plugin event replays failed and wait"
+                    );
+                }
+                self.replaying.store(replayed.more, Ordering::Relaxed);
+                if let Ok(mut after) = self.replay_after.lock() {
+                    *after = replayed.after;
+                }
+            }
+            Err(error) => warn!(%error, "Could not replay plugin events"),
         }
         self.forward(&shared, now_ms).await;
         let rechecked = self.rechecked.load(Ordering::Relaxed);
@@ -424,7 +449,10 @@ pub fn spawn_worker(
             }
             tokio::select! {
                 _ = token.cancelled() => break,
-                _ = tokio::time::sleep(TICK) => {}
+                _ = tokio::time::sleep(match worker.replaying.load(Ordering::Relaxed) {
+                    true => std::time::Duration::ZERO,
+                    false => TICK,
+                }) => {}
             }
         }
         worker.stop().await;

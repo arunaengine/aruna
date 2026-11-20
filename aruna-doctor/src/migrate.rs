@@ -5,11 +5,11 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
 use aruna_core::federation::FederationSettings;
 use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
@@ -27,7 +27,7 @@ use aruna_core::keyspaces::{
     STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
     UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     ForwardRow, JOURNAL_ROW, PENDING_ROW, PluginRun, RUN_ROW, SourceEvent,
@@ -35,33 +35,33 @@ use aruna_core::plugin_runs::{
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
-use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
-use aruna_core::structs::execution::harvest::{HarvestSource, RepositoryConnectorSecret};
-use aruna_core::structs::execution::job::record_rows::{
-    ConflictRecord, PendingNeed, PendingRecord,
-};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::harvest::HarvestSource;
+use aruna_core::structs::execution::job::family::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
+};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
+use aruna_core::structs::persistent_id::{LegacyMapping, PersistentIdMapping};
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyIntent, PolicyMutationRecord,
 };
 use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
+use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
-use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
+use aruna_core::structs::sync_quarantine::QUARANTINE_USAGE_KEY;
 use aruna_operations::plugins::decide::WaitingRow;
-use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
-use aruna_storage::{SEALED_KEYSPACES, row_aad};
+use aruna_storage::storage::sealing::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};
 use serde::de::DeserializeOwned;
@@ -73,7 +73,7 @@ use ulid::Ulid;
 
 mod buckets;
 mod compute;
-mod cursor_repair;
+pub(crate) mod cursor_repair;
 mod families;
 mod federation;
 mod git;
@@ -89,15 +89,12 @@ mod sessions;
 mod sizes;
 mod staging;
 mod sync_ops;
-mod topic_purge;
+pub(crate) mod topic_purge;
 mod trailing;
 mod uploads;
 mod user_sessions;
 mod vault;
 mod versions;
-
-pub use cursor_repair::{CursorRepair, repair_cursor};
-pub use topic_purge::purge_topic;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
@@ -769,7 +766,7 @@ fn seal_rows(
     skipped: &mut Vec<String>,
 ) -> Result<Rewrites, ExplorerError> {
     let plain = |value: &[u8]| match name {
-        CONNECTOR_SECRET_KEYSPACE => RepositoryConnectorSecret::from_bytes(value).is_ok(),
+        CONNECTOR_SECRET_KEYSPACE => SourceConnectorSecret::from_bytes(value).is_ok(),
         _ => false,
     };
     let mut scanned = 0;
@@ -1124,13 +1121,13 @@ mod tests {
         FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::node_vault::NodeVaultKey;
-    use aruna_core::structs::execution::job::record_rows::{
-        PendingNeed, PendingRecord, ProjectionCache,
-    };
-    use aruna_core::structs::execution::job::{
+    use aruna_core::node::vault::NodeVaultKey;
+    use aruna_core::structs::execution::job::family::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
+    };
+    use aruna_core::structs::execution::job::record_rows::{
+        PendingNeed, PendingRecord, ProjectionCache,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
@@ -1419,7 +1416,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::UserId::nil(REALM),
+                owner: aruna_core::user::id::UserId::nil(REALM),
             },
         };
         // Only the node_state row holds the identity; another row that decodes must not win.
@@ -1440,13 +1437,13 @@ mod tests {
     #[test]
     fn seals_plain_secrets() {
         use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes};
-        use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
+        use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
         use std::collections::HashMap;
 
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         node_state(&path);
-        let plain = RepositoryConnectorSecret::new(
+        let plain = SourceConnectorSecret::new(
             Ulid::from_bytes([1u8; 16]),
             HashMap::from([("token".to_string(), "canary-61d0".to_string())]),
             std::time::SystemTime::UNIX_EPOCH,
@@ -1473,7 +1470,7 @@ mod tests {
         let sealed = &read(&path, CONNECTOR_SECRET_KEYSPACE)[b"row".as_slice()];
         assert!(!sealed.windows(11).any(|window| window == b"canary-61d0"));
         let key = CredentialEncryptionKey::derive(&[11u8; 32]);
-        let aad = aruna_storage::row_aad(CONNECTOR_SECRET_KEYSPACE, b"row");
+        let aad = aruna_storage::storage::sealing::row_aad(CONNECTOR_SECRET_KEYSPACE, b"row");
         assert_eq!(open_bytes(&key, sealed, &aad).unwrap(), plain);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!((again.secrets_sealed, again.secrets_skipped.len()), (0, 1));
@@ -1501,7 +1498,7 @@ mod tests {
         };
         // The source row is still plain; the backend row is sealed with the S3 credential key.
         let backend_key = backend_id.to_bytes();
-        let aad = aruna_storage::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
+        let aad = aruna_storage::storage::sealing::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
         let credential = CredentialEncryptionKey::derive(&[11u8; 32]);
         let sealed = seal_bytes(
             &credential,
@@ -1526,7 +1523,7 @@ mod tests {
         assert!(read(&path, BACKEND_SECRET_KEYSPACE).is_empty());
         let vault = read(&path, NODE_VAULT_KEYSPACE);
         let key = NodeVaultKey::derive(&[11u8; 32]);
-        let opened = |entry: aruna_core::node_vault::VaultEntry| {
+        let opened = |entry: aruna_core::node::vault::VaultEntry| {
             let row = &vault[&entry.key()];
             assert!(!row.windows(11).any(|window| window == b"canary-7e21"));
             key.open(entry, row).unwrap().expose().to_vec()

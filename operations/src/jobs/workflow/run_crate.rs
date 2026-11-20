@@ -7,10 +7,17 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
-use aruna_core::structs::ORIGIN_DEVICE_TAG;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
-    JobRecord, JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
+use aruna_core::rows::{outside_answer, outside_call};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputContent, InputSource, JobPayload,
+};
+use aruna_core::structs::execution::job::launch::{LaunchRecord, LocalCrate};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobRecord, JobResultPayload, RunCrateStatus, RunLink,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, schedule_watch_drain, watch_event_entry,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -20,7 +27,8 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::{MetaResourceId, StructuredId};
+use aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use aruna_core::structs::storage::release::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
@@ -43,26 +51,26 @@ use super::super::store::row_calls::{
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-    CreateDocumentResult,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
 };
 use crate::metadata::create_entry::DocumentMintOperation;
 use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::notifications::watch::origin::EmitEventOperation;
 use crate::realm::mutate_placement::node_kind;
-use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
-use crate::replication::protocol::{LocationSummary, LocationSummaryRequest};
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::remote::RemoteLocationOperation;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::StorageReadError;
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::operation::Operation;
+use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::warn;
 
@@ -301,6 +309,10 @@ enum RecordStep {
         status: RunCrateStatus,
         document_id: Ulid,
     },
+    Armed {
+        status: RunCrateStatus,
+        document_id: Ulid,
+    },
     Link {
         status: RunCrateStatus,
         run_crate: Option<Ulid>,
@@ -491,10 +503,11 @@ impl RecordCrateOperation {
         self.call(RecordStep::Create, IoCall::child(create))
     }
 
-    /// Announces the created crate document, then records it as the run's written crate.
+    /// Queues the watch event of the created crate document, then records it as the run's
+    /// written crate.
     fn written(&mut self, record: MetadataRegistryRecord, event_id: Ulid) -> RecordNext {
         let (_, realm_id) = self.place()?;
-        let emit = EmitEventOperation::metadata_created(
+        let event = WatchEvent::metadata_created(
             realm_id,
             self.parent.created_by,
             record.group_id,
@@ -502,13 +515,23 @@ impl RecordCrateOperation {
             &record.document_path,
             event_id,
         );
-        let step = RecordStep::Emitted {
-            status: RunCrateStatus::Written {
-                resource: record.document_id.to_string(),
-            },
-            document_id: record.document_id,
+        let status = RunCrateStatus::Written {
+            resource: record.document_id.to_string(),
         };
-        self.call(step, IoCall::child(emit))
+        let document_id = record.document_id;
+        match watch_event_entry(&event) {
+            Ok(entry) => {
+                let step = RecordStep::Emitted {
+                    status,
+                    document_id,
+                };
+                self.call(step, outside_call(IoCall::Write(vec![entry])))
+            }
+            Err(error) => {
+                warn!(job_id = %self.for_job, %error, "Run crate watch event failed");
+                self.finish(status, Some(document_id))
+            }
+        }
     }
 
     /// Records the final status with the run link; a link the receipt wrote keeps its family.
@@ -638,8 +661,23 @@ impl Operation for RecordCrateOperation {
                 status,
                 document_id,
             } => {
-                if let Err(error) = result.child::<(), IoError>()? {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
                     warn!(job_id = %self.for_job, %error, "Run crate watch event failed");
+                    return self.finish(status, Some(document_id));
+                }
+                let step = RecordStep::Armed {
+                    status,
+                    document_id,
+                };
+                self.call(step, IoCall::from(schedule_watch_drain()))
+            }
+            // The drain also runs on its next arming, so a timer that is not armed only warns.
+            RecordStep::Armed {
+                status,
+                document_id,
+            } => {
+                if let Err(error) = result.event() {
+                    warn!(job_id = %self.for_job, %error, "Run crate watch drain not armed");
                 }
                 self.finish(status, Some(document_id))
             }
@@ -1350,11 +1388,10 @@ mod pure_tests {
         assert!(is_transient(&profile_rejection("validator_unavailable")));
     }
 
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, CapturedInput, InputMode, InputSelection, OutputObject,
-    };
+    use aruna_core::structs::execution::job::input::{CapturedInput, InputMode, InputSelection};
+    use aruna_core::structs::execution::job::local::{AttemptIntent, OutputObject};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use serde_json::Value;
 
     pub(super) fn execution_record() -> (JobRecord, ExecutionSpec) {
@@ -1558,7 +1595,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: group,
@@ -1885,7 +1922,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: Default::default(),
@@ -1915,7 +1952,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: Default::default(),
@@ -2256,7 +2293,7 @@ mod tests {
         // The built-in shapes must accept what this generator writes.
         use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
         use aruna_core::profile_shapes::ProfileShapes;
-        use aruna_graph::ProfileShaclEngine;
+        use aruna_graph::shacl::ProfileShaclEngine;
 
         let (record, spec) = execution_record();
         // An input from a device carries its provenance entity, which the shapes must accept.

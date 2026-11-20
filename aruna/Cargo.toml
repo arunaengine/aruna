@@ -26,6 +26,7 @@ aruna-wire = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-clock = { workspace = true }
+aruna-config = { workspace = true }
 aruna-core = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
@@ -75,17 +76,18 @@ ulid = { workspace = true }
 byteview = { workspace = true }
 rand = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
-
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-api = { workspace = true, features = ["test-hooks"] }
-aruna-cli = { workspace = true }
+aruna-test-support = { workspace = true }
+aruna-cli = { workspace = true, features = ["test-hooks"] }
 aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-net = { workspace = true, features = ["test-hooks"] }
 aruna-storage = { workspace = true, features = ["test-hooks"] }
 async_zip = { workspace = true }
 bytes = { workspace = true }
 craqle = { workspace = true }
+getrandom = { workspace = true }
 oxrdf = { workspace = true }
 percent-encoding = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

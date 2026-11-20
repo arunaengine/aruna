@@ -13,7 +13,7 @@ use aruna_core::calls::ChildOutcome;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::structs::storage::distribution::OriginalEpoch;
 use aruna_drivers::driver::drive;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 fn set() -> Ulid {
     Ulid::from_bytes([4; 16])

@@ -15,10 +15,10 @@ use utoipa_axum::routes;
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
-use aruna_operations::device::realm_documents::realm_removed;
 use aruna_operations::device::sync_status::{
     DatasetRow, DocumentRow, SyncStatus, start_sync_run, sync_status,
 };
+use aruna_operations::device_node::realm_documents::realm_removed;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()

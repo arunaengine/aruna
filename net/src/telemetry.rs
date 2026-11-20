@@ -5,9 +5,7 @@
 
 use std::time::Duration;
 
-pub(crate) use aruna_core::telemetry::{
-    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
-};
+use aruna_core::telemetry::duration_ms;
 use iroh::endpoint::Connection;
 use tracing::{Span, field, warn};
 

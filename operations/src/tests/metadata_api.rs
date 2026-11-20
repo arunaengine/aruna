@@ -5,9 +5,8 @@
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::types::GroupId;
-use aruna_core::{MetaResourceId, StructuredId};
 use aruna_storage::storage;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
@@ -26,7 +25,7 @@ pub(crate) fn metadata_test() -> MetadataTest {
     let storage_dir = tempdir().expect("storage dir");
     let metadata_dir = tempdir().expect("metadata dir");
     let storage_handle =
-        storage::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
             .expect("storage opens");
     let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),

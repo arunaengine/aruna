@@ -10,7 +10,7 @@ use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::drive;
 use aruna_operations::distribution::routing::upload_tags;
 use aruna_operations::distribution::uploads::{InventoryUploadsInput, InventoryUploadsOperation};
-use aruna_operations::s3::object::member_merge::{
+use aruna_operations::s3::object::member::merge::{
     MarkerQuery, MergedMarkersOperation, UploadSource, UploadsPart,
 };
 use s3s::dto::{

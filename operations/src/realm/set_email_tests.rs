@@ -4,12 +4,12 @@
 
 use super::*;
 use crate::document_repository::GetConfigOperation;
-use crate::testing::path_context;
-use aruna_core::UserId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use aruna_core::types::Key;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::path_context;
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
 use ulid::Ulid;
@@ -53,7 +53,7 @@ fn email_config(actor: &Actor, profile: Option<EmailInput>) -> SetEmailConfig {
 }
 
 async fn write(ctx: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
-    crate::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
+    aruna_drivers::testing::write_value(&ctx.storage_handle, key_space, key, value).await;
 }
 
 /// Seeds a config where `kind` describes the actor's node and makes the actor a realm admin.
@@ -264,7 +264,7 @@ fn delete_tombstones_candidates() {
     assert_eq!(state.materialized_realm_email(), None);
     assert!(state.materialized_realm_vault().is_empty());
     for entry in entries {
-        let path = aruna_core::reducer::vault_entry_path(&entry);
+        let path = aruna_core::reducer::paths::vault_entry_path(&entry);
         assert_eq!(state.user_subject_ids[&path].value, None);
     }
 }

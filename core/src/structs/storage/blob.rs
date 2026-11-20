@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
 };
@@ -23,6 +22,7 @@ use crate::structs::storage::format::{Compression, EncodingClass, StoredFormat, 
 use crate::structs::storage::group_backend::GroupBackendKind;
 use crate::structs::storage::routing::StorageRoutingRule;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use byteview::ByteView;
 use core::fmt;
 use serde::{Deserialize, Serialize};
@@ -1669,6 +1669,26 @@ impl UserAccess {
     }
 }
 
+/// Compute the S3 common prefix for `key` under the given `prefix`/`delimiter`,
+/// or `None` when the key has no delimiter past the prefix (so it is listed as
+/// an individual entry). Shared by the delimiter-grouping list operations.
+pub fn common_prefix_of(
+    key: &str,
+    prefix: Option<&str>,
+    delimiter: Option<&str>,
+) -> Option<String> {
+    let delimiter = delimiter.filter(|delimiter| !delimiter.is_empty())?;
+    let prefix_len = prefix.map_or(0, str::len);
+    let relative_match = key.get(prefix_len..)?.find(delimiter)?;
+    Some(key[..prefix_len + relative_match + delimiter.len()].to_string())
+}
+
+/// Whether an ETag can bind a read through `If-Match`: present and not weak.
+pub fn strong_validator(etag: Option<&str>) -> bool {
+    etag.map(str::trim)
+        .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1678,9 +1698,8 @@ mod tests {
         ManagedCopyRecord, ManagedCopyState, VersionKey, bucket_permission_path,
         group_permission_path, key_content_type, object_permission_path,
     };
-    use crate::NodeId;
-    use crate::UserId;
     use crate::errors::ConversionError;
+    use crate::id::NodeId;
     use crate::structs::execution::source_access::SourceMetadata;
     use crate::structs::execution::source_connector::SourceConnectorKind;
     use crate::structs::execution::staging::{
@@ -1694,6 +1713,7 @@ mod tests {
     use crate::structs::storage::format::Compression;
     use crate::structs::storage::format::EncodingClass;
     use crate::structs::storage::format::StoredFormat;
+    use crate::user::id::UserId;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;

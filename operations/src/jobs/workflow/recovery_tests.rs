@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::{AdoptableEvidence, AttemptPhase, ResumePoint};
-use aruna_core::structs::execution::job::AttemptIntent;
+use aruna_core::structs::execution::job::local::AttemptIntent;
 
 use super::super::fixtures::{
     EPOCH, artifact, child, compute, control, job, prepared, record, scope, status, stops, token,

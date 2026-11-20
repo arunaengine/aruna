@@ -5,7 +5,8 @@
 
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
-use aruna_core::structs::execution::job::{
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::input::{
     StagingJobCheckpoint, StagingJobError, StagingJobItem, StagingJobPhase, StagingJobPrefix,
     StagingJobSpec,
 };
@@ -13,7 +14,7 @@ use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -209,7 +210,9 @@ mod tests {
     use super::super::tests::{read, write};
     use super::*;
     use aruna_core::keyspaces::{JOB_KEYSPACE, S3_BUCKET_KEYSPACE, STAGING_STATE_KEYSPACE};
-    use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, job_record_key};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::{JobRecord, job_record_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::Compression;
     use std::time::Duration;

@@ -58,14 +58,13 @@ const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
 mod archive;
 mod control;
-mod session;
+pub mod session;
 
 use archive::{
     ArchivePlan, BuildError, UPLOAD_LIMIT, build_archive, container_path, count_limited,
     list_archive, output_spec, stream_output,
 };
 use control::{ControlGuard, ControlRecord, DaemonLock};
-pub use session::session_gateway;
 
 /// Local Docker/OCI executor backend over bollard.
 pub struct DockerBackend {
@@ -421,7 +420,7 @@ impl DockerBackend {
             self.verify_layout(container_id, plan).await?;
         }
         self.cancel_submission(attempt, cancel).await?;
-        guard.mark_start()?;
+        guard.mark_start().await?;
         let started = self.start_by_name(container_id).await;
         self.cancel_submission(attempt, cancel).await?;
         started?;
@@ -746,7 +745,10 @@ impl ExecutorBackend for DockerBackend {
 
     async fn health(&self) -> Result<(), BackendError> {
         self.docker.ping().await.map_err(|e| classify(&e))?;
-        self.daemon_lock.verify()?;
+        let daemon_lock = Arc::clone(&self.daemon_lock);
+        tokio::task::spawn_blocking(move || daemon_lock.verify())
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker health task failed: {error}")))??;
         if let Some(bytes) = self.config.default_disk_bytes {
             self.probe_disk_limit(bytes).await?;
         }
@@ -1610,6 +1612,7 @@ fn parse_rfc3339_ms(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::session::session_gateway;
     use super::*;
 
     /// A byte bound tests pass explicitly, the size of the former fixed limit.

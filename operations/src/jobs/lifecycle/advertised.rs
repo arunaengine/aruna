@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;

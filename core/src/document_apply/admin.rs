@@ -9,7 +9,6 @@ use ulid::Ulid;
 
 use super::registry::Row;
 use super::{ApplyError, Step, invalid};
-use crate::UserId;
 use crate::admin_checks::{
     coalescible_config_op, config_mutation_allowed, validate_config_actor, validate_config_target,
     validate_revocation_snapshot,
@@ -23,12 +22,12 @@ use crate::keyspaces::{
     GROUP_DELETE_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE,
     SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE,
 };
-use crate::reducer::{
-    AdminApplyStatus, AdminDocumentState, RevocationIndex, decode_reducer_state,
+use crate::reducer::overlay::{
     materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
     materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_state,
     overlay_realm_config,
 };
+use crate::reducer::{AdminApplyStatus, AdminDocumentState, RevocationIndex, decode_reducer_state};
 use crate::row_plan::{PlanRows, Planned, RowPlan};
 use crate::storage_entries::{
     conflict_write_entries, group_deletion_entries, reducer_state_entry, reducer_state_key,
@@ -40,6 +39,7 @@ use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDoc
 use crate::structs::identity::user::User;
 use crate::structs::storage::abe_access::{due_rows, indexed_buckets};
 use crate::types::{GroupId, Key, KeySpace};
+use crate::user::id::UserId;
 
 /// What the caller still does after an admin operation committed.
 #[derive(Debug, Default, PartialEq, Eq)]

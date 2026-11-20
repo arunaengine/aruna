@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentDot;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -13,6 +12,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementStrategy;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
 use aruna_tasks::TaskHandle;
@@ -25,7 +25,7 @@ use crate::tests::calls::node;
 
 /// A storage context with a loopback net and a task plane, its net handle and its directory.
 pub(crate) async fn net_context() -> (DriverContext, NetHandle, TempDir) {
-    let (dir, context) = crate::testing::temp_context();
+    let (dir, context) = aruna_drivers::testing::temp_context();
     let net_handle = NetHandle::new(
         aruna_drivers::testing::local_net(),
         context.storage_handle.clone(),

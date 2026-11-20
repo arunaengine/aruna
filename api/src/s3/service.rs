@@ -8,13 +8,10 @@ mod attributes;
 mod bucket;
 mod copy;
 mod encryption;
-mod forward;
+pub(crate) mod forward;
 mod listing;
 mod payload;
 mod pinned;
-
-pub(crate) use forward::forwarded_digest;
-pub(crate) use forward::reads::delegated_caller;
 
 use crate::s3::auth::DelegatedRequest;
 use aruna_core::structs::storage::distribution::delegation::{
@@ -25,9 +22,9 @@ mod link;
 mod multipart;
 mod object;
 mod response;
-mod view;
+pub(crate) mod view;
 
-pub(crate) use self::view::InputView;
+use self::view::InputView;
 
 use self::attributes::{
     RequestedAttributes, attributes_checksum, attributes_output, attributes_parts, parse_max_parts,
@@ -39,14 +36,16 @@ use self::response::{
 use aruna_core::structs::storage::format::Compression;
 
 use self::copy::{copy_object_response, copy_part_response, copy_source_conditions};
-use self::forward::copy::{CopyPath, CopySource};
-use self::forward::list::{Resume, decode_bound, encode_bound};
+use self::forward::copy::CopySource;
+use self::forward::list::{decode_bound, encode_bound};
 use self::listing::{
     ObjectListingPage, list_parts_output, list_uploads_output, marker_continuation_token,
     next_marker_for,
 };
 use self::multipart::parse_upload_marker;
 use self::object::object_range_request;
+use aruna_operations::s3::object::member::merge::MergeResume as Resume;
+use aruna_operations::s3::object::member::write::CopyPath;
 
 use crate::object_key::ObjectKey;
 use crate::s3::auth::map_authorize_error;
@@ -63,7 +62,7 @@ use crate::s3::multipart_join::{
     completion_registry, conflicting_completion,
 };
 use crate::s3::scope::SubpathScope;
-use crate::s3::server::DeleteObjectsBody;
+use crate::s3::server::body::DeleteObjectsBody;
 use crate::s3::util::{
     check_sse, checked_size, checksum_response_hashes, convert_input, declared_trailer_algorithm,
     location_sse, map_checksum_type, parse_checksum_hint, parse_checksum_type,
@@ -71,19 +70,25 @@ use crate::s3::util::{
     parse_version_id, reject_sse, sse_header, stored_encrypted, validate_object_key,
 };
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::compute::session::{SessionRequest, TouchedObject};
+use aruna_core::id::NodeId;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::execution::job::{RoCrateLimits, credential_job_id};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::execution::job::local::credential_job_id;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
 use aruna_core::structs::storage::encryption::TokenCredential;
+use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
+use aruna_core::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, drive_until, node_routing};
 use aruna_drivers::position::open_cursor;
 use aruna_operations::auth::check_permissions::{
@@ -93,53 +98,42 @@ use aruna_operations::auth::enforcement::PolicyLoadOperation;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aruna_operations::auth::request_authorization::BucketAccessOperation;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::session::SessionOperation;
-use aruna_operations::placement::policy::GateOperation;
+use aruna_operations::placement::policy::gate::GateOperation;
+use aruna_operations::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_operations::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::replication::sync_relationship::create::CreateRelationshipOperation;
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::s3::bucket::list::{ListBucketsInput as LBI, ListBucketsOperation};
-use aruna_operations::s3::multipart::abort::{AbortUploadInput as AMUI, AbortUploadOperation};
-use aruna_operations::s3::multipart::complete::{
-    CompleteUploadInput as CMUI, CompleteUploadOperation,
+use aruna_operations::s3::bucket::list::ListBucketsOperation;
+use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use aruna_operations::s3::multipart::complete::{CompleteUploadInput, CompleteUploadOperation};
+use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_operations::s3::multipart::part_upload::UploadPartOperation;
+use aruna_operations::s3::multipart::parts::ListPartsOperation;
+use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
+use aruna_operations::s3::object::attributes::{GetAttributesInput, GetAttributesOperation};
+use aruna_operations::s3::object::delete::DeleteObjectOperation;
+use aruna_operations::s3::object::delete::bulk::{
+    BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
 };
-use aruna_operations::s3::multipart::create::{
-    CreateMultipartInput as CMPI, CreateMultipartOperation,
-};
-use aruna_operations::s3::multipart::part_copy::{
-    KeepPoliciesOperation, PartCopyInput as UploadPartCopyData, PartCopyOperation,
-};
-use aruna_operations::s3::multipart::part_upload::{UploadPartInput as UPI, UploadPartOperation};
-use aruna_operations::s3::multipart::parts::{ListPartsInput as LPI, ListPartsOperation};
-use aruna_operations::s3::multipart::uploads::{ListUploadsInput as LMUI, ListUploadsOperation};
-use aruna_operations::s3::object::attributes::{
-    GetAttributesInput as GOAI, GetAttributesOperation,
-};
-use aruna_operations::s3::object::copy::{
+use aruna_operations::s3::object::head::HeadObjectOperation;
+use aruna_operations::s3::object::list::{ListBucketInput, ListBucketOperation};
+use aruna_operations::s3::object::member::read::{MemberPayload, MemberRead, MemberRequest};
+use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
+use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
+use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed};
+use aruna_operations::transfer::copy::{
     CopyObjectInput as CopyObjectData, CopyObjectOperation, CopyReferences,
 };
-use aruna_operations::s3::object::delete::bulk::{
-    BulkDeleteEntry, BulkDeleteInput as DOSI, BulkDeleteOperation,
+use aruna_operations::transfer::part_copy::{
+    KeepPoliciesOperation, PartCopyInput as UploadPartCopyData, PartCopyOperation,
 };
-use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
-use aruna_operations::s3::object::get::GetObjectInput as GOI;
-use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
-use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
-use aruna_operations::s3::object::member_read::MemberRead;
-use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
-use aruna_operations::s3::object::read::{
+use aruna_operations::transfer::read::{
     GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
-};
-use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
-use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed};
-use aruna_operations::sync::mirror_repair::{
-    KickRepairOperation, MirrorRecordOperation, SyncMirrorIntent,
-};
-use aruna_operations::sync::sync_relationship::{
-    CreateRelationshipOperation, SyncRelationshipDirection,
 };
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
@@ -282,7 +276,7 @@ impl ArunaS3Service {
             .get::<PolicyRequestExtras>()
             .cloned()
             .ok_or_else(|| s3_error!(InternalError, "Missing policy context"))?;
-        let input = LOV2I {
+        let input = ListBucketInput {
             bucket: bucket.to_owned(),
             group_id,
             continuation_token: None,
@@ -523,7 +517,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let result = drive(
-            ListBucketsOperation::new(LBI {
+            ListBucketsOperation::new(aruna_operations::s3::bucket::list::ListBucketsInput {
                 group_id: user_access.group_id,
                 prefix: req.input.prefix.clone(),
                 continuation_token: req.input.continuation_token.clone(),
@@ -776,7 +770,7 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let input = LOV2I {
+        let input = ListBucketInput {
             bucket: bucket.clone(),
             group_id,
             continuation_token,
@@ -939,7 +933,7 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let input = LOV2I {
+        let input = ListBucketInput {
             bucket: bucket.clone(),
             group_id,
             continuation_token,
@@ -1080,7 +1074,7 @@ impl S3 for ArunaS3Service {
             .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Put,
                 operation: "PutObject",
                 bucket: req.input.bucket.clone(),
@@ -1092,7 +1086,7 @@ impl S3 for ArunaS3Service {
                         body,
                         forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
                     ),
-                    None => forward::ForwardBody::Empty,
+                    None => MemberPayload::Empty,
                 },
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
@@ -1363,14 +1357,14 @@ impl S3 for ArunaS3Service {
                         .await
                 }
                 CopyPath::Delegate => {
-                    let request = forward::ForwardRequest {
+                    let request = MemberRequest {
                         method: aruna_core::member_read::MemberMethod::Put,
                         operation: "CopyObject",
                         bucket: dest_bucket,
                         key: dest_key,
                         query: forward::passed_query(req.uri.query()),
                         headers: forward::passed_headers(&req.headers, None),
-                        body: forward::ForwardBody::Empty,
+                        body: MemberPayload::Empty,
                     };
                     let response = self.forward_write(&user_access, &forward, request).await?;
                     self.delegated_copy(response).await
@@ -1474,14 +1468,14 @@ impl S3 for ArunaS3Service {
             .forward_target(&req.extensions, bucket_info.as_ref(), &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Post,
                 operation: "CreateMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: forward::passed_headers(&req.headers, None),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return self
@@ -1525,7 +1519,7 @@ impl S3 for ArunaS3Service {
         )
         .await
         .map_err(gate_context_error)?;
-        let mut operation = CreateMultipartOperation::new(CMPI {
+        let mut operation = CreateMultipartOperation::new(CreateMultipartInput {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             group_id,
@@ -1615,7 +1609,7 @@ impl S3 for ArunaS3Service {
                     _ => body,
                 }
             });
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Put,
                 operation: "UploadPart",
                 bucket: req.input.bucket.clone(),
@@ -1627,7 +1621,7 @@ impl S3 for ArunaS3Service {
                         body,
                         forward::trailer_checksum(trailer_algorithm, trailing_headers.clone()),
                     ),
-                    None => forward::ForwardBody::Empty,
+                    None => MemberPayload::Empty,
                 },
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
@@ -1675,16 +1669,21 @@ impl S3 for ArunaS3Service {
             .map(BackendStream::new_from_boxed)
             .ok_or_else(|| s3_error!(InvalidRequest, "Missing body"))?;
 
-        let operation = UploadPartOperation::new(UPI {
-            bucket: req.input.bucket,
-            key: req.input.key,
-            upload_id,
-            part_number: parse_part_number(req.input.part_number, S3ErrorCode::InvalidArgument)?,
-            content_length: req.input.content_length.map(checked_size).transpose()?,
-            body: Some(body),
-            created_by: user_access.user_identity,
-            expected_checksums: checksum_request.expected.clone(),
-        });
+        let operation = UploadPartOperation::new(
+            aruna_operations::s3::multipart::part_upload::UploadPartInput {
+                bucket: req.input.bucket,
+                key: req.input.key,
+                upload_id,
+                part_number: parse_part_number(
+                    req.input.part_number,
+                    S3ErrorCode::InvalidArgument,
+                )?,
+                content_length: req.input.content_length.map(checked_size).transpose()?,
+                body: Some(body),
+                created_by: user_access.user_identity,
+                expected_checksums: checksum_request.expected.clone(),
+            },
+        );
 
         let result = drive(operation, &self.state)
             .await
@@ -1815,14 +1814,14 @@ impl S3 for ArunaS3Service {
                     self.relay_part(&user_access, &forward, target, read).await
                 }
                 CopyPath::Delegate => {
-                    let request = forward::ForwardRequest {
+                    let request = MemberRequest {
                         method: aruna_core::member_read::MemberMethod::Put,
                         operation: "UploadPartCopy",
                         bucket: req.input.bucket,
                         key: req.input.key,
                         query: forward::passed_query(req.uri.query()),
                         headers: forward::passed_headers(&req.headers, None),
-                        body: forward::ForwardBody::Empty,
+                        body: MemberPayload::Empty,
                     };
                     let response = self.forward_write(&user_access, &forward, request).await?;
                     self.delegated_part(response).await
@@ -1899,14 +1898,14 @@ impl S3 for ArunaS3Service {
             let mut headers = forward::passed_headers(&req.headers, Some(body.len() as i64));
             headers.retain(|(name, _)| name != "content-type");
             headers.push(("content-type".to_string(), "application/xml".to_string()));
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Post,
                 operation: "CompleteMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers,
-                body: forward::ForwardBody::Known(bytes::Bytes::from(body)),
+                body: MemberPayload::Known(bytes::Bytes::from(body)),
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return self.forwarded_complete(response).await;
@@ -1990,7 +1989,7 @@ impl S3 for ArunaS3Service {
             declared,
             object_size,
         );
-        let mut operation = CompleteUploadOperation::new(CMUI {
+        let mut operation = CompleteUploadOperation::new(CompleteUploadInput {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             upload_id,
@@ -2084,14 +2083,14 @@ impl S3 for ArunaS3Service {
             .forward_upload(&req.extensions, bucket_info, &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Delete,
                 operation: "AbortMultipartUpload",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             self.forward_write(&user_access, &forward, request).await?;
             return Ok(S3Response::new(AbortMultipartUploadOutput::default()));
@@ -2099,7 +2098,7 @@ impl S3 for ArunaS3Service {
         let upload_id = self
             .upload_id(bucket_info, &req.input.key, &req.input.upload_id)
             .await?;
-        let operation = AbortUploadOperation::new(AMUI {
+        let operation = AbortUploadOperation::new(AbortUploadInput {
             bucket: req.input.bucket,
             key: req.input.key,
             upload_id,
@@ -2183,7 +2182,7 @@ impl S3 for ArunaS3Service {
 
         let range_request = requested_range.map(object_range_request);
 
-        let input = GOI {
+        let input = aruna_operations::s3::object::get::GetObjectInput {
             bucket,
             key,
             version_id,
@@ -2349,7 +2348,7 @@ impl S3 for ArunaS3Service {
             .unwrap_or(user_access.group_id);
 
         let result = drive(
-            GetAttributesOperation::new(GOAI {
+            GetAttributesOperation::new(GetAttributesInput {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id,
@@ -2365,7 +2364,7 @@ impl S3 for ArunaS3Service {
             Some(
                 drive(
                     ObjectInfoOperation::new(
-                        GOI {
+                        aruna_operations::s3::object::get::GetObjectInput {
                             bucket,
                             key,
                             version_id,
@@ -2475,11 +2474,12 @@ impl S3 for ArunaS3Service {
             MemberRead::Local(stale) => stale,
         };
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
-        let operation = HeadObjectOperation::new(HOI {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id,
-        });
+        let operation =
+            HeadObjectOperation::new(aruna_operations::s3::object::head::HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id,
+            });
 
         let result = match drive(operation, &self.state).await {
             Ok(result) => result,
@@ -2514,7 +2514,7 @@ impl S3 for ArunaS3Service {
             Some(
                 drive(
                     ObjectInfoOperation::new(
-                        GOI {
+                        aruna_operations::s3::object::get::GetObjectInput {
                             bucket,
                             key,
                             version_id,
@@ -2610,14 +2610,14 @@ impl S3 for ArunaS3Service {
             .forward_upload(&req.extensions, bucket_info, &req.input.key)
             .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Get,
                 operation: "ListParts",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return self
@@ -2642,7 +2642,7 @@ impl S3 for ArunaS3Service {
         };
 
         let result = drive(
-            ListPartsOperation::new(LPI {
+            ListPartsOperation::new(aruna_operations::s3::multipart::parts::ListPartsInput {
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 upload_id,
@@ -2710,7 +2710,7 @@ impl S3 for ArunaS3Service {
         }
 
         let result = drive(
-            ListUploadsOperation::new(LMUI {
+            ListUploadsOperation::new(ListUploadsInput {
                 bucket: bucket.clone(),
                 prefix: prefix.clone(),
                 delimiter: delimiter.clone(),
@@ -2809,7 +2809,7 @@ impl S3 for ArunaS3Service {
             Some(_) => (None, None),
             None => (key_marker, version_id_marker),
         };
-        let input = LOVI {
+        let input = ListVersionsInput {
             bucket: bucket.clone(),
             prefix: prefix.clone(),
             delimiter: delimiter.clone(),
@@ -2845,14 +2845,14 @@ impl S3 for ArunaS3Service {
                 .forward_target(&req.extensions, bucket_info, &req.input.key)
                 .await?
         {
-            let request = forward::ForwardRequest {
+            let request = MemberRequest {
                 method: aruna_core::member_read::MemberMethod::Delete,
                 operation: "DeleteObject",
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 query: forward::passed_query(req.uri.query()),
                 headers: Vec::new(),
-                body: forward::ForwardBody::Empty,
+                body: MemberPayload::Empty,
             };
             let response = self.forward_write(&user_access, &forward, request).await?;
             return Ok(Self::forwarded_delete(&response));
@@ -2877,16 +2877,17 @@ impl S3 for ArunaS3Service {
         let replication_key = req.input.key.clone();
         let replicate_latest_delete = version_id.is_none();
 
-        let operation = DeleteObjectOperation::new(DOI {
-            bucket: req.input.bucket,
-            key: req.input.key,
-            version_id,
-            group_id: user_access.group_id,
-            realm_id: self.realm_id,
-            node_id: self.node_id,
-            deleted_by: user_access.user_identity,
-        })
-        .with_restrictions(replication_auth.path_restrictions.clone());
+        let operation =
+            DeleteObjectOperation::new(aruna_operations::s3::object::delete::DeleteObjectInput {
+                bucket: req.input.bucket,
+                key: req.input.key,
+                version_id,
+                group_id: user_access.group_id,
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                deleted_by: user_access.user_identity,
+            })
+            .with_restrictions(replication_auth.path_restrictions.clone());
         let operation = match guards.is_empty() {
             true => operation,
             false => operation.with_fence(guards, Vec::new()),
@@ -3004,7 +3005,7 @@ impl S3 for ArunaS3Service {
             )
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
-            let policy_request = aruna_operations::auth::request_policy::policy_request_with(
+            let policy_request = aruna_core::request_policy::policy_request_with(
                 &object_path,
                 &Permission::WRITE,
                 Some(&replication_auth),
@@ -3040,7 +3041,7 @@ impl S3 for ArunaS3Service {
         errors.extend(forward_errors);
 
         let outcomes = drive(
-            BulkDeleteOperation::new(DOSI {
+            BulkDeleteOperation::new(BulkDeleteInput {
                 bucket: bucket.clone(),
                 entries,
                 group_id: user_access.group_id,

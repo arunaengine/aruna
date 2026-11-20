@@ -2,18 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
 };
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::execution::job::user_dedup_key;
+use aruna_core::structs::execution::job::local::user_dedup_key;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord, NotificationTransportMessage,
 };
@@ -27,10 +26,11 @@ use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind, TokenRevocation,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::jobs::store::test_calls::find_dedup_plan;
 use aruna_operations::notifications::checks::MAX_FUTURE_SKEW;
 use aruna_operations::notifications::client::{
     HolderRequestOperation, RemoteError, delivered, events_delivered, listed, marked_read,
@@ -43,10 +43,11 @@ use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_operations::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
 use aruna_operations::realm::load_config::config_unavailable;
-use aruna_operations::tests::notifications::create_local_watch;
+use aruna_operations::tests::notifications::local_watch;
 use aruna_operations::tests::notifications::{data_group_id, data_node_id, data_path};
 use aruna_operations::tests::notifications::{seeded_record, upload_event};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::jobs::find_dedup_plan;
 use byteview::ByteView;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +59,8 @@ struct Node {
     _dir: TempDir,
     net: NetHandle,
     context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
@@ -86,11 +89,12 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     Node {
         _dir: dir,
         net,
         context,
+        _incoming: incoming,
     }
 }
 
@@ -304,7 +308,6 @@ async fn webhook_pair(realm_seed: u8) -> (Node, Node, UserId, RealmConfigDocumen
     let config = drive(GetConfigOperation::new(recipient.realm_id), &b.context)
         .await
         .inspect_err(config_unavailable)
-        .ok()
         .expect("realm config");
     (a, b, recipient, config)
 }
@@ -346,18 +349,14 @@ async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
 /// stored record of the same batch.
 /// The watches of `owner` stored on the node behind `storage`.
 async fn list_watch_subscriptions(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     owner: UserId,
 ) -> Result<
     Vec<aruna_core::structs::execution::notification_watch::WatchSubscription>,
     aruna_operations::notifications::watch::records::WatchSubscriptionError,
 > {
     let list = ListWatchesOperation::new(WatchScope::Owner(owner));
-    let page = drive(
-        list,
-        &aruna_operations::tests::notifications::context(storage),
-    )
-    .await?;
+    let page = drive(list, &aruna_drivers::testing::test_context(storage.clone())).await?;
     Ok(page.subscriptions)
 }
 
@@ -1662,12 +1661,16 @@ async fn events_expand_idempotently() {
     let actor = UserId::new(Ulid::generate(), realm_id);
     install_watch_authorization(&b, realm_id, owner, &[]).await;
     admit_peers(&b, &config).await;
-    create_local_watch(
-        &b.context.storage_handle,
+    let (_, store) = local_watch(
         owner,
         data_path(""),
         WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
         1,
+    )
+    .expect("holder subscription");
+    drive(
+        store,
+        &aruna_drivers::testing::test_context(b.context.storage_handle.clone()),
     )
     .await
     .expect("holder subscription");
@@ -1712,21 +1715,29 @@ async fn stale_subscription_skipped() {
     install_watch_authorization(&b, realm_id, local_owner, &[stale_owner]).await;
     // Before the new member joined, both owners were held locally.
     install_config(&b, realm_id, &[(b.net.node_id(), RealmNodeKind::Server)]).await;
-    create_local_watch(
-        &b.context.storage_handle,
+    let (_, store) = local_watch(
         local_owner,
         data_path(""),
         WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
         1,
     )
+    .expect("local subscription fixture");
+    drive(
+        store,
+        &aruna_drivers::testing::test_context(b.context.storage_handle.clone()),
+    )
     .await
     .expect("local subscription fixture");
-    create_local_watch(
-        &b.context.storage_handle,
+    let (_, store) = local_watch(
         stale_owner,
         data_path(""),
         WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
         1,
+    )
+    .expect("stale subscription fixture");
+    drive(
+        store,
+        &aruna_drivers::testing::test_context(b.context.storage_handle.clone()),
     )
     .await
     .expect("stale subscription fixture");
@@ -1800,12 +1811,16 @@ async fn kind_mismatch_rejected() {
     .await;
 
     let owner = recipient_for_holder(&config, b.net.node_id(), realm_id);
-    create_local_watch(
-        &b.context.storage_handle,
+    let (_, store) = local_watch(
         owner,
         data_path(""),
         WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
         1,
+    )
+    .expect("holder subscription");
+    drive(
+        store,
+        &aruna_drivers::testing::test_context(b.context.storage_handle.clone()),
     )
     .await
     .expect("holder subscription");
@@ -1845,12 +1860,16 @@ async fn delivery_trust_gated() {
     .await;
 
     let owner = UserId::new(Ulid::generate(), realm_id);
-    create_local_watch(
-        &b.context.storage_handle,
+    let (_, store) = local_watch(
         owner,
         data_path(""),
         WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
         1,
+    )
+    .expect("holder subscription");
+    drive(
+        store,
+        &aruna_drivers::testing::test_context(b.context.storage_handle.clone()),
     )
     .await
     .expect("holder subscription");

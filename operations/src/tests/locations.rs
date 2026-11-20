@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::replication::protocol::LocationSummaryRequest;
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
+use aruna_core::replication_protocol::LocationSummaryRequest;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 pub fn realm_id() -> RealmId {

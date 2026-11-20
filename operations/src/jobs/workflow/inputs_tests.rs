@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{InputContent, InputMode};
+use aruna_core::structs::execution::job::input::{InputContent, InputMode};
 
 use super::super::fixtures::{child, claimed, is_child, job, node, realm, record, spec, token};
 use super::*;

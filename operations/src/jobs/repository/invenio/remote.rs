@@ -5,12 +5,11 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::repository::invenio::{record_id, validate_id};
-use aruna_core::repository::remote::{InvenioError, NodeScope};
-use aruna_core::repository::{
-    LinkFailure, LinkReview, LinkTarget, PullCheck, RemoteState, RepositoryDestination,
-    RepositoryLink, RepositoryRecord,
+use aruna_core::repository::link::{
+    LinkFailure, LinkReview, LinkTarget, PullCheck, RemoteState, RepositoryLink,
 };
-use aruna_core::rows::value;
+use aruna_core::repository::remote::{InvenioError, NodeScope};
+use aruna_core::repository::{RepositoryDestination, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use serde_json::Value;
@@ -212,7 +211,7 @@ impl Operation for LinkSessionOperation {
             return Ok(Next::Done(session_of(result)?));
         }
         let link = &self.link;
-        let credential = parse_secret(value(result)?)
+        let credential = parse_secret(result.value()?)
             .map_err(|error| TransferError::Retryable(error.to_string()))?
             .filter(|secret| {
                 secret.link_id == Some(link.link_id) && secret.endpoint == link.endpoint

@@ -22,7 +22,7 @@ use crate::keyspaces::{
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord, MetadataLifecycleRecord};
 use crate::operation::TransactionMode;
-use crate::reducer::reduced_admin_target;
+use crate::reducer::overlay::reduced_admin_target;
 use crate::register::{Admission, admit_write};
 use crate::row_plan::{PlanRows, PlanStop, Planned, RowPlan};
 use crate::storage_entries::sync_revision_key;
@@ -30,12 +30,13 @@ use crate::structs::execution::notification_watch::interest_dirty_key;
 use crate::structs::execution::setting::SettingChannel;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::{head_rows, record_rows, user_record_key};
+use crate::structs::persistent_id::PersistentIdMapping;
 use crate::structs::placement::policy::document::{
     PlacementPolicyDocument, verify_policy_authority,
 };
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
-use crate::structs::{PersistentIdMapping, SyncQuarantineIdentity, SyncRejection};
+use crate::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 use crate::sync_checks::{
     check_vault_record, node_info_supersedes, published_by, shared_verdict, validate_link,
     validate_node_upsert, validate_pid_mapping, validate_policy_document, validate_register_upsert,

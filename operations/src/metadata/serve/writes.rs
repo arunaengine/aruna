@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{MetadataEffect, MetadataError};
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -19,9 +19,6 @@ use crate::auth::error::AuthorizeError;
 use crate::forward::authorize::{
     ForwardAuthError, ForwardedCallerOperation, forward_auth_error, write_check,
 };
-use crate::forward::replay::{
-    CreateRows, CreateRowsOperation, HeldRecordError, HeldRecordOperation, replay_answer,
-};
 use crate::forward::transport::{forwarded_unavailable, reject};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
@@ -29,12 +26,15 @@ use crate::metadata::create_document::{
 use crate::metadata::create_entry::CreateEntryOperation;
 use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::forward::replay::{
+    CreateRows, CreateRowsOperation, HeldRecordError, HeldRecordOperation, replay_answer,
+};
 use crate::metadata::persistent_id::forward::pid_authority_node;
-use crate::metadata::protocol::MetadataTransportMessage as Message;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
 use crate::metadata::update_entry::UpdateEntryOperation;
+use aruna_core::metadata::protocol::MetadataTransportMessage as Message;
 
 #[derive(Debug, PartialEq)]
 enum WriteStage {

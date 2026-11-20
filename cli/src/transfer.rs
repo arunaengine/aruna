@@ -7,12 +7,13 @@ use crate::error::{CliError, s3_error};
 use aruna_wire::info::InfoResponse;
 use aruna_wire::session::{CLIENT_REFRESH_WINDOW, SessionTokenResponse};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use reqwest::Method;
 use serde::Serialize;
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
 
@@ -141,6 +142,10 @@ pub struct S3Access {
     api: Api,
     session: Option<S3Session>,
     client: aws_sdk_s3::Client,
+    endpoint: String,
+    /// The group and endpoint fallback a lapsed session is taken again for.
+    group_id: String,
+    fallback: Option<String>,
 }
 
 impl S3Access {
@@ -156,27 +161,41 @@ impl S3Access {
             Err(CliError::Api(error)) if error.status == 403 => return Err(refused(group_id)),
             other => Some(other?),
         };
-        let client = match &session {
-            Some(session) => s3_client(session),
+        let (client, endpoint) = match &session {
+            Some(session) => (s3_client(session), session.endpoint.clone()),
             None => {
                 let node_id = api.node_id.clone().unwrap_or_default();
                 let endpoint = node_endpoint(api, fallback, &node_id).await?;
-                aws_sdk_s3::Client::from_conf(client_config(&endpoint).allow_no_auth().build())
+                let config = client_config(&endpoint).allow_no_auth().build();
+                (aws_sdk_s3::Client::from_conf(config), endpoint)
             }
         };
         Ok(Self {
             api: api.clone(),
             session,
             client,
+            endpoint,
+            group_id: group_id.to_string(),
+            fallback: fallback.map(str::to_string),
         })
     }
 
-    /// The client, after refreshing a session that is about to expire.
+    /// The client, after refreshing a session that is about to expire, or taking a new one for
+    /// the same group from the same node once it expired, as after a long wait for a record.
     pub async fn client(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
         let Some(session) = &mut self.session else {
             return Ok(self.client.clone());
         };
         let now = chrono::Utc::now();
+        if expires_within(&session.token.expires_at, now, chrono::TimeDelta::zero()) {
+            // The node refuses to refresh an expired session; the caller's token gives the new
+            // one the same restrictions.
+            let fresh =
+                request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
+            self.client = s3_client(&fresh);
+            *session = fresh;
+            return Ok(self.client.clone());
+        }
         if !expires_within(&session.token.expires_at, now, REFRESH_BEFORE) {
             return Ok(self.client.clone());
         }
@@ -263,13 +282,14 @@ pub fn reusable_parts(
     md5s: &[String],
     stored: &[StoredPart],
 ) -> Vec<Option<String>> {
+    let by_number: std::collections::HashMap<i32, &StoredPart> =
+        stored.iter().map(|held| (held.number, held)).collect();
     parts
         .iter()
         .zip(md5s)
         .map(|(part, md5)| {
-            stored
-                .iter()
-                .find(|held| held.number == part.number && held.size == part.length)
+            (by_number.get(&part.number))
+                .filter(|held| held.size == part.length)
                 .filter(|held| held.etag.trim_matches('"').eq_ignore_ascii_case(md5))
                 .map(|held| held.etag.clone())
         })
@@ -297,18 +317,6 @@ fn digest_file(path: &Path, parts: &[Part]) -> std::io::Result<(String, Vec<Stri
     Ok((whole.finalize().to_hex().to_string(), md5s))
 }
 
-pub async fn hash_file(path: &Path) -> Result<String, CliError> {
-    let path = path.to_path_buf();
-    let digest = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update_reader(std::fs::File::open(path)?)?;
-        Ok(hasher.finalize().to_hex().to_string())
-    })
-    .await
-    .map_err(|error| CliError::Io(std::io::Error::other(error)))??;
-    Ok(digest)
-}
-
 /// What an upload sent and how much of it an earlier attempt had already stored.
 #[derive(Clone, Debug, Serialize)]
 pub struct Uploaded {
@@ -317,22 +325,30 @@ pub struct Uploaded {
     pub reused_parts: usize,
 }
 
-/// Uploads a file; above `part_size` as a multipart upload that continues an unfinished one.
+/// Uploads a file; above `part_size` as a multipart upload. The upload id is kept in `records`,
+/// so only a rerun of the same transfer continues it, and never two runs at once.
 pub async fn upload(
     access: &mut S3Access,
-    bucket: &str,
-    key: &str,
+    (bucket, key): (&str, &str),
     path: &Path,
     part_size: u64,
+    records: &Path,
 ) -> Result<Uploaded, CliError> {
     let size = tokio::fs::metadata(path).await?.len();
-    let client = access.client().await?;
     if size <= part_size {
-        let blake3 = hash_file(path).await?;
-        let body = ByteStream::from_path(path)
-            .await
-            .map_err(|error| CliError::S3(error.to_string()))?;
-        client
+        // One read is hashed and sent, so the reported digest and size are of the sent bytes.
+        let bytes = tokio::fs::read(path).await?;
+        let (bytes, blake3) = tokio::task::spawn_blocking(move || {
+            let blake3 = blake3::hash(&bytes).to_hex().to_string();
+            (bytes, blake3)
+        })
+        .await
+        .map_err(|error| CliError::Io(std::io::Error::other(error)))?;
+        let size = bytes.len() as u64;
+        let body = ByteStream::from(bytes);
+        access
+            .client()
+            .await?
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -353,11 +369,17 @@ pub async fn upload(
             .await
             .map_err(|error| CliError::Io(std::io::Error::other(error)))??
     };
-    let (upload_id, stored) = match unfinished_upload(&client, bucket, key).await? {
-        Some(upload_id) => {
-            let stored = stored_parts(&client, bucket, key, &upload_id).await?;
-            (upload_id, stored)
-        }
+    let named = (access.endpoint.as_str(), bucket, key, blake3.as_str());
+    let (mut record, kept) = claim_record(upload_record(records, named, &parts)).await?;
+    // Hashing and the wait for the record can outlast the session, so it refreshes only now.
+    let client = access.client().await?;
+    let resumed = match kept {
+        Some(upload_id) => (stored_parts(&client, bucket, key, &upload_id).await?)
+            .map(|stored| (upload_id, stored)),
+        None => None,
+    };
+    let (upload_id, stored) = match resumed {
+        Some(resumed) => resumed,
         None => {
             let created = client
                 .create_multipart_upload()
@@ -369,6 +391,17 @@ pub async fn upload(
             let upload_id = created
                 .upload_id
                 .ok_or_else(|| CliError::S3("the node returned no upload id".into()))?;
+            if let Err(error) = keep_id(&mut record, &upload_id) {
+                // Without its record no run could resume or find the new upload, so it goes.
+                let abort = client.abort_multipart_upload().bucket(bucket).key(key);
+                if let Err(failed) = abort.upload_id(&upload_id).send().await {
+                    eprintln!(
+                        "warning: upload {upload_id} was not aborted: {}",
+                        s3_error(failed)
+                    );
+                }
+                return Err(error.into());
+            }
             (upload_id, Vec::new())
         }
     };
@@ -386,6 +419,7 @@ pub async fn upload(
             && let Some(done) = tasks.join_next().await
         {
             let (number, etag) = joined(done)?;
+            check_part(&md5s, (number, &etag), path)?;
             etags[number as usize - 1] = Some(etag);
         }
         let client = access.client().await?;
@@ -396,6 +430,7 @@ pub async fn upload(
     }
     while let Some(done) = tasks.join_next().await {
         let (number, etag) = joined(done)?;
+        check_part(&md5s, (number, &etag), path)?;
         etags[number as usize - 1] = Some(etag);
     }
     let completed: Vec<CompletedPart> = parts
@@ -423,11 +458,114 @@ pub async fn upload(
         .send()
         .await
         .map_err(s3_error)?;
+    clear_record(&mut record, key);
     Ok(Uploaded {
         size,
         blake3,
         reused_parts,
     })
+}
+
+/// The folder of upload records below the config folder.
+pub(crate) const UPLOAD_RECORDS: &str = "uploads";
+
+/// Records `upload_id` as the provider upload of copying `path` to `bucket` and `key` at
+/// `endpoint` in parts of `part_size` bytes, as an interrupted run leaves it.
+#[cfg(feature = "test-hooks")]
+pub(crate) async fn keep_upload(
+    config_dir: &Path,
+    (endpoint, bucket, key): (&str, &str, &str),
+    (path, part_size): (&Path, u64),
+    upload_id: &str,
+) -> Result<(), CliError> {
+    let parts = split_parts(std::fs::metadata(path)?.len(), part_size);
+    let (blake3, _) = digest_file(path, &parts)?;
+    let records = config_dir.join(UPLOAD_RECORDS);
+    let record = upload_record(&records, (endpoint, bucket, key, &blake3), &parts);
+    let (mut record, _) = claim_record(record).await?;
+    keep_id(&mut record, upload_id)?;
+    Ok(())
+}
+
+/// The record file of one transfer: its endpoint, bucket, key, content and part layout name it.
+fn upload_record(records: &Path, named: (&str, &str, &str, &str), parts: &[Part]) -> PathBuf {
+    let (endpoint, bucket, key, blake3) = named;
+    let mut hasher = blake3::Hasher::new();
+    for field in [endpoint, bucket, key, blake3] {
+        hasher.update(&(field.len() as u64).to_le_bytes());
+        hasher.update(field.as_bytes());
+    }
+    for part in parts {
+        hasher.update(&part.offset.to_le_bytes());
+        hasher.update(&part.length.to_le_bytes());
+    }
+    records.join(format!("{}.upload", hasher.finalize().to_hex()))
+}
+
+/// Opens and locks the record at `path`, waiting while another run holds it, and answers the
+/// upload id an earlier run of the same transfer kept there. The lock ends with the file.
+async fn claim_record(path: PathBuf) -> Result<(std::fs::File, Option<String>), CliError> {
+    let claimed = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+        if let Some(folder) = path.parent() {
+            std::fs::create_dir_all(folder)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock()?;
+        let mut kept = String::new();
+        file.read_to_string(&mut kept)?;
+        let kept = kept.trim().to_string();
+        Ok((file, (!kept.is_empty()).then_some(kept)))
+    });
+    Ok(claimed
+        .await
+        .map_err(|error| CliError::Io(std::io::Error::other(error)))??)
+}
+
+/// Marks a claimed record finished. The emptied file stays, so a run waiting on its lock and
+/// every later run lock this same file.
+fn finish_record(record: &mut std::fs::File) -> std::io::Result<()> {
+    keep_id(record, "")
+}
+
+/// Finishes the record of a completed upload, best effort: the object exists, and a kept id
+/// only makes a later run of the same file meet `NoSuchUpload` and start afresh.
+fn clear_record(record: &mut std::fs::File, key: &str) {
+    if let Err(error) = finish_record(record) {
+        eprintln!("warning: the upload record of {key} was not cleared: {error}");
+    }
+}
+
+/// Replaces the upload id in a claimed record; an empty id marks the transfer as finished.
+fn keep_id(record: &mut std::fs::File, upload_id: &str) -> std::io::Result<()> {
+    record.set_len(0)?;
+    record.rewind()?;
+    record.write_all(upload_id.as_bytes())?;
+    record.sync_all()
+}
+
+/// A part's ETag is the MD5 of the bytes the node stored; another MD5 than the hashed one means
+/// the file changed while it was sent, so the hashed digest would not describe the upload.
+fn check_part(md5s: &[String], (number, etag): (i32, &str), path: &Path) -> Result<(), CliError> {
+    let expected = (number as usize)
+        .checked_sub(1)
+        .and_then(|index| md5s.get(index));
+    let etag = etag.trim_matches('"');
+    match expected {
+        Some(expected) if expected.eq_ignore_ascii_case(etag) => Ok(()),
+        expected => Err(CliError::Checksum {
+            path: path.display().to_string(),
+            expected: format!(
+                "part {number} with MD5 {}",
+                expected.map_or("", String::as_str)
+            ),
+            actual: etag.to_string(),
+        }),
+    }
 }
 
 fn joined(
@@ -467,47 +605,34 @@ async fn send_part(
     Ok((part.number, etag))
 }
 
-/// The newest unfinished multipart upload of exactly `key`, which a rerun continues.
-async fn unfinished_upload(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<String>, CliError> {
-    let listed = client
-        .list_multipart_uploads()
-        .bucket(bucket)
-        .prefix(key)
-        .send()
-        .await
-        .map_err(s3_error)?;
-    let mut uploads: Vec<_> = listed
-        .uploads
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|upload| upload.key.as_deref() == Some(key))
-        .collect();
-    uploads.sort_by_key(|upload| upload.initiated);
-    Ok(uploads.pop().and_then(|upload| upload.upload_id))
-}
-
+/// The parts the node holds for `upload_id`, or `None` once the node no longer knows the upload.
 async fn stored_parts(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
     upload_id: &str,
-) -> Result<Vec<StoredPart>, CliError> {
+) -> Result<Option<Vec<StoredPart>>, CliError> {
     let mut stored = Vec::new();
     let mut marker = None;
     loop {
-        let page = client
+        let listed = client
             .list_parts()
             .bucket(bucket)
             .key(key)
             .upload_id(upload_id)
             .set_part_number_marker(marker)
             .send()
-            .await
-            .map_err(s3_error)?;
+            .await;
+        let page = match listed {
+            Ok(page) => page,
+            Err(error)
+                if error.as_service_error().and_then(|error| error.code())
+                    == Some("NoSuchUpload") =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(s3_error(error)),
+        };
         for part in page.parts.unwrap_or_default() {
             if let (Some(number), Some(size), Some(etag)) =
                 (part.part_number, part.size, part.e_tag)
@@ -521,7 +646,7 @@ async fn stored_parts(
         }
         match (page.is_truncated, page.next_part_number_marker) {
             (Some(true), Some(next)) => marker = Some(next),
-            _ => return Ok(stored),
+            _ => return Ok(Some(stored)),
         }
     }
 }
@@ -632,6 +757,73 @@ mod tests {
     }
 
     #[test]
+    fn changed_part_refused() {
+        // A part whose stored MD5 differs from the hashed one fails the upload.
+        let md5s = vec!["aa".to_string(), "bb".to_string()];
+        let path = Path::new("data.bin");
+        assert!(check_part(&md5s, (2, "\"BB\""), path).is_ok());
+        assert!(matches!(
+            check_part(&md5s, (1, "\"cc\""), path),
+            Err(CliError::Checksum { .. })
+        ));
+        assert!(check_part(&md5s, (3, "\"aa\""), path).is_err());
+    }
+
+    #[test]
+    fn transfers_keep_apart() {
+        // Another file for the same key is another transfer, with an upload of its own.
+        let records = Path::new("records");
+        let parts = split_parts(25, 10);
+        let named = |blake3| ("http://node", "bucket", "key", blake3);
+        let first = upload_record(records, named("aa"), &parts);
+        assert_eq!(first, upload_record(records, named("aa"), &parts));
+        assert_ne!(first, upload_record(records, named("bb"), &parts));
+        let other = split_parts(25, 5);
+        assert_ne!(first, upload_record(records, named("aa"), &other));
+    }
+
+    #[tokio::test]
+    async fn record_keeps_id() {
+        // A rerun of the same transfer reads the id the first run kept; a finished one none.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("nested").join("record.upload");
+        let (mut record, kept) = claim_record(path.clone()).await.unwrap();
+        assert_eq!(kept, None);
+        keep_id(&mut record, "upload-1").unwrap();
+        drop(record);
+        let (mut record, kept) = claim_record(path.clone()).await.unwrap();
+        assert_eq!(kept.as_deref(), Some("upload-1"));
+        keep_id(&mut record, "").unwrap();
+        drop(record);
+        assert_eq!(claim_record(path).await.unwrap().1, None);
+    }
+
+    #[test]
+    fn clearing_best_effort() {
+        // A record that cannot be written leaves the completed upload a success.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("record.upload");
+        std::fs::write(&path, "upload-1").unwrap();
+        let mut read_only = std::fs::File::open(&path).unwrap();
+        clear_record(&mut read_only, "key");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "upload-1");
+    }
+
+    #[tokio::test]
+    async fn finished_record_stays() {
+        // A finished transfer keeps its emptied record, so a waiting run locks the same file.
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("record.upload");
+        let (mut record, _) = claim_record(path.clone()).await.unwrap();
+        keep_id(&mut record, "upload-1").unwrap();
+        finish_record(&mut record).unwrap();
+        assert!(path.exists(), "the record stays while its lock is held");
+        drop(record);
+        assert!(path.exists());
+        assert_eq!(claim_record(path).await.unwrap().1, None);
+    }
+
+    #[test]
     fn reuses_matching_parts() {
         let parts = split_parts(25, 10);
         let md5s = vec!["aa".to_string(), "bb".to_string(), "cc".to_string()];
@@ -707,9 +899,22 @@ mod tests {
             api: Api::new("http://127.0.0.1:1", None).unwrap(),
             client: s3_client(&session),
             session: Some(session),
+            endpoint: "http://127.0.0.1:1".into(),
+            group_id: "g".into(),
+            fallback: None,
         };
         let error = access.client().await.unwrap_err();
         assert!(error.to_string().contains("cannot refresh"), "{error}");
+        // An expired session is taken again, so the unreachable API is now asked.
+        let lapsed = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+        if let Some(session) = access.session.as_mut() {
+            session.token.expires_at = lapsed.to_rfc3339();
+        }
+        let error = access.client().await.unwrap_err();
+        assert!(
+            error.to_string().contains("cannot reach the API"),
+            "{error}"
+        );
     }
 
     #[test]

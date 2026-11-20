@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -32,7 +32,7 @@ struct Fixture {
 fn actor(realm_id: RealmId) -> Actor {
     Actor {
         node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-        user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
         realm_id,
     }
 }
@@ -40,7 +40,7 @@ fn actor(realm_id: RealmId) -> Actor {
 async fn fixture(limits: RoCrateLimits) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let storage_handle =
-        aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let realm_id = RealmId::from_bytes(
         *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()

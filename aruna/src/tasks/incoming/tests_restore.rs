@@ -2,16 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::harness::*;
+use super::support::*;
 use super::*;
-use aruna_drivers::testing::freeze_clock;
+use crate::tasks::incoming::outbox::drive_sync_drain;
+use aruna_drivers::testing::{RecordingTaskHandler, freeze_clock};
 
 #[tokio::test]
 async fn restore_document_records() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -35,7 +37,8 @@ async fn restore_document_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -154,7 +157,8 @@ async fn drain_keeps_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage = FjallStorage::open(temp_dir.path().to_str().expect("storage opens"))
         .expect("storage opens");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -224,7 +228,8 @@ async fn outbox_sync_retry() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -274,7 +279,8 @@ async fn retained_outbox_timer() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         vec![node(2)],
@@ -312,13 +318,53 @@ async fn retained_outbox_timer() {
     assert_eq!(restored_key, TaskKey::DrainSyncOutbox);
 }
 
+// The outbox runs the follow-ups its applies stored and owns none itself: a graph cleanup that
+// storage refuses keeps its queued obligation for the drain, with no write after the apply.
 #[tokio::test]
-async fn tombstones_are_return() {
+async fn refused_cleanup_kept() {
+    use aruna_core::document::{
+        AppliedStep, AppliedSync, DocumentReconcileResult, applied_sync_entry,
+    };
+    use aruna_core::events::StorageEvent;
+    use aruna_core::keyspaces::{APPLIED_SYNC_KEYSPACE, PRUNE_JOB_KEYSPACE};
+    use aruna_test_support::metadata::refusing;
+
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let realm_id = RealmId::from_bytes([65u8; 32]);
+    let tombstone = GraphLifecycleRecord::deleted(
+        "urn:graph:tombstone-kept".to_string(),
+        realm_id,
+        Ulid::from_parts(21, 1),
+        Ulid::from_parts(21, 2),
+        3,
+    );
+    let queued = AppliedSync {
+        id: Ulid::from_parts(22, 1),
+        node_id: node(1),
+        realm_id: Some(realm_id),
+        result: DocumentReconcileResult {
+            metadata_graph_tombstones: vec![tombstone.clone()],
+            ..DocumentReconcileResult::default()
+        },
+        next: AppliedStep::Metadata,
+    };
+    let (space, key, value) = applied_sync_entry(&queued).expect("row encodes");
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: space,
+            key,
+            value,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected write event: {other:?}"),
+    }
     let context = Arc::new(DriverContext {
-        storage_handle: storage.clone(),
+        storage_handle: refusing(storage.clone(), PRUNE_JOB_KEYSPACE),
         net_handle: None,
         blob_handle: None,
         graph_handle: None,
@@ -327,16 +373,8 @@ async fn tombstones_are_return() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let document_id = Ulid::from_parts(17, 1);
-    let tombstone = GraphLifecycleRecord::deleted(
-        "urn:graph:tombstone-before-retry".to_string(),
-        RealmId::from_bytes([3; 32]),
-        Ulid::from_parts(18, 1),
-        document_id,
-        19,
-    );
 
-    let outcome = handler
+    handler
         .finish_sync_batch(
             &TaskKey::DrainSyncOutbox,
             Vec::new(),
@@ -344,10 +382,7 @@ async fn tombstones_are_return() {
             Event::Net(NetEvent::DocumentSync(
                 DocumentNetEvent::DocumentsReconciled {
                     applied: 1,
-                    targets: vec![DocumentTarget::MetadataCreateEvent {
-                        document_id,
-                        event_id: Ulid::from_parts(20, 1),
-                    }],
+                    targets: Vec::new(),
                     metadata_create_events: Vec::new(),
                     metadata_graph_tombstones: vec![tombstone.clone()],
                 },
@@ -356,10 +391,231 @@ async fn tombstones_are_return() {
         )
         .await;
 
-    assert!(outcome.retry_needed);
-    let jobs = read_graph_jobs(&storage).await;
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].graph_iri, tombstone.graph_iri);
+    assert!(read_graph_jobs(&storage).await.is_empty());
+    let rows = storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: APPLIED_SYNC_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: 16,
+            txn_id: None,
+        })
+        .await;
+    let values = match rows {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        other => panic!("unexpected storage event: {other:?}"),
+    };
+    let applied: Vec<AppliedSync> = (values.iter())
+        .map(|(_, value)| AppliedSync::from_bytes(value.as_ref()).expect("row decodes"))
+        .collect();
+    assert_eq!(applied, vec![queued]);
+}
+
+// An applied drain that asks for a retry keeps a live wake when its timer cannot be stored: the
+// fired timer's row is gone, and the applied rows wait on that wake.
+#[tokio::test]
+async fn applied_retry_kept() {
+    use aruna_core::document::{
+        AppliedStep, AppliedSync, DocumentReconcileResult, applied_sync_entry,
+    };
+    use aruna_operations::node::applied_drain::APPLIED_RETRY_AFTER;
+    use aruna_test_support::metadata::refusing;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    // A logged create the projection cannot read fails the follow-up at its projection wake.
+    let result = DocumentReconcileResult {
+        targets: vec![DocumentTarget::MetadataCreateEvent {
+            document_id: Ulid::from_parts(31, 1),
+            event_id: Ulid::from_parts(31, 2),
+        }],
+        ..DocumentReconcileResult::default()
+    };
+    let applied = AppliedSync {
+        id: Ulid::from_parts(31, 3),
+        node_id: node(31),
+        realm_id: None,
+        result,
+        next: AppliedStep::Metadata,
+    };
+    let row = applied_sync_entry(&applied).expect("row encodes");
+    aruna_drivers::testing::write_entries(&storage, vec![row]).await;
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: refusing(storage.clone(), TASK_TIMER_KEYSPACE),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+
+    handler.run_trigger(TaskKey::DrainAppliedSync).await;
+
+    let shorten = TaskEffect::ShortenTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::from_secs(10_000),
+    };
+    let Event::Task(TaskEvent::TimerScheduled { after, .. }) =
+        task_handle.send_effect(Effect::Task(shorten)).await
+    else {
+        panic!("expected timer scheduled");
+    };
+    assert!(
+        after <= APPLIED_RETRY_AFTER,
+        "the retry stays armed in memory"
+    );
+}
+
+// A converted timer whose rearm cannot be stored keeps a live wake, as a backend import does
+// after an accepted rule, so its work does not stop until the node restarts.
+#[tokio::test]
+async fn refused_rearm_kept() {
+    use aruna_operations::jobs::PRUNE_POLL_AFTER;
+    use aruna_test_support::metadata::refusing;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: refusing(storage, TASK_TIMER_KEYSPACE),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+
+    handler.run_trigger(TaskKey::PruneJobs).await;
+
+    let shorten = TaskEffect::ShortenTimer {
+        key: TaskKey::PruneJobs,
+        after: PRUNE_POLL_AFTER * 2,
+    };
+    let Event::Task(TaskEvent::TimerScheduled { after, .. }) =
+        task_handle.send_effect(Effect::Task(shorten)).await
+    else {
+        panic!("expected timer scheduled");
+    };
+    assert!(after <= PRUNE_POLL_AFTER, "the rearm stays armed in memory");
+}
+
+/// A handler on storage that refuses timer rows, with its task handle.
+fn refusing_handler() -> (tempfile::TempDir, OperationsTaskHandler, TaskHandle) {
+    use aruna_test_support::metadata::refusing;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: refusing(storage, TASK_TIMER_KEYSPACE),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    (temp_dir, handler, task_handle)
+}
+
+/// The deadline the scheduler holds for `key`, read by asking it to shorten to `probe`.
+async fn armed_after(task_handle: &TaskHandle, key: TaskKey, probe: Duration) -> Duration {
+    let shorten = TaskEffect::ShortenTimer { key, after: probe };
+    let Event::Task(TaskEvent::TimerScheduled { after, .. }) =
+        task_handle.send_effect(Effect::Task(shorten)).await
+    else {
+        panic!("expected timer scheduled");
+    };
+    after
+}
+
+// A registry renewal whose row cannot be stored stays armed in memory, so the lease is renewed
+// once storage recovers instead of expiring.
+#[tokio::test]
+async fn renewal_rearm_kept() {
+    use aruna_core::federation::PUBLISH_INTERVAL;
+
+    let (_temp_dir, handler, task_handle) = refusing_handler();
+    handler.publish_registration().await;
+    let key = TaskKey::PublishRegistration;
+    let after = armed_after(&task_handle, key, PUBLISH_INTERVAL * 2).await;
+    assert!(
+        after <= PUBLISH_INTERVAL,
+        "the renewal stays armed in memory"
+    );
+}
+
+// The backend import pass armed at start stays armed in memory when its row cannot be stored,
+// so rules without a restored wake still run.
+#[tokio::test]
+async fn startup_imports_kept() {
+    let (_temp_dir, handler, task_handle) = refusing_handler();
+    let (seen_tx, mut seen_rx) = mpsc::channel(1);
+    task_handle
+        .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+        .await;
+    handler.arm_backend_imports().await;
+    let fired = tokio::time::timeout(Duration::from_secs(5), seen_rx.recv()).await;
+    assert_eq!(fired.ok().flatten(), Some(TaskKey::RunBackendImports));
+}
+
+// A timer change waits while another change of the same key holds it, so its row and the
+// scheduler take both changes in one order.
+#[tokio::test]
+async fn timer_change_waits() {
+    use aruna_storage::task_timers::{hold_change, read_timer};
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    let key = TaskKey::RefreshBlobHolders;
+    let other = TaskEffect::ResetTimer {
+        key: key.clone(),
+        after: Duration::from_secs(5),
+    };
+    let held = hold_change(&other).await;
+
+    let rearm = handler.reschedule_timer(key.clone(), Duration::from_secs(60));
+    tokio::pin!(rearm);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut rearm)
+            .await
+            .is_err()
+    );
+    assert!(
+        read_timer(&storage, &key)
+            .await
+            .expect("timer reads")
+            .is_none()
+    );
+
+    drop(held);
+    assert!(rearm.await);
+    assert!(
+        read_timer(&storage, &key)
+            .await
+            .expect("timer reads")
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -421,10 +677,11 @@ async fn drain_reconcile_summary() {
     use aruna_core::structs::storage::usage::{
         NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, UsageCounters, global_shard_key, usage_global_key,
     };
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
+    use aruna_net::config::NetConfig;
 
     async fn write_stat(
-        storage: &aruna_storage::StorageHandle,
+        storage: &aruna_storage::storage::handle::StorageHandle,
         key_space: &str,
         key: Vec<u8>,
         value: Vec<u8>,
@@ -549,7 +806,8 @@ async fn drain_reconcile_summary() {
 async fn drain_reconcile_config() {
     use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{SUMMARY_GLOBAL_KEY, UsageCounters};
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::NetHandle;
+    use aruna_net::config::NetConfig;
 
     let temp_dir = tempdir().expect("temp dir");
     let storage =
@@ -627,7 +885,7 @@ async fn drain_reconcile_config() {
     net.shutdown().await;
 }
 
-async fn restore_document_key(storage: &aruna_storage::StorageHandle) -> TaskKey {
+async fn restore_document_key(storage: &aruna_storage::storage::handle::StorageHandle) -> TaskKey {
     let task_handle = TaskHandle::new();
     let (seen_tx, mut seen_rx) = mpsc::channel(1);
     task_handle

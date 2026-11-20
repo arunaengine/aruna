@@ -621,8 +621,8 @@ fn requires_body_examples() {
 
 /// Ids inside signed payloads that do not decode as the realm or user id they stand for.
 fn payload_id_gaps(node: &Value, in_payload: bool, gaps: &mut Vec<String>) {
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     match node {
         Value::Object(fields) => {
             for (key, value) in fields {
@@ -884,7 +884,7 @@ fn accepts_typed_examples() {
 #[tokio::test]
 async fn accepts_runtime_examples() {
     let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
-    let cancel = response_value(crate::routes::tes::cancel_response()).await;
+    let cancel = response_value(crate::routes::execution::tes::cancel_response()).await;
     accepts_example(
         &doc,
         "/ga4gh/tes/v1/tasks/{id}:cancel",

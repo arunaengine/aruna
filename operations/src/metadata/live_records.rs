@@ -12,7 +12,7 @@ use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataLifecycleRecord, REGISTRY_CANDIDATE_LIMIT,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     document_lifecycle_key, graph_lifecycle_key, metadata_document_key,
 };
@@ -20,8 +20,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, TxnId, Value};
 use thiserror::Error;
 use ulid::Ulid;
-
-use crate::metadata::call_results::read_values;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LiveRecordsError {
@@ -112,7 +110,7 @@ impl Operation for LiveRecordsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, LiveRecordsError> {
-        let values = read_values(result)?;
+        let values = result.values()?;
         Ok(Next::Done(self.live(values)?))
     }
 }
@@ -159,7 +157,7 @@ impl Operation for LiveRecordOperation {
             let turn = lifecycle.next(result)?;
             return Self::lifecycle_turn(turn);
         }
-        let Some(bytes) = value(result)? else {
+        let Some(bytes) = result.value()? else {
             return Ok(Next::Done(None));
         };
         let record: MetadataRegistryRecord = postcard::from_bytes(&bytes)

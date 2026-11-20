@@ -2,131 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::harness::*;
+use super::support::*;
 use super::*;
+use crate::tasks::incoming::restore::start_task_queues;
+use aruna_clock::testing::poll_until;
 use aruna_drivers::testing::freeze_clock;
-
-#[test]
-fn admin_block_spans() {
-    let origin = node(4);
-    let blocked_topic = irokle::TopicId::hash(b"blocked-admin-page");
-    let healthy_topic = irokle::TopicId::hash(b"healthy-admin-page");
-    let mut defer = DrainDeferState::default();
-    let (_, deferred, _) = partition_drain_records(
-        vec![(b"first".to_vec(), admin_record(origin, 1), blocked_topic)],
-        &mut defer,
-        true,
-        |_| false,
-        |_| DeferOutcome::Retry,
-    );
-    assert_eq!(deferred.len(), 1);
-
-    let (published, deferred, undeliverable) = partition_drain_records(
-        vec![(b"second".to_vec(), admin_record(origin, 2), healthy_topic)],
-        &mut defer,
-        true,
-        |_| true,
-        |_| DeferOutcome::Retry,
-    );
-    assert!(published.is_empty());
-    assert_eq!(deferred.len(), 1);
-    assert!(undeliverable.is_empty());
-}
-
-// A blocked admin operation blocks its later origin sequence for the rotation across all topics.
-// Publishing a later sequence first would make the earlier record stale.
-#[test]
-fn admin_origin_blocks() {
-    let origin = node(4);
-    let blocked_topic = irokle::TopicId::hash(b"blocked-admin-topic");
-    let healthy_topic = irokle::TopicId::hash(b"healthy-admin-topic");
-    let records = vec![
-        (b"first".to_vec(), admin_record(origin, 1), blocked_topic),
-        (b"second".to_vec(), admin_record(origin, 2), healthy_topic),
-    ];
-
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
-        records,
-        &mut defer,
-        true,
-        |topic| topic != blocked_topic,
-        |_| DeferOutcome::Retry,
-    );
-
-    assert!(
-        to_publish.is_empty(),
-        "a later origin_seq must not overtake"
-    );
-    assert_eq!(deferred.len(), 2);
-    assert!(undeliverable.is_empty());
-    assert!(defer.blocked_origins.contains(&origin));
-}
-
-#[test]
-fn topic_block_spans() {
-    let topic = irokle::TopicId::hash(b"blocked-topic-pages");
-    let healthy_topic = irokle::TopicId::hash(b"healthy-topic-pages");
-    let mut defer = DrainDeferState::default();
-    let (_, deferred, _) = partition_drain_records(
-        vec![(b"first".to_vec(), shard_topic_record(1), topic)],
-        &mut defer,
-        true,
-        |_| false,
-        |_| DeferOutcome::Retry,
-    );
-    assert_eq!(deferred.len(), 1);
-
-    let (published, deferred, undeliverable) = partition_drain_records(
-        vec![
-            (b"healthy".to_vec(), shard_topic_record(3), healthy_topic),
-            (b"second".to_vec(), shard_topic_record(2), topic),
-        ],
-        &mut defer,
-        true,
-        |_| true,
-        |_| DeferOutcome::Retry,
-    );
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].0, b"healthy".to_vec());
-    assert_eq!(deferred.len(), 1);
-    assert!(undeliverable.is_empty());
-}
-
-// Evaluate topic availability once so adjacent records cannot split across defer and publish.
-// Publishing the newer record first would invert the origin sequence.
-#[test]
-fn drain_partition_flips() {
-    let topic = irokle::TopicId::hash(b"shard-genesis-race");
-    let older = shard_topic_record(1);
-    let newer = shard_topic_record(2);
-    assert!(older.target.uses_shard_topic());
-    let records = vec![
-        (b"older".to_vec(), older, topic),
-        (b"newer".to_vec(), newer, topic),
-    ];
-
-    let mut calls = 0usize;
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
-        records,
-        &mut defer,
-        true,
-        |_| {
-            calls += 1;
-            calls > 1
-        },
-        |_| DeferOutcome::Retry,
-    );
-
-    assert_eq!(calls, 1, "topic availability is evaluated once per run");
-    assert!(
-        to_publish.is_empty(),
-        "no record of a deferred topic may publish"
-    );
-    assert_eq!(deferred.len(), 2);
-    assert!(undeliverable.is_empty());
-}
+use aruna_operations::sync::outbox::rotation::RotationTotals;
 
 #[test]
 fn outbox_upsert_revision() {
@@ -223,7 +104,7 @@ async fn topic_page_blocks() {
     net.ensure_sync_topics(&[healthy_topic], Vec::new())
         .await
         .expect("healthy topic genesis");
-    let blocked = aruna_operations::sync::outbox_record::new_identified_record(
+    let blocked = aruna_operations::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         blocked_target,
@@ -235,7 +116,7 @@ async fn topic_page_blocks() {
         aruna_core::structs::placement::record::PlacementRef::NIL,
         true,
     );
-    let healthy = aruna_operations::sync::outbox_record::new_identified_record(
+    let healthy = aruna_operations::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         healthy_target,
@@ -446,11 +327,6 @@ async fn close_routes_defer() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let rotation = OutboxRotation {
         totals: RotationTotals {
             deferred: 2,
@@ -458,18 +334,20 @@ async fn close_routes_defer() {
             invocations: 2,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
 
     handler.close_rotation(key.clone(), rotation).await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    assert!(
-        !handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .contains_key(&key),
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
+    assert_eq!(
+        attempts, 0,
         "progress in the clean suffix resets failure backoff"
     );
 }
@@ -479,31 +357,25 @@ async fn close_keeps_retry() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let rotation = OutboxRotation {
         totals: RotationTotals {
             retry_invocations: 1,
             invocations: 2,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
 
     handler.close_rotation(key.clone(), rotation).await;
 
     assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&4)
-    );
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
+    assert_eq!(attempts, 4);
 }
 
 #[tokio::test(start_paused = true)]
@@ -511,11 +383,6 @@ async fn close_resets_progress() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let rotation = OutboxRotation {
         totals: RotationTotals {
             // A retry on an early page followed by a clean suffix made
@@ -525,6 +392,7 @@ async fn close_resets_progress() {
             invocations: 2,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
 
@@ -534,14 +402,12 @@ async fn close_resets_progress() {
         scheduled_after(&task_handle).await,
         Duration::from_millis(250)
     );
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&1)
-    );
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
+    assert_eq!(attempts, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -572,14 +438,7 @@ async fn retry_suffix_closes() {
     let rotation = handler.rotation.lock().expect("rotation lock");
     assert!(rotation.boundary.is_none());
     assert!(rotation.cursor.is_none());
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&1)
-    );
+    assert_eq!(rotation.retry_attempts, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -588,11 +447,6 @@ async fn midpoint_retry_keeps() {
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
     let topic = irokle::TopicId::hash(b"midpoint-retry-topic");
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let mut rotation = OutboxRotation {
         boundary: Some(b"last".to_vec()),
         cursor: Some(b"middle".to_vec()),
@@ -601,6 +455,7 @@ async fn midpoint_retry_keeps() {
             invocations: 1,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
     rotation.blocked_topics.insert(topic);
@@ -665,78 +520,24 @@ fn outbox_bound_finite() {
     assert_ne!(OUTBOX_INVOCATION_RECORDS, 0);
 }
 
-#[test]
-fn drain_partition_order() {
-    let topic = irokle::TopicId::hash(b"shard-genesis-present");
-    let records = vec![
-        (b"older".to_vec(), shard_topic_record(1), topic),
-        (b"newer".to_vec(), shard_topic_record(2), topic),
-    ];
-
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) =
-        partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
-
-    assert!(deferred.is_empty());
-    assert!(undeliverable.is_empty());
-    let keys: Vec<Vec<u8>> = to_publish.into_iter().map(|(key, _, _)| key).collect();
-    assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
-}
-
-// A non-holder can neither create nor join a bucket topic, so it cannot publish the record.
-// It is classified for reporting and retained unless a relay succeeds.
-#[test]
-fn unheld_bucket_undeliverable() {
-    let topic = irokle::TopicId::hash(b"unheld-bucket");
-    let records = vec![
-        (b"older".to_vec(), shard_topic_record(1), topic),
-        (b"newer".to_vec(), shard_topic_record(2), topic),
-    ];
-
-    let mut classified = 0usize;
-    let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
-        records,
-        &mut defer,
-        true,
-        |_| false,
-        |_| {
-            classified += 1;
-            DeferOutcome::Undeliverable
-        },
-    );
-
-    assert_eq!(classified, 1, "holdership is decided once per topic");
-    assert!(to_publish.is_empty());
-    assert!(deferred.is_empty());
-    let keys: Vec<Vec<u8>> = undeliverable.into_iter().map(|(key, _, _)| key).collect();
-    assert_eq!(keys, vec![b"older".to_vec(), b"newer".to_vec()]);
-}
-
 #[tokio::test(start_paused = true)]
 async fn empty_resets_backoff() {
     let _clock = freeze_clock();
     let (_dir, handler, _task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
+    handler.store_rotation(OutboxRotation {
+        retry_attempts: 3,
+        ..OutboxRotation::default()
+    });
+    let rotation = std::mem::take(&mut *handler.rotation.lock().expect("rotation lock"));
 
-    assert!(
-        handler
-            .open_rotation(&key, OutboxRotation::default())
-            .await
-            .is_none()
-    );
-    assert!(
-        !handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .contains_key(&key)
-    );
+    assert!(handler.open_rotation(&key, rotation).await.is_none());
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
+    assert_eq!(attempts, 0, "an empty outbox drops the retry ladder");
 }
 
 #[tokio::test]
@@ -760,18 +561,17 @@ async fn blocked_keeps_backoff() {
     });
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
-    let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
+    handler.store_rotation(OutboxRotation {
+        retry_attempts: 3,
+        ..OutboxRotation::default()
+    });
     let mut blocked_change = change();
     blocked_change.placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: Ulid::from_bytes([48; 16]),
         shard: 1,
     };
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target(),
         Vec::new(),
@@ -787,14 +587,12 @@ async fn blocked_keeps_backoff() {
     handler.drain_sync_outbox().await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&3)
-    );
+    let attempts = handler
+        .rotation
+        .lock()
+        .expect("rotation lock")
+        .retry_attempts;
+    assert_eq!(attempts, 3);
     shutdown_net(&net).await;
 }
 
@@ -849,7 +647,7 @@ async fn deferred_head_paginates() {
     };
     let mut writes = Vec::with_capacity(OUTBOX_DRAIN_SIZE + 1);
     for index in 0..OUTBOX_DRAIN_SIZE {
-        let record = aruna_operations::sync::outbox_record::new_identified_record(
+        let record = aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             node(1),
             deferred_target.clone(),
@@ -862,14 +660,14 @@ async fn deferred_head_paginates() {
             false,
         );
         writes.push(
-            aruna_operations::sync::outbox_record::outbox_write_entry(&record)
+            aruna_operations::sync::outbox::record::outbox_write_entry(&record)
                 .expect("outbox entry"),
         );
     }
 
     // One later origin record for a shared (non-shard) topic, ordered
     // strictly after the head page, so only pagination reaches it.
-    let publish_record = aruna_operations::sync::outbox_record::new_identified_record(
+    let publish_record = aruna_operations::sync::outbox::record::new_identified_record(
         Ulid::from_parts(2, 0),
         node(1),
         DocumentTarget::RealmAuthorization { realm_id },
@@ -883,7 +681,7 @@ async fn deferred_head_paginates() {
     );
     let publish_key = outbox_key(&publish_record).to_vec();
     writes.push(
-        aruna_operations::sync::outbox_record::outbox_write_entry(&publish_record).expect("entry"),
+        aruna_operations::sync::outbox::record::outbox_write_entry(&publish_record).expect("entry"),
     );
 
     match storage
@@ -993,7 +791,7 @@ async fn rotation_streak() {
     );
     let total = u128::from(OUTBOX_CONTINUATION_STREAK) + 2;
     for index in 1..=total {
-        let record = aruna_operations::sync::outbox_record::new_identified_record(
+        let record = aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),
@@ -1122,7 +920,8 @@ async fn draining_a_topics() {
         "the rank-0 shard topic must not exist before the config change is drained"
     );
 
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
         Vec::new(),
@@ -1135,20 +934,14 @@ async fn draining_a_topics() {
     );
     write_outbox_record(&storage, &record).await;
     task_handle
-        .send_effect(aruna_operations::sync::outbox_record::schedule_drain_effect())
+        .send_effect(aruna_operations::sync::outbox::record::schedule_drain_effect())
         .await;
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if net.sync_topic_exists(topic).unwrap_or(false) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "rank-0 shard topic was not created after the local config change drained"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let exists = || std::future::ready(net.sync_topic_exists(topic).unwrap_or(false).then_some(()));
+    assert!(
+        poll_until(Duration::from_secs(20), exists).await.is_some(),
+        "rank-0 shard topic was not created after the local config change drained"
+    );
 
     net.shutdown().await;
 }
@@ -1180,7 +973,8 @@ async fn retry_publishes_once() {
     net.refresh_document_peers(&config)
         .await
         .expect("refresh peers");
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
         Vec::new(),
@@ -1225,7 +1019,7 @@ async fn retry_publishes_once() {
 
 struct ConfigHarness {
     _dir: tempfile::TempDir,
-    storage: aruna_storage::StorageHandle,
+    storage: aruna_storage::storage::handle::StorageHandle,
     net: NetHandle,
     handler: OperationsTaskHandler,
     config: RealmConfigDocument,
@@ -1261,7 +1055,7 @@ async fn config_setup() -> ConfigHarness {
         .expect("shared topic genesis");
     let mut shard_change = change();
     shard_change.placement = placement;
-    let shared = aruna_operations::sync::outbox_record::new_identified_record(
+    let shared = aruna_operations::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         shared_target,
@@ -1273,7 +1067,7 @@ async fn config_setup() -> ConfigHarness {
         aruna_core::structs::placement::record::PlacementRef::NIL,
         true,
     );
-    let shard = aruna_operations::sync::outbox_record::new_identified_record(
+    let shard = aruna_operations::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         shard_target.clone(),
@@ -1344,7 +1138,7 @@ async fn pull_reaches_holder() {
     ex_holder.add_peer_addr(net.endpoint_addr()).await;
     // The ex-holder must serve inbound sync streams for the pull to reach
     // its genesis.
-    crate::inbound::initialize_incoming_fixture(Arc::new(DriverContext {
+    let _incoming = crate::inbound::initialize_incoming_fixture(Arc::new(DriverContext {
         storage_handle: ex_storage.clone(),
         net_handle: Some(ex_holder.clone()),
         blob_handle: None,
@@ -1404,7 +1198,8 @@ async fn pull_reaches_holder() {
 
     let mut change = change();
     change.placement = placement;
-    let record = aruna_operations::sync::outbox_record::new_outbox_record(
+    let record = aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         net.node_id(),
         target,
         vec![ex_holder.node_id()],
@@ -1428,22 +1223,17 @@ async fn pull_reaches_holder() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
+    let (handler, storage, record_key) = (&handler, &storage, &record_key);
+    let published = poll_until(Duration::from_secs(60), move || async move {
         handler.drain_sync_outbox().await;
-        if read_outbox_record(&storage, &record_key)
-            .await
-            .expect("read outbox record")
-            .is_none()
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "record never published: the drain did not adopt the ex-holder's genesis"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        let record = read_outbox_record(storage, record_key).await;
+        record.expect("read outbox record").is_none().then_some(())
+    })
+    .await;
+    assert!(
+        published.is_some(),
+        "record never published: the drain did not adopt the ex-holder's genesis"
+    );
     assert!(
         net.sync_topic_exists(topic).unwrap_or(false),
         "the genesis must be adopted from the stamped ex-holder"
@@ -1462,7 +1252,7 @@ fn admin_placement(shard: u32) -> aruna_core::structs::placement::record::Placem
 
 fn admin_outbox(
     realm_id: RealmId,
-    origin: aruna_core::NodeId,
+    origin: aruna_core::id::NodeId,
     origin_seq: u64,
     target: DocumentTarget,
     placement: aruna_core::structs::placement::record::PlacementRef,
@@ -1470,8 +1260,9 @@ fn admin_outbox(
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
-    let user_id = aruna_core::UserId::nil(realm_id);
-    aruna_operations::sync::outbox_record::new_outbox_record(
+    let user_id = aruna_core::user::id::UserId::nil(realm_id);
+    aruna_operations::sync::outbox::record::new_identified_record(
+        ulid::Ulid::generate(),
         node(1),
         target,
         Vec::new(),
@@ -1495,16 +1286,6 @@ fn admin_outbox(
     )
 }
 
-fn admin_record(origin: aruna_core::NodeId, origin_seq: u64) -> DocumentOutboxRecord {
-    admin_outbox(
-        RealmId([3; 32]),
-        origin,
-        origin_seq,
-        target(),
-        admin_placement(1),
-    )
-}
-
 fn shard_change(seed: u8) -> DocumentChange {
     let mut value = change();
     value.placement = aruna_core::structs::placement::record::PlacementRef {
@@ -1514,23 +1295,9 @@ fn shard_change(seed: u8) -> DocumentChange {
     value
 }
 
-fn shard_topic_record(origin_seq: u64) -> DocumentOutboxRecord {
-    aruna_operations::sync::outbox_record::new_outbox_record(
-        node(1),
-        target(),
-        vec![node(2)],
-        DocumentOutboxEvent::Upsert {
-            bytes: vec![origin_seq as u8],
-            change: change(),
-        },
-        aruna_core::structs::placement::record::PlacementRef::NIL,
-        false,
-    )
-}
-
 struct BoundaryHarness {
     _dir: tempfile::TempDir,
-    storage: aruna_storage::StorageHandle,
+    storage: aruna_storage::storage::handle::StorageHandle,
     net: NetHandle,
     task_handle: TaskHandle,
     handler: OperationsTaskHandler,
@@ -1584,7 +1351,7 @@ impl BoundaryHarness {
         target: DocumentTarget,
         event: DocumentOutboxEvent,
     ) -> DocumentOutboxRecord {
-        aruna_operations::sync::outbox_record::new_identified_record(
+        aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, id),
             node(1),
             target,
@@ -1699,4 +1466,43 @@ impl BoundaryHarness {
         );
         shutdown_net(&self.net).await;
     }
+}
+
+// A realm config that cannot be decoded postpones the drain instead of reading as absent, where
+// the bootstrap rules would let a record publish without verified membership.
+#[tokio::test]
+async fn unreadable_config_waits() {
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let realm_id = RealmId::from_bytes([66u8; 32]);
+    let load = || crate::tasks::incoming::outbox::load_drain_config(&context, realm_id);
+    assert!(matches!(load().await, Ok(None)));
+
+    let written = storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            value: ByteView::from(vec![0xff]),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        written,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    assert!(load().await.is_err());
+
+    let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    write_realm_config(&storage, realm_id, &config, node(1)).await;
+    assert!(matches!(load().await, Ok(Some(_))));
 }

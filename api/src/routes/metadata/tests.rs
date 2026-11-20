@@ -9,6 +9,7 @@ use super::rocrate::*;
 use super::validation::*;
 use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
+use crate::metadata::model::*;
 use crate::metadata::*;
 use crate::server::state::ServerState;
 use crate::tests::metadata_fixtures::{
@@ -19,11 +20,11 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_drivers::driver::drive;
+use aruna_drivers::testing::installed_graph_handle;
 use aruna_drivers::testing::test_context;
 use aruna_operations::metadata::api::read_types::ApiQueryMode;
 use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
 use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
-use aruna_operations::testing::installed_graph_handle;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -55,16 +56,18 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::{drain_projection_queue, schedule_projection_drain};
-use aruna_operations::testing::{process_graph_tombstones, prune_jobs_exist};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::metadata::{process_graph_tombstones, prune_jobs_exist};
+use aruna_test_support::projection::drain_projection_queue;
+use aruna_test_support::projection::schedule_projection_drain;
 use serde_json::json;
 use std::collections::HashSet;
 use std::time::SystemTime;
@@ -255,7 +258,7 @@ async fn public_routes_work() {
     assert_eq!(raw.context_digest.len(), 64);
     assert_eq!(raw.dataset_digest.as_deref().map(str::len), Some(64));
     assert!(raw.projected_event_id.is_none());
-    let projected_jsonld = aruna_operations::testing::export_rocrate_jsonld(
+    let projected_jsonld = aruna_test_support::metadata::export_rocrate_jsonld(
         test.state.get_ctx().as_ref(),
         created.summary.graph_iri.clone(),
     )
@@ -1110,7 +1113,7 @@ async fn hides_document_existence() {
     assert!(owner.is_ok());
 
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
@@ -1200,7 +1203,7 @@ async fn preview_refuses_stranger() {
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
@@ -1318,7 +1321,7 @@ async fn grant_anonymous_read(test: &TestState) {
                 format!("/{realm_id}/g/{}/**", test.group_id),
                 Permission::READ,
             )]),
-            assigned_users: HashSet::from([aruna_core::UserId::nil(realm_id)]),
+            assigned_users: HashSet::from([aruna_core::user::id::UserId::nil(realm_id)]),
         },
     );
     write_doc(
@@ -2530,7 +2533,7 @@ async fn create_linking_doc(
     created.summary.document_id
 }
 
-async fn seed_owned_group(test: &TestState, group_id: Ulid, owner: aruna_core::UserId) {
+async fn seed_owned_group(test: &TestState, group_id: Ulid, owner: aruna_core::user::id::UserId) {
     let realm_id = test.state.get_realm_id();
     let actor = Actor {
         node_id: test.state.get_node_id(),
@@ -2669,7 +2672,7 @@ async fn references_omits_unauthorized() {
     // A private backlink from a group the caller cannot read is dropped.
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
-    let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let foreign_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let foreign_group = Ulid::generate();
     seed_owned_group(&test, foreign_group, foreign_user).await;
     let foreign_auth = AuthContext {
@@ -2945,7 +2948,7 @@ async fn preflight_distinguishes_states() {
 async fn hidden_references_concealed() {
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
-    let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let foreign_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let foreign_group = Ulid::generate();
     seed_owned_group(&test, foreign_group, foreign_user).await;
     let foreign_auth = AuthContext {
@@ -3216,7 +3219,7 @@ pub(crate) async fn setup_state() -> TestState {
     let metadata_dir = tempfile::tempdir().unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
     let realm_id = test_realm_id(3);
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id,
@@ -3303,7 +3306,7 @@ pub(crate) async fn setup_network_state() -> TestState {
     .await
     .unwrap();
     let node_id = net.node_id();
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id,
@@ -3336,7 +3339,7 @@ pub(crate) async fn setup_network_state() -> TestState {
         config
             .to_bytes(&Actor {
                 node_id,
-                user_id: aruna_core::UserId::nil(realm_id),
+                user_id: aruna_core::user::id::UserId::nil(realm_id),
                 realm_id,
             })
             .unwrap()
@@ -3390,7 +3393,7 @@ pub(crate) async fn setup_network_state() -> TestState {
 }
 
 async fn setup_closed_storage() -> Arc<ServerState> {
-    let (storage_handle, receivers) = storage::StorageHandle::new();
+    let (storage_handle, receivers) = storage::handle::StorageHandle::new();
     drop(receivers);
 
     let realm_id = test_realm_id(3);
@@ -3447,7 +3450,7 @@ mod authorization {
                 .to_bytes(),
         );
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -3457,7 +3460,7 @@ mod authorization {
     fn stranger_auth(state: &ServerState) -> AuthContext {
         let realm_id = state.get_realm_id();
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -3662,7 +3665,7 @@ async fn lookup_hides_private() {
     ];
     use aruna_operations::metadata::persistent_id::forward::{PidRouteOperation, outcome_mapping};
     let ctx = test.state.get_ctx();
-    let request = aruna_operations::metadata::PersistentIdRequest::AddIdentifiers {
+    let request = aruna_core::metadata::protocol::PersistentIdRequest::AddIdentifiers {
         identifiers,
         occurred_at_ms: aruna_clock::unix_timestamp_millis(),
     };
@@ -3699,7 +3702,7 @@ async fn lookup_hides_private() {
         serde_json::json!({"matches": [{"document_id": document_id.to_string(), "origin": "imported"}]})
     );
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), test.auth.realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), test.auth.realm_id),
         ..test.auth.clone()
     };
     for auth in [None, Some(stranger)] {

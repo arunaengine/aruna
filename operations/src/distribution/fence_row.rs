@@ -6,7 +6,6 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::done;
 use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
 use aruna_core::types::Key;
 use thiserror::Error;
@@ -14,7 +13,7 @@ use ulid::Ulid;
 
 /// One change of a fence row.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum FenceChange {
+pub(crate) enum FenceChange {
     /// Closes the set to incoming publications.
     Close,
     /// Fences every range for the deletion with this identity and closes the set.
@@ -50,7 +49,7 @@ impl FenceChange {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub(super) enum FenceError {
+pub(crate) enum FenceError {
     #[error(transparent)]
     Io(#[from] IoError),
     #[error("{0}")]
@@ -60,7 +59,7 @@ pub(super) enum FenceError {
 /// Applies one change to the fence row of `set_id` in one transaction and outputs the row as
 /// it is afterwards. A conflict with a write that read the row is driven again.
 #[derive(Debug, PartialEq)]
-pub(super) struct UpdateFenceOperation {
+pub(crate) struct UpdateFenceOperation {
     set_id: Ulid,
     change: FenceChange,
     /// The changed row, once it is being written.
@@ -68,7 +67,7 @@ pub(super) struct UpdateFenceOperation {
 }
 
 impl UpdateFenceOperation {
-    pub(super) fn new(set_id: Ulid, change: FenceChange) -> Self {
+    pub(crate) fn new(set_id: Ulid, change: FenceChange) -> Self {
         Self {
             set_id,
             change,
@@ -92,7 +91,7 @@ impl Operation for UpdateFenceOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<LocalFence>, FenceError> {
         if let Some(fence) = self.written.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(fence));
         }
         let value = result.values()?.into_iter().next().flatten();

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::topology::init_logging;
+use aruna_clock::testing::poll_until;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -29,7 +30,7 @@ use aruna_core::types::{GroupId, Key, Value};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::metadata::local_query::LocalQueryOperation;
 use aruna_operations::metadata::text_search::LocalSearchOperation;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -40,7 +41,7 @@ const REALM: RealmId = RealmId([9u8; 32]);
 struct TestHarness {
     _storage_dir: TempDir,
     _metadata_dir: TempDir,
-    storage: aruna_storage::StorageHandle,
+    storage: aruna_storage::storage::handle::StorageHandle,
     context: DriverContext,
     group_id: GroupId,
 }
@@ -59,7 +60,7 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
     storage.install_metadata_indexes(metadata_dir.path());
     // Policy loading fails closed without realm config and group documents.
     let group_id = Ulid::generate();
-    let owner = aruna_core::UserId::nil(REALM);
+    let owner = aruna_core::user::id::UserId::nil(REALM);
     let actor = Actor {
         node_id,
         user_id: owner,
@@ -192,7 +193,7 @@ async fn create_crate_graph(harness: &TestHarness, index: usize) -> Result<Strin
 }
 
 async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::testing::send_metadata_effect(
+    let event = aruna_drivers::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
@@ -246,16 +247,12 @@ async fn wait_for(
     deadline: Duration,
     mut condition: impl AsyncFnMut() -> Result<bool, BoxError>,
 ) -> Result<bool, BoxError> {
-    let started = Instant::now();
-    loop {
-        if condition().await? {
-            return Ok(true);
-        }
-        if started.elapsed() > deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let held = poll_until(deadline, async || match condition().await {
+        Ok(false) => None,
+        answer => Some(answer),
+    })
+    .await;
+    held.unwrap_or(Ok(false))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -560,7 +557,7 @@ async fn graph_filter_first() -> Result<(), BoxError> {
 }
 
 async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Result<(), BoxError> {
-    let event = aruna_operations::testing::send_metadata_effect(
+    let event = aruna_drivers::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
@@ -647,7 +644,7 @@ async fn local_order_by() -> Result<(), BoxError> {
 async fn lazy_matches_eager() -> Result<(), BoxError> {
     let harness = build_harness(None).await?;
     let group_id = harness.group_id;
-    let member = aruna_core::UserId::local(Ulid::generate(), REALM);
+    let member = aruna_core::user::id::UserId::local(Ulid::generate(), REALM);
     let actor = Actor {
         node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         user_id: member,
@@ -720,7 +717,7 @@ async fn lazy_matches_eager() -> Result<(), BoxError> {
         session: None,
     };
     let outsider_auth = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), REALM),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), REALM),
         realm_id: REALM,
         path_restrictions: None,
         session: None,
@@ -917,7 +914,7 @@ async fn concurrent_mutation_profile() -> Result<(), BoxError> {
                 let jsonld = format!(
                     "{{\"@id\": \"./load-{writer}-{round}.dat\", \"@type\": \"MediaObject\", \"name\": \"load-{writer}-{round}\", \"keywords\": [{keywords}]}}"
                 );
-                let event = aruna_operations::testing::send_metadata_effect(&harness.context, MetadataEffect::UpsertDataEntity {
+                let event = aruna_drivers::testing::send_metadata_effect(&harness.context, MetadataEffect::UpsertDataEntity {
                         request: UpsertEntityRequest {
                             graph_iri,
                             jsonld,

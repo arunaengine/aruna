@@ -6,26 +6,27 @@ use aruna_core::id_mint::IdMint;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     NODE_STATE_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::read_row;
+use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+    WatchEvent, WatchEventDetail, WatchEventKind, schedule_watch_drain, watch_event_entry,
+    watch_resource_path,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::replication::ReplicationFailure;
 use aruna_core::structs::storage::routing::NodeRouting;
-use aruna_core::structs::{
+use aruna_core::structs::sync_relationship::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -52,11 +53,12 @@ use super::version_replication::{
     SourceAuthorizationError,
 };
 use crate::groups::routing::{QuotaOperation, RoutingInputsError};
-use crate::notifications::watch::origin::EmitEventOperation;
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::queue_backoff::{due_after, min_due_at, retry_delay_ms};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation, SyncMirrorError};
+use crate::replication::mirror_repair::SyncMirrorError;
+use crate::replication::mirror_repair::kick::KickRepairOperation;
+use crate::replication::mirror_repair::status::StoreStatusOperation;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::structs::storage::replication_queue::{
@@ -796,6 +798,7 @@ enum JobStep {
     Scope,
     Store(Option<(u64, Option<String>)>, Box<AfterStore>),
     Emit(Box<AfterStore>),
+    Armed(Box<AfterStore>),
 }
 
 /// Runs one replication job and keeps its relationship's status.
@@ -1091,11 +1094,16 @@ impl ProcessJobOperation {
             },
         );
         match event {
-            // Failures only warn inside the operation.
-            Some(event) => {
-                let emit = EmitEventOperation::new(event);
-                self.call(JobStep::Emit(Box::new(after)), IoCall::child(emit))
-            }
+            Some(event) => match watch_event_entry(&event) {
+                Ok(entry) => {
+                    let write = outside_call(IoCall::Write(vec![entry]));
+                    self.call(JobStep::Emit(Box::new(after)), write)
+                }
+                Err(error) => {
+                    warn!(%error, "A sync watch event could not be queued");
+                    self.after_store(after)
+                }
+            },
             None => self.after_store(after),
         }
     }
@@ -1271,8 +1279,18 @@ impl Operation for ProcessJobOperation {
                 let stored = result.child::<Result<bool, String>, BlobQueueError>()??;
                 self.stored(watch, *after, stored)
             }
-            JobStep::Emit(after) => {
-                result.child::<(), IoError>()?.ok();
+            // A queued event leaves with the drain; a failed queue write only warns.
+            JobStep::Emit(after) => match outside_answer(result).and_then(IoResult::done) {
+                Ok(()) => self.call(JobStep::Armed(after), IoCall::from(schedule_watch_drain())),
+                Err(error) => {
+                    warn!(%error, "A sync watch event could not be queued");
+                    self.after_store(*after)
+                }
+            },
+            JobStep::Armed(after) => {
+                if let Err(error) = result.event() {
+                    warn!(%error, "The watch drain could not be armed");
+                }
                 self.after_store(*after)
             }
         }

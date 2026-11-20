@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::alpn::{ADMISSION_CLOSE, Alpn, AlpnRole, MEMBERSHIP_CLOSE};
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use iroh::Endpoint;
 use iroh::endpoint::{ClosedStream, Connection, ReadError, ReadToEndError, VarInt};
@@ -26,9 +26,8 @@ use crate::connection_pool::{ConnectionLease, ConnectionPool};
 use crate::device_limits::{DeviceLimiter, DeviceLimits, DevicePermit, DeviceRefusal};
 use crate::document_sync::DocumentSyncService;
 use crate::error::{NetError, Result};
-use crate::telemetry::{
-    duration_ms, record_duration_ms, record_selected_path, warn_iroh_phase, warn_iroh_request,
-};
+use crate::telemetry::{record_selected_path, warn_iroh_phase, warn_iroh_request};
+use aruna_core::telemetry::{duration_ms, record_duration_ms};
 
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const INBOUND_CONNECTION_LIMIT: usize = 256;
@@ -1210,7 +1209,7 @@ mod tests {
 
     fn user_kind() -> RealmNodeKind {
         RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(
+            owner: aruna_core::user::id::UserId::nil(
                 aruna_core::structs::identity::realm::RealmId::from_bytes([7u8; 32]),
             ),
         }

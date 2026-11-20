@@ -15,7 +15,6 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use crate::tests::routes::{seed_realm_auth, test_state, test_storage};
 use crate::tests::users::foreign_auth;
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -37,6 +36,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_drivers::testing::test_context;
@@ -172,7 +172,8 @@ async fn setup_state() -> (Arc<ServerState>, TempDir) {
 /// A realm whose initial admin is claimed, so the realm admin path grants.
 async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,

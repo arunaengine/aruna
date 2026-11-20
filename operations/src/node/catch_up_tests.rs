@@ -139,7 +139,7 @@ fn alone_refreshes_contact() {
         manager.next(config(RealmNodeKind::Management, &[])),
         contact()
     );
-    let owner = aruna_core::UserId::local(ulid::Ulid::from_bytes([4; 16]), REALM);
+    let owner = aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([4; 16]), REALM);
     let mut device = started();
     assert_eq!(
         device.next(config(RealmNodeKind::User { owner }, &[2])),
@@ -195,12 +195,12 @@ fn discard_marker_waits() {
         assert_eq!(operation.next(marker), Ok(Next::Call(held)));
         operation
     };
-    let job_id = aruna_core::structs::execution::job::JobId::from_bytes([8; 16]);
+    let job_id = aruna_core::structs::execution::job::identity::JobId::from_bytes([8; 16]);
     let reservation = JobReservationRecord {
         execution_id: ulid::Ulid::from_bytes([7; 16]),
         job_id,
         logical_job_id: job_id,
-        resources: aruna_core::structs::execution::job::EffectiveResources {
+        resources: aruna_core::structs::execution::job::family::EffectiveResources {
             cpu_cores: 1,
             ram_bytes: 0,
             disk_bytes: 0,

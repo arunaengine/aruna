@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::RealmId;
@@ -16,8 +16,8 @@ use super::plan::{
     PageGuards, PageItem, Plan, check_guards, guard_reads, page_items, page_rows, plan_items,
     previous_reads,
 };
-use super::{PageAnswer, ReferencePage};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
+use aruna_core::replication_protocol::{PageAnswer, ReferencePage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApplyState {

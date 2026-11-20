@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::placement::read_holder_sets;
@@ -19,16 +19,15 @@ use super::routed::export::RoutedExportOperation;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::{FanoutOperation, FetchError, PeerAnswer};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export_types::{
-    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
-};
+use crate::metadata::api::export_types::ExportMetadataRequest;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::live_records::{LiveRecordOperation, LiveRecordsError};
 use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::raw_events::RawReadError;
-use crate::metadata::revision_read::{MetadataRawView, RawDisplayOperation};
+use crate::metadata::revision_read::RawDisplayOperation;
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::api::{ExportMetadataResult, MetadataRawView, RoCrateExportView};
+use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 type ExportTurn = Result<Next<ExportMetadataResult>, MetadataReadError>;
 
@@ -312,7 +311,7 @@ impl Operation for ProfileExportOperation {
             ExportStage::Peers => self.peers_read(result),
             ExportStage::Owner => result
                 .child::<ExportMetadataResult, MetadataApiError>()?
-                .map_err(crate::forward::transport::read_error)
+                .map_err(crate::metadata::forward::write::read_error)
                 .map(Next::Done),
         }
     }

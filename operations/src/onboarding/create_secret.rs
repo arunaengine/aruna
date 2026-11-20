@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
@@ -18,6 +18,8 @@ use ulid::Ulid;
 use crate::onboarding::secret_state::secret_state_entry;
 
 pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
+/// Prefixes the expiry index: one row per secret, soonest expiry first.
+pub const SECRET_EXPIRY_PREFIX: &str = "secret-expiry:";
 /// Secrets one page of the outstanding-secret scan reads. The scan follows its
 /// cursor to the end of the range: an owner's secret beyond the first page
 /// still occupies one of their device slots.
@@ -106,6 +108,7 @@ impl CreateSecretOperation {
         Ok(Next::Call(IoCall::Write(vec![
             (ONBOARDING_KEYSPACE.to_string(), key, ByteView::from(value)),
             state_entry,
+            expiry_entry(&self.input.record),
         ])))
     }
 
@@ -226,7 +229,7 @@ impl Operation for CreateSecretOperation {
             }
             Stage::Count { .. } => self.handle_page(result),
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.input.record.clone()))
             }
         }
@@ -244,18 +247,37 @@ pub fn secret_record_key(enrollment_id: Ulid) -> ByteView {
     ByteView::from(format!("{SECRET_RECORD_PREFIX}{enrollment_id}").into_bytes())
 }
 
+/// The expiry index key of a secret: its expiry big-endian, then its enrollment id.
+pub fn secret_expiry_key(expires_at: u64, enrollment_id: Ulid) -> ByteView {
+    let mut key = SECRET_EXPIRY_PREFIX.as_bytes().to_vec();
+    key.extend_from_slice(&expires_at.to_be_bytes());
+    key.extend_from_slice(&enrollment_id.to_bytes());
+    ByteView::from(key)
+}
+
+/// The expiry index row of `record`, written in the transaction that writes the record.
+pub(crate) fn expiry_entry(record: &OnboardingSecretRecord) -> (String, Key, Value) {
+    let key = secret_expiry_key(record.expires_at, record.enrollment_id);
+    (
+        ONBOARDING_KEYSPACE.to_string(),
+        key,
+        ByteView::from(Vec::new()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CreateSecretError, CreateSecretInput, CreateSecretOperation};
-    use aruna_core::UserId;
+    use aruna_core::calls::CallRun;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
     use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_core::operation::{EffectOperation, Runnable};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
@@ -264,6 +286,28 @@ mod tests {
 
     fn realm() -> RealmId {
         RealmId::from_bytes([4u8; 32])
+    }
+
+    #[test]
+    fn expiry_keys_order() {
+        // The index sorts by expiry first, whatever the enrollment id.
+        let (late, early) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([9; 16]));
+        assert!(super::secret_expiry_key(5, early) < super::secret_expiry_key(6, late));
+        assert!(super::secret_expiry_key(256, late) > super::secret_expiry_key(255, early));
+    }
+
+    #[test]
+    fn writes_expiry_row() {
+        // The record, its state and its expiry row are written together.
+        let record = device_record(UserId::new(Ulid::from_bytes([2; 16]), realm()));
+        let key = super::secret_expiry_key(record.expires_at, record.enrollment_id);
+        let mut operation = CreateSecretOperation::new(CreateSecretInput { record });
+        let Ok(aruna_core::calls::Next::Call(aruna_core::calls::IoCall::Write(rows))) =
+            operation.write_record()
+        else {
+            panic!("expected the record writes");
+        };
+        assert!(rows.iter().any(|(_, row, _)| *row == key));
     }
 
     fn device_node(index: usize) -> iroh::PublicKey {
@@ -286,7 +330,8 @@ mod tests {
         enrolled: &[UserId],
     ) -> (tempfile::TempDir, DriverContext) {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let mut config = RealmConfigDocument::new(realm(), Vec::new(), 3);
         config.quota = QuotaConfig {
             devices_per_user: cap,
@@ -320,7 +365,7 @@ mod tests {
     /// Runs a mint's effects against storage up to its commit and hands that
     /// commit back, so two mints can be interleaved deliberately.
     async fn run_to_commit(
-        operation: &mut impl EffectOperation,
+        operation: &mut CallRun<impl Operation>,
         context: &DriverContext,
     ) -> StorageEffect {
         let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
@@ -454,14 +499,12 @@ mod tests {
         // read conflicts with the winner's insert, so only one commits.
         let owner = UserId::local(Ulid::generate(), realm());
         let (_dir, context) = context_with_cap(Some(1), &[]).await;
-        let mut first = CreateSecretOperation::new(CreateSecretInput {
+        let mut first = CallRun::new(CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
-        })
-        .into_machine();
-        let mut second = CreateSecretOperation::new(CreateSecretInput {
+        }));
+        let mut second = CallRun::new(CreateSecretOperation::new(CreateSecretInput {
             record: device_record(owner),
-        })
-        .into_machine();
+        }));
 
         let first_commit = run_to_commit(&mut first, &context).await;
         let second_commit = run_to_commit(&mut second, &context).await;

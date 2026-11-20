@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
@@ -15,7 +14,6 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
@@ -25,17 +23,18 @@ use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{GroupId, Key, KeySpace, RoleId};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::epoch_due::DueMarks;
-use crate::notifications::emit::emit_notifications_effect;
-use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::sync::outbox_record::{
+use crate::sync::notification_outbox::emit_notifications_effect;
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::notification_routing::{RoutingContext, route_resource_event};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 
@@ -425,14 +424,14 @@ impl Operation for MemberRemoval {
                 self.emit_auth_write(auth_doc, reducer, realm_config)
             }
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 Ok(self.after_writes())
             }
             Stage::Fence => {
@@ -541,12 +540,10 @@ fn should_seed_role(state: &AdminDocumentState, role_id: RoleId) -> bool {
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use aruna_core::SYNC_OUTBOX_KEYSPACE;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
     use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::execution::notification::NotificationRecord;
     use aruna_core::structs::identity::auth::Actor;
@@ -554,6 +551,7 @@ pub mod test {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::RoleId;
+    use aruna_core::user::id::UserId;
     use aruna_net::NetHandle;
     use tempfile::TempDir;
     use ulid::Ulid;

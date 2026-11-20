@@ -14,7 +14,7 @@ use aruna_core::jobs::{JobEffect, JobEvent, JobReport};
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::execution::job::StagingJobCheckpoint;
+use aruna_core::structs::execution::job::input::StagingJobCheckpoint;
 use aruna_core::structs::execution::source_access::{ResolvedSourceConnector, SourceMetadata};
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -29,17 +29,17 @@ use super::walk::{
     StagedFile, Turns, WalkPlace, authority_call, file_access, lane_turn, own_files,
     record_failure, rules_call, rules_result, with_manifest,
 };
-use super::{ItemFailure, PageFailure, StagingRun, checkpoint_key, committed, pinned};
+use super::{ItemFailure, PageFailure, StagingRun, committed, pinned};
 use crate::auth::permission_rules::PermissionRules;
 use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
-use crate::staging::head_source::{
+use crate::s3::object::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
-use crate::staging::page::import::{
-    PageEntry, PageImportError, PageImportInput, PageImportOperation, PageImportResult,
-    PreparePageOperation,
+use crate::staging::page::import::{PageImportOperation, PreparePageOperation};
+use crate::staging::page::rows::{
+    PageEntry, PageImportError, PageImportInput, PageImportResult, PreparedRows,
 };
-use crate::staging::page::rows::PreparedRows;
+use aruna_core::staging_checkpoint::checkpoint_key;
 
 /// Page transactions one listed page runs at most while their commits conflict.
 const PAGE_ATTEMPTS: u32 = 8;

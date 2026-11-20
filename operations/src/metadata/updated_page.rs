@@ -12,7 +12,6 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{page_rows, read_values};
 use crate::metadata::timestamp_sweep::{records_call, scan_call};
 
 /// One page of registry records ordered by `updated_at_ms`, plus stale index
@@ -154,10 +153,10 @@ impl Operation for UpdatedPageOperation {
 
     fn next(&mut self, result: IoResult) -> PageTurn {
         if self.candidates.is_empty() {
-            let (rows, next) = page_rows(result)?;
+            let (rows, next) = result.page()?;
             return self.scanned_page(rows, next);
         }
-        self.read_records(read_values(result)?)
+        self.read_records(result.values()?)
     }
 }
 

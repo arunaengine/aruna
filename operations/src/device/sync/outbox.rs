@@ -7,20 +7,20 @@ use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_ORIGIN_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::offered_directory::modified_ms;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     EntrySide, EntryState, FolderState, LocalOrigin, SyncBase, SyncPull, SyncPullAck, SyncRefusal,
     SyncedBytes, SyncedFolder,
 };
@@ -31,9 +31,9 @@ use ulid::Ulid;
 use crate::device::backlog::{
     DrainOperation, DrainQueue, ForwardOutcome, forward_member, outcome_rechecks,
 };
-use crate::device::drain::DrainOutcome;
+use crate::device::publish_queue::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_at};
-use crate::device::scan_rows::{ScanRowsError, ScanRowsOperation};
+use crate::device_node::scan_rows::{ScanRowsError, ScanRowsOperation};
 use crate::document_repository::{config_of, realm_config};
 use aruna_core::structs::identity::realm::NodeRealm;
 
@@ -86,7 +86,7 @@ impl DrainQueue for UploadQueue {
 
 /// Forwards every due upload, oldest folder first. A realm that limits a device's concurrent
 /// requests gets no more uploads at once.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainOutboxOperation {
     ids: NodeRealm,
     draining: bool,
@@ -554,7 +554,7 @@ impl Operation for LocalOriginOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<LocalOrigin>>, FolderError> {
-        let origin = value(result)?.map(|bytes| LocalOrigin::from_bytes(&bytes));
+        let origin = result.value()?.map(|bytes| LocalOrigin::from_bytes(&bytes));
         let origin = origin.transpose().map_err(|_| FolderError::Unavailable)?;
         Ok(Next::Done(origin))
     }
@@ -681,24 +681,24 @@ impl Operation for RequeueUploadsOperation {
 mod tests {
     use std::sync::Arc;
 
-    use aruna_core::UserId;
-    use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::structs::synced_folder::{FolderMode, RemoteBinding};
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     use super::{
         ForwardOutcome, ForwardUploadOperation, SettleUploadOperation, StoreUploadOperation,
         SyncPullAck, SyncUpload, UploadState, drain_sync_outbox,
     };
-    use crate::device::drain::DrainOutcome;
+    use crate::device::publish_queue::DrainOutcome;
     use crate::device::sync::repository::requeued;
     use crate::device::sync::repository::{base_key, upload_entry};
     use crate::tests::device::{context, read_value, store_folder, write_rows};
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderState, SyncBase, SyncedFolder};
+    use aruna_core::structs::synced_folder::{FolderState, SyncBase, SyncedFolder};
     use aruna_drivers::driver::{DriverContext, drive};
 
-    fn node_id() -> aruna_core::NodeId {
+    fn node_id() -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[1u8; 32]).public()
     }
 

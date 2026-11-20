@@ -6,8 +6,7 @@ pub mod after_sync;
 pub mod api;
 pub mod audit;
 pub mod audit_entry;
-pub(crate) mod builtin;
-pub(crate) mod call_results;
+pub mod builtin;
 pub(crate) mod checkpoint;
 pub(crate) mod checkpoint_window;
 pub mod create_document;
@@ -15,6 +14,7 @@ pub mod create_entry;
 pub mod data_links;
 pub mod delete_document;
 pub mod deletion_guard;
+pub mod device;
 pub mod device_pull;
 pub mod forward;
 pub mod get_document;
@@ -27,20 +27,19 @@ pub mod list_documents;
 pub(crate) mod live_records;
 pub mod local_query;
 pub mod materialization_queue;
-pub(crate) mod message_kind;
-pub mod mirror_request;
 pub(crate) mod object_version;
+pub mod owned_events;
 pub mod persistent_id;
 pub mod pid_read;
 pub(crate) mod pid_transition;
 pub mod profile;
 pub mod projection;
-pub mod protocol;
 pub mod provenance;
 pub mod prune_jobs;
 pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
+pub mod queue_timer;
 pub(crate) mod raw_events;
 pub mod raw_revision;
 pub(crate) mod read_peer;
@@ -62,14 +61,6 @@ pub mod update_entry;
 pub(crate) mod updated_page;
 pub mod visibility_index;
 pub(crate) mod visible_scope;
-pub mod write_peer;
-
-pub use builtin::builtin_shapes;
-pub use message_kind::transport_message_kind;
-pub use protocol::{
-    MetadataPathWinner, MetadataReadError, PersistentIdOutcome, PersistentIdRequest,
-    PersistentIdResolution,
-};
 
 #[cfg(test)]
 mod store_tests;

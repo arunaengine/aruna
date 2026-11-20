@@ -6,12 +6,12 @@ use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
 use crate::tests::routes::write_fixture;
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
+use aruna_core::notification_routing::route_watch_event;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, watch_resource_path,
 };
@@ -22,13 +22,14 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::notifications::inbox::UpsertInboxOperation;
-use aruna_operations::notifications::routing::route_watch_event;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;

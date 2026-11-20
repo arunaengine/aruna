@@ -4,18 +4,17 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::{PersistentIdRequest, PersistentIdResolution};
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::PersistentIdMapping;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{MintPersistentSpec, PersistentIdMapping};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::GetVisibleRequest;
 use aruna_operations::metadata::forward::authorized_create::CreateAuthorizedError;
@@ -23,12 +22,12 @@ use aruna_operations::metadata::forward::authorized_create::PinnedCreateOperatio
 use aruna_operations::metadata::forward::pinned::PinnedCreate;
 use aruna_operations::metadata::forward::routed::read::RoutedReadOperation;
 use aruna_operations::metadata::forward::routed::write::RouteDeleteOperation;
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::id_mapping::PersistentIdError;
 use aruna_operations::metadata::persistent_id::MappingReadOperation;
 use aruna_operations::metadata::persistent_id::forward::{
-    PidRouteOperation, outcome_mapping, outcome_resolution, outcome_submission, submission_error,
+    PidRouteOperation, outcome_mapping, outcome_resolution,
 };
-use aruna_operations::metadata::{PersistentIdRequest, PersistentIdResolution};
 use ulid::Ulid;
 
 fn local_node(context: &DriverContext) -> Option<NodeId> {
@@ -80,7 +79,7 @@ async fn pid_request(
     (realm_id, document_id): (RealmId, Ulid),
     request: PersistentIdRequest,
     caller: (Option<AuthToken>, Option<AuthContext>),
-) -> Result<aruna_operations::metadata::PersistentIdOutcome, MetadataApiError> {
+) -> Result<aruna_core::metadata::protocol::PersistentIdOutcome, MetadataApiError> {
     let node = (realm_id, local_node(context));
     drive(
         PidRouteOperation::new(node, document_id, request, caller),
@@ -136,25 +135,6 @@ pub async fn resolve_pid_routed(
     outcome.and_then(outcome_resolution)
 }
 
-pub async fn submit_mint_pid(
-    context: &Arc<DriverContext>,
-    spec: MintPersistentSpec,
-    local_node_id: NodeId,
-    retention_ms: u64,
-    token: Option<AuthToken>,
-) -> Result<SubmitJobResult, SubmitJobError> {
-    let realm_id = context.serving_realm(spec.minted_by.realm_id);
-    let request = PersistentIdRequest::SubmitMint {
-        minted_by: spec.minted_by,
-        retention_ms,
-    };
-    let node = (realm_id, local_node(context));
-    let route = PidRouteOperation::new(node, spec.document_id, request, (token, None))
-        .with_owner(local_node_id);
-    let outcome = drive(route, context).await.map_err(submission_error)?;
-    outcome_submission(outcome)
-}
-
 pub async fn add_identifiers_routed(
     context: &Arc<DriverContext>,
     realm_id: RealmId,
@@ -184,7 +164,7 @@ pub async fn route_metadata_update(
     record: Option<&MetadataRegistryRecord>,
     document_id: Ulid,
     public: Option<bool>,
-    mutation: aruna_operations::metadata::update_document::UpdateDocumentMutation,
+    mutation: aruna_core::metadata::api::UpdateDocumentMutation,
     expected_revision: Option<Ulid>,
     token: Option<AuthToken>,
     commit_message: Option<String>,

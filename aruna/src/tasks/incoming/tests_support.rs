@@ -5,7 +5,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     DocumentSyncRevision, DocumentTarget,
@@ -15,14 +14,16 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{PRUNE_JOB_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::GraphPruneRecord;
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_net::{NetConfig, NetHandle};
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_net::NetHandle;
+use aruna_net::config::NetConfig;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -33,10 +34,8 @@ use ulid::Ulid;
 use crate::tasks::incoming::OperationsTaskHandler;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::sync::outbox_record::write_outbox_effect;
+use aruna_operations::sync::outbox::record::write_outbox_effect;
 use aruna_tasks::InboundTaskHandler;
-
-pub(crate) use aruna_operations::testing::RecordingTaskHandler;
 
 pub(crate) fn job_id() -> JobId {
     aruna_operations::testing::fresh_job_id(
@@ -69,7 +68,7 @@ pub(crate) async fn shutdown_net(net: &NetHandle) {
 
 pub(crate) struct InstalledHarness {
     pub(crate) _dir: tempfile::TempDir,
-    pub(crate) storage: aruna_storage::StorageHandle,
+    pub(crate) storage: aruna_storage::storage::handle::StorageHandle,
     pub(crate) net: NetHandle,
     pub(crate) task_handle: TaskHandle,
     pub(crate) context: Arc<DriverContext>,
@@ -83,7 +82,7 @@ pub(crate) async fn recv_progress(receiver: &mut mpsc::Receiver<()>) -> bool {
     receiver.recv().await.is_some()
 }
 
-pub(crate) fn node(seed: u8) -> aruna_core::NodeId {
+pub(crate) fn node(seed: u8) -> aruna_core::id::NodeId {
     let mut bytes = [0u8; 32];
     bytes[0] = seed;
     iroh::SecretKey::from_bytes(&bytes).public()
@@ -135,7 +134,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         .await
         .expect("shared topic genesis");
     for index in 1..=2u128 {
-        let record = aruna_operations::sync::outbox_record::new_identified_record(
+        let record = aruna_operations::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),
@@ -202,7 +201,7 @@ pub(crate) fn change() -> DocumentChange {
 }
 
 pub(crate) async fn read_graph_jobs(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
 ) -> Vec<GraphPruneRecord> {
     match storage
         .send_storage_effect(StorageEffect::Iter {
@@ -223,7 +222,7 @@ pub(crate) async fn read_graph_jobs(
 }
 
 pub(crate) async fn write_outbox_record(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     record: &DocumentOutboxRecord,
 ) {
     match storage
@@ -237,7 +236,7 @@ pub(crate) async fn write_outbox_record(
 
 pub(crate) async fn make_net_handle(
     realm_id: RealmId,
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     secret: [u8; 32],
 ) -> NetHandle {
     NetHandle::new(
@@ -253,10 +252,10 @@ pub(crate) async fn make_net_handle(
 }
 
 pub(crate) async fn write_realm_config(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
     realm_id: RealmId,
     config: &RealmConfigDocument,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) {
     let actor = Actor {
         node_id,

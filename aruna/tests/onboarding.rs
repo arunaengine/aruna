@@ -4,17 +4,17 @@
 
 use crate::shared;
 
-use aruna::config::StartupMode;
-use aruna_core::UserId;
+use aruna_config::StartupMode;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase};
-use aruna_core::placement::build_view;
+use aruna_core::placement::resolver::build_view;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
@@ -31,7 +31,7 @@ async fn read_user(
     match context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: aruna_core::USER_KEYSPACE.to_string(),
+            key_space: aruna_core::keyspaces::USER_KEYSPACE.to_string(),
             key: ByteView::from(user_id.to_bytes()),
             txn_id: None,
         }))

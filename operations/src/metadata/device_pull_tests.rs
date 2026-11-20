@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
 use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::user::id::UserId;
 
 fn realm() -> RealmId {
     RealmId::from_bytes([4; 32])
@@ -38,7 +38,7 @@ fn request(deleted: bool) -> SyncPull {
 }
 
 fn bucket() -> BucketInfo {
-    crate::tests::s3::bucket_info(Ulid::from_parts(3, 3), UserId::nil(realm()))
+    aruna_test_support::s3::bucket_info(Ulid::from_parts(3, 3), UserId::nil(realm()))
 }
 
 fn child<T, E>(result: Result<T, E>) -> IoResult

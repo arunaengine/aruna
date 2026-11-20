@@ -3,30 +3,32 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::SubmissionRefusal;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputContent, InputSelection, SubmissionId, WorkspaceMode,
-    object_count,
+use aruna_core::structs::execution::job::family::SubmissionId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputContent, InputSelection, object_count,
 };
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::dataset_description::{DatasetDescription, DescriptionError};
 use aruna_core::structs::storage::origin::SourcePin;
+use aruna_core::user::id::UserId;
 use serde::Serialize;
 use ulid::Ulid;
 
-use super::ids::{self, RequestIdentity, SubmissionRequest, SubmissionScope};
-use crate::jobs::read_access::SourceReadError;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::submit::SubmitJobError;
 use crate::realm::peer_trust::is_sync_eligible;
+use crate::s3::object::read_access::SourceReadError;
+use aruna_core::job_request::{
+    self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError,
+};
 
 /// What one resolve request or answer may carry: half a transport message, so the bearer and
 /// the envelope always fit beside it.
-const RESOLVE_BATCH_BYTES: usize = crate::metadata::protocol::MAX_MESSAGE_SIZE / 2;
+const RESOLVE_BATCH_BYTES: usize = aruna_core::metadata::protocol::MAX_MESSAGE_SIZE / 2;
 
 /// Adds `item` to a batch of `size` encoded bytes when it still fits one resolve batch.
 pub(super) fn fits(size: &mut usize, item: &impl Serialize) -> bool {
@@ -59,7 +61,7 @@ pub(super) fn answers_input(
     (selection, captured): &(InputSelection, CapturedInput),
     node: NodeId,
 ) -> bool {
-    use aruna_core::structs::execution::job::InputSource;
+    use aruna_core::structs::execution::job::input::InputSource;
     let pin = |input: &InputSelection| match &input.source {
         InputSource::S3 { version_id, .. } => {
             (version_id.as_deref()).and_then(|v| Ulid::from_string(v).ok())
@@ -133,7 +135,7 @@ pub(super) fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
     for output in &mut spec.file_outputs {
         output.destination_node_id = Some(node_id);
     }
-    let (mode, bucket) = ids::workspace_of(spec);
+    let (mode, bucket) = job_request::workspace_of(spec);
     if mode == WorkspaceMode::Existing
         && let Some(bucket) = bucket
     {
@@ -145,7 +147,7 @@ pub(super) fn pin_outputs(spec: &mut ExecutionSpec, node_id: NodeId) {
 /// be present here. Local presence is the admitting holder's check.
 pub(super) fn reference_shape(spec: &ExecutionSpec) -> Result<(), SubmitJobError> {
     for input in &spec.inputs {
-        let aruna_core::structs::execution::job::InputSource::S3 {
+        let aruna_core::structs::execution::job::input::InputSource::S3 {
             bucket,
             key,
             version_id,
@@ -191,7 +193,7 @@ pub(super) fn reference_content(
         return Err(refused("input is not materialized"));
     };
     let range_bound = binding.descriptor.kind.enforces_if_match()
-        && crate::s3::object::get::strong_validator(metadata.etag.as_deref());
+        && aruna_core::structs::storage::blob::strong_validator(metadata.etag.as_deref());
     let pin = SourcePin::of(&binding.descriptor);
     let content = InputContent::Reference {
         etag: metadata.etag.clone(),
@@ -210,7 +212,7 @@ pub(super) fn caller_of(
     let expires_at = now_ms.saturating_add(retention_ms) / 1000;
     (
         created_by,
-        ids::submission_of(created_by, scope),
+        job_request::submission_of(created_by, scope),
         expires_at,
     )
 }
@@ -230,7 +232,7 @@ pub(super) fn source_error(reference: &str, error: SourceReadError) -> SubmitJob
 
 /// An input the caller names on another node must name its exact version there too.
 pub(super) fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError> {
-    let aruna_core::structs::execution::job::InputSource::S3 {
+    let aruna_core::structs::execution::job::input::InputSource::S3 {
         bucket,
         key,
         version_id,
@@ -248,7 +250,8 @@ pub(super) fn exact_version(input: &InputSelection) -> Result<(), SubmitJobError
 
 /// A directory input names a key prefix, marked by its trailing `/`.
 pub(super) fn is_directory(input: &InputSelection) -> bool {
-    let aruna_core::structs::execution::job::InputSource::S3 { key, .. } = &input.source else {
+    let aruna_core::structs::execution::job::input::InputSource::S3 { key, .. } = &input.source
+    else {
         return false;
     };
     key.ends_with('/') && input.dest_key.ends_with('/')
@@ -362,6 +365,6 @@ pub(super) fn forwarded_request_fits(request: &SubmissionRequest, ingress: NodeI
             .file_outputs
             .iter()
             .all(|output| output.destination_node_id == Some(ingress))
-        && (ids::workspace_of(spec).0 != WorkspaceMode::Existing
+        && (job_request::workspace_of(spec).0 != WorkspaceMode::Existing
             || spec.workspace_outputs.is_empty())
 }

@@ -12,10 +12,9 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::repository::{
-    StorageReadError, parse_secret_read, read_secret_effect, source_connector_key,
-};
-use crate::storage_read::decode_row;
+use crate::connectors::repository::{parse_secret_read, read_secret_effect, source_connector_key};
+use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetSourceInput {
@@ -82,12 +81,12 @@ impl Operation for GetSourceOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, GetSourceError> {
         let Some(connector) = self.connector.take() else {
-            let connector = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+            let connector = decode_row(result.value()?, SourceConnector::from_bytes)?;
             self.connector = Some(connector.ok_or(GetSourceError::NotFound)?);
             let read = read_secret_effect(self.input.connector_id, None);
             return Ok(Next::Call(IoCall::Effect(Box::new(read))));
         };
-        let secret = parse_secret_read(rows::event(result)?, self.input.connector_id)?;
+        let secret = parse_secret_read(result.event()?, self.input.connector_id)?;
         Ok(Next::Done(GetSourceResult {
             connector,
             has_secret_config: secret.is_some(),

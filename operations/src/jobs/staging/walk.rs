@@ -14,9 +14,10 @@ use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::keyspaces::STAGING_QUEUE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{
-    JobId, StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase,
-    StagingJobSpec, StagingWalk,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    StagingJobCheckpoint, StagingJobDirectory, StagingJobError, StagingJobPhase, StagingJobSpec,
+    StagingWalk,
 };
 use aruna_core::structs::execution::source_access::{
     DigestOrigin, DigestScope, ListRequest, SourceDigest, SourceEntry, SourceEntryKind,
@@ -26,9 +27,9 @@ use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionView, WriteRoute,
-};
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::route::WriteRoute;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use ulid::Ulid;
@@ -47,7 +48,7 @@ use crate::distribution::guard::{GuardError, authority_reads, write_target, writ
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
-use crate::staging::page::rows::MAX_ERROR_SAMPLE;
+use aruna_core::staging_checkpoint::MAX_ERROR_SAMPLE;
 
 /// Entries one listing request reads.
 const STAGING_PAGE_SIZE: usize = 1000;
@@ -80,7 +81,7 @@ pub(super) fn start_prefix_walk(
     });
     // The prefix's manifest is read before its first page, so every page can look it up.
     checkpoint.manifest = spec.checksum_manifest.as_ref().map(|name| {
-        aruna_core::structs::execution::job::ManifestRead {
+        aruna_core::structs::execution::job::input::ManifestRead {
             source_path: format!("{}{name}", directory_list_path(&prefix.source_prefix)),
             offset: 0,
             observation: None,

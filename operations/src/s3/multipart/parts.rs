@@ -156,15 +156,15 @@ impl Operation for ListPartsOperation {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::tests::s3::seed_upload;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
+    use aruna_test_support::s3::seed_upload;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -208,7 +208,11 @@ mod test {
         }
     }
 
-    async fn seed_part(storage_handle: &storage::StorageHandle, upload_id: Ulid, part_number: u16) {
+    async fn seed_part(
+        storage_handle: &storage::handle::StorageHandle,
+        upload_id: Ulid,
+        part_number: u16,
+    ) {
         let record = MultipartPart {
             part_number,
             location: part_location(),
@@ -233,7 +237,7 @@ mod test {
     async fn varint_parts_sorted() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -271,7 +275,7 @@ mod test {
     async fn marker_paginates() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -317,7 +321,7 @@ mod test {
     async fn zero_limit_resumes() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -368,7 +372,7 @@ mod test {
     async fn missing_upload_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle);
 
         let result = drive(
@@ -390,7 +394,7 @@ mod test {
     async fn target_mismatch_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -419,7 +423,7 @@ mod test {
     async fn completing_upload_listed() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();
@@ -451,7 +455,7 @@ mod test {
     async fn closed_upload_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = test_context(storage_handle.clone());
 
         let upload_id = Ulid::generate();

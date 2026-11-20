@@ -2,14 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
 };
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ACCESS_OWNER_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
@@ -25,6 +24,7 @@ use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -34,7 +34,7 @@ use super::index::{
 };
 use crate::groups::fence::group_fence_key;
 use crate::s3::bucket::key::rows::{Row, audit_row};
-use crate::s3::session::{draw_secret, drawn_secret};
+use aruna_core::compute::{draw_secret, drawn_secret};
 
 pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 /// The letters and digits of a new access secret.
@@ -821,7 +821,7 @@ mod pure_tests {
         }
 
         fn info() -> BucketInfo {
-            crate::tests::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
+            aruna_test_support::s3::bucket_info(Ulid::from_bytes([3; 16]), user(1))
         }
 
         fn sealed() -> BucketEncryption {

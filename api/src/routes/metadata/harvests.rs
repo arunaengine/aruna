@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::job_service::{lookup_job_dedup, submit_harvest_job};
 use aruna_core::structs::execution::harvest::{HarvestJobSpec, HarvestSelector};
-use aruna_core::structs::execution::job::JobPayload;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_drivers::driver::drive;

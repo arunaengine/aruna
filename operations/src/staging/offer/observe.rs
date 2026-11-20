@@ -15,7 +15,7 @@ use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, journaled};
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::structs::execution::offered_directory::{
     FileStat, OFFERED_DIRECTORY_BUCKET, weak_fingerprint,
 };
@@ -30,8 +30,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::usage::UsageDelta;
 use ulid::Ulid;
 
-use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
+use aruna_core::blob_records::{HeadAliasContext, build_transition_effects, write_version_effect};
 
 use super::super::offered_directory::{ObservationScope, OfferedDirectoryError};
 
@@ -162,7 +162,7 @@ impl CurrentRows {
         key: &str,
         result: IoResult,
     ) -> Result<Option<IoCall>, OfferError> {
-        let row = value(result)?;
+        let row = result.value()?;
         self.pointer = row
             .map(|row| CurrentVersionPointer::from_bytes(&row))
             .transpose()?;
@@ -175,7 +175,7 @@ impl CurrentRows {
     }
 
     fn version(result: IoResult) -> Result<Option<BlobVersion>, OfferError> {
-        let row = value(result)?;
+        let row = result.value()?;
         Ok(row.map(|row| BlobVersion::from_bytes(&row)).transpose()?)
     }
 }

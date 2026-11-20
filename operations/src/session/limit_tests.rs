@@ -19,7 +19,8 @@ async fn session_realm() -> (
 ) {
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     let dir = tempfile::tempdir().unwrap();
-    let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let context = aruna_drivers::driver::DriverContext {
         storage_handle: storage,
         net_handle: None,

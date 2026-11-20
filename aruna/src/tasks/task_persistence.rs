@@ -5,83 +5,117 @@
 use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
-use aruna_core::task::{PersistedTaskTimer, TaskEffect};
-use aruna_storage::StorageHandle;
-use aruna_storage::task_timers::delete_timer_key;
+use aruna_core::task::{PersistedTaskTimer, TaskEvent};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::task_timers::{delete_malformed, hold_timer, read_timer};
 use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use tracing::warn;
 
 const RESTORE_PAGE_SIZE: usize = 256;
 
-pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let mut start_after = None;
+/// Where a timer restoration stopped: the row after which a retry starts, and why.
+#[derive(Debug)]
+pub struct RestoreStopped {
+    pub resume_after: Option<ByteView>,
+    pub error: String,
+}
+
+/// Re-arms the persisted timers after the row `start_after`, page by page. A failed page or a
+/// timer the scheduler refused stops it there, so a retry resumes without skipping a row. A timer
+/// only moves earlier, so a retry never pushes back a newer live deadline.
+pub async fn restore_task_timers(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    start_after: Option<ByteView>,
+) -> Result<(), RestoreStopped> {
+    let mut accepted = start_after;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: TASK_TIMER_KEYSPACE.to_string(),
                 prefix: None,
-                start: start_after.take().map(IterStart::After),
+                start: accepted.clone().map(IterStart::After),
                 limit: RESTORE_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
-
+        let stopped = |resume_after, error| {
+            Err(RestoreStopped {
+                resume_after,
+                error,
+            })
+        };
         let (values, next_start_after) = match event {
             Event::Storage(StorageEvent::IterResult {
                 values,
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to restore persisted task timers");
-                return;
+                return stopped(accepted, error.to_string());
             }
-            other => {
-                warn!(event = ?other, "Unexpected event while restoring persisted task timers");
-                return;
-            }
+            other => return stopped(accepted, format!("unexpected storage event: {other:?}")),
         };
 
         for (key_bytes, value) in values {
-            let record = match postcard::from_bytes::<PersistedTaskTimer>(&value) {
-                Ok(record) => record,
+            match postcard::from_bytes::<PersistedTaskTimer>(&value) {
+                Ok(record) => {
+                    if let Err(message) = restore_timer(storage, task_handle, record).await {
+                        return stopped(accepted, message);
+                    }
+                }
                 Err(error) => {
                     warn!(error = %error, "Failed to decode persisted task timer");
-                    delete_timer_key(storage, key_bytes).await;
-                    continue;
+                    if let Err(error) = delete_malformed(storage, key_bytes.clone()).await {
+                        warn!(%error, "Failed to delete an undecodable persisted task timer");
+                    }
                 }
-            };
-            let after = Duration::from_millis(
-                record
-                    .due_unix_millis
-                    .saturating_sub(unix_timestamp_millis()),
-            );
-            let event = task_handle
-                .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: record.key,
-                    after,
-                }))
-                .await;
-            if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
-                warn!(message = %message, "Failed to restore persisted task timer");
             }
+            accepted = Some(key_bytes);
         }
 
         match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => break,
+            Some(next) => accepted = Some(next),
+            None => return Ok(()),
         }
+    }
+}
+
+/// Arms the timer of a row the page read, as its row stands under the key's change lock: a row a
+/// cancellation removed since stays unarmed, and a reset row arms at its new deadline.
+async fn restore_timer(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    record: PersistedTaskTimer,
+) -> Result<(), String> {
+    let _held = hold_timer(&record.key).await;
+    let Some(current) = read_timer(storage, &record.key).await? else {
+        return Ok(());
+    };
+    let now_ms = unix_timestamp_millis();
+    let after = Duration::from_millis(current.due_unix_millis.saturating_sub(now_ms));
+    // The row already exists, so its own admission arms the wake and its firing deletes it.
+    let admission = current.admission;
+    match task_handle
+        .shorten_owned(current.key, after, admission)
+        .await
+    {
+        (Event::Task(TaskEvent::Error { message, .. }), _) => Err(message),
+        _ => Ok(()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::task::TaskKey;
-    use aruna_storage::FjallStorage;
+    use aruna_core::effects::Effect;
+    use aruna_core::handle::Handle;
+    use aruna_core::task::{TaskEffect, TaskKey};
+    use aruna_drivers::effect_adapters::task::change_timer;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_storage::task_timers::{persist_task_effect, read_timer};
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
@@ -128,12 +162,332 @@ mod tests {
             }))
             .await;
 
-        restore_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle, None)
+            .await
+            .expect("timers restore");
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
             .expect("restored timer should fire");
 
         assert_eq!(*observed.lock().await, Some(key));
+    }
+
+    /// The deadline the scheduler holds for `key`, read by asking it to shorten to `probe`.
+    async fn armed_after(task_handle: &TaskHandle, key: &TaskKey, probe: Duration) -> Duration {
+        let shorten = TaskEffect::ShortenTimer {
+            key: key.clone(),
+            after: probe,
+        };
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) =
+            task_handle.send_effect(Effect::Task(shorten)).await
+        else {
+            panic!("expected timer scheduled");
+        };
+        after
+    }
+
+    // A row the page read but a later change cancelled or postponed is restored as it stands now,
+    // so restoration never revives cancelled work or pulls a postponed timer forward.
+    #[tokio::test]
+    async fn stale_row_reread() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let probe = Duration::from_secs(7_200);
+        let stale = |key: &TaskKey| PersistedTaskTimer {
+            key: key.clone(),
+            due_unix_millis: unix_timestamp_millis(),
+            admission: 9,
+        };
+        let cancelled = TaskKey::RefreshBlobHolders;
+        let cancel = TaskEffect::CancelTimer {
+            key: cancelled.clone(),
+        };
+        persist_task_effect(&storage, &cancel)
+            .await
+            .expect("row deleted");
+        restore_timer(&storage, &task_handle, stale(&cancelled))
+            .await
+            .expect("restores");
+        assert_eq!(armed_after(&task_handle, &cancelled, probe).await, probe);
+
+        let postponed = TaskKey::PublishRegistration;
+        let reset = TaskEffect::ResetTimer {
+            key: postponed.clone(),
+            after: Duration::from_secs(3_600),
+        };
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("row written");
+        restore_timer(&storage, &task_handle, stale(&postponed))
+            .await
+            .expect("restores");
+        let after = armed_after(&task_handle, &postponed, probe).await;
+        assert!(
+            after > Duration::from_secs(60),
+            "armed at the new deadline: {after:?}"
+        );
+    }
+
+    // A firing deletes only the row its stamp names: a replacement written while it waited to start
+    // stays, even when that replacement is already due itself.
+    #[tokio::test]
+    async fn firing_keeps_replacement() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let fired = PersistedTaskTimer {
+            key: key.clone(),
+            due_unix_millis: unix_timestamp_millis().saturating_sub(10_000),
+            admission: 5,
+        };
+        let row = StorageEffect::Write {
+            key_space: TASK_TIMER_KEYSPACE.to_string(),
+            key: key.storage_key().expect("key encodes"),
+            value: ByteView::from(postcard::to_allocvec(&fired).expect("row encodes")),
+            txn_id: None,
+        };
+        storage.send_storage_effect(row).await;
+        let replacement = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::ZERO,
+        };
+        persist_task_effect(&storage, &replacement)
+            .await
+            .expect("row written");
+        let stamp = Some(fired.admission);
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, stamp).await;
+        assert!(read_timer(&storage, &key).await.expect("reads").is_some());
+    }
+
+    /// Admits a firing and holds it: its stamp is kept, and the run never ends.
+    struct HeldFiring {
+        stamp: Arc<Mutex<Option<u64>>>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for HeldFiring {
+        async fn handle_timer(&self, _key: TaskKey) {}
+
+        async fn handle_firing(&self, _key: TaskKey, stamp: Option<u64>) {
+            *self.stamp.lock().await = stamp;
+            self.notify.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+
+    // A shorten that arrives after the scheduler admitted a firing, but before that firing
+    // deleted its row, arms a new admission whose row the old firing cannot delete.
+    #[tokio::test]
+    async fn shorten_after_dispatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let stamp = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        let firing = HeldFiring {
+            stamp: stamp.clone(),
+            notify: notify.clone(),
+        };
+        task_handle.set_inbound_handler(Arc::new(firing)).await;
+        let key = TaskKey::PublishRegistration;
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::ZERO,
+        };
+        change_timer(&storage, Some(&task_handle), reset, false).await;
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the first wake is admitted");
+        let shorten = TaskEffect::ShortenTimer {
+            key: key.clone(),
+            after: Duration::from_secs(10),
+        };
+        change_timer(&storage, Some(&task_handle), shorten, false).await;
+
+        let fired = *stamp.lock().await;
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, fired).await;
+        let row = read_timer(&storage, &key).await.expect("reads");
+        let row = row.expect("the shortened wake keeps its row");
+        assert_ne!(Some(row.admission), fired);
+    }
+
+    // Two resets with the same deadline are two admissions: the first one's firing leaves the
+    // row the second one wrote.
+    #[tokio::test]
+    async fn equal_resets_owned() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        let reset = || TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        change_timer(&storage, Some(&task_handle), reset(), false).await;
+        let first = read_timer(&storage, &key).await.expect("reads");
+        let first = first.expect("row");
+        change_timer(&storage, Some(&task_handle), reset(), false).await;
+        let second = read_timer(&storage, &key).await.expect("reads");
+        let second = second.expect("row");
+        assert_ne!(first.admission, second.admission);
+        let stamp = Some(first.admission);
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, stamp).await;
+        assert_eq!(
+            read_timer(&storage, &key).await.expect("reads"),
+            Some(second)
+        );
+    }
+
+    // A row that stopped decoding is deleted only while it still does not decode, so a timer a
+    // later change wrote for its key stays.
+    #[tokio::test]
+    async fn malformed_delete_rechecks() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let row_key = key.storage_key().expect("key encodes");
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("row written");
+        delete_malformed(&storage, row_key.clone())
+            .await
+            .expect("checked");
+        assert!(read_timer(&storage, &key).await.expect("reads").is_some());
+        let garbage = StorageEffect::Write {
+            key_space: TASK_TIMER_KEYSPACE.to_string(),
+            key: row_key.clone(),
+            value: ByteView::from(vec![0xff, 0xff]),
+            txn_id: None,
+        };
+        storage.send_storage_effect(garbage).await;
+        delete_malformed(&storage, row_key).await.expect("deleted");
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), None);
+    }
+
+    // A failed page stops the restoration with its resume point instead of ending it as done, and
+    // a retry from there arms the timer.
+    #[tokio::test]
+    async fn failed_page_resumes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_millis(1),
+        };
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("timer persists");
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_page = move |effect: &StorageEffect| {
+            let page = matches!(effect, StorageEffect::Iter { .. });
+            page && !failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        };
+        let flaky = aruna_test_support::metadata::refusing_when(storage.clone(), first_page);
+        let task_handle = TaskHandle::new();
+        let observed = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingHandler {
+                observed: observed.clone(),
+                notify: notify.clone(),
+            }))
+            .await;
+
+        let restored = restore_task_timers(&flaky, &task_handle, None).await;
+        let stopped = restored.expect_err("the failed page stops the restoration");
+        assert_eq!(stopped.resume_after, None);
+        restore_task_timers(&flaky, &task_handle, stopped.resume_after)
+            .await
+            .expect("the retry restores");
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("restored timer should fire");
+        assert_eq!(*observed.lock().await, Some(key));
+    }
+
+    // A fired timer removes only the row its admission owns: a firing without one, or of another
+    // admission, leaves a due row for the wake that owns it.
+    #[tokio::test]
+    async fn fired_keeps_replacement() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = |after| TaskEffect::ResetTimer {
+            key: key.clone(),
+            after,
+        };
+        let later = reset(Duration::from_secs(3600));
+        persist_task_effect(&storage, &later)
+            .await
+            .expect("timer persists");
+
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, Some(7)).await;
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_some()
+        );
+
+        let due = reset(Duration::ZERO);
+        persist_task_effect(&storage, &due)
+            .await
+            .expect("timer persists");
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, None).await;
+        let unstamped = read_timer(&storage, &key).await.expect("timer reads");
+        assert!(
+            unstamped.is_some(),
+            "a firing without an admission owns no row"
+        );
+        let owner = Some(aruna_storage::task_timers::NO_ADMISSION);
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, owner).await;
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_none()
+        );
+    }
+
+    // A cancellation whose row could not be deleted fails, so no caller acknowledges it while the
+    // row would schedule the work again at the next restart.
+    #[tokio::test]
+    async fn failed_cancel_errs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("timer persists");
+        let refused = aruna_test_support::metadata::refusing(storage.clone(), TASK_TIMER_KEYSPACE);
+
+        let cancel = TaskEffect::CancelTimer { key: key.clone() };
+        assert!(persist_task_effect(&refused, &cancel).await.is_err());
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -178,7 +532,9 @@ mod tests {
         assert!(shortened_timer.due_unix_millis < reset_timer.due_unix_millis);
 
         let task_handle = TaskHandle::new();
-        restore_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle, None)
+            .await
+            .expect("timers restore");
         let aruna_core::task::TaskEvent::TimerScheduled { after, .. } =
             task_handle.schedule_idle_timer(key, Duration::ZERO).await
         else {
@@ -349,7 +705,9 @@ mod tests {
             }))
             .await;
 
-        restore_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle, None)
+            .await
+            .expect("timers restore");
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
             .expect("restored timer should fire");

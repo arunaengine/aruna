@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod account;
+pub mod admitted;
 pub mod artifacts;
 pub mod attempt;
 pub mod bound;
@@ -10,8 +11,7 @@ pub mod check;
 pub mod cleanup;
 pub mod clock;
 pub mod copies;
-pub mod copy_rows;
-pub mod copy_steps;
+pub mod copy;
 pub mod creates;
 pub mod dataset;
 pub mod decide;
@@ -22,8 +22,7 @@ pub mod forward;
 pub mod grants;
 pub mod held;
 pub mod hooks;
-pub mod host_calls;
-pub mod host_steps;
+pub mod host;
 pub mod install;
 pub mod intents;
 pub mod job_work;
@@ -47,39 +46,28 @@ pub mod rules;
 pub mod runs;
 pub mod screen;
 pub(crate) mod secret_use;
+pub mod send_calls;
 pub mod settings;
 pub mod state;
 pub mod submit;
+pub mod task;
 pub mod sweep;
-pub mod task_cancel;
-pub mod task_change;
-pub mod task_pass;
-pub mod task_report;
-pub mod task_row;
-pub mod task_send;
-pub mod task_settle;
-pub mod task_start;
-pub mod tasks;
 pub mod transfer_steps;
 pub mod waiting;
 pub mod work;
-pub mod work_calls;
 
 use aruna_plugin_types::calls::{ErrorKind, HostError};
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 #[path = "calls_tests.rs"]
 pub mod calls;
 #[cfg(test)]
 #[path = "fixtures_tests.rs"]
 pub(crate) mod fixtures;
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 #[path = "test_flows.rs"]
 pub mod flow_support;
-#[cfg(any(test, feature = "test-hooks"))]
-#[path = "store_tests.rs"]
-pub mod store;
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 pub mod test_support;
 
 #[cfg(test)]

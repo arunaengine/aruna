@@ -8,7 +8,6 @@ use crate::openapi::ApiDoc;
 use crate::tests::routes::{
     seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
 };
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -31,6 +30,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::testing::test_context;
 use std::collections::HashMap;
@@ -294,7 +294,7 @@ async fn queue_failure_repairable() {
 #[test]
 fn staging_submit_classifies() {
     // Job admission refusals must keep their status instead of collapsing into 500.
-    use aruna_operations::jobs::submit::SubmitJobError;
+    use aruna_core::job_request::SubmitJobError;
 
     assert_eq!(
         map_submit_error(SubmitJobError::PlacementUnavailable(
@@ -445,7 +445,9 @@ async fn batch_rejects_node() {
 // Every job store state reads as itself or its collapsed class; nothing settled reads as running.
 #[test]
 fn job_states_mapped() {
-    use aruna_core::structs::execution::job::{JobId, JobRecord, StagingJobSpec};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::StagingJobSpec;
+    use aruna_core::structs::execution::job::local::JobRecord;
     let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
     let user_id = UserId::new(Ulid::from_bytes([2; 16]), realm_id);
     let spec = StagingJobSpec {

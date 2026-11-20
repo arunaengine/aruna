@@ -11,12 +11,13 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
+use aruna_core::structs::storage::object_read::ObjectInfo;
 use aruna_core::user::validation::RESERVED_PREFIX;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::complete::CompleteUploadResult;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteOutcome;
 use aruna_operations::s3::object::delete::{DeleteObjectError, DeleteObjectResult};
-use aruna_operations::s3::object::get::{GetObjectResult, ObjectInfo};
+use aruna_operations::s3::object::get::GetObjectResult;
 use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use aruna_operations::s3::object::put::PutObjectResult;
 use s3s::dto::{
@@ -55,7 +56,7 @@ pub(super) fn reference_metadata_refresh(
     bucket: String,
     key: String,
     result: &GetObjectResult,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     auth_context: aruna_core::structs::identity::auth::AuthContext,
 ) -> Option<ReferenceRefresh> {
     if result.location.is_some() {
@@ -421,13 +422,14 @@ fn internal_delete_error(key: String, requested_version_id: Option<Ulid>) -> S3D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::NodeId;
+    use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
 
     async fn test_service() -> (tempfile::TempDir, ArunaS3Service) {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage =
-            aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

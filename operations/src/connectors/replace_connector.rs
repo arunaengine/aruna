@@ -21,11 +21,12 @@ use ulid::Ulid;
 use crate::connectors::reference_prune::schedule_prune;
 use crate::connectors::reference_scan::{ReferenceScan, ScanStep};
 use crate::connectors::repository::{
-    StorageReadError, delete_secret_effect, parse_secret_read, read_secret_effect,
-    source_connector_key, write_secret_effect,
+    delete_secret_effect, parse_secret_read, read_secret_effect, source_connector_key,
+    write_secret_effect,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
-use crate::storage_read::decode_row;
+use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::decode_row;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplaceSourceInput {
@@ -229,13 +230,13 @@ impl Operation for ReplaceSourceOperation {
         let connector_id = self.input.connector_id;
         match &mut self.stage {
             Stage::Current => {
-                let existing = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+                let existing = decode_row(result.value()?, SourceConnector::from_bytes)?;
                 self.prepare_replacement(existing.ok_or(ReplaceSourceError::NotFound)?);
                 self.stage = Stage::Secret;
                 Ok(Next::Call(read_secret_effect(connector_id, None).into()))
             }
             Stage::Secret => {
-                let current = parse_secret_read(rows::event(result)?, connector_id)?;
+                let current = parse_secret_read(result.event()?, connector_id)?;
                 if !secret_config_changed(current.as_ref(), self.replacement_secret.as_ref()) {
                     return self.write_records();
                 }
@@ -249,7 +250,7 @@ impl Operation for ReplaceSourceOperation {
                 self.scanned(step)
             }
             Stage::Records => {
-                rows::done(result)?;
+                result.done()?;
                 let effect = match self.replacement_secret.as_ref() {
                     Some(secret) => write_secret_effect(secret, None)?,
                     None => delete_secret_effect(connector_id, None),
@@ -257,7 +258,7 @@ impl Operation for ReplaceSourceOperation {
                 self.stage = Stage::SecretWritten;
                 Ok(Next::Call(effect.into()))
             }
-            Stage::SecretWritten => self.secret_written(rows::event(result)?),
+            Stage::SecretWritten => self.secret_written(result.event()?),
         }
     }
 

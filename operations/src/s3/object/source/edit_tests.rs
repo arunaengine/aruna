@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::keyspaces::CONNECTOR_REFERENCE_KEYSPACE;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{PortableSourceDescriptor, StagingStrategy};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 
 use super::*;
 

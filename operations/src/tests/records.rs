@@ -4,20 +4,23 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::structs::execution::job::{
-    CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
-    ExecutionReceipt, ExecutionSpec, ExecutionStop, ExecutionUpdate, JobAdmissionRecord,
-    JobCancelRecord, JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
-    JobRetryPolicy, LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
-    PhysicalExecutionState, ResultMessage, StopEvidence, SubmissionClaim, SubmissionId,
-    WitnessBudgetRecord,
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::family::{
+    CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt, ExecutionStop,
+    ExecutionUpdate, JobAdmissionRecord, JobCancelRecord, JobFamilyId, JobFamilyRecord,
+    JobRecordBody, JobRecordEnvelope, JobRetryPolicy, LaunchIntent, LogicalJobSpec, OutputSet,
+    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, StopEvidence, SubmissionClaim,
+    SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::structs::execution::job::{CapturedInput, InputContent, InputSelection};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, CollisionPolicy, ComputeResources, ExecutionSpec, InputContent, InputSelection,
+};
+use aruna_core::structs::execution::job::local::OutputObject;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use aruna_core::document::DocumentTarget;
@@ -25,7 +28,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;
 
 use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
@@ -33,8 +37,8 @@ use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::node_inputs::launch_node;
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::records::verify::FamilyView;
-use crate::metadata::protocol::MetadataTransportMessage;
 use aruna_core::effects::LaunchFrame;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_drivers::driver::{DriverContext, drive};
 
 pub const REALM: RealmId = RealmId([3u8; 32]);
@@ -125,7 +129,7 @@ impl Family {
             group_id: Ulid::from_bytes([2u8; 16]),
             created_by: user(),
             created_at_ms: 1_000,
-            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
             payload: payload(),
             request_digest: self.request_digest,
             spec_digest: [0u8; 32],

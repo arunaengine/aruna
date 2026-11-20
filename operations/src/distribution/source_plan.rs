@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::SourceResolutionError;
@@ -12,25 +11,27 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::rows::{read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobVersion, BlobVersionState, BucketInfo, HiddenBlobKey, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::on_use::{KeptKind, PullPlan};
-use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionView};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::types::{GroupId, Value};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::held::{HeldElsewhere, admitted};
-use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
-use crate::s3::object::get::strong_validator;
+use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
+use aruna_core::structs::storage::blob::strong_validator;
 
 /// One reference a read served from its source.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,12 +49,12 @@ pub struct SourceKeep {
 /// What a keeping member keeps of one reference version.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
-    pub(super) kind: KeptKind,
-    pub(super) pull: PullPlan,
-    pub(super) set_id: Ulid,
-    pub(super) member_id: Ulid,
-    pub(super) identity: [u8; 32],
-    pub(super) version: BlobVersion,
+    pub(crate) kind: KeptKind,
+    pub(crate) pull: PullPlan,
+    pub(crate) set_id: Ulid,
+    pub(crate) member_id: Ulid,
+    pub(crate) identity: [u8; 32],
+    pub(crate) version: BlobVersion,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -83,7 +84,7 @@ type PlanNext = Result<Next<Option<Plan>>, PlanError>;
 
 /// Reads the version and this member's strategy; outputs `None` when nothing is to be kept.
 #[derive(Debug, PartialEq)]
-pub(super) struct KeepPlanOperation {
+pub(crate) struct KeepPlanOperation {
     keep: SourceKeep,
     state: PlanState,
     version: Option<(BlobVersion, [u8; 32])>,
@@ -91,7 +92,7 @@ pub(super) struct KeepPlanOperation {
 }
 
 impl KeepPlanOperation {
-    pub(super) fn new(keep: SourceKeep) -> Self {
+    pub(crate) fn new(keep: SourceKeep) -> Self {
         Self {
             keep,
             state: PlanState::Version,
@@ -225,13 +226,13 @@ impl Operation for KeepPlanOperation {
     }
 
     fn next(&mut self, result: IoResult) -> PlanNext {
-        self.decide(value(result)?)
+        self.decide(result.value()?)
     }
 }
 
 #[derive(Debug, Error, PartialEq)]
 #[error("{0}")]
-pub(super) struct SpoolError(String);
+pub(crate) struct SpoolError(String);
 
 impl From<IoError> for SpoolError {
     fn from(error: IoError) -> Self {
@@ -244,7 +245,7 @@ fn spool_error(reason: impl Into<String>) -> SpoolError {
 }
 
 /// A verified hidden copy: its location, BLAKE3 digest and size.
-pub(super) type SpooledCopy = (BackendLocation, [u8; 32], u64);
+pub(crate) type SpooledCopy = (BackendLocation, [u8; 32], u64);
 
 /// What the pending call of a source copy answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -264,7 +265,7 @@ const NO_REFERENCE: &str = "the version is no reference";
 /// recorded ETag binds the read, or the recorded digests must match the copy. A copy that does
 /// not match is deleted again.
 #[derive(Debug, PartialEq)]
-pub(super) struct SpoolSourceOperation {
+pub(crate) struct SpoolSourceOperation {
     keep: SourceKeep,
     plan: Plan,
     step: SpoolStep,
@@ -272,7 +273,7 @@ pub(super) struct SpoolSourceOperation {
 }
 
 impl SpoolSourceOperation {
-    pub(super) fn new(keep: SourceKeep, plan: Plan) -> Self {
+    pub(crate) fn new(keep: SourceKeep, plan: Plan) -> Self {
         Self {
             keep,
             plan,
@@ -442,7 +443,7 @@ mod tests {
     }
 
     fn metadata(length: u64) -> SourceMetadata {
-        crate::tests::staging::sized_source(length, None)
+        aruna_test_support::staging::sized_source(length, None)
     }
 
     fn spool_plan(reference: bool) -> SpoolSourceOperation {
@@ -455,8 +456,8 @@ mod tests {
             true => {
                 let source = crate::connectors::descriptor::build_source_binding(
                     StagingStrategy::Snapshot,
-                    &crate::tests::staging::sample_connector(),
-                    &crate::tests::staging::sample_metadata(),
+                    &aruna_test_support::staging::sample_connector(),
+                    &aruna_test_support::staging::sample_metadata(),
                     "folder/file.txt".to_string(),
                     None,
                     None,

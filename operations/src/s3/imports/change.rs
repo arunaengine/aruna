@@ -14,8 +14,7 @@ use aruna_core::keyspaces::{
     STORAGE_BACKEND_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::structs::execution::job::JobRecord;
-use aruna_core::structs::execution::job::job_record_key;
+use aruna_core::structs::execution::job::local::{JobRecord, job_record_key};
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, import_key, object_prefix, read_patterns, retire_pattern, valid_pattern,
@@ -246,7 +245,9 @@ impl Operation for ChangeImportOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, JobState};
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::backend_import::{

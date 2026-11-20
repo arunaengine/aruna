@@ -5,12 +5,12 @@
 
 use super::*;
 use crate::s3::bucket::key::test_rows::{authority_rows, settings};
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, EncryptionMode, GrantState, HolderOrigin,
 };
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::user::id::UserId;
 use std::time::SystemTime;
 
 const LOCKED: Ulid = Ulid::from_bytes([1; 16]);

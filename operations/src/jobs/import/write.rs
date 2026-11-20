@@ -3,13 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::Event;
 use aruna_core::jobs::{ArchiveEntryRead, ByteStream, JobEffect, JobEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_core::structs::execution::job::ImportReportRow;
+use aruna_core::structs::execution::job::input::ImportReportRow;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -31,13 +31,11 @@ use crate::harvest::read_connector::ConnectorView;
 use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::reference::WriteRepositoryReference;
 use crate::jobs::repository::{TransferError, is_reference, reference_source};
-use crate::placement::policy::{GateContext, GateContextError, GateOperation};
-use crate::replication::queue::{
-    BlobQueueError, LiveVersionInput, LiveVersionOperation, QueueBlobResult,
-};
+use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 
 /// The connector kind of a repository import in reference mode, read through its connector.
 pub(super) fn reference_kind_call(run: &ImportRun) -> Option<IoCall> {
@@ -206,7 +204,7 @@ impl WriteEntryOperation {
         if put.version_id != entry.version_id {
             let mut row = entry_report(&entry);
             row.entry_key = format!("divergent/{}", entry.path);
-            row.code = aruna_core::structs::execution::job::ReasonCode::Failed;
+            row.code = aruna_core::structs::execution::job::input::ReasonCode::Failed;
             row.message = Some(format!(
                 "object write returned version {} instead of the planned {}; \
                  the written version was left in place",
@@ -389,7 +387,7 @@ impl Operation for WriteEntryOperation {
                 Ok(Next::Call(self.queue()?))
             }
             Step::ReferenceQueue => {
-                (result.child::<QueueBlobResult, BlobQueueError>()?)
+                (result.child::<bool, IoError>()?)
                     .map_err(|error| ImportFailure::Retryable(error.to_string()))?;
                 self.checkpoint.imported = self.checkpoint.imported.saturating_add(1);
                 Ok(self.advanced())
@@ -450,7 +448,7 @@ impl Operation for WriteEntryOperation {
                 written(result)?;
                 let code = self.entry()?.code;
                 let checkpoint = &mut self.checkpoint;
-                use aruna_core::structs::execution::job::ReasonCode;
+                use aruna_core::structs::execution::job::input::ReasonCode;
                 match code {
                     ReasonCode::Imported => {
                         checkpoint.imported = checkpoint.imported.saturating_add(1)

@@ -28,7 +28,7 @@ use ulid::Ulid;
 
 use crate::blob::migration::shared::MigrationError;
 use crate::blob::reclaim::{ReclaimBlobError, ReclaimBlobOperation, ReclaimVerdict};
-use crate::blob::records::{iter_index_effect, owners_scan_effect};
+use aruna_core::blob_records::{iter_index_effect, owners_scan_effect};
 
 const RULE_PAGE: usize = 128;
 /// Claim index pages one pass reads past claims whose delete was sent.
@@ -1075,7 +1075,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::{EncodingClass, StoredFormat, StoredLayout};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};

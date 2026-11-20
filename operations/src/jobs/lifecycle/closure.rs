@@ -16,12 +16,13 @@ use aruna_core::keyspaces::{
     SUBMISSION_CLOSURE_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::execution::job::family::{
+    CLOCK_MARGIN_MS, JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent,
+    SubmissionId,
+};
+use aruna_core::structs::execution::job::prune::FamilyTombstone;
 use aruna_core::structs::execution::job::record_keys::{family_prefix, submission_prefix};
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
-use aruna_core::structs::execution::job::{
-    CLOCK_MARGIN_MS, FamilyTombstone, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
-    JobRecordKind, LaunchIntent, SubmissionId,
-};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
@@ -37,7 +38,7 @@ use crate::jobs::records::append::{
 };
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
-use crate::metadata::protocol::{
+use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
 

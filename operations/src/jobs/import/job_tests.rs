@@ -6,7 +6,7 @@ use super::super::ImportInput;
 use super::super::tests::{entry, plan, run, stops};
 use super::*;
 use crate::jobs::repository::test_support::{artifact, child};
-use aruna_core::structs::execution::job::JobResultPayload;
+use aruna_core::structs::execution::job::local::JobResultPayload;
 
 fn job(phase: ImportPhase, step: Step) -> ImportJobOperation {
     let mut job = ImportJobOperation::new(run());

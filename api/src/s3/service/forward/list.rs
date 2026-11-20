@@ -8,8 +8,8 @@ use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::drive;
 use aruna_operations::distribution::routing::{copies_interval, lists_interval};
 use aruna_operations::s3::object::list::ListBucketInput;
-pub(in crate::s3::service) use aruna_operations::s3::object::member_merge::MergeResume as Resume;
-use aruna_operations::s3::object::member_merge::{
+use aruna_operations::s3::object::member::merge::MergeResume as Resume;
+use aruna_operations::s3::object::member::merge::{
     MergeCaller, MergeError, MergeShows, MergedObject, MergedObjectsOperation,
 };
 use aruna_operations::s3::object::visible::VisibleError;

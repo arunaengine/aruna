@@ -2,17 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::ops::Range;
-
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::StagingSourceError;
-use aruna_core::events::{Event, NetEvent};
-use aruna_core::id_mint::IdMint;
+use aruna_core::id::NodeId;
 use aruna_core::native_reference::{
-    DelegatedBody, DelegatedReadEffect, NativeAuthority, NativeRange, NativeReferenceReject,
-    NativeReferenceRequest,
+    NativeAuthority, NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -25,7 +19,7 @@ use aruna_core::structs::storage::read_grant::{
     self, GrantScope, HEAD_OPERATION, MAX_REQUEST_SECS, READ_OPERATION, SignedRequest,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{SyncRelationship, SyncState};
+use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState};
 use aruna_core::types::GroupId;
 use bytes::Bytes;
 use tracing::warn;
@@ -33,22 +27,21 @@ use ulid::Ulid;
 
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::delegate::{DelegationInput, unsigned_delegation};
 use crate::distribution::nonce::{NonceError, SpendNonceOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
-};
+use crate::replication::mirror_repair::SyncMirrorError;
+use crate::replication::mirror_repair::kick::KickRepairOperation;
+use crate::replication::mirror_repair::status::StoreStatusOperation;
+use crate::replication::sync_relationship::get::GetRelationshipOperation;
+use crate::replication::sync_relationship::{SyncRelationshipDirection, SyncRelationshipError};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation, SyncMirrorError};
-use crate::sync::sync_relationship::{
-    GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 
 /// This node and its realm.
 type Ids = (NodeId, RealmId);
@@ -67,97 +60,6 @@ fn request_operation(request: &NativeReferenceRequest) -> &'static str {
     match request.head {
         true => HEAD_OPERATION,
         false => READ_OPERATION,
-    }
-}
-
-/// One exact version read from the holder for a caller this node verified itself, bound by a
-/// D33 delegation to this operation, version and range.
-pub(crate) fn delegated_read(
-    ids: Option<Ids>,
-    caller: DelegationInput,
-    arn: &VersionedObjectArn,
-    range: Option<Range<u64>>,
-    head: bool,
-) -> DelegatedReadOperation {
-    DelegatedReadOperation {
-        now_ms: 0,
-        mint: IdMint::default(),
-        ids,
-        caller: Some(caller),
-        arn: arn.clone(),
-        range,
-        head,
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) struct DelegatedReadOperation {
-    ids: Option<Ids>,
-    caller: Option<DelegationInput>,
-    arn: VersionedObjectArn,
-    range: Option<Range<u64>>,
-    head: bool,
-    now_ms: u64,
-    mint: IdMint,
-}
-
-impl Operation for DelegatedReadOperation {
-    type Output = DelegatedBody;
-    type Error = StagingSourceError;
-
-    fn stamp(&mut self, now_ms: u64) {
-        self.now_ms = now_ms;
-    }
-
-    fn seed(&mut self, entropy: u128) {
-        self.mint = IdMint::new(entropy);
-    }
-
-    fn first(&mut self) -> Result<Next<DelegatedBody>, StagingSourceError> {
-        let range = NativeRange::checked(self.range.clone())?;
-        let operation = match self.head {
-            true => HEAD_OPERATION,
-            false => READ_OPERATION,
-        };
-        let arn = &self.arn;
-        let scope = GrantScope::Version(arn.clone());
-        let digest = read_grant::request_digest(
-            operation,
-            &scope,
-            range.map(|range| (range.start, range.end)),
-        )
-        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-        let ids = self.ids.ok_or(StagingSourceError::HandleMissing)?;
-        let caller = self.caller.take().ok_or(IoError::Unfinished)?;
-        let input = DelegationInput {
-            target: arn.node_id,
-            operation: operation.to_string(),
-            bucket: arn.bucket.clone(),
-            key: arn.key.clone(),
-            request_digest: digest,
-            ..caller
-        };
-        let now = self.now_ms / 1000;
-        let nonce = self.mint.mint(self.now_ms).to_bytes();
-        let read = DelegatedReadEffect {
-            delegation: unsigned_delegation(ids, input, (now, nonce)),
-            version_id: arn.version,
-            head: self.head,
-            range,
-        };
-        let effect = Effect::Net(NetEffect::DelegatedRead(Box::new(read)));
-        Ok(Next::Call(IoCall::from(effect)))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<DelegatedBody>, StagingSourceError> {
-        match result.event()? {
-            Event::Net(NetEvent::DelegatedRead(answer)) => Ok(Next::Done(*answer?)),
-            other => Err(IoError::Unexpected {
-                expected: "Event::Net(NetEvent::DelegatedRead)",
-                got: other.label(),
-            }
-            .into()),
-        }
     }
 }
 
@@ -735,14 +637,70 @@ fn head_metadata(
     Ok(metadata)
 }
 
+/// The answer to a native reference stream and its bytes, for a read.
+pub type NativeAnswer = (
+    NativeReferenceResponse,
+    Option<BackendStream<Result<Bytes, StreamError>>>,
+);
+
+/// Prepares a peer's native reference request and decides its answer: a caller read names the
+/// group, while a sync relationship knows its own bucket; a refusal is answered as such.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeAnswerOperation {
+    ids: Option<Ids>,
+    peer: NodeId,
+    request: Option<NativeReferenceRequest>,
+    relationship: bool,
+}
+
+impl NativeAnswerOperation {
+    pub fn new(ids: Option<Ids>, peer: NodeId, request: NativeReferenceRequest) -> Self {
+        let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
+        Self {
+            ids,
+            peer,
+            request: Some(request),
+            relationship,
+        }
+    }
+}
+
+impl Operation for NativeAnswerOperation {
+    type Output = NativeAnswer;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<NativeAnswer>, IoError> {
+        let request = self.request.take().ok_or(IoError::Unfinished)?;
+        let prepare = PrepareReferenceOperation::new(self.ids, self.peer, request);
+        Ok(Next::Call(IoCall::child(prepare)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<NativeAnswer>, IoError> {
+        let answer = match result.child::<PreparedReference, Reject>()? {
+            Ok(prepared) => {
+                let response = match prepared.group_id.filter(|_| !self.relationship) {
+                    None => NativeReferenceResponse::Content(prepared.metadata),
+                    Some(group_id) => NativeReferenceResponse::Described {
+                        metadata: prepared.metadata,
+                        group_id,
+                    },
+                };
+                (response, prepared.body)
+            }
+            Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
+        };
+        Ok(Next::Done(answer))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::replication::ArunaArn;
-    use aruna_core::structs::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
+    use aruna_core::structs::sync_relationship::{ReferenceHandling, SyncMode, SyncStatusSnapshot};
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
     where
@@ -766,6 +724,47 @@ mod tests {
             head: false,
             range: None,
         }
+    }
+
+    // A relationship read never names the group, a caller read does, and a refusal is answered.
+    #[test]
+    fn native_answer_chosen() {
+        let metadata = SourceMetadata {
+            content_length: 3,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        };
+        let group_id = GroupId::from_bytes([5; 16]);
+        let prepared = || PreparedReference {
+            metadata: metadata.clone(),
+            group_id: Some(group_id),
+            body: None,
+        };
+        let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
+        let mut answer = NativeAnswerOperation::new(Some(ids()), ids().0, read_request(authority));
+        assert!(matches!(answer.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let content = NativeReferenceResponse::Content(metadata.clone());
+        let Ok(Next::Done((response, None))) = answer.next(child(Ok::<_, Reject>(prepared())))
+        else {
+            panic!("a prepared read is answered");
+        };
+        assert_eq!(response, content);
+        answer.relationship = false;
+        let Ok(Next::Done((response, None))) = answer.next(child(Ok::<_, Reject>(prepared())))
+        else {
+            panic!("a prepared read is answered");
+        };
+        let described = NativeReferenceResponse::Described { metadata, group_id };
+        assert_eq!(response, described);
+        let refused = Reject::Unavailable("gone".to_string());
+        let rejected = answer.next(child(Err::<PreparedReference, _>(refused.clone())));
+        let Ok(Next::Done((NativeReferenceResponse::Rejected(reason), None))) = rejected else {
+            panic!("a refusal is answered");
+        };
+        assert_eq!(reason, refused);
     }
 
     // Without a network there is no identity to check a peer's read against.
@@ -796,7 +795,7 @@ mod tests {
     fn missing_bucket_found() {
         let authority = NativeAuthority::Relationship(Ulid::from_bytes([4; 16]));
         let auth = AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([5; 16]), ids().1),
             realm_id: ids().1,
             path_restrictions: None,
             session: None,
@@ -841,9 +840,8 @@ mod tests {
     async fn denial_journals_failure() {
         // A native read whose creator lost READ fails the relationship and journals its
         // `sync_failed` with that status write, with no replication job queued.
-        use crate::sync::sync_relationship::{
-            StoreRelationshipOperation, SyncRelationshipDirection,
-        };
+        use crate::replication::sync_relationship::SyncRelationshipDirection;
+        use crate::replication::sync_relationship::store::StoreRelationshipOperation;
         use aruna_core::structs::storage::blob::BucketInfo;
         use aruna_core::structs::storage::format::Compression;
         let tempdir = tempfile::tempdir().unwrap();
@@ -860,7 +858,7 @@ mod tests {
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let source = iroh::SecretKey::from_bytes(&[3; 32]).public();
         let target = iroh::SecretKey::from_bytes(&[4; 32]).public();
-        let creator = aruna_core::UserId::local(Ulid::from_parts(5, 5), realm_id);
+        let creator = aruna_core::user::id::UserId::local(Ulid::from_parts(5, 5), realm_id);
         let relationship = SyncRelationship {
             id: Ulid::from_parts(2, 2),
             source: ArunaArn::s3_bucket(realm_id, source, "source").unwrap(),
@@ -922,7 +920,7 @@ mod tests {
             reference_handling: ReferenceHandling::Materialize,
             reference_serving: false,
             replicate_deletes: true,
-            created_by: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            created_by: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             created_at: std::time::SystemTime::UNIX_EPOCH,
             state: SyncState::Enabled,
             status: SyncStatusSnapshot::default(),

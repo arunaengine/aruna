@@ -6,9 +6,9 @@
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::NodeId;
 use aruna_core::calls::IoError;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -18,26 +18,26 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::delivery::AdmissionError;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceRoot};
-use aruna_core::structs::storage::distribution::{
-    AdmissionError, DistributionBinding, DistributionView,
-};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::structs::tagged_receipt;
+use aruna_core::structs::synced_folder::tagged_receipt;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
+use super::PAGE_RECORDS;
 use crate::connectors::root_record::{compact_version, root_write};
 use crate::distribution::inventory::{AddedVersion, InventoryChange, entry_of, version_written};
 use crate::replication::incoming::{IncomingVersionError, member_reference, same_reference};
-use crate::replication::protocol::VersionReplicationManifest;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
+use aruna_core::replication_protocol::{PageAnswer, ReferencePage, VersionReplicationManifest};
 
 /// Rows read ahead of the records: bucket, encryption, purge fence, record and member fence.
 pub(super) const GUARD_READS: usize = 5;

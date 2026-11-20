@@ -2,29 +2,32 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::PeerAuthRefusal;
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobRecord, KeyWait};
+use aruna_core::structs::execution::job::family::JobFamilyId;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 
-use super::job_artifacts::{
+use super::job::artifacts::{
     ArtifactLookup, ArtifactRangeOperation, ArtifactRead, OwnedArtifact, OwnedArtifactOperation,
 };
-use super::job_cancel::{
+use super::job::cancel::{
     CancelJobOutcome, CancelOwnedOperation, CancelReport, MatchingRunsOperation,
 };
-use super::job_reads::{
+use super::job::reads::{
     JobOwnerOperation, JobReadError, LocalStatusOperation, RecordData, RecordDataOperation,
 };
-use super::job_reports::{JobReportLookup, JobReportOperation, ReportQuery};
+use super::job::reports::{JobReportLookup, JobReportOperation, ReportQuery};
 use super::key_locks::KeyCheckError;
 use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::cancel::CancelFamilyOperation;
@@ -34,7 +37,7 @@ use super::records::verify::FamilyView;
 use super::remote_key::{AcceptWakeOperation, RegisterWaitsOperation};
 use super::route::{JobRouteError, RoutedJobStatus};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::write_peer::WritePeerOperation;
+use crate::forward::write_peer::WritePeerOperation;
 use crate::realm::load_config::config_unavailable;
 
 /// What a job-control request is answered with. `running` names the local attempts the
@@ -455,7 +458,7 @@ fn wake_answer(result: Result<bool, KeyCheckError>) -> JobResponse {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum RequestStep {
     Auth,
     Alias,
@@ -471,7 +474,7 @@ enum RequestStep {
 /// Authenticates one job-control request and answers it. Owner-directed requests are answered
 /// by the immutable owner or a node that knows the job's family; key waits address the node
 /// that holds the content or the job instead. Every refusal is an answer to the peer.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JobRequestOperation {
     peer: NodeId,
     request: Option<JobRequest>,
@@ -644,8 +647,9 @@ impl Operation for JobRequestOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::jobs::job_reads::tests::{auth_of, child, is_child, job_id, node, owner, realm};
-    use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
+    use crate::jobs::job::reads::tests::{auth_of, child, is_child, job_id, node, owner, realm};
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::local::{JobProgress, WorkspaceMode};
     use ulid::Ulid;
 
     use aruna_core::jobs::JobKind;
@@ -705,7 +709,7 @@ mod pure_tests {
     #[test]
     fn owner_gate_applies() {
         let family = JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([7u8; 32]),
+            submission_id: aruna_core::structs::execution::job::family::SubmissionId([7u8; 32]),
             request_digest: [8u8; 32],
         };
         let mut serve = authed(status_request());
@@ -790,7 +794,7 @@ mod pure_tests {
     }
 
     fn record() -> JobRecord {
-        crate::jobs::job_reads::tests::record_of(crate::jobs::job_reads::tests::probe())
+        crate::jobs::job::reads::tests::record_of(crate::jobs::job::reads::tests::probe())
     }
 
     fn report(outcome: CancelJobOutcome, running: Vec<JobId>) -> IoResult {
@@ -837,7 +841,7 @@ mod pure_tests {
         let mut serve = cancel();
         serve.step = CancelStep::Runs;
         serve.family = Some(JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([7u8; 32]),
+            submission_id: aruna_core::structs::execution::job::family::SubmissionId([7u8; 32]),
             request_digest: [8u8; 32],
         });
         let none = child(Ok::<_, JobRouteError>(Vec::<JobId>::new()));

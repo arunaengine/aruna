@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::handle::{CleanupEntry, CleanupKind, StorageHandle};
 use super::tests::{poll_queued, worker};
-use super::{CleanupEntry, CleanupKind, FjallStorage, SlowQueueAggregator, StorageHandle};
+use super::worker::{FjallStorage, SlowQueueAggregator};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};

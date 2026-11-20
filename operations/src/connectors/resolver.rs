@@ -25,14 +25,14 @@ use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBind
 use aruna_core::types::{GroupId, TxnId};
 use ulid::Ulid;
 
+use crate::connectors::harvest_rows::INVENIO_TOKEN;
 use crate::connectors::repository::{
     iter_connectors_effect, parse_connector_iter, parse_secret_read, read_secret_effect,
     source_connector_key,
 };
 use crate::connectors::root_record::{parse_root, read_root};
-use crate::harvest::create_connector::INVENIO_TOKEN;
-use crate::storage_read::decode_row;
 use aruna_core::native_reference::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
+use aruna_core::storage_read::decode_row;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 
 /// Names the distributed bucket whose holders keep the bytes of a record-only version.
@@ -115,12 +115,12 @@ impl Operation for ResolveConnectorOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SourceResolutionError> {
         let Some(connector) = self.connector.take() else {
-            let connector = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+            let connector = decode_row(result.value()?, SourceConnector::from_bytes)?;
             self.connector = Some(connector.ok_or(SourceResolutionError::NotFound)?);
             let read = read_secret_effect(self.input.connector_id, None);
             return Ok(Next::Call(read.into()));
         };
-        let secret = parse_secret_read(rows::event(result)?, self.input.connector_id)?;
+        let secret = parse_secret_read(result.event()?, self.input.connector_id)?;
         let access = build_source_access(
             connector.kind,
             &connector.public_config,
@@ -224,7 +224,7 @@ impl ResolveBindingOperation {
     /// The token is used only while the connector still points at the bound endpoint,
     /// so a connector moved to another host never sends its new token to the old one.
     fn repository_read(&mut self, event: Event) -> Resolved {
-        let connector = crate::harvest::repository::parse_connector_read(event)?;
+        let connector = crate::connectors::harvest_rows::parse_connector_read(event)?;
         let bound = self.input.source.descriptor.public_config.get("endpoint");
         match (connector, self.input.source.connector_id) {
             (Some(connector), Some(connector_id))
@@ -232,7 +232,7 @@ impl ResolveBindingOperation {
                     && bound.is_some_and(|bound| same_endpoint(bound, &connector.endpoint)) =>
             {
                 self.state = ResolveBindingState::ReadRepositorySecret;
-                call(crate::harvest::repository::read_secret_effect(
+                call(crate::connectors::harvest_rows::read_secret_effect(
                     connector_id,
                     None,
                 ))
@@ -262,7 +262,7 @@ impl Operation for ResolveBindingOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Resolved {
-        let event = rows::event(result)?;
+        let event = result.event()?;
         match self.state {
             ResolveBindingState::ReadRoot => self.root_read(event),
             ResolveBindingState::MatchConnector => self.matched(event),
@@ -273,11 +273,26 @@ impl Operation for ResolveBindingOperation {
             )?)),
             ResolveBindingState::ReadRepository => self.repository_read(event),
             ResolveBindingState::ReadRepositorySecret => {
-                let secret = crate::harvest::repository::parse_secret_read(event)?;
+                let secret = crate::connectors::harvest_rows::parse_secret_read(event)?;
                 self.finish_repository(secret.map(|secret| secret.secret_config))
             }
         }
     }
+}
+
+/// Resolves the connector of a source path below its root.
+pub(crate) fn resolve_call(
+    group_id: aruna_core::types::GroupId,
+    connector_id: ulid::Ulid,
+    source_path: String,
+) -> aruna_core::calls::IoCall {
+    let input = ResolveConnectorInput {
+        group_id,
+        connector_id,
+        source_path,
+        allow_root: false,
+    };
+    aruna_core::calls::IoCall::from(resolve_connector_effect(input))
 }
 
 pub fn resolve_connector_effect(input: ResolveConnectorInput) -> Effect {
@@ -511,7 +526,7 @@ fn repository_read_effect(source: &VersionSourceBinding) -> Result<Effect, Sourc
     if source.strategy != StagingStrategy::Reference {
         return Err(SourceResolutionError::ResolveFailed);
     }
-    Ok(crate::harvest::repository::read_connector_effect(
+    Ok(crate::connectors::harvest_rows::read_connector_effect(
         group_id,
         connector_id,
         None,
@@ -587,8 +602,9 @@ mod tests {
     #[tokio::test]
     async fn merges_public_secret() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -653,8 +669,9 @@ mod tests {
     #[tokio::test]
     async fn matches_source_root() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -853,8 +870,9 @@ mod tests {
     #[tokio::test]
     async fn uses_stored_descriptor() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -952,8 +970,9 @@ mod tests {
         use crate::connectors::root_record::root_write;
         use aruna_core::structs::storage::distribution::source_root::RootEntry;
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
         let context = DriverContext {
             storage_handle,
             net_handle: None,

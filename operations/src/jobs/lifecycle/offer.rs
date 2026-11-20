@@ -12,8 +12,9 @@ use aruna_core::operation::Operation;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// What a target answered to one offer.
 #[derive(Debug, PartialEq)]
@@ -99,7 +100,7 @@ impl Operation for OfferLaunchOperation {
             Ok(other) => {
                 debug!(
                     peer = %self.target,
-                    reply = crate::metadata::transport_message_kind(&other),
+                    reply = aruna_core::metadata::protocol::transport_message_kind(&other),
                     "Execution target answered a launch offer with another message"
                 );
                 OfferOutcome::Unavailable

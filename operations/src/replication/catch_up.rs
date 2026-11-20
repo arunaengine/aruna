@@ -7,19 +7,21 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StatementSignEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, CATCH_UP_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows::SettleMarkerOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
-use aruna_core::structs::storage::distribution::snapshot::{DistributionView, RangeFill};
-use aruna_core::structs::storage::distribution::{
-    DistributionMember, DistributionSnapshot, KeyRange, Statement, StatementClaim,
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, RangeFill,
 };
+use aruna_core::structs::storage::distribution::statement::{Statement, StatementClaim};
+use aruna_core::structs::storage::distribution::{DistributionMember, KeyRange};
 use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 use ulid::Ulid;
@@ -29,12 +31,11 @@ use super::bootstrap::{
     ReadCursorOperation,
 };
 use super::members::{ReadRecordOperation, RecordError};
-use super::queue::{BlobQueueError, schedule_blob_drain};
-use crate::distribution::forward::PublishRefusal;
-use crate::distribution::lifecycle::SettleMarkerOperation;
-use crate::distribution::purge_steps::PurgeError;
+use super::queue::BlobQueueError;
 use crate::distribution::submit::SubmitOperation;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::structs::storage::distribution::request::PublishRefusal;
+use aruna_core::structs::storage::replication_queue::schedule_blob_drain;
 
 /// Sets and pages one drain works on at most.
 const SET_BATCH: usize = 16;
@@ -236,7 +237,7 @@ impl Operation for ProcessBootstrapOperation {
                 self.next_set()
             }
             DrainStep::Settled => {
-                (result.child::<(), PurgeError>()?).map_err(failed)?;
+                (result.child::<(), IoError>()?).map_err(failed)?;
                 self.next_set()
             }
         }

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{OutputDestination, OutputSelection};
+use aruna_core::structs::execution::job::input::{OutputDestination, OutputSelection};
 use ulid::Ulid;
 
 use super::super::fixtures::{
@@ -449,7 +449,7 @@ fn with_output() -> Arc<AttemptScope> {
 // A plugin task's report is kept before anything else of an exited attempt is read.
 #[test]
 fn task_report_first() {
-    use aruna_core::structs::execution::job::{PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG};
+    use aruna_core::structs::execution::job::input::{PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG};
     let mut spec = (*with_output().spec).clone();
     for (tag, value) in [
         (PLUGIN_INSTALL_TAG, Ulid::from_parts(1, 1).to_string()),

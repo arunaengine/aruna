@@ -116,7 +116,7 @@ impl Operation for StartCheckOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
+    use aruna_core::user::id::UserId;
     use std::time::SystemTime;
     use ulid::Ulid;
 

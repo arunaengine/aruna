@@ -10,7 +10,6 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{VISIBILITY_INDEX_KEYSPACE, VISIBILITY_STATE_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{all_values, event};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -21,11 +20,11 @@ use ulid::Ulid;
 
 use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluator, PolicyLoadOperation};
 use crate::auth::error::PolicyEnforcementError;
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::repository::StorageReadError;
 use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation, UpdatedRecordsPage};
-use crate::storage_read::parse_storage_scan;
+use aruna_core::errors::StorageReadError;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_core::storage_read::parse_storage_scan;
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
 const BUILD_BATCH: usize = 256;
@@ -266,7 +265,7 @@ fn scan_call(start: IterStart, limit: usize) -> IoCall {
 }
 
 fn scanned(result: IoResult) -> Result<PageRows, VisibilityError> {
-    Ok(parse_storage_scan(event(result)?)?)
+    Ok(parse_storage_scan(result.event()?)?)
 }
 
 fn evaluators_call(records: &[MetadataRegistryRecord]) -> IoCall {
@@ -938,7 +937,7 @@ impl Operation for VisibilityPassOperation {
                 self.load_group(*loads)
             }
             PassStage::Datestamps(visible) => {
-                let values = all_values(result)?;
+                let values = result.values()?;
                 let datestamps = (values.into_iter())
                     .map(datestamp_value)
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1021,6 +1020,7 @@ mod tests {
     use crate::metadata::repository::create_outbox_entries;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::request_policy::{PolicyKind, RequestPolicy};
     use aruna_core::structs::identity::auth::Actor;
@@ -1028,7 +1028,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::time::unix_timestamp_millis;
-    use aruna_core::{NodeId, UserId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::collections::{HashMap, HashSet};
 
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     fn context() -> (DriverContext, tempfile::TempDir) {
-        let (dir, context) = crate::testing::temp_context();
+        let (dir, context) = aruna_drivers::testing::temp_context();
         (context, dir)
     }
 

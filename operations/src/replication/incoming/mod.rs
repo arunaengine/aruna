@@ -2,19 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::holders::dht_registration_effect;
-use crate::blob::records::{HeadAliasContext, release_rows};
 use crate::connectors::root_record::{compact_version, root_write};
 use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, RecordReadError, backend_key};
 use crate::groups::storage_routing::load_group_inputs;
-use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, ReadPolicyError, gate_decision,
-    split_drift_reads, union_refs, write_gate,
+use crate::placement::policy::gate::{
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, split_drift_reads,
+    union_refs, write_gate,
 };
+use crate::placement::policy::read::ReadPolicyError;
 use crate::replication::error::ReplicationError;
-use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
-use crate::replication::queue::schedule_blob_drain;
 use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::object::put::abe::{abe_reads, keyed, located_rows, parse_abe};
@@ -23,6 +20,7 @@ use crate::s3::usage::{
     QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
     schedule_snapshot_publish,
 };
+use aruna_core::blob_records::{HeadAliasContext, dht_registration_effect, release_rows};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect};
@@ -41,8 +39,9 @@ use aruna_core::keyspaces::{
 use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_entry};
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::replication_protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use aruna_core::rows::read_row;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::table::searchable;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::NODE_SUBJECT_KEY;
@@ -57,11 +56,10 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::bucket_metadata::strip_release_keys;
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
+use aruna_core::structs::storage::distribution::delivery::AdmissionError;
 use aruna_core::structs::storage::distribution::inventory::{VersionEntry, logical_identity};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
-use aruna_core::structs::storage::distribution::{
-    AdmissionError, DistributionBinding, OriginalEpoch,
-};
+use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
@@ -74,14 +72,14 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
 };
-use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::live_obligation_entry;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, schedule_blob_drain};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::structs::tagged_receipt;
+use aruna_core::structs::synced_folder::tagged_receipt;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{GroupId, Key, Value};
 use std::time::{Duration, SystemTime};

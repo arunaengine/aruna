@@ -7,15 +7,15 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
 use crate::effects::{Effect, StorageEffect};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use crate::metadata::{MetadataEventPayload, MetadataEventRecord};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::object_permission_path;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 /// Runs of one install that run at once on its receiver.
 pub const RUNS_PARALLEL: usize = 4;

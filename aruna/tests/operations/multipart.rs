@@ -4,7 +4,7 @@
 
 use aruna_blob::blob::BlobHandler;
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::UserId;
+use aruna_core::calls::CallRun;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     BUCKET_STATS_DB, DHT_KEYSPACE, OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE,
     S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Runnable};
+use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::identity::realm::RealmId;
@@ -28,7 +28,9 @@ use aruna_core::structs::storage::multipart::{
     MultipartUploadStatus,
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive, node_routing};
+use aruna_drivers::testing::read_value;
 use aruna_net::NetHandle;
 use aruna_net::dht::storage::decode_entries;
 use aruna_operations::blob::cleanup::{
@@ -37,13 +39,11 @@ use aruna_operations::blob::cleanup::{
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
-    CompleteUploadResult,
 };
 use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_operations::testing::read_value;
 use aruna_storage::storage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};
@@ -65,7 +65,7 @@ async fn setup_context() -> TestContext {
     let blob_root = format!("{temp_root}/blobstore");
     create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1456,8 +1456,8 @@ async fn answer(context: &TestContext, effect: Effect) -> Option<Event> {
 async fn stall_completion(
     context: &TestContext,
     input: CompleteUploadInput,
-) -> impl EffectOperation<Output = CompleteUploadResult, Error = CompleteUploadError> {
-    let mut operation = CompleteUploadOperation::new(input).into_machine();
+) -> CallRun<CompleteUploadOperation> {
+    let mut operation = CallRun::new(CompleteUploadOperation::new(input));
     let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
         let Some(event) = answer(context, effect).await else {
@@ -1473,7 +1473,7 @@ async fn stall_completion(
 
 // Runs the calls a deadline's abort makes, so the record is left as production
 // would leave it.
-async fn run_abort(context: &TestContext, operation: &mut impl EffectOperation) {
+async fn run_abort(context: &TestContext, operation: &mut CallRun<impl Operation>) {
     for effect in operation.abort() {
         answer(context, effect).await;
     }
@@ -1801,7 +1801,7 @@ async fn setup_s3_context() -> (TestContext, HashMap<String, String>) {
     ]);
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::abe::ScopeView;
+use super::abe::records::ScopeView;
 use super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -12,7 +12,8 @@ use crate::routes::storage::bucket::keys::activate_and_wake;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::BlobError;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::abe_access::KeyScope;
@@ -26,7 +27,7 @@ use aruna_core::structs::storage::holders::{
 use aruna_core::structs::storage::key_audit::AuditAction;
 use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionState};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
@@ -38,11 +39,11 @@ use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
 use aruna_operations::s3::bucket::token_list::{ListTokensOperation, TokenEntry};
-use aruna_operations::s3::key_status::{
-    AbeSnapshot, KeySnapshot, KeyStatusError, KeyStatusOperation,
-};
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
+};
+use aruna_operations::transfer::key_status::{
+    AbeSnapshot, KeySnapshot, KeyStatusError, KeyStatusOperation,
 };
 use axum::Json;
 use axum::extract::{Path, State};
@@ -1073,7 +1074,7 @@ mod tests {
         };
         let bucket_id = Ulid::from_bytes([4; 16]);
         let realm = RealmId::from_bytes([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm);
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let entry = |generation, credential_active| TokenEntry {
             grant: KeyGrant {
@@ -1266,7 +1267,7 @@ mod tests {
 
     #[test]
     fn reports_abe_state() {
-        use aruna_operations::s3::abe_rekey::RekeyProgress;
+        use aruna_operations::transfer::abe_rekey::RekeyProgress;
         let mut abe = snapshot();
         abe.abe = Some(AbeSnapshot {
             epoch: 4,

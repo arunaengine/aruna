@@ -10,6 +10,7 @@ use aruna_core::download_slots::DownloadSlots;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::heartbeat::NodeHeartbeat;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE,
     S3_BUCKET_KEYSPACE,
@@ -22,18 +23,23 @@ use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubject
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::distribution::presets::{replica_layout, shard_layout};
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement};
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, Statement, next_snapshot,
+    DistributionBinding, DistributionConfig, DistributionSettings,
 };
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::distribution::inventory::open_ranges;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::Router;
 use axum::http::{StatusCode, Uri};
 use std::collections::HashMap;
@@ -74,7 +80,7 @@ pub(crate) async fn node_state() -> Node {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let storage = FjallStorage::open(root).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId([3; 32]);
     let config = NetConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -172,7 +178,7 @@ pub(crate) async fn node_state() -> Node {
 pub(crate) async fn hidden_link(node: &Node, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let target = LinkTarget {
         arn: VersionedObjectArn {
             realm_id: node.owner.realm_id,

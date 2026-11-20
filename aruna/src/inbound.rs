@@ -7,18 +7,18 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::inbound_frames;
-use aruna_blob::blob::{InboundError, refuse_stream};
-use aruna_blob::native;
+use crate::peer_frames::{PeerRead, read_peer, write_peer};
+use aruna_blob::blob::inbound::{InboundError, refuse_stream};
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
+use aruna_core::document::{AppliedStep, DocumentEvictedDocument, DocumentTarget};
 use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
-use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
-use aruna_core::native_reference::{NativeAuthority, NativeReferenceResponse};
-use aruna_core::structs::execution::job::RoCrateLimits;
-use aruna_core::structs::execution::notification::NotificationTransportMessage;
+use aruna_core::metadata::protocol::{
+    INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
+};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
 use aruna_core::telemetry::record_elapsed_ms;
@@ -26,23 +26,13 @@ use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_drivers::driver::{DriverContext, drive, drive_retry_until, node_routing};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_net::InboundEventHandler;
-use aruna_net::job_control::{read_request, write_answer};
-use aruna_net::notification::{
-    close_stream, drain_request, read_frame, write_frame, write_message,
-};
 use aruna_net::streams::BiStream;
-use aruna_operations::jobs::protocol::{JobAnswer, JobRequestOperation};
 use aruna_operations::jobs::records::pages::ServePageOperation;
 use aruna_operations::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
-use aruna_operations::metadata::after_sync::AfterSyncOperation;
 use aruna_operations::metadata::deletion_guard::PruneGraphsOperation;
-use aruna_operations::metadata::protocol::{
-    INBOUND_FRAME_BYTES, MetadataReadError, MetadataTransportMessage,
-};
-use aruna_operations::metadata::serve::{
-    ServeNode, ServeRequestOperation, ServedReply, needs_view,
-};
-use aruna_operations::node::heartbeat::ReceiveHeartbeatOperation;
+use aruna_operations::metadata::serve::forwards::needs_view;
+use aruna_operations::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
+use aruna_operations::node::applied_drain::SettleAppliedOperation;
 use aruna_operations::node::summary_refresh::RefreshUsageOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
@@ -54,18 +44,16 @@ use aruna_operations::replication::catch_up::WakeBootstrapOperation;
 use aruna_operations::replication::incoming::stream::{
     BaoAdmission, BaoAdmissionOperation, BaoPeerStream, ServeBaoOperation,
 };
-use aruna_operations::shard::incoming::{ManifestAnswer, ServeManifestOperation};
-use aruna_operations::staging::native_source::PrepareReferenceOperation;
 use aruna_operations::sync::evicted::ReemitEvictedOperation;
-use aruna_operations::triggers::{PeerInput, peer_operation};
+use aruna_operations::triggers::{PeerAnswer, PeerInput, peer_operation};
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
+use futures_util::future::BoxFuture;
 use tokio::sync::Semaphore;
 use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
-const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Peer audit pages this node serves at once.
 const AUDIT_INBOUND_LIMIT: usize = 16;
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -84,22 +72,61 @@ struct OperationsInboundHandler {
 }
 
 impl OperationsInboundHandler {
-    /// Answers one job-control request and signals the attempts a cancel reached.
-    async fn answer_job_stream(&self, mut stream: BiStream, peer: NodeId) {
-        let Some(request) = read_request(&mut stream, peer).await else {
+    /// Serves one peer request through the operation the trigger table names for it: reads the
+    /// request in its protocol's framing, drives the operation once and writes its answer.
+    #[tracing::instrument(
+        name = "peer.incoming.stream",
+        level = "debug",
+        skip(self, stream),
+        fields(peer = %peer, alpn = ?alpn)
+    )]
+    async fn serve_peer(&self, alpn: Alpn, mut stream: BiStream, peer: NodeId) {
+        let context = self.context.as_ref();
+        let Some(net_handle) = context.net_handle.as_ref() else {
+            debug!(peer = %peer, "Dropping inbound peer stream without net handle");
             return;
         };
-        let context = self.context.as_ref();
-        let serving = context.node_and_realm();
-        let now_ms = aruna_clock::unix_timestamp_millis();
-        let serve = JobRequestOperation::new(peer, request, serving, now_ms);
-        let answer = drive(serve, context)
-            .await
-            .unwrap_or_else(JobAnswer::unavailable);
-        for job_id in answer.running {
-            self.jobs_runtime.request_cancel(job_id);
+        let Some(PeerRead {
+            request,
+            slot: _slot,
+        }) = read_peer(alpn, &mut stream, peer, net_handle).await
+        else {
+            return;
+        };
+        let input = PeerInput {
+            alpn,
+            peer,
+            local_node: net_handle.node_id(),
+            local_realm: *net_handle.realm_id(),
+            now_ms: unix_timestamp_millis(),
+            request,
+        };
+        let answer = match peer_operation(&input) {
+            Some(operation) => match operation.deadline() {
+                Some(limit) => {
+                    let build = || operation.clone();
+                    let deadline = tokio::time::Instant::now() + limit;
+                    drive_retry_until(build, context, peer.as_bytes(), deadline).await
+                }
+                None => drive(operation, context).await,
+            },
+            // A request no operation answers gets no answer of its own; its protocol refuses it.
+            None => Ok(PeerAnswer::Kept),
+        };
+        let answer = answer.or_else(|failure| match PeerAnswer::unavailable(alpn, &failure) {
+            Some(unavailable) => {
+                warn!(peer = %peer, error = %failure, "Peer request broke off; answering unavailable");
+                Ok(unavailable)
+            }
+            None => Err(failure),
+        });
+        // The attempts a cancel reached run here, so the runtime signals them.
+        if let Ok(PeerAnswer::Job(job)) = &answer {
+            for job_id in &job.running {
+                self.jobs_runtime.request_cancel(*job_id);
+            }
         }
-        write_answer(stream, peer, &answer.response, answer.body).await;
+        write_peer(&input, stream, answer).await;
     }
 
     fn new(
@@ -308,7 +335,7 @@ async fn peer_request(
                 unix_timestamp_millis(),
             );
             let admit =
-                aruna_operations::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
+                aruna_operations::jobs::lifecycle::admit::forwarded::AdmitForwardedOperation::new(
                     peer,
                     auth_token,
                     submission_id,
@@ -506,7 +533,11 @@ async fn reconcile_inbound_topics(
     };
     let run_started = Instant::now();
     let topic_count = topics.len();
-    let reconcile = ReconcileTopicsOperation::new(*net_handle.realm_id(), topics).reloading_peers();
+    // Each apply stores its metadata follow-up in its own transaction, so a cleanup refused
+    // after the cursor moved is never lost; the applied drain owns it from there.
+    let reconcile = ReconcileTopicsOperation::new(*net_handle.realm_id(), topics)
+        .reloading_peers()
+        .queuing_followups(net_handle.node_id(), AppliedStep::Metadata);
     let targets = match drive(reconcile, context).await {
         Ok(targets) => targets,
         Err(err) => {
@@ -518,7 +549,8 @@ async fn reconcile_inbound_topics(
     let applied = targets.applied();
     debug!(applied, "Reconciled inbound document sync events");
     if applied == 0 {
-        return true;
+        // A pass that applied nothing still hands on work an earlier pass could not.
+        return settle_followups(context).await;
     }
     let dashboard_changed = targets
         .targets
@@ -558,22 +590,33 @@ async fn reconcile_inbound_topics(
     if let Err(error) = drive(refresh, context).await {
         warn!(%error, "Watch interest refresh stopped after a document sync");
     }
-    let after = AfterSyncOperation::new(Some(net_handle.node_id()), targets, true);
-    let timings = drive(after, context).await.unwrap_or_default();
+    let followups_started = Instant::now();
+    let settled = settle_followups(context).await;
     info!(
         event = "pipeline.reconcile.summary",
         topics = topic_count,
         applied,
         reconcile_ms = duration_ms(reconcile_elapsed),
-        project_ms = duration_ms(timings.project),
-        prune_ms = duration_ms(timings.prune),
+        followups_ms = duration_ms(followups_started.elapsed()),
         total_ms = duration_ms(run_started.elapsed()),
         "Inbound document sync reconcile summary"
     );
     if dashboard_changed {
         context.notify_dashboard_change();
     }
-    true
+    settled
+}
+
+/// Runs the follow-ups the applies stored, which the applied drain owns. A pass whose leftover
+/// work the drain's timer did not take fails, so it runs again and arms it then.
+pub(crate) async fn settle_followups(context: &DriverContext) -> bool {
+    match drive(SettleAppliedOperation::new(), context).await {
+        Ok(settled) => settled,
+        Err(error) => {
+            warn!(%error, "Queued follow-ups of a document sync were not settled");
+            false
+        }
+    }
 }
 
 /// Lifecycle owner for a test-installed inbound handler: it holds the job
@@ -611,9 +654,20 @@ impl IncomingFixture {
     }
 }
 
+/// A fixture dropped without `stop` still deregisters its handler: the handler holds the context
+/// that holds the net handle, so a registered one keeps both and their sync folder alive.
+impl Drop for IncomingFixture {
+    fn drop(&mut self) {
+        if self.installed() {
+            self.net_handle.clear_inbound_handler();
+        }
+    }
+}
+
 /// Installs a handler under fixture-owned lifecycle owners; bind the fixture
 /// and call [`IncomingFixture::stop`] to deregister and drain before dropping
 /// test storage. Startup uses [`initialize_net_holder`] with the node owners.
+#[must_use = "dropping the fixture deregisters its handler"]
 pub fn initialize_incoming_fixture(context: Arc<DriverContext>) -> Option<IncomingFixture> {
     let net_handle = context.net_handle.clone()?;
     let shutdown = Shutdown::new();
@@ -783,54 +837,28 @@ impl InboundEventHandler for OperationsInboundHandler {
             trace!(event = "stream.received", peer = %node_id, alpn = ?alpn, "Received inbound stream");
             // Debug poll frames reserve stack for every branch at once, so each
             // protocol branch is boxed to keep only the active one on the stack.
-            match alpn {
-                Alpn::Bao => {
-                    Box::pin(handle_bao_stream(
-                        self.context.as_ref(),
-                        &self.rocrate_limits,
-                        stream,
-                        node_id,
-                    ))
-                    .await;
-                }
-                Alpn::DocumentSync => {
-                    Box::pin(self.accept_document_sync(stream, node_id)).await;
-                }
-                Alpn::Metadata => {
-                    Box::pin(self.handle_metadata_stream(stream, node_id)).await;
-                }
-                Alpn::NativeReference => {
-                    Box::pin(answer_native_stream(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await;
-                }
-                Alpn::Notification => {
-                    Box::pin(receive_notification(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await
-                }
-                Alpn::Shard => {
-                    Box::pin(serve_shard_stream(self.context.as_ref(), stream, node_id)).await
-                }
-                Alpn::Heartbeat => {
-                    Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
-                }
-                Alpn::JobControl => {
-                    Box::pin(self.answer_job_stream(stream, node_id)).await
-                }
+            let serve: BoxFuture<'_, ()> = match alpn {
+                Alpn::Bao => Box::pin(async move {
+                    let limits = &self.rocrate_limits;
+                    handle_bao_stream(self.context.as_ref(), limits, stream, node_id).await;
+                }),
+                Alpn::DocumentSync => Box::pin(async move {
+                    self.accept_document_sync(stream, node_id).await;
+                }),
+                Alpn::Metadata => Box::pin(async move {
+                    self.handle_metadata_stream(stream, node_id).await;
+                }),
+                Alpn::Notification
+                | Alpn::Shard
+                | Alpn::Heartbeat
+                | Alpn::JobControl
+                | Alpn::NativeReference => Box::pin(self.serve_peer(alpn, stream, node_id)),
                 Alpn::Dht => {
-                    warn!(
-                        peer = %node_id,
-                        "Ignoring inbound stream for non-stream ALPN"
-                    );
+                    warn!(peer = %node_id, "Ignoring inbound stream for non-stream ALPN");
+                    return;
                 }
-            }
+            };
+            serve.await;
         }
         .instrument(span)
         .await;
@@ -900,179 +928,6 @@ fn schedule_sync_maintenance(
     });
 }
 
-/// Answers one native reference stream with what its request prepared.
-async fn answer_native_stream(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(request) = native::read_request(&mut stream, peer).await else {
-        return;
-    };
-    let relationship = matches!(request.authority, NativeAuthority::Relationship(_));
-    let prepare = PrepareReferenceOperation::new(context.node_and_realm(), peer, request);
-    let (response, body) = match drive(prepare, context).await {
-        Ok(prepared) => {
-            // Only a caller read names the group; a sync relationship knows its own bucket.
-            let response = match prepared.group_id.filter(|_| !relationship) {
-                None => NativeReferenceResponse::Content(prepared.metadata),
-                Some(group_id) => NativeReferenceResponse::Described {
-                    metadata: prepared.metadata,
-                    group_id,
-                },
-            };
-            (response, prepared.body)
-        }
-        Err(reject) => (NativeReferenceResponse::Rejected(reject), None),
-    };
-    native::write_answer(stream, peer, &response, body).await;
-}
-
-/// Serves one inbound notification stream: reads a request frame, runs the operation the trigger
-/// table names for it and writes its answer frame.
-#[tracing::instrument(
-    name = "notifications.incoming.stream",
-    level = "debug",
-    skip(context, stream),
-    fields(peer = %peer)
-)]
-async fn receive_notification(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        warn!(peer = %peer, "Dropping inbound notification stream without net handle");
-        return;
-    };
-    let frame = match read_frame(&mut stream).await {
-        Ok(frame) => frame,
-        Err(error) => {
-            warn!(peer = %peer, error = %error, "Failed to read notification message");
-            return;
-        }
-    };
-    if let Err(error) = drain_request(&mut stream).await {
-        warn!(peer = %peer, error = %error, "Failed to drain notification request stream");
-        close_stream(&mut stream).await;
-        return;
-    }
-    let input = PeerInput {
-        alpn: Alpn::Notification,
-        peer,
-        local_node: net_handle.node_id(),
-        local_realm: *net_handle.realm_id(),
-        now_ms: unix_timestamp_millis(),
-        frame: &frame,
-    };
-    let written = match peer_operation(input) {
-        // The same bound the config read had before, so a slow store cannot hold the stream.
-        Some(operation) => {
-            let build = || operation.clone();
-            let deadline = tokio::time::Instant::now() + NOTIFICATION_AUTH_TIMEOUT;
-            match drive_retry_until(build, context, peer.as_bytes(), deadline).await {
-                Ok(answer) => write_frame(&mut stream, &answer).await,
-                Err(error) => Err(error.to_string()),
-            }
-        }
-        // Every request has an operation; an answer frame sent as a request is refused.
-        None => match postcard::from_bytes::<NotificationTransportMessage>(&frame) {
-            Ok(message) => {
-                debug!(peer = %peer, message = message.label(), "Received notification message");
-                let reason = "unexpected notification control message".to_string();
-                let response = NotificationTransportMessage::Reject(reason);
-                write_message(&mut stream, &response).await
-            }
-            Err(error) => Err(error.to_string()),
-        },
-    };
-    if let Err(error) = written {
-        warn!(peer = %peer, error = %error, "Failed to write notification response");
-    }
-    close_stream(&mut stream).await;
-}
-
-/// Reads one bounded heartbeat frame of `peer` within the stream limits and keeps it through
-/// the heartbeat operation; every refusal is only logged.
-async fn receive_heartbeat(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return;
-    };
-    let Some(_slot) = net_handle.heartbeat_slot(peer) else {
-        debug!(%peer, "Dropping a heartbeat stream past the stream limits");
-        return;
-    };
-    let read = tokio::time::timeout(HEARTBEAT_IO_TIMEOUT, heartbeat_frame(&mut stream)).await;
-    let _ = stream.0.finish();
-    let frame = match read {
-        Ok(Ok(frame)) => frame,
-        Ok(Err(error)) => {
-            debug!(%peer, %error, "Dropping an invalid heartbeat");
-            return;
-        }
-        Err(_) => {
-            debug!(%peer, "Heartbeat read timed out");
-            return;
-        }
-    };
-    let receive = ReceiveHeartbeatOperation::new(peer, *net_handle.realm_id(), frame);
-    if let Err(error) = drive(receive, context).await {
-        debug!(%peer, %error, "Heartbeat not kept");
-    }
-}
-
-/// One length-prefixed heartbeat frame, at most [`MAX_HEARTBEAT_BYTES`] long.
-async fn heartbeat_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
-    use tokio::io::AsyncReadExt;
-    let mut length = [0u8; 4];
-    stream
-        .1
-        .read_exact(&mut length)
-        .await
-        .map_err(|error| error.to_string())?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_HEARTBEAT_BYTES {
-        return Err("heartbeat frame exceeds the size limit".to_string());
-    }
-    let mut bytes = vec![0u8; length];
-    stream
-        .1
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(bytes)
-}
-
-/// Answers one inbound shard manifest request on `stream`.
-#[tracing::instrument(
-    name = "shard.incoming.stream",
-    level = "debug",
-    skip(context, stream),
-    fields(peer = %peer)
-)]
-async fn serve_shard_stream(
-    context: &DriverContext,
-    mut stream: aruna_net::streams::BiStream,
-    peer: NodeId,
-) {
-    use aruna_net::shard_manifest::{
-        close_shard_stream, read_manifest_request, write_manifest, write_rejection,
-    };
-    let Some(local) = context.node_and_realm() else {
-        warn!(peer = %peer, "Dropping inbound shard stream without net handle");
-        return;
-    };
-    let message = match read_manifest_request(&mut stream).await {
-        Ok(message) => message,
-        Err(error) => {
-            warn!(peer = %peer, error = %error, "Failed to read shard manifest request");
-            return;
-        }
-    };
-    let serve = ServeManifestOperation::new(local, peer, message);
-    let written = match drive(serve, context).await {
-        Ok(ManifestAnswer::Manifest(manifest)) => write_manifest(&mut stream, &manifest).await,
-        Ok(ManifestAnswer::Reject(reason)) => write_rejection(&mut stream, reason).await,
-        Err(error) => write_rejection(&mut stream, error.to_string()).await,
-    };
-    if let Err(error) = written {
-        warn!(peer = %peer, error = %error, "Failed to write shard manifest response");
-    }
-    close_shard_stream(&mut stream).await;
-}
-
 /// Reconciles the metadata store with document sync and prunes deleted graphs.
 async fn run_maintenance(context: &DriverContext, source: &'static str, attempt: usize) {
     let Some(graph) = context.graph_handle.as_ref() else {
@@ -1104,19 +959,19 @@ async fn run_maintenance(context: &DriverContext, source: &'static str, attempt:
 mod tests {
     use super::*;
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::replication_protocol::{
+        LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
+    };
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
-    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
-    use aruna_operations::replication::protocol::{
-        LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
-    };
-    use aruna_storage::FjallStorage;
+    use aruna_core::user::id::UserId;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -1187,7 +1042,7 @@ mod tests {
             outbound_handle: None,
         };
         let documents = vec![evicted(1), evicted(2)];
-        let (failed, receivers) = aruna_storage::StorageHandle::new();
+        let (failed, receivers) = aruna_storage::storage::handle::StorageHandle::new();
         drop(receivers);
         let failed = context(failed);
         assert!(!reemit_evicted_documents(&failed, documents.clone()).await);
@@ -1301,41 +1156,66 @@ mod tests {
         net_b.shutdown().await;
     }
 
+    /// A node context with storage, net and metadata below `dir`, and its net handle.
+    async fn fixture_context(
+        dir: &tempfile::TempDir,
+    ) -> (aruna_net::NetHandle, Arc<DriverContext>) {
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let net = aruna_net::NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                sync_storage_path: Some(dir.path().join("document-sync")),
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let graph_handle = aruna_graph::GraphHandle::open(
+            dir.path().join("metadata"),
+            net.node_id(),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
+            aruna_graph::GraphOptions::default(),
+        )
+        .unwrap();
+        storage.install_metadata_indexes(dir.path().join("metadata"));
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            graph_handle: Some(graph_handle),
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        });
+        (net, context)
+    }
+
+    // The handler holds the context that holds the net handle, so only deregistering it lets
+    // the net, its sync service and that service's folder go.
+    #[tokio::test]
+    async fn dropped_fixture_deregisters() {
+        let dir = tempdir().unwrap();
+        let (net, context) = fixture_context(&dir).await;
+        let fixture = initialize_incoming_fixture(context.clone()).expect("net handle installs");
+        let handler = fixture.handler.clone();
+        drop(fixture);
+        assert_eq!(
+            handler.strong_count(),
+            0,
+            "the net handle let the handler go"
+        );
+        net.shutdown().await;
+    }
+
     #[tokio::test]
     async fn fixtures_stop_cleanly() {
         for _ in 0..2 {
             let dir = tempdir().unwrap();
-            let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-            let net = aruna_net::NetHandle::new(
-                NetConfig {
-                    bind_addr: "127.0.0.1:0".parse().unwrap(),
-                    discovery_method: DiscoveryMethod::None,
-                    relay_method: RelayMethod::None,
-                    sync_storage_path: Some(dir.path().join("document-sync")),
-                    ..NetConfig::default()
-                },
-                storage.clone(),
-            )
-            .await
-            .unwrap();
-            let graph_handle = aruna_graph::GraphHandle::open(
-                dir.path().join("metadata"),
-                net.node_id(),
-                Some(net.document_sync_node()),
-                Some(net.document_sync_database()),
-                aruna_graph::GraphOptions::default(),
-            )
-            .unwrap();
-            storage.install_metadata_indexes(dir.path().join("metadata"));
-            let context = Arc::new(DriverContext {
-                storage_handle: storage,
-                net_handle: Some(net.clone()),
-                blob_handle: None,
-                graph_handle: Some(graph_handle),
-                task_handle: None,
-                compute_handle: None,
-                outbound_handle: None,
-            });
+            let (net, context) = fixture_context(&dir).await;
 
             let fixture =
                 initialize_incoming_fixture(context.clone()).expect("net handle installs");

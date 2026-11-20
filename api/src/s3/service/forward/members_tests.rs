@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::dto::{GetObjectInput, PutObjectInput, StreamingBlob};
 use s3s::{S3, S3Request};
@@ -18,7 +18,7 @@ use crate::tests::members::{BUCKET, Members, members};
 async fn snapshot_of(
     service: &crate::s3::service::ArunaS3Service,
     binding: &aruna_core::structs::storage::distribution::DistributionBinding,
-) -> aruna_core::structs::storage::distribution::DistributionSnapshot {
+) -> aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot {
     let view = aruna_operations::distribution::routing::bound_view(binding);
     let view = aruna_drivers::driver::drive(view, service.state.as_ref());
     view.await.unwrap().head.snapshot
@@ -376,7 +376,7 @@ async fn origin_of(
     let node = &members.nodes[on];
     let local = (members.realm_id, node.node_id());
     let view = aruna_drivers::driver::drive(
-        aruna_operations::s3::object::origin::ReadOriginOperation::new(local.0, BUCKET, key, None),
+        aruna_operations::transfer::origin::ReadOriginOperation::new(local.0, BUCKET, key, None),
         &node.context,
     )
     .await
@@ -426,7 +426,8 @@ async fn copy_streams_source() {
 // A copy signed with a run's workspace credential records the run, on every copy path.
 #[tokio::test]
 async fn copy_records_run() {
-    use aruna_core::structs::execution::job::{JobId, workspace_credential_id};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::local::workspace_credential_id;
     use aruna_core::structs::storage::origin::VersionOrigin;
     let members = members(3, &["h", "p"], 0).await;
     let job_id = JobId::from_bytes([7; 16]);
@@ -767,7 +768,7 @@ async fn listing_merges_ranges() {
 async fn hidden_link(members: &Members, on: usize, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let node = &members.nodes[on];
     let target = LinkTarget {
         arn: VersionedObjectArn {
@@ -1252,7 +1253,7 @@ async fn uploads_merge_ranges() {
 // across its key ranges, as the S3 listing does, and every name is checked for Everyone.
 #[tokio::test]
 async fn folder_spans_ranges() {
-    use aruna_core::UserId;
+    use aruna_core::user::id::UserId;
     let members = members(3, &["f/m", "p"], 0).await;
     for key in ["f/a.txt", "f/z.txt", "g/other"] {
         put(&members, 0, key, b"public").await;
@@ -1529,19 +1530,19 @@ async fn copy_read_marked() {
     copy_rows(&members, 1, 2).await;
     let binding = members.nodes[0].bucket().await.distribution.unwrap();
     let snapshot = snapshot_of(&members.nodes[0].service, &binding).await;
-    let copy = super::Forward {
+    let copy = aruna_operations::s3::object::member::read::MemberTarget {
         set_id: binding.set_id,
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),
     };
-    let read = || super::ForwardRequest {
+    let read = || aruna_operations::s3::object::member::read::MemberRequest {
         method: aruna_core::member_read::MemberMethod::Get,
         operation: "GetObject",
         bucket: BUCKET.to_string(),
         key: "k/1".to_string(),
         query: None,
         headers: Vec::new(),
-        body: super::ForwardBody::Empty,
+        body: aruna_operations::s3::object::member::read::MemberPayload::Empty,
     };
     let service = &members.nodes[0].service;
     let error = service

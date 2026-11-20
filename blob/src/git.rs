@@ -98,6 +98,11 @@ impl GitStore {
         time_stage("git_document_lock", self.documents.lock(document_id)).await
     }
 
+    /// Waits from blocking code for the lock every effect on repository `id` runs under.
+    pub fn hold_repository(&self, id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.locks.mutex(id).blocking_lock_owned()
+    }
+
     /// The document lock when it is free; reads use it to avoid waiting for a running snapshot.
     pub fn try_lock(&self, document_id: ulid::Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.documents.try_lock(document_id)
@@ -111,7 +116,7 @@ impl GitStore {
     pub async fn execute(
         &self,
         effect: GitEffect,
-        actor: aruna_core::UserId,
+        actor: aruna_core::user::id::UserId,
     ) -> std::io::Result<GitEvent> {
         if let GitEffect::Layout {
             document_id,
@@ -383,7 +388,7 @@ impl GitStore {
 /// Records the settings last applied, so a configured repository needs no Git process.
 const SETTINGS: &str = "aruna-settings";
 
-fn settings(hooks: &str) -> [(&'static str, &str); 7] {
+fn settings(hooks: &str) -> [(&'static str, &str); 8] {
     [
         ("core.hooksPath", hooks),
         ("http.receivepack", "true"),
@@ -393,6 +398,8 @@ fn settings(hooks: &str) -> [(&'static str, &str); 7] {
         ("core.logAllRefUpdates", "true"),
         // The repository is a cache rebuilt from the replicated records, so it skips disk syncs.
         ("core.fsync", "none"),
+        // An automatic repack after a push runs inside the push, under the repository lock.
+        ("gc.autoDetach", "false"),
     ]
 }
 
@@ -597,7 +604,9 @@ mod tests {
             directory.path().to_path_buf(),
             "helper".into(),
         ));
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let busy = ulid::Ulid::from(1);
         let held = store.locks.lock(busy).await;
         let waiting = (0..2)
@@ -625,7 +634,9 @@ mod tests {
     async fn layouts_stay_known() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = GitStore::new(directory.path().to_path_buf(), "helper".into());
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let id = ulid::Ulid::from(3);
         let repository = directory.path().join(format!("{id}.git"));
         let run = |args: &[&str]| {
@@ -682,7 +693,9 @@ mod tests {
         let helper = directory.path().join("helper");
         let store = GitStore::new(directory.path().join("git"), helper);
         let id = ulid::Ulid::from(7);
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let repository = directory.path().join("git").join(format!("{id}.git"));
         let config = || async {
             tokio::fs::metadata(repository.join("config"))

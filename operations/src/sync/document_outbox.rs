@@ -12,13 +12,12 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
-use aruna_core::rows::{event, page};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use tracing::warn;
 
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     ADMIN_OUTBOX_PREFIX, outbox_stream_prefixes, revocation_index_key,
 };
 
@@ -198,7 +197,7 @@ impl Operation for OutboxTailsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ApplyError> {
-        let values = match event(result)? {
+        let values = match result.event()? {
             Event::Storage(StorageEvent::IterResult { values, .. }) => values,
             Event::Storage(StorageEvent::Error { error }) => {
                 return Err(ApplyError::Storage(error));
@@ -249,12 +248,12 @@ impl Operation for OutboxTimerOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ApplyError> {
         if self.arming {
-            return match event(result)? {
+            return match result.event()? {
                 Event::Task(TaskEvent::Error { message, .. }) => Err(ApplyError::Failed(message)),
                 _ => Ok(Next::Done(())),
             };
         }
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         if rows.is_empty() {
             return Ok(Next::Done(()));
         }
@@ -270,28 +269,27 @@ impl Operation for OutboxTimerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::outbox_record::{
+    use crate::sync::outbox::record::{
         OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
     };
-    use crate::sync::outbox_record::{
-        new_identified_record, new_outbox_record, write_outbox_effect,
-    };
-    use crate::testing::{read_outbox_record, read_outbox_records};
-    use aruna_core::NodeId;
-    use aruna_core::UserId;
+    use crate::sync::outbox::record::{new_identified_record, write_outbox_effect};
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
     use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
     use aruna_core::handle::Handle;
+    use aruna_core::id::NodeId;
     use aruna_core::row_plan::PlanOperation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use aruna_drivers::testing::test_context;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -442,7 +440,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let corrupt_key = b"000-corrupt-outbox".to_vec();
-        let valid = new_outbox_record(
+        let valid = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -499,7 +498,8 @@ mod tests {
     #[test]
     fn record_roundtrip_deduplicates() {
         let peer = node(3);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![peer, peer],
@@ -519,7 +519,8 @@ mod tests {
 
     #[test]
     fn upsert_roundtrip_revision() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(3)],
@@ -545,7 +546,8 @@ mod tests {
 
     #[test]
     fn delete_roundtrip_revision() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(3)],
@@ -568,7 +570,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let left = new_outbox_record(
+        let left = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -576,7 +579,8 @@ mod tests {
             aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         );
-        let right = new_outbox_record(
+        let right = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -597,7 +601,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let mut older = new_outbox_record(
+        let mut older = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -606,7 +611,8 @@ mod tests {
             false,
         );
         older.outbox_id = Ulid::from_parts(1, 0);
-        let mut newer = new_outbox_record(
+        let mut newer = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig {
                 realm_id: RealmId::from_bytes([9u8; 32]),
@@ -625,7 +631,8 @@ mod tests {
     fn admin_keys_ordered() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let target = DocumentTarget::User { user_id };
-        let mut earlier = new_outbox_record(
+        let mut earlier = new_identified_record(
+            Ulid::generate(),
             node(1),
             target.clone(),
             Vec::new(),
@@ -634,7 +641,8 @@ mod tests {
             false,
         );
         earlier.outbox_id = Ulid::from_parts(2, 2);
-        let mut later = new_outbox_record(
+        let mut later = new_identified_record(
+            Ulid::generate(),
             node(1),
             target,
             Vec::new(),
@@ -652,7 +660,8 @@ mod tests {
     #[test]
     fn admin_prefix_scopes() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::User { user_id },
             Vec::new(),
@@ -669,7 +678,8 @@ mod tests {
     #[test]
     fn index_uses_key() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -690,7 +700,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -736,7 +747,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
-        let metadata = new_outbox_record(
+        let metadata = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -747,7 +759,8 @@ mod tests {
             aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         );
-        let admin = new_outbox_record(
+        let admin = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::User { user_id },
             Vec::new(),
@@ -797,7 +810,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),

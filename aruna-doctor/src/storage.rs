@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-pub use aruna_storage::snapshot::{SnapshotError, SnapshotStats};
+use aruna_storage::snapshot::{SnapshotError, SnapshotStats};
 use aruna_storage::snapshot::{SnapshotReader, SnapshotRecord, SnapshotWriter};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode};
 use std::fs::{File, OpenOptions};
@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TXN_ENTRY_LIMIT: usize = 1_000;
+/// Bytes of keys and values one import transaction holds before it commits, so large values
+/// commit in smaller batches than the entry limit alone gives.
+const TXN_BYTE_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportStats {
@@ -77,6 +80,8 @@ pub fn snapshot_database(
     Ok(stats)
 }
 
+/// Imports a snapshot into a new database at `target_db_path`. It is built in an owner-only
+/// staging folder and published only after the footer checked, so a failed import can retry.
 pub fn import_new_database(
     snapshot_path: impl AsRef<Path>,
     target_db_path: impl AsRef<Path>,
@@ -87,7 +92,26 @@ pub fn import_new_database(
 
     let file = File::open(snapshot_path)?;
     let mut reader = SnapshotReader::new(BufReader::new(file))?;
-    let db = OptimisticTxDatabase::builder(target_db_path)
+    // Every error drops the staging directory, which removes it.
+    let staging = staging_dir(target_db_path)?;
+    import_into(&mut reader, staging.path())?;
+    publish_dir(staging.path(), target_db_path)?;
+    let _published = staging.keep();
+    let stats = reader.stats();
+    Ok(ImportStats {
+        snapshot_created_unix: stats.created_unix_seconds,
+        keyspace_count: stats.keyspace_count,
+        entry_count: stats.entry_count,
+        target_path: target_db_path.to_path_buf(),
+    })
+}
+
+/// Writes every record into a new database at `target` and closes it again.
+fn import_into(
+    reader: &mut SnapshotReader<impl std::io::Read>,
+    target: &Path,
+) -> Result<(), SnapshotError> {
+    let db = OptimisticTxDatabase::builder(target)
         .manual_journal_persist(true)
         .open()?;
     let mut keyspace_state: Option<ImportKeyspaceState> = None;
@@ -95,7 +119,8 @@ pub fn import_new_database(
     while let Some(record) = reader.next_record()? {
         match record {
             SnapshotRecord::Keyspace(name) => {
-                let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
+                let keyspace =
+                    db.keyspace(keyspace_name(&name)?, KeyspaceCreateOptions::default)?;
                 keyspace_state = Some(ImportKeyspaceState::new(keyspace));
             }
             SnapshotRecord::Entry { key, value } => {
@@ -112,13 +137,18 @@ pub fn import_new_database(
     }
 
     db.persist(PersistMode::Buffer)?;
-    let stats = reader.stats();
-    Ok(ImportStats {
-        snapshot_created_unix: stats.created_unix_seconds,
-        keyspace_count: stats.keyspace_count,
-        entry_count: stats.entry_count,
-        target_path: target_db_path.to_path_buf(),
-    })
+    Ok(())
+}
+
+/// A bare Fjall keyspace name from a snapshot: Fjall asserts a name is nonempty and at most 255
+/// bytes, so a damaged one must fail the import instead.
+pub(crate) fn keyspace_name(name: &str) -> Result<&str, SnapshotError> {
+    if name.is_empty() || name.len() > usize::from(u8::MAX) {
+        return Err(SnapshotError::InvalidStructure(
+            "invalid keyspace name in snapshot",
+        ));
+    }
+    Ok(name)
 }
 
 pub(crate) fn unix_now() -> Result<u64, SnapshotError> {
@@ -128,11 +158,12 @@ pub(crate) fn unix_now() -> Result<u64, SnapshotError> {
         .as_secs())
 }
 
-/// Commits one keyspace's imported entries in transactions of bounded size.
+/// Commits one keyspace's imported entries in transactions of bounded entries and bytes.
 pub(crate) struct ImportKeyspaceState {
     keyspace: OptimisticTxKeyspace,
     pending_txn: Option<fjall::OptimisticWriteTx>,
     pending_txn_entries: usize,
+    pending_txn_bytes: usize,
 }
 
 impl ImportKeyspaceState {
@@ -141,6 +172,7 @@ impl ImportKeyspaceState {
             keyspace,
             pending_txn: None,
             pending_txn_entries: 0,
+            pending_txn_bytes: 0,
         }
     }
 
@@ -155,11 +187,12 @@ impl ImportKeyspaceState {
         }
 
         if let Some(txn) = self.pending_txn.as_mut() {
+            self.pending_txn_bytes += key.len() + value.len();
             txn.insert(self.keyspace.clone(), key, value);
             self.pending_txn_entries += 1;
         }
 
-        if self.pending_txn_entries >= TXN_ENTRY_LIMIT {
+        if self.pending_txn_entries >= TXN_ENTRY_LIMIT || self.pending_txn_bytes >= TXN_BYTE_LIMIT {
             self.commit_pending_txn()?;
         }
 
@@ -175,8 +208,78 @@ impl ImportKeyspaceState {
             let _ = txn.commit()?;
         }
         self.pending_txn_entries = 0;
+        self.pending_txn_bytes = 0;
         Ok(())
     }
+}
+
+/// An empty directory beside `target` that only its owner may enter, uniquely named so a crashed
+/// run leaves nothing that blocks the next one.
+pub(crate) fn staging_dir(target: &Path) -> std::io::Result<tempfile::TempDir> {
+    let parent = parent_dir(target);
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".restore-");
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    builder.tempdir_in(parent)
+}
+
+/// Moves the finished `staging` directory to `target`, refusing even an empty directory that
+/// appeared there meanwhile; Windows refuses to rename over a directory by itself.
+pub(crate) fn publish_dir(staging: &Path, target: &Path) -> Result<(), SnapshotError> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let moved = {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, staging, CWD, target, RenameFlags::NOREPLACE)
+            .map_err(std::io::Error::from)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let moved = std::fs::rename(staging, target);
+    match moved {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(SnapshotError::TargetPathExists(target.to_path_buf()));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // The rename is durable only once the directory that now names the target is synced.
+    sync_dir(parent_dir(target))?;
+    Ok(())
+}
+
+/// The directory that holds `target`, the working directory for a bare name.
+fn parent_dir(target: &Path) -> &Path {
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Syncs every file and directory below and including `root`, so restored files are durable
+/// before they are published; answers how many it synced.
+pub(crate) fn sync_tree(root: &Path) -> std::io::Result<usize> {
+    let mut synced = 0;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            synced += sync_tree(&entry.path())?;
+        } else if file_type.is_file() {
+            File::open(entry.path())?.sync_all()?;
+            synced += 1;
+        }
+    }
+    sync_dir(root)?;
+    Ok(synced + 1)
+}
+
+/// Syncs a directory's entries; Windows cannot open a directory to sync it, and needs no sync.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 pub(crate) fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
@@ -199,13 +302,13 @@ pub(crate) fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotEr
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyspaceCreateOptions, OptimisticTxDatabase, SnapshotError, import_new_database,
-        snapshot_database,
+        ImportKeyspaceState, KeyspaceCreateOptions, OptimisticTxDatabase, TXN_BYTE_LIMIT,
+        import_new_database, snapshot_database,
     };
     use crate::tests::fixtures::env_lock;
-    use aruna::config::load;
     use aruna_api::server::state::ServerState;
     use aruna_blob::blob::BlobHandler;
+    use aruna_config::load;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
@@ -216,7 +319,8 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::testing::EnvGuard;
     use aruna_drivers::driver::{DriverContext, drive, node_routing};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
@@ -226,6 +330,7 @@ mod tests {
     };
     use aruna_operations::s3::bucket::create::CreateBucketOperation;
     use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use aruna_storage::snapshot::SnapshotError;
     use aruna_tasks::TaskHandle;
     use fjall::Readable;
     use std::collections::BTreeMap;
@@ -234,6 +339,58 @@ mod tests {
     use tempfile::tempdir;
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
+
+    // A bare keyspace name Fjall would refuse fails the import instead of panicking, and the
+    // failed import leaves nothing at its destination, so it can be retried there.
+    #[test]
+    fn bad_name_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("imported");
+        for name in [String::new(), "k".repeat(256)] {
+            let mut writer = aruna_storage::snapshot::SnapshotWriter::new(Vec::new(), 1).unwrap();
+            writer.begin_keyspace(&name).unwrap();
+            writer.end_keyspace().unwrap();
+            let file = dir.path().join("bad.snapshot");
+            std::fs::write(&file, writer.finish().unwrap().0).unwrap();
+            assert!(import_new_database(&file, &target).is_err());
+            assert!(!target.exists(), "a failed import publishes nothing");
+        }
+        let staged = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(staged, 1, "only the snapshot file is left");
+    }
+
+    // Every restored file and directory is synced, each once.
+    #[test]
+    fn tree_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("one.git/objects")).unwrap();
+        std::fs::write(dir.path().join("one.git/HEAD"), b"ref").unwrap();
+        std::fs::write(dir.path().join("one.git/objects/pack"), b"data").unwrap();
+        assert_eq!(super::sync_tree(dir.path()).unwrap(), 5);
+    }
+
+    // Large values commit once their bytes reach the limit, long before the entry limit.
+    #[test]
+    fn large_values_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OptimisticTxDatabase::builder(dir.path()).open().unwrap();
+        let keyspace = db
+            .keyspace("large", KeyspaceCreateOptions::default)
+            .unwrap();
+        let mut state = ImportKeyspaceState::new(keyspace);
+        state.insert(&db, b"a".to_vec(), vec![0; 16]).unwrap();
+        assert!(
+            state.pending_txn.is_some(),
+            "a small value waits for its batch"
+        );
+        state
+            .insert(&db, b"b".to_vec(), vec![0; TXN_BYTE_LIMIT])
+            .unwrap();
+        assert!(
+            state.pending_txn.is_none(),
+            "the batch committed on its bytes"
+        );
+    }
 
     #[tokio::test]
     async fn snapshot_preserves_data() {
@@ -320,7 +477,8 @@ mod tests {
             )
             .await;
 
-            let realm_admin = aruna_core::UserId::local(Ulid::generate(), config.realm_id);
+            let realm_admin =
+                aruna_core::user::id::UserId::local(Ulid::generate(), config.realm_id);
             drive(
                 CreateRealmOperation::new(CreateRealmConfig {
                     actor: Actor {

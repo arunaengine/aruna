@@ -94,10 +94,11 @@ impl Operation for ListGroupOperation {
 mod test {
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::list_groups::ListGroupOperation;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -107,7 +108,7 @@ mod test {
     pub async fn test_list_group() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),

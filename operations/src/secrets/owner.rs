@@ -12,6 +12,7 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -31,13 +32,13 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRec
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, TxnId};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, drains, widening_notices};
-use crate::s3::session::{draw_secret, drawn_secret};
-use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox::record::{new_identified_record, outbox_write_entry};
+use aruna_core::compute::{draw_secret, drawn_secret};
 
 /// Register documents read per page.
 const PAGE: usize = 256;
@@ -516,13 +517,13 @@ impl Operation for OwnerSecretOperation {
                     self.reader.start(None),
                 ))))
             }
-            Stage::Reading => match self.reader.step(rows::event(result)?, None)? {
+            Stage::Reading => match self.reader.step(result.event()?, None)? {
                 Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
                 None => self.read_managers(),
             },
-            Stage::Managers => self.write(rows::value(result)?.as_deref()),
+            Stage::Managers => self.write(result.value()?.as_deref()),
             Stage::Write => {
-                rows::done(result)?;
+                result.done()?;
                 Ok(Next::Then {
                     output: self.result.take().flatten(),
                     calls: drains(self.notices),
@@ -635,10 +636,10 @@ impl Operation for OwnerSecretsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
         if self.view.is_none() {
-            self.view = Some(WriterView::read(rows::value(result)?.as_deref())?);
+            self.view = Some(WriterView::read(result.value()?.as_deref())?);
             return Ok(self.page(self.after.clone()));
         }
-        let (values, next) = rows::page(result)?;
+        let (values, next) = result.page()?;
         for (_, value) in values {
             self.documents.push(SecretDocument::from_bytes(&value)?);
         }
@@ -722,10 +723,10 @@ impl Operation for ReadbackOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
         if let Some(entry) = self.entry.take() {
-            rows::done(result)?;
+            result.done()?;
             return Ok(Next::Done(entry));
         }
-        match self.reader.step(rows::event(result)?, None)? {
+        match self.reader.step(result.event()?, None)? {
             Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
             None => self.audit(),
         }

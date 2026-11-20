@@ -8,7 +8,7 @@ use aruna_core::jobs::RunningJobView;
 use aruna_core::keyspaces::JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::PrefixPages;
-use aruna_core::structs::execution::job::JobRecord;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::types::GroupId;
 use std::collections::HashMap;
 use thiserror::Error;

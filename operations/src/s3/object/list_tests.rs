@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::s3::test_storage;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
@@ -17,9 +15,11 @@ use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersion
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
 use aruna_storage::storage;
+use aruna_test_support::s3::test_storage;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -481,7 +481,7 @@ async fn reference_object_lists() {
 }
 
 async fn seed_materialized_keys(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     bucket: &str,
     keys: &[&str],
     created_by: UserId,
@@ -551,7 +551,7 @@ async fn seed_materialized_keys(
 }
 
 async fn seed_deleted_keys(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     bucket: &str,
     keys: &[&str],
     created_by: UserId,
@@ -1153,11 +1153,12 @@ async fn markers_skipped() {
 
 #[tokio::test]
 async fn pending_archives_listed() {
-    use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+    use crate::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
     use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
     use aruna_core::structs::storage::blob::ArchiveKey;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::PithosLayout;
+    use aruna_core::structs::storage::listing::ListVersionsItem;
 
     let (_temp_handle, storage_handle) = test_storage();
     let driver_ctx = test_context(storage_handle.clone());

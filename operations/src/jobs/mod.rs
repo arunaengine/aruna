@@ -6,7 +6,6 @@ use std::time::Duration;
 
 pub mod backend_import;
 pub mod backend_record;
-pub(crate) mod blob_request;
 pub mod command;
 pub mod copy;
 pub mod demand;
@@ -19,12 +18,7 @@ pub mod handed_imports;
 pub mod harvest;
 pub mod import;
 mod import_listing;
-pub mod job_artifacts;
-pub mod job_cancel;
-pub mod job_delete;
-pub mod job_reads;
-pub mod job_reports;
-pub mod job_routes;
+pub mod job;
 pub mod key_locks;
 pub mod key_wake;
 pub mod lifecycle;
@@ -37,7 +31,6 @@ pub mod persistent_id;
 pub mod protocol;
 pub mod prune;
 pub mod quota;
-pub mod read_access;
 pub mod recent;
 pub mod records;
 pub mod remote_key;
@@ -53,8 +46,6 @@ pub mod store;
 #[cfg(test)]
 mod submission_tests;
 pub mod submit;
-pub mod submit_execution;
-pub mod submit_local;
 pub mod workflow;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
@@ -64,7 +55,7 @@ pub const JOB_HEARTBEAT_MS: u64 = 20_000;
 /// Attempts before a retryable failure becomes terminal `Failed`.
 pub const JOB_MAX_ATTEMPTS: u32 = 5;
 /// Default terminal-state retention before pruning.
-pub const JOB_RETENTION_MS: u64 = aruna_core::structs::execution::job::RETENTION_MS;
+pub const JOB_RETENTION_MS: u64 = aruna_core::structs::execution::job::identity::RETENTION_MS;
 /// Minimum spacing between throttled progress flushes.
 pub const FLUSH_INTERVAL_MS: u64 = 500;
 /// Bounded OCC retries when a job mutation transaction conflicts.

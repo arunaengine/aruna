@@ -10,25 +10,31 @@ use aruna::bootstrap::{
     fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use aruna::config::{Config, resolve_settings};
-use aruna::identity::{mark_onboarding_phase, mark_state_complete};
-use aruna::inbound::initialize_incoming_fixture;
-use aruna::settings::read_settings_from;
-use aruna::tasks::incoming::start_task_queues;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
-use aruna_api::routes::credentials::{CreatePathRestriction, CreateS3Request, CreateS3Response};
-use aruna_api::routes::groups::{CreateGroupRequest, CreateGroupResponse, GroupInfoResponse};
-use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
+use aruna_api::routes::access::credentials::{
+    CreatePathRestriction, CreateS3Request, CreateS3Response,
+};
+use aruna_api::routes::access::groups::{
+    CreateGroupRequest, CreateGroupResponse, GroupInfoResponse,
+};
+use aruna_api::s3::server::{S3Server, S3ServerHandle};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_blob::blob::{BackendRegistry, BlobHandler};
-use aruna_compute::ExecutorRegistry;
-use aruna_core::UserId;
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::BackendRegistry;
+use aruna_clock::testing::poll_until;
+use aruna_compute::registry::ExecutorRegistry;
+use aruna_config::identity::{mark_onboarding_phase, mark_state_complete};
+use aruna_config::settings::read_settings_from;
+use aruna_config::{Config, resolve_settings};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
+use aruna_core::listener::S3ServerTimeouts;
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::onboarding::{
     CreateSecretRequest, CreateSecretResponse, OnboardingMode, OnboardingPhase,
 };
@@ -39,12 +45,15 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::node::info::flows::SeedInfoOperation;
-use aruna_operations::placement::policy::{SubjectScanMode, SubjectSyncOperation, SubjectTrigger};
+use aruna_operations::placement::policy::reconcile::{SubjectSyncOperation, SubjectTrigger};
+use aruna_operations::placement::policy::subject::SubjectScanMode;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -52,7 +61,8 @@ use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperat
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::s3::access::get::GetAccessOperation;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -66,14 +76,13 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, timeout as time_limit};
+use tokio::time::timeout as time_limit;
 use ulid::Ulid;
 
 pub(crate) type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub(crate) const AWS_REGION: &str = "eu-central-1";
 pub(crate) const WAIT_CAP: Duration = Duration::from_secs(300);
 const CONDITION_CAP: Duration = Duration::from_secs(30);
-const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Deadlock cap for one shutdown phase: far above any honest shutdown, so a
 /// stuck child is reported by name instead of hanging until the job timeout.
 const SHUTDOWN_CAP: Duration = Duration::from_secs(120);
@@ -172,6 +181,8 @@ pub(crate) struct SeedNode {
     server_task: JoinHandle<()>,
     s3_task: Option<S3ServerHandle>,
     ops_task: JoinHandle<()>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 impl SeedNode {
@@ -201,6 +212,8 @@ pub(crate) struct JoinerNode {
     pub(crate) s3: Option<S3Endpoint>,
     server_task: JoinHandle<()>,
     s3_task: Option<S3ServerHandle>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 impl JoinerNode {
@@ -244,33 +257,31 @@ pub(crate) async fn shutdown_pair(joiner: JoinerNode, seed: SeedNode) {
     tokio::join!(joiner.shutdown(), seed.shutdown());
 }
 
+/// Asks `condition` until it holds, each ask capped at `CONDITION_CAP`, through the shared
+/// bounded poll; fails once `timeout` has passed.
 pub(crate) async fn wait_until<F, Fut>(
     description: &str,
     timeout: Duration,
-    mut interval: Duration,
     mut condition: F,
 ) -> TestResult<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if time_limit(timeout.min(CONDITION_CAP), condition())
-            .await
-            .is_ok_and(|ready| ready)
-        {
-            return Ok(());
+    let cap = timeout.min(CONDITION_CAP);
+    let held = poll_until(timeout, || {
+        let ask = condition();
+        async move {
+            time_limit(cap, ask)
+                .await
+                .is_ok_and(|ready| ready)
+                .then_some(())
         }
-        if Instant::now() >= deadline {
-            return Err(
-                std::io::Error::other(format!("timed out waiting for {description}")).into(),
-            );
-        }
-        sleep(interval).await;
-        // Heavy predicates (HTTP plus S3 round trips) must not busy-poll a
-        // loaded node for the whole cap.
-        interval = interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
+    })
+    .await;
+    match held {
+        Some(()) => Ok(()),
+        None => Err(std::io::Error::other(format!("timed out waiting for {description}")).into()),
     }
 }
 
@@ -279,20 +290,15 @@ pub(crate) async fn wait_realm_nodes(
     realm_id: &RealmId,
     expected: usize,
 ) -> TestResult<()> {
-    wait_until(
-        "realm node convergence",
-        WAIT_CAP,
-        Duration::from_millis(100),
-        || async {
-            for context in contexts {
-                match drive(GetNodesOperation::new(*realm_id), context).await {
-                    Ok(nodes) if nodes.len() == expected => {}
-                    _ => return false,
-                }
+    wait_until("realm node convergence", WAIT_CAP, || async {
+        for context in contexts {
+            match drive(GetNodesOperation::new(*realm_id), context).await {
+                Ok(nodes) if nodes.len() == expected => {}
+                _ => return false,
             }
-            true
-        },
-    )
+        }
+        true
+    })
     .await
 }
 
@@ -454,16 +460,11 @@ pub(crate) async fn wait_group_http(
     bearer_token: &str,
     group_id: &str,
 ) -> TestResult<GroupInfoResponse> {
-    wait_until(
-        "group visibility over REST",
-        WAIT_CAP,
-        Duration::from_millis(100),
-        || async {
-            get_group_http(base_url, bearer_token, group_id)
-                .await
-                .is_ok()
-        },
-    )
+    wait_until("group visibility over REST", WAIT_CAP, || async {
+        get_group_http(base_url, bearer_token, group_id)
+            .await
+            .is_ok()
+    })
     .await?;
 
     get_group_http(base_url, bearer_token, group_id).await
@@ -475,16 +476,11 @@ pub(crate) async fn wait_group_member(
     bearer_token: &str,
     group_id: &str,
 ) -> TestResult<()> {
-    wait_until(
-        "group membership over REST",
-        WAIT_CAP,
-        Duration::from_millis(100),
-        || async {
-            get_group_http(base_url, bearer_token, group_id)
-                .await
-                .is_ok_and(|group| group.dataset_location.is_some())
-        },
-    )
+    wait_until("group membership over REST", WAIT_CAP, || async {
+        get_group_http(base_url, bearer_token, group_id)
+            .await
+            .is_ok_and(|group| group.dataset_location.is_some())
+    })
     .await
 }
 
@@ -513,11 +509,9 @@ pub(crate) async fn request_credentials(
     group_id: &str,
     path_restrictions: Option<Vec<CreatePathRestriction>>,
 ) -> TestResult<S3Credentials> {
-    let client = reqwest::Client::new();
-    let deadline = Instant::now() + WAIT_CAP;
-    let mut interval = Duration::from_millis(100);
-    loop {
-        let response = client
+    let (client, path_restrictions) = (&reqwest::Client::new(), &path_restrictions);
+    let answered = poll_until(WAIT_CAP, move || async move {
+        let sent = client
             .post(format!("{base_url}/api/v1/access/credentials"))
             .bearer_auth(bearer_token)
             .json(&CreateS3Request {
@@ -528,26 +522,31 @@ pub(crate) async fn request_credentials(
                 token_public_key: None,
             })
             .send()
-            .await?;
-        if response.status() == StatusCode::CREATED {
-            let response: CreateS3Response = response.json().await?;
-            return Ok(S3Credentials {
-                access_key_id: response.access_key_id,
-                access_secret: response.access_secret,
-            });
+            .await;
+        match sent {
+            Ok(response) if response.status() == StatusCode::SERVICE_UNAVAILABLE => None,
+            sent => Some(sent),
         }
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if status != StatusCode::SERVICE_UNAVAILABLE || Instant::now() >= deadline {
-            return Err(std::io::Error::other(format!(
-                "unexpected create credentials status: {} body={}",
-                status, body
-            ))
-            .into());
-        }
-        sleep(interval).await;
-        interval = interval.saturating_mul(2).min(Duration::from_secs(1));
+    })
+    .await;
+    let Some(response) = answered else {
+        return Err(std::io::Error::other("create credentials stayed unavailable").into());
+    };
+    let response = response?;
+    if response.status() == StatusCode::CREATED {
+        let response: CreateS3Response = response.json().await?;
+        return Ok(S3Credentials {
+            access_key_id: response.access_key_id,
+            access_secret: response.access_secret,
+        });
     }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(std::io::Error::other(format!(
+        "unexpected create credentials status: {} body={}",
+        status, body
+    ))
+    .into())
 }
 
 #[allow(dead_code)]
@@ -726,7 +725,7 @@ pub(crate) async fn spawn_keyed_joiner(
 /// Stores a pending server identity with a chosen node key and a delegation the seed's realm key
 /// signs. Startup then refreshes the enrollment with it, as after a restart during onboarding.
 async fn store_pending_joiner(dir: &TempDir, seed: &SeedNode, net_key: [u8; 32]) -> TestResult<()> {
-    use aruna::identity::IdentityStore;
+    use aruna_config::identity::IdentityStore;
     use aruna_core::structs::identity::node_state::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
@@ -822,7 +821,7 @@ async fn spawn_seed_at(
         Some(_) => NodeVaultKey::derive(&[13; 32]),
         None => NodeVaultKey::random(),
     };
-    let context = initialize_context(
+    let (context, incoming) = initialize_context(
         storage,
         net.clone(),
         full_storage_config.as_ref(),
@@ -941,6 +940,7 @@ async fn spawn_seed_at(
         server_task,
         s3_task,
         ops_task,
+        _incoming: incoming,
     })
 }
 
@@ -977,7 +977,7 @@ async fn spawn_joiner_mode(
     .await?;
     let full_storage_config =
         (mode == NodeServiceMode::Full).then(|| FullStorageConfig::from_config(&config));
-    let joiner_context = initialize_context(
+    let (joiner_context, joiner_incoming) = initialize_context(
         storage_handle,
         joiner_net.clone(),
         full_storage_config.as_ref(),
@@ -1093,6 +1093,7 @@ async fn spawn_joiner_mode(
         s3,
         server_task,
         s3_task,
+        _incoming: joiner_incoming,
     })
 }
 
@@ -1102,7 +1103,7 @@ async fn initialize_context(
     full_storage_config: Option<&FullStorageConfig>,
     compute: Option<Arc<ExecutorRegistry>>,
     vault: NodeVaultKey,
-) -> TestResult<Arc<DriverContext>> {
+) -> TestResult<(Arc<DriverContext>, Option<IncomingFixture>)> {
     storage_handle.open_vault(vault);
     let task_handle = TaskHandle::new();
     let graph_handle = if let Some(config) = full_storage_config {
@@ -1142,7 +1143,7 @@ async fn initialize_context(
         compute_handle: compute,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
@@ -1151,7 +1152,7 @@ async fn initialize_context(
         &shutdown,
     )
     .await;
-    Ok(context)
+    Ok((context, incoming))
 }
 
 async fn announce_realm_presence(
@@ -1202,7 +1203,7 @@ async fn spawn_rest_server(
         state.clone(),
         ServerConfig {
             http_addr: addr,
-            max_body_size: aruna_api::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors: test_cors_config(),
         },
     );
@@ -1363,4 +1364,25 @@ pub(crate) async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client
         .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
     let client = s3_client(endpoint, &credentials);
     Ok((seed, client))
+}
+
+/// A healthy Docker daemon with its own state root, so tests that run at once never contend for
+/// one owner lock. The tests that need it are ignored by default, so a missing daemon fails them.
+#[cfg(feature = "docker")]
+pub async fn docker_backend() -> aruna_compute::executor::docker::DockerBackend {
+    use aruna_compute::executor::ExecutorBackend;
+    use aruna_compute::executor::docker::DockerBackend;
+    let config = aruna_compute::executor::config::DockerConfig {
+        keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
+        state_root: std::env::temp_dir()
+            .join("aruna-compute-tests")
+            .join(ulid::Ulid::generate().to_string()),
+        ..aruna_compute::executor::config::DockerConfig::default()
+    };
+    let backend = DockerBackend::with_config(config)
+        .unwrap_or_else(|error| panic!("no reachable docker daemon: {error}"));
+    if let Err(error) = backend.health().await {
+        panic!("docker daemon unhealthy: {error}");
+    }
+    backend
 }

@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobRecordEnvelope, JobRecordKind, PhysicalExecutionState,
 };
 use aruna_core::types::{Key, Value};

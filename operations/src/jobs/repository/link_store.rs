@@ -8,11 +8,10 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::repository::credential::RepositoryCredential;
+use aruna_core::repository::link::{LinkStatus, RepositoryLink, link_key, link_prefix};
 use aruna_core::repository::remote::NodeScope;
-use aruna_core::repository::{
-    LinkStatus, RepositoryCredential, RepositoryLink, link_key, link_prefix,
-};
-use aruna_core::rows::{PrefixPages, all_values, value};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::types::{Key, Value};
@@ -23,8 +22,8 @@ use super::links::{ChangeLinkOperation, LinkChange, LinkError, id_key};
 use super::push::creator_auth;
 use super::submit::{LinkJob, LinkJobOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route_for};
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 const LINK_PAGE: usize = 256;
 
@@ -88,7 +87,7 @@ impl Operation for ReadLinkOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Option<RepositoryLink>> {
-        Ok(Next::Done(parse_link(value(result)?)?))
+        Ok(Next::Done(parse_link(result.value()?)?))
     }
 }
 
@@ -170,7 +169,7 @@ impl Operation for ListLinksOperation {
             self.links = Some(links);
             return Ok(Next::Call(IoCall::Read(reads)));
         };
-        let queued = all_values(result)?;
+        let queued = result.values()?;
         Ok(Next::Done(
             links
                 .into_iter()

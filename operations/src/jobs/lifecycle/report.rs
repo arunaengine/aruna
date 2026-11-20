@@ -9,25 +9,27 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::JobStatusView;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, PLAN_EXPLAIN_KEYSPACE};
 use aruna_core::scheduling::{PlanCandidate, PlannedInput};
-use aruna_core::structs::execution::job::{
-    CancelAuthority, JobFamilyId, JobFamilyRecord, JobId, JobProjection, JobRecordEnvelope,
-    JobRecordKey, JobRecordKind, LogicalJobSpec, LogicalJobState, OutputObject,
-    PhysicalExecutionResult, PhysicalExecutionState, ProjectedExecution, SubmissionId,
+use aruna_core::structs::execution::job::family::{
+    CancelAuthority, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope, JobRecordKey,
+    JobRecordKind, LogicalJobSpec, LogicalJobState, PhysicalExecutionResult,
+    PhysicalExecutionState, ProjectedExecution, SubmissionId,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::OutputObject;
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::types::Key;
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::debug;
 
-use super::witness_arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
+use super::witness::arm::{WitnessDeadline, WitnessExplain, deadline_index_key};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::route::JobRouteError;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::DEADLINE_INDEX_KEYSPACE;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{page, values};
-use aruna_core::structs::execution::job::record_keys::submission_prefix;
-use aruna_core::structs::execution::job::record_rows::from_bytes;
+use aruna_core::rows::values;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 
 /// Sibling families of one submission a conflict count may scan.
@@ -191,7 +193,7 @@ impl ReportDetailsOperation {
     }
 
     fn siblings(&mut self, result: IoResult) -> DetailNext {
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let digests: BTreeSet<[u8; 32]> = rows
             .iter()
             .filter_map(|(key, _)| key.get(32..64)?.try_into().ok())
@@ -220,7 +222,7 @@ impl ReportDetailsOperation {
     }
 
     fn stored_plan(&mut self, result: IoResult) -> DetailNext {
-        let (rows, _) = page(result)?;
+        let (rows, _) = result.page()?;
         let explain = rows
             .iter()
             .find_map(|(_, value)| from_bytes::<WitnessExplain>(value).ok());
@@ -428,7 +430,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{Family, node};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::{CancelAuthority, OutputSet};
+    use aruna_core::structs::execution::job::family::{CancelAuthority, OutputSet};
 
     fn projection(fixture: &Family) -> JobProjection {
         let family = fixture.family();
@@ -468,7 +470,7 @@ mod tests {
 
     // Other request digests count as conflicts; without a stored plan the newest launch places.
     #[test]
-    fn reads_conflicts_and_launch() {
+    fn conflicts_and_launch() {
         let fixture = Family::new([2u8; 32]);
         let family = fixture.family();
         let mut details = ReportDetailsOperation::new(family, &projection(&fixture), None);

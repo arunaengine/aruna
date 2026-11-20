@@ -5,45 +5,40 @@
 use crate::topology;
 use aruna_operations::metadata::forward::route_create::RouteCreateOperation;
 
-use crate::job_calls::find_dedup_job;
-use crate::job_calls::read_job_record;
-use crate::job_calls::read_job_routed;
 use crate::metadata_calls::{
-    mint_pid_routed, read_mapping, resolve_pid_routed, route_metadata_delete, submit_mint_pid,
-    withdraw_pid_routed,
+    mint_pid_routed, read_mapping, resolve_pid_routed, route_metadata_delete, withdraw_pid_routed,
 };
-use aruna_core::StructuredId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{ID_MAPPING_KEYSPACE, PENDING_PROJECTION_KEYSPACE};
+use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_core::metadata::protocol::PersistentIdResolution;
 use aruna_core::storage_entries::pending_projection_key;
-use aruna_core::structs::execution::job::{JobId, pid_dedup_key};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::persistent_id::{
+    PersistentIdMapping, PersistentIdRevision, PersistentIdStatus, persistent_id_key,
+};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{
-    MintPersistentSpec, PersistentIdMapping, PersistentIdRevision, PersistentIdStatus,
-    persistent_id_key,
-};
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::{DriverContext, drive};
-use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
-use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
+use aruna_operations::metadata::forward::write::MetadataWriteError;
 use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_operations::testing::replay_event_log;
+use aruna_test_support::projection::replay_event_log;
 use ulid::Ulid;
 
-use topology::{TestNode, TestResult, Topology, wait_for_convergence, wait_until};
+use crate::convergence::wait_for_convergence;
+use topology::{TestNode, TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 5;
 const USER_NODES: usize = 1;
 const REPLICATION_FACTOR: u32 = 3;
-const JOB_RETENTION_MS: u64 = 60_000;
 /// Plantings of a pending projection marker before a drain race counts as a failure.
 const PLANT_ATTEMPTS: usize = 20;
 
@@ -105,10 +100,8 @@ async fn withdraw_precedes_mint() -> TestResult<()> {
     let (document_id, placement) = seed_document(&realm, group_id, "datasets/raced", true).await?;
     let forwarder = realm.non_holder(&placement);
 
-    // The submitted job is accepted here; the worker's mint runs after the
+    // The creation queued the mint job; its worker's mint runs after the
     // withdrawal below, exactly as the race orders it.
-    submit_routed(&realm, realm.node(0), document_id, realm.user_id).await?;
-
     let withdrawn = withdraw_routed(&realm, forwarder, document_id).await?;
     assert_eq!(withdrawn.status, PersistentIdStatus::AdminWithdrawn);
     assert_eq!(withdrawn.minted_at_ms, None);
@@ -332,69 +325,6 @@ async fn authority_loss_unavailable() -> TestResult<()> {
     Ok(())
 }
 
-/// Two authorized users minting the same document through two ingress nodes get one job on one
-/// owner.
-#[tokio::test]
-async fn mint_dedups_ingress() -> TestResult<()> {
-    let realm = Topology::spawn(MANAGEMENT_NODES, USER_NODES, REPLICATION_FACTOR).await?;
-    let group_id = realm.seed_group().await?;
-    let (document_id, placement) = seed_document(&realm, group_id, "datasets/shared", true).await?;
-    let other = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
-    realm.grant_group_user(group_id, other).await?;
-
-    let authority = realm.holder(&placement);
-    let ingress = realm.non_holder_ids(&placement);
-    let (first_node, second_node) = (realm.find(ingress[0]), realm.find(ingress[1]));
-
-    let first = submit_routed(&realm, first_node, document_id, realm.user_id).await?;
-    let second = submit_routed(&realm, second_node, document_id, other).await?;
-
-    // A retried submission joins its own lost attempt, so only the second
-    // submitter's join carries the dedup contract.
-    assert!(!second.created, "the second user joins the first job");
-    assert_eq!(first.job_id, second.job_id);
-
-    for node in realm.nodes.iter() {
-        let stored = read_job_record(&node.context, first.job_id, None).await?;
-        assert_eq!(
-            stored.is_some(),
-            node.node_id() == authority.node_id(),
-            "only the authority may own the mint job"
-        );
-    }
-    // Either user resolves the reservation, which is what makes it document-global.
-    for user in [realm.user_id, other] {
-        assert_eq!(
-            find_dedup_job(&authority.context, user, &pid_dedup_key(document_id), None,).await?,
-            Some(first.job_id)
-        );
-    }
-
-    let owner = read_job_routed(
-        first_node.context.as_ref(),
-        &realm.auth_context(),
-        first.job_id,
-        Some(realm.bearer_token()),
-    )
-    .await?;
-    assert_eq!(owner.job.created_by, realm.user_id);
-    let joiner = read_job_routed(
-        second_node.context.as_ref(),
-        &realm.auth_for(other),
-        second.job_id,
-        Some(realm.bearer_for(other)),
-    )
-    .await?;
-    assert_eq!(
-        joiner.job.created_by, other,
-        "a joined handle is served to its own caller, never as the first submitter"
-    );
-    assert_eq!(joiner.job.job_id, first.job_id);
-
-    realm.shutdown().await;
-    Ok(())
-}
-
 /// A mapping row on a node that is not the authority carries no version anyone can compare, so
 /// it may neither create a redirect nor a tombstone.
 #[tokio::test]
@@ -490,7 +420,7 @@ async fn owner_cannot_withdraw() -> TestResult<()> {
     let group_id = realm.seed_group().await?;
     let (document_id, placement) =
         seed_document(&realm, group_id, "datasets/guarded", true).await?;
-    let owner = aruna_core::UserId::local(Ulid::generate(), realm.realm_id);
+    let owner = aruna_core::user::id::UserId::local(Ulid::generate(), realm.realm_id);
     realm.grant_group_user(group_id, owner).await?;
     let sender = realm.non_holder(&placement);
 
@@ -662,7 +592,10 @@ fn revision(occurred_at_ms: u64) -> PersistentIdRevision {
     }
 }
 
-fn active_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
+fn active_mapping(
+    document_id: Ulid,
+    minted_by: aruna_core::user::id::UserId,
+) -> PersistentIdMapping {
     let mut mapping = PersistentIdMapping::requested(
         document_id,
         false,
@@ -676,7 +609,10 @@ fn active_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> Persisten
     mapping
 }
 
-fn withdrawn_mapping(document_id: Ulid, minted_by: aruna_core::UserId) -> PersistentIdMapping {
+fn withdrawn_mapping(
+    document_id: Ulid,
+    minted_by: aruna_core::user::id::UserId,
+) -> PersistentIdMapping {
     let mut mapping = PersistentIdMapping::requested(
         document_id,
         false,
@@ -745,45 +681,6 @@ async fn write_entry(
     }
 }
 
-/// A routed mint submission, retried while the authority reports it
-/// unavailable: the document-global dedup key makes a replay join the job the
-/// lost attempt created rather than open a second one.
-async fn submit_routed(
-    realm: &Topology,
-    node: &TestNode,
-    document_id: Ulid,
-    minted_by: aruna_core::UserId,
-) -> TestResult<SubmitJobResult> {
-    let submitted = std::cell::RefCell::new(None);
-    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
-        "no mint submission reached the authority",
-        || async {
-            match submit_mint_pid(
-                &node.context,
-                MintPersistentSpec {
-                    document_id,
-                    minted_by,
-                },
-                node.node_id(),
-                JOB_RETENTION_MS,
-                Some(realm.bearer_for(minted_by)),
-            )
-            .await
-            {
-                Err(SubmitJobError::PlacementUnavailable(_)) => Ok(1),
-                other => {
-                    *submitted.borrow_mut() = Some(other?);
-                    Ok(0)
-                }
-            }
-        },
-    )
-    .await?;
-    Ok(submitted
-        .into_inner()
-        .ok_or("the mint submission produced no job")?)
-}
-
 /// A routed mint, retried while the fan-out reports it unavailable: the mint is
 /// idempotent on the authority, so a replay after a lost response returns the
 /// existing mapping instead of a second one.
@@ -791,7 +688,10 @@ async fn mint_routed(
     realm: &Topology,
     node: &TestNode,
     document_id: Ulid,
-) -> TestResult<(aruna_core::structs::PersistentIdMapping, bool)> {
+) -> TestResult<(
+    aruna_core::structs::persistent_id::PersistentIdMapping,
+    bool,
+)> {
     let minted = std::cell::RefCell::new(None);
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed mint reached the authority",
@@ -826,7 +726,7 @@ async fn withdraw_routed(
     realm: &Topology,
     node: &TestNode,
     document_id: Ulid,
-) -> TestResult<aruna_core::structs::PersistentIdMapping> {
+) -> TestResult<aruna_core::structs::persistent_id::PersistentIdMapping> {
     let withdrawn = std::cell::RefCell::new(None);
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         "no routed withdrawal reached the authority",

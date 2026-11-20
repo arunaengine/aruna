@@ -2,19 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, overlay_placement};
-use aruna_core::rows::{PrefixPages, done, values};
+use aruna_core::reducer::placement::overlay_placement;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, pending_projection_target, reducer_state_entry, stale_conflict_deletes,
 };
@@ -40,7 +41,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::shard_placement::schedule_revalidation;
@@ -1223,14 +1224,14 @@ impl Operation for PlacementWrite {
             }
             Stage::PendingEvents => self.pending_events(result.values()?),
             Stage::Write if !self.deletes.is_empty() => {
-                done(result)?;
+                result.done()?;
                 self.stage = Stage::Delete;
                 Ok(Next::Call(IoCall::Delete(std::mem::take(
                     &mut self.deletes,
                 ))))
             }
             Stage::Write | Stage::Delete => {
-                done(result)?;
+                result.done()?;
                 self.finish()
             }
         }

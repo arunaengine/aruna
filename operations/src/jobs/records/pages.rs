@@ -5,30 +5,34 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, MetadataAnswer, NetEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::INPUT_PAGE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::record_keys::submission_prefix;
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputPage, InputSelection, JobFamilyRecord, LaunchIntent, LogicalJobSpec,
-    PageEntries, PageError, PageManifest, SubmissionId, launch_entries, needs_pages, paginate,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, LaunchIntent, LogicalJobSpec, SubmissionId,
+};
+use aruna_core::structs::execution::job::input::{CapturedInput, InputSelection};
+use aruna_core::structs::execution::job::pages::{
+    InputPage, PageEntries, PageError, PageManifest, launch_entries, needs_pages, paginate,
     spec_entries, verify_chain,
 };
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::{debug, warn};
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 
 /// Upper bound of one page request; the transport's own step limits end it earlier.
 const FETCH_DEADLINE: Duration = Duration::from_secs(60);
@@ -195,7 +199,7 @@ fn answered_page(answer: MetadataAnswer, digest: &[u8; 32]) -> Result<Option<Inp
             .filter(|page| page.digest().ok().as_ref() == Some(digest))),
         other => Err(format!(
             "the node answered {}",
-            crate::metadata::transport_message_kind(&other)
+            aruna_core::metadata::protocol::transport_message_kind(&other)
         )),
     }
 }
@@ -210,7 +214,7 @@ impl Operation for LoadChainOperation {
 
     fn next(&mut self, result: IoResult) -> ChainNext {
         match self.step.take() {
-            Some(ChainStep::Local(digest)) => match value(result)? {
+            Some(ChainStep::Local(digest)) => match result.value()? {
                 Some(row) => {
                     self.pages.push(stored_page(&row, &digest)?);
                     self.read_next()
@@ -219,7 +223,7 @@ impl Operation for LoadChainOperation {
             },
             Some(ChainStep::Fetch(digest, peer)) => self.fetched(digest, peer, result),
             Some(ChainStep::Keep(page)) => {
-                done(result)?;
+                result.done()?;
                 self.pages.push(*page);
                 self.read_next()
             }
@@ -506,7 +510,7 @@ impl Operation for StoreEntriesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<PageManifest>>, PageReadError> {
-        done(result)?;
+        result.done()?;
         Ok(Next::Done(self.manifest.take()))
     }
 }
@@ -551,7 +555,8 @@ impl Operation for ServePageOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ServedPage>, PageReadError> {
         if self.admitted {
-            let page = value(result)?
+            let page = result
+                .value()?
                 .map(|row| stored_page(&row, &self.digest))
                 .transpose()?;
             return Ok(Next::Done(page.map(Box::new)));
@@ -568,16 +573,16 @@ impl Operation for ServePageOperation {
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::structs::execution::job::InputContent;
+    use aruna_core::structs::execution::job::input::InputContent;
     use ulid::Ulid;
 
     use super::*;
     use crate::tests::records::node;
-    use crate::tests::s3::test_storage;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::PeerRequestError;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::testing::test_context;
+    use aruna_test_support::s3::test_storage;
 
     fn submission() -> SubmissionId {
         SubmissionId([3; 32])
@@ -725,14 +730,14 @@ mod tests {
         for index in 0..400u32 {
             let key = format!("db/{index:05}-{}", "x".repeat(800));
             inputs.push(InputSelection {
-                source: aruna_core::structs::execution::job::InputSource::S3 {
+                source: aruna_core::structs::execution::job::input::InputSource::S3 {
                     bucket: "bakta".to_string(),
                     key: key.clone(),
                     version_id: Some(Ulid::from_parts(u64::from(index), 1).to_string()),
                 },
                 source_node_id: None,
                 dest_key: key.clone(),
-                mode: aruna_core::structs::execution::job::InputMode::Mount,
+                mode: aruna_core::structs::execution::job::input::InputMode::Mount,
                 container_path: Some(format!("/{key}")),
                 name: None,
                 description: None,

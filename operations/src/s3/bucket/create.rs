@@ -343,7 +343,6 @@ impl Operation for CreateBucketOperation {
 #[cfg(test)]
 mod mapped_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::effects::BlobEffect;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::BlobError;
@@ -355,6 +354,7 @@ mod mapped_tests {
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::{Effects, TxnId};
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -533,6 +533,7 @@ mod mapped_tests {
         );
         let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
+            sequence: 1,
         }));
         assert_eq!(effects.as_slice(), [schedule_snapshot_publish()]);
         operation.step(Event::Task(TaskEvent::TimerScheduled {
@@ -664,7 +665,7 @@ mod test {
     async fn test_create_bucket() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,
@@ -701,7 +702,7 @@ mod test {
     async fn duplicate_bucket_rejected() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,
@@ -747,7 +748,7 @@ mod test {
     async fn recreation_gets_incarnation() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,
@@ -803,7 +804,7 @@ mod test {
     async fn member_binds_incarnation() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle,
             net_handle: None,

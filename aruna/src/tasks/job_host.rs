@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use aruna_blob::pace::{Pace, paced};
 use aruna_core::jobs::{JobReport, JobStops};
-use aruna_core::operation::Runnable;
-use aruna_core::structs::execution::job::{CopyJobSpec, JobError, StagingJobSpec};
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::input::{CopyJobSpec, StagingJobSpec};
+use aruna_core::structs::execution::job::local::JobError;
 use aruna_core::structs::storage::backend_import::BackendImportSpec;
 use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use futures_util::future::BoxFuture;
@@ -25,10 +26,12 @@ use aruna_drivers::driver::{drive, node_routing};
 use aruna_drivers::effect_adapters::job::{JobHost, with_job_host};
 use aruna_drivers::jobs::context::JobContext;
 use aruna_drivers::jobs::executor::RangeTurns;
-use aruna_operations::jobs::backend_import::{BackendImportOperation, ImportJob};
+use aruna_operations::jobs::backend_import::ImportJob;
+use aruna_operations::jobs::backend_import::job::BackendImportOperation;
 use aruna_operations::jobs::copy::CopyJobOperation;
 use aruna_operations::jobs::repository::JobScope;
-use aruna_operations::jobs::staging::{StagingJobOperation, StagingRun};
+use aruna_operations::jobs::staging::StagingRun;
+use aruna_operations::jobs::staging::job::StagingJobOperation;
 use aruna_operations::jobs::workflow::purge::{PurgeJobOperation, PurgeRun};
 
 /// This job as the repository and harvest operations see it.
@@ -101,9 +104,9 @@ impl JobHost for ContextHost {
 
 /// Drives a job's operation with the job's host answering its effects. A failure of the run
 /// itself is retryable, since the job's checkpoint stays.
-pub async fn run_hosted<O, K>(ctx: &JobContext, operation: O) -> JobRunOutcome
+pub async fn run_hosted<O>(ctx: &JobContext, operation: O) -> JobRunOutcome
 where
-    O: Runnable<K, Output = JobRunOutcome>,
+    O: Operation<Output = JobRunOutcome>,
     O::Error: Display,
 {
     let host = Arc::new(ContextHost {

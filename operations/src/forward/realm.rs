@@ -4,18 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::{PeerFrame, peer_call, peer_reply};
+use crate::forward::fetch::PeerFrame;
 use crate::forward::transport::{ForwardError, reject};
-use crate::metadata::protocol::{MetadataTransportMessage, WriteAuthError};
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
-use aruna_core::NodeId;
+use crate::sync::outbox::record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
+use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
+use aruna_core::metadata::protocol::{
+    MetadataTransportMessage, WriteAuthError, peer_call, peer_reply,
+};
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
-use aruna_core::rows::done;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use std::time::Duration;
@@ -156,6 +160,8 @@ pub(crate) struct ApplyRelayOperation {
     peer: NodeId,
     relay: Option<AdminRelay>,
     writing: bool,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 type RelayTurn = Result<Next<MetadataTransportMessage>, IoError>;
@@ -185,6 +191,8 @@ impl ApplyRelayOperation {
             peer,
             relay,
             writing: false,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -212,7 +220,8 @@ impl ApplyRelayOperation {
             RelayAdmission::Unavailable => return Ok(Next::Done(unavailable)),
         }
         // The relay never mints a genesis for another origin's document.
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            self.ids.mint(self.now_ms),
             local,
             relay.target,
             Vec::new(),
@@ -236,6 +245,14 @@ impl Operation for ApplyRelayOperation {
     type Output = MetadataTransportMessage;
     type Error = IoError;
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
     fn first(&mut self) -> RelayTurn {
         if self.relay.is_none() {
             return Ok(Next::Done(reject("unexpected admin relay message")));
@@ -250,7 +267,7 @@ impl Operation for ApplyRelayOperation {
 
     fn next(&mut self, result: IoResult) -> RelayTurn {
         if self.writing {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Then {
                 output: MetadataTransportMessage::AdminEventQueued,
                 calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
@@ -269,12 +286,12 @@ impl Operation for ApplyRelayOperation {
 mod tests {
     use super::*;
     use crate::tests::peers::{failed_answer, peer_answer};
-    use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::events::PeerRequestError;
     use aruna_core::placement::resolve_shard_holders;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {

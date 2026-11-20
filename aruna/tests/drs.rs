@@ -4,12 +4,12 @@
 
 use crate::shared;
 
+use aruna_core::blob_paths::ResolvePathsOperation;
 use aruna_core::structs::storage::blob::HashIndex;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_drivers::driver::drive;
 use aruna_drivers::driver::node_facts;
-use aruna_operations::blob::permission_paths::ResolvePathsOperation;
 use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
@@ -20,7 +20,6 @@ use shared::{
     create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner, spawn_complete_seed,
     spawn_seed_node, wait_group_member, wait_realm_nodes, wait_until,
 };
-use std::time::Duration;
 use ulid::Ulid;
 
 const FIXTURE_BYTES: &[u8] = b"drs placeholder fixture bytes";
@@ -132,9 +131,9 @@ async fn content_hash_missing() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn crowded_hash_conflicts() -> TestResult<()> {
+    use aruna_core::blob_paths::MAX_HASH_ALIASES;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_operations::blob::permission_paths::MAX_HASH_ALIASES;
 
     let seed = spawn_complete_seed().await?;
     let result = async {
@@ -437,22 +436,17 @@ async fn remote_version_downloads() -> TestResult<()> {
         .to_string();
         let object_url = format!("{}/api/v1/ga4gh/drs/v1/objects/{object_id}", seed.base_url);
         // The seed answers 503 until the published document reaches it.
-        wait_until(
-            "routed DRS lookup",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || {
-                let request = reqwest::Client::new()
-                    .get(&object_url)
-                    .bearer_auth(&bearer_token);
-                async move {
-                    request
-                        .send()
-                        .await
-                        .is_ok_and(|response| response.status() == StatusCode::OK)
-                }
-            },
-        )
+        wait_until("routed DRS lookup", shared::WAIT_CAP, || {
+            let request = reqwest::Client::new()
+                .get(&object_url)
+                .bearer_auth(&bearer_token);
+            async move {
+                request
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status() == StatusCode::OK)
+            }
+        })
         .await?;
         let object_body: Value = reqwest::Client::new()
             .get(&object_url)

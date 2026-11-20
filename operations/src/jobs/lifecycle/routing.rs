@@ -4,14 +4,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::jobs::{JobKind, JobStatusView};
-use aruna_core::structs::execution::job::{
-    JobError, JobId, JobProgress, JobProjection, JobResultPayload, JobState, LogicalJobSpec,
-    LogicalJobState, PhysicalExecutionState, ResultMessage, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    JobProjection, LogicalJobSpec, LogicalJobState, PhysicalExecutionState, ResultMessage,
+};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobProgress, JobResultPayload, WorkspaceMode,
 };
 
-use super::ids::workspace_of;
 use crate::jobs::records::project::ProjectedFamily;
 use crate::jobs::route::JobRouteError;
+use aruna_core::job_request::workspace_of;
 
 /// Why a partial projection answers nothing: it reduced only part of its
 /// family, so its state, executions, and outputs are unknown, never absent.
@@ -143,7 +146,7 @@ fn local_state(state: LogicalJobState) -> JobState {
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::structs::execution::job::{JobFamilyId, SubmissionId};
+    use aruna_core::structs::execution::job::family::{JobFamilyId, SubmissionId};
 
     use super::*;
 

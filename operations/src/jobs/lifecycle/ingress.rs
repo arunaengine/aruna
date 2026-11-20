@@ -4,29 +4,28 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::jobs::lifecycle::ids::store_workspace;
     use crate::jobs::lifecycle::input_walk::RangeHolderOperation;
     use crate::jobs::lifecycle::submission_rules::{
         admitted_description, answers_input, batch_len, exact_version, pin_outputs,
         reference_content, reference_shape, refusal_of, resolve_answer, resolver_admits,
         sources_match,
     };
-    use crate::jobs::submit::SubmitJobError;
-    use crate::metadata::protocol::MetadataTransportMessage;
     use crate::tests::records::captured_input;
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::job_request::{SubmitJobError, store_workspace};
     use aruna_core::jobs::SubmissionRefusal;
-    use aruna_core::structs::execution::job::OutputDestination;
-    use aruna_core::structs::execution::job::{CapturedInput, WorkspaceMode};
-    use aruna_core::structs::execution::job::{
-        InputContent, InputMode, InputSelection, InputSource, OutputSelection, WorkspaceOutput,
+    use aruna_core::metadata::protocol::MetadataTransportMessage;
+    use aruna_core::structs::execution::job::input::{
+        CapturedInput, InputContent, InputMode, InputSelection, InputSource, OutputDestination,
+        OutputSelection, WorkspaceOutput,
     };
+    use aruna_core::structs::execution::job::local::WorkspaceMode;
     use aruna_core::structs::identity::auth::{AuthContext, Permission};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::storage::dataset_description::DatasetDescription;
     use aruna_core::structs::storage::dataset_description::DescriptionError;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::drive;
     use ulid::Ulid;
 
@@ -53,11 +52,17 @@ mod tests {
     // its key, not refused because this member holds no copy.
     #[tokio::test]
     async fn routes_range_holder() {
-        use crate::distribution::test_record::{binding, record, secret, store_record};
+        use crate::distribution::test_record::{binding, record, secret};
         use crate::distribution::test_store::{context, open};
         let (_dir, handle) = open();
         let (snapshot, bytes) = record(true);
-        store_record(&handle, snapshot.set_id(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id: Ulid::from_bytes([90; 16]),
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -306,7 +311,7 @@ mod tests {
         let inputs: Vec<InputSelection> = answers.iter().map(|(input, _)| input.clone()).collect();
         let encode = |answers: &[(InputSelection, CapturedInput)]| {
             let result = Ok(answers.to_vec());
-            crate::metadata::protocol::encode_message(
+            aruna_core::metadata::protocol::encode_message(
                 &MetadataTransportMessage::ResolvedJobInputs { result },
             )
         };

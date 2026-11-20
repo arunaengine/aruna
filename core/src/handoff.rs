@@ -7,12 +7,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::federation::{
     FederationError, FederationSettings, Layout, MAX_NAME_LEN, RealmDescriptor, Signable, Signed,
     valid_federation_url,
 };
 use crate::structs::identity::realm::RealmId;
+use crate::user::id::UserId;
 
 pub const HANDOFF_DOMAIN: &str = "aruna-login-handoff-v1";
 /// Longest lifetime of a handoff.

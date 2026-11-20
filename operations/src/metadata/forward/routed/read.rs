@@ -3,10 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::placement::read_holder_sets;
@@ -18,20 +18,20 @@ use super::super::holder_reads::{READ_FANOUT_LIMIT, READ_PEER_TIMEOUT};
 use super::super::read::METADATA_READ_DEADLINE;
 use super::export::owner_reads;
 use crate::device::replica::{ReplicaRecord, read_answer as replica_answer, replica_read};
-use crate::device::selection::keep_read;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::fetch::read_answer;
-use crate::forward::replay::routed_record_matches;
-use crate::forward::transport::read_error;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::readable::RecordReadableOperation;
-use crate::metadata::call_results::effect_event;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::metadata_request;
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, encode_message};
+use crate::metadata::device::selection::keep_read;
+use crate::metadata::forward::replay::routed_record_matches;
+use crate::metadata::forward::write::read_error;
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, encode_message, metadata_request,
+};
 
 type ReadTurn = Result<Next<MetadataRegistryRecord>, MetadataApiError>;
 
@@ -106,7 +106,7 @@ impl RoutedReadOperation {
     }
 
     fn replica_read(&mut self, result: IoResult) -> ReadTurn {
-        let replica = replica_answer(&effect_event(result)?).filter(ReplicaRecord::serves_reads);
+        let replica = replica_answer(&result.event()?).filter(ReplicaRecord::serves_reads);
         let pinned =
             (replica.as_ref()).is_some_and(|replica| replica.selected || replica.pending_edits > 0);
         self.replica = replica;

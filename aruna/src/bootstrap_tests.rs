@@ -9,10 +9,10 @@ use super::{
 };
 use crate::inbound::initialize_incoming_fixture;
 use crate::tasks::incoming::OutboxDrainer;
-use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::execution::notification_watch::{
@@ -25,13 +25,15 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::testing::test_context;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::notifications::watch::interest::PublishInterestOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
-use aruna_operations::testing::{read_outbox_records, reconcile_topics};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::documents::read_outbox_records;
+use aruna_test_support::documents::reconcile_topics;
 use byteview::ByteView;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,10 +43,10 @@ use tempfile::tempdir;
 fn user_topics_deduplicate() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let first = DocumentTarget::User {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
     };
     let second = DocumentTarget::User {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
     };
     let first_shard = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: ulid::Ulid::from_bytes([4u8; 16]),
@@ -106,7 +108,7 @@ fn unreachable_peer_waited() {
 // selects it: infrastructure keeps fetching its documents over sync.
 #[test]
 fn device_identity_routes() {
-    let owner = aruna_core::UserId::nil(RealmId::from_bytes([2u8; 32]));
+    let owner = aruna_core::user::id::UserId::nil(RealmId::from_bytes([2u8; 32]));
     assert_eq!(PersistedNodeIdentity::User { owner }.owner(), Some(owner));
     assert_eq!(
         PersistedNodeIdentity::Server {
@@ -136,7 +138,7 @@ fn watch_target_cases() {
 }
 
 fn context_net(
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     net_handle: NetHandle,
 ) -> DriverContext {
     DriverContext {
@@ -233,7 +235,7 @@ async fn write_config_nodes(
         .collect();
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     assert!(matches!(
@@ -409,8 +411,8 @@ async fn joiner_announces_watch() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 11).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_incoming_fixture(bootstrap_context.clone());
-    initialize_incoming_fixture(joiner_context.clone());
+    let _bootstrap_incoming = initialize_incoming_fixture(bootstrap_context.clone());
+    let _joiner_incoming = initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -496,8 +498,8 @@ async fn retries_until_seeded() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 13).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_incoming_fixture(bootstrap_context.clone());
-    initialize_incoming_fixture(joiner_context.clone());
+    let _bootstrap_incoming = initialize_incoming_fixture(bootstrap_context.clone());
+    let _joiner_incoming = initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -690,7 +692,7 @@ fn readiness_requires_all() {
 async fn read_digest(
     context: &DriverContext,
     realm_id: RealmId,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> WatchInterestDigest {
     match context
         .storage_handle

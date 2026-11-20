@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::records::HeadAliasContext;
 use crate::distribution::guard::{GuardError, authority_reads, write_authority};
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::resolve_set::{
@@ -12,6 +11,7 @@ use crate::placement::policy::resolve_set::{
 use crate::s3::policy::successor::{
     CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
 };
+use aruna_core::blob_records::HeadAliasContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
@@ -30,8 +30,9 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
-use aruna_core::structs::storage::distribution::{DistributionBinding, RouteError};
+use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::types::{GroupId, Key, Value};
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -834,15 +835,14 @@ mod tests {
         BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, CaptureRun, CloseRun,
         PolicyBulkOperation,
     };
-    use crate::placement::policy::GateOperation;
     use crate::placement::policy::cache::cache_key;
+    use crate::placement::policy::gate::GateOperation;
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::s3::bucket::placement::{PutPlacementInput, PutPlacementOperation};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::UserId;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -869,8 +869,10 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::types::{GroupId, Key, Value};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use std::collections::HashMap;
@@ -897,7 +899,7 @@ mod tests {
         let temp_root = temp_handle.path().to_str().expect("utf8 path");
         let blob_root = format!("{temp_root}/blobstore");
         std::fs::create_dir_all(&blob_root).expect("blob root");
-        let storage_handle = storage::FjallStorage::open(temp_root).expect("storage opens");
+        let storage_handle = storage::worker::FjallStorage::open(temp_root).expect("storage opens");
         let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let net_handle = NetHandle::new(
@@ -1393,9 +1395,15 @@ mod tests {
 
     /// Binds the bucket to member 1 of the two-shard test set: it coordinates the keys below "m".
     async fn distribute(context: &DriverContext) -> Ulid {
-        use crate::distribution::test_record::{binding, record, store_record};
+        use crate::distribution::test_record::{binding, record};
         let (snapshot, bytes) = record(true);
-        store_record(&context.storage_handle, snapshot.set_id(), bytes).await;
+        aruna_drivers::testing::write_value(
+            &context.storage_handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
         // The inventory a mint keeps current needs the set's ranges opened on this member.
         crate::distribution::test_store::install(
             &context.storage_handle,
@@ -1511,7 +1519,7 @@ mod tests {
         // key goes on and a later pass decides the refused key again.
         use crate::distribution::guard::GuardError;
         use crate::s3::policy::successor::SuccessorError;
-        use aruna_core::structs::storage::distribution::RouteError;
+        use aruna_core::structs::storage::distribution::route::RouteError;
         let range_id = Ulid::from_bytes([7; 16]);
         for refusal in [
             GuardError::Route(RouteError::StaleRange(range_id)),

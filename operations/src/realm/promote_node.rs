@@ -5,10 +5,10 @@
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::PeerRequestError;
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
@@ -20,13 +20,12 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use thiserror::Error;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::fetch::{peer_call, peer_reply};
-use crate::metadata::protocol::{
-    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message,
-};
-use crate::metadata::transport_message_kind;
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message, peer_call,
+    peer_reply, transport_message_kind,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromoteNodeConfig {
@@ -277,10 +276,10 @@ fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::protocol::decode_message;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::{Effect, NetEffect};
     use aruna_core::events::{Event, MetadataAnswer, NetEvent};
+    use aruna_core::metadata::protocol::decode_message;
     use aruna_core::structs::identity::realm::RealmId;
 
     /// Node ids in ascending order of `rank`, so a test knows which one owns database requests.
@@ -372,7 +371,7 @@ mod tests {
         let config = PromoteNodeConfig {
             actor: Actor {
                 node_id: node(1),
-                user_id: aruna_core::UserId::nil(realm_id),
+                user_id: aruna_core::user::id::UserId::nil(realm_id),
                 realm_id,
             },
             node_id: node(2),

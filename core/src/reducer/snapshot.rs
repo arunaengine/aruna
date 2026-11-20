@@ -4,8 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::structs::storage::distribution::snapshot::{Installed, forked, install};
-use crate::structs::storage::distribution::{DistributionError, DistributionView, SignedSnapshot};
+use crate::structs::storage::distribution::snapshot::{
+    DistributionView, Installed, SignedSnapshot, forked, install,
+};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 const VIEW_PATH: &str = "distribution.view";
 

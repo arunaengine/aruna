@@ -62,7 +62,10 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Adding identifiers needs WRITE on the document, also on the authority itself.
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_parts(7, 7), fixture.actor.realm_id),
+        user_id: aruna_core::user::id::UserId::local(
+            ulid::Ulid::from_parts(7, 7),
+            fixture.actor.realm_id,
+        ),
         realm_id: fixture.actor.realm_id,
         path_restrictions: None,
         session: None,
@@ -362,7 +365,7 @@ async fn invenio_searches_records() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn doi_keeps_case() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::resolve;
-    use aruna_operations::jobs::repository::RecordReference;
+    use aruna_operations::jobs::repository::invenio::query::RecordReference;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let connector_id = connector(&fixture, &server).await;
@@ -511,7 +514,8 @@ async fn start_update(
     use super::driven::current_event;
     use super::driven::start_pull;
     use super::driven::{change_link, list_links};
-    use aruna_core::repository::{ImportOptions, PullCheck, RepositoryPull};
+    use aruna_core::repository::link::PullCheck;
+    use aruna_core::repository::{ImportOptions, RepositoryPull};
     use aruna_operations::jobs::repository::links::LinkChange;
     let connector_id = connector(fixture, server).await;
     let spec = spec_with_source(
@@ -535,6 +539,7 @@ async fn start_update(
     super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &spec)).await);
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let links = list_links(&fixture.context, doc_id(1)).await?;
     let [(link, true)] = links.as_slice() else {
         panic!("the import keeps one pull link with its next check queued: {links:?}");
@@ -580,6 +585,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     super::link::succeeded(Box::pin(run_rocrate_import(&ctx, &update)).await);
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
 
     let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
@@ -619,8 +625,9 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Adds a contextual entity through the normal update, without materializing it.
 async fn add_note(fixture: &Fixture, name: &str) -> Result<Ulid, Box<dyn std::error::Error>> {
+    use aruna_core::metadata::api::UpdateDocumentMutation;
     use aruna_operations::metadata::update_document::{
-        UpdateDocumentConfig, UpdateDocumentMutation, UpdateDocumentOperation,
+        UpdateDocumentConfig, UpdateDocumentOperation,
     };
     let note =
         json!({"@id": format!("https://example.org/{name}"), "@type": "Thing", "name": name});
@@ -652,6 +659,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     add_note(&fixture, "earlier-edit").await?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     {
@@ -677,6 +685,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     );
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
+    super::driven::queue_changes(&fixture.context).await?;
 
     let revision = drive(RawViewOperation::revision(doc_id(1)), &fixture.context)
         .await?
@@ -698,7 +707,7 @@ async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
 async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::{change_link, list_links};
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_core::repository::{LinkPatch, LinkStatus};
+    use aruna_core::repository::link::{LinkPatch, LinkStatus};
     use aruna_operations::jobs::repository::links::LinkChange;
     use aruna_operations::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;

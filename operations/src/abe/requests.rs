@@ -3,16 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::notifications::outbox_record::new_outbox_record;
 use aruna_core::request_policy::CompiledPolicySet;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationKind, NotificationRecord,
+    NotificationClass, NotificationKind, NotificationRecord, new_outbox_record,
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
+
+/// Bucket holders read per page before the pending request is announced to them.
+pub(super) const HOLDER_PAGE: usize = 256;
 
 impl KeyOperation {
     /// Checks the bucket-wide request bindings that do not depend on the recipient.
@@ -516,52 +519,107 @@ impl KeyOperation {
     /// Reads the bucket holders, including a caller who holds the bucket key.
     pub(super) fn holders(&mut self) -> Option<KeyTurn> {
         let snapshot = self.snapshot.as_ref()?;
+        self.role_holders = snapshot.holders.iter().copied().collect();
+        self.explicit_started = false;
+        Some(self.role_batch())
+    }
+    /// Tells the role holders in chunks of `HOLDER_PAGE`, then reads the explicit holders.
+    fn role_batch(&mut self) -> KeyTurn {
+        while !self.role_holders.is_empty() {
+            let take = self.role_holders.len().min(HOLDER_PAGE);
+            let chunk: Vec<UserId> = self.role_holders.drain(..take).collect();
+            let notices = match self.notices(chunk) {
+                Ok(notices) => notices,
+                Err(error) => return self.fail(error),
+            };
+            if !notices.is_empty() {
+                self.notify = true;
+                self.state = State::HolderWrite;
+                return Ok(Next::Call(IoCall::Write(notices)));
+            }
+        }
+        self.explicit_started = true;
+        match self.holder_page(None) {
+            Some(turn) => turn,
+            None => self.flush(),
+        }
+    }
+    /// One page of bucket holders after the holder key `after`.
+    fn holder_page(&mut self, after: Option<Key>) -> Option<KeyTurn> {
+        let snapshot = self.snapshot.as_ref()?;
         let prefix = snapshot.parameters.key.bucket_id.to_bytes().to_vec();
         self.state = State::Holders;
         Some(Ok(Next::Call(IoCall::Page {
             space: BUCKET_HOLDER_KEYSPACE.to_string(),
             prefix: prefix.into(),
-            after: None,
-            limit: usize::MAX,
+            after,
+            limit: HOLDER_PAGE,
         })))
     }
-    /// Tells every current holder except the member that the member waits for keys.
-    pub(super) fn notify_holders(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
-        let (Some(info), Some(snapshot)) = (&self.info, &self.snapshot) else {
-            return self.fail(KeyError::Missing);
-        };
-        let mut holders = snapshot.holders.clone();
+    /// Tells the explicit holders of one page that the member waits for keys; each page's
+    /// notices are written before the next page is read, and the told set keeps users apart.
+    pub(super) fn holders_read(&mut self, page: (Vec<(Key, Value)>, Option<Key>)) -> KeyTurn {
+        let (values, next) = page;
+        self.explicit_started = true;
+        let mut holders = Vec::new();
         for (_, value) in values {
             match BucketHolder::from_bytes(&value) {
                 Ok(holder) if holder.origin == HolderOrigin::Explicit => {
-                    holders.insert(holder.user_id);
+                    holders.push(holder.user_id);
                 }
                 Ok(_) => {}
                 Err(_) => return self.fail(AbeError::Context),
             }
         }
+        let notices = match self.notices(holders) {
+            Ok(notices) => notices,
+            Err(error) => return self.fail(error),
+        };
+        self.holder_next = next;
+        if notices.is_empty() {
+            return self.holders_written();
+        }
+        self.notify = true;
+        self.state = State::HolderWrite;
+        Ok(Next::Call(IoCall::Write(notices)))
+    }
+    /// The next role holder chunk or holder page, or the remaining writes once all were told.
+    pub(super) fn holders_written(&mut self) -> KeyTurn {
+        if !self.explicit_started {
+            return self.role_batch();
+        }
+        match (self.holder_next.take()).and_then(|after| self.holder_page(Some(after))) {
+            Some(turn) => turn,
+            None => self.flush(),
+        }
+    }
+    /// The outbox rows telling `holders` the member waits: each user once, never the member or
+    /// a user of another realm, who has no inbox here and sees requests on the bucket page.
+    fn notices(&mut self, holders: Vec<UserId>) -> Result<Vec<(String, Key, Value)>, KeyError> {
         let member = self.recipient();
-        holders.remove(&member);
-        // Users of another realm have no inbox here; they see requests on the bucket page.
-        holders.retain(|holder| holder.realm_id == self.auth.realm_id);
+        let info = self.info.as_ref().ok_or(KeyError::Missing)?;
         let kind = NotificationKind::BucketKeyPending {
             bucket: self.bucket.clone(),
             node_id: self.node,
             group_id: info.group_id,
             member_user_id: member,
         };
+        let mut rows = Vec::new();
         for holder in holders {
+            if holder == member
+                || holder.realm_id != self.auth.realm_id
+                || !self.notified.insert(holder)
+            {
+                continue;
+            }
             let class = NotificationClass::Direct;
             let id = self.ids.mint(self.now);
             let record = NotificationRecord::new(id, holder, class, kind.clone(), self.now);
             let outbox_id = self.ids.mint(self.now);
-            match outbox_write_entry(&new_outbox_record(outbox_id, record)) {
-                Ok(entry) => self.writes.push(entry),
-                Err(_) => return self.fail(KeyError::Storage),
-            }
+            let entry = outbox_write_entry(&new_outbox_record(outbox_id, record));
+            rows.push(entry.map_err(|_| KeyError::Storage)?);
         }
-        self.notify = !self.writes.is_empty();
-        self.flush()
+        Ok(rows)
     }
 }
 

@@ -11,7 +11,7 @@ use ulid::Ulid;
 
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
-use crate::structs::{SyncPullAck, SyncPullStatus, SyncRefusal};
+use crate::structs::synced_folder::{SyncPullAck, SyncPullStatus, SyncRefusal};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
@@ -95,6 +95,12 @@ pub enum TaskKey {
     PruneFamilies,
     /// Catches up with the realm config after a start, then refreshes the last contact.
     ConfigCatchUp,
+    /// Emits the watch events producers queued as rows, then deletes the rows.
+    DrainWatchEvents,
+    /// Runs the follow-ups of the reconciles shard pulls applied, then deletes their rows.
+    DrainAppliedSync,
+    /// Takes the Git snapshots of materialized documents whose capture marks remain.
+    DrainCaptures,
 }
 
 impl TaskKey {
@@ -109,6 +115,8 @@ pub struct PersistedTaskTimer {
     pub key: TaskKey,
     #[serde(rename = "due_at_unix_millis")]
     pub due_unix_millis: u64,
+    /// The scheduler admission that owns this row: only the firing of that admission deletes it.
+    pub admission: u64,
 }
 
 /// The message of the error a task effect gets on a node without a task handler.

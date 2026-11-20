@@ -2,17 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::USER_KEYSPACE;
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::id_mint::IdMint;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
-use aruna_core::rows::{done, values};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -20,13 +18,14 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{INSTALL_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
 use byteview::ByteView;
 use std::collections::HashMap;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};
-use crate::sync::outbox_record::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::oidc_user::initial_sync_change;
@@ -315,7 +314,7 @@ impl Operation for ServiceWrite {
                 self.handle_config(value)
             }
             Stage::Write => {
-                done(result)?;
+                result.done()?;
                 if self.fence.is_empty() {
                     return self.committed();
                 }

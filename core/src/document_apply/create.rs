@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use byteview::ByteView;
 use ulid::Ulid;
 
+use super::followups::{FollowUpNode, followup_id, followup_row, order_rows};
 use super::quarantine::quarantine_entries;
 use super::registry::{
     Row, accepted_create, create_fence, event_logged, lifecycle_stale, placement_fence,
@@ -14,13 +15,13 @@ use super::registry::{
 };
 use super::{ApplyError, PlacementOutcome, Step, invalid};
 use crate::deferred_topics::DocumentSyncDependency;
-use crate::document::{DocumentChange, DocumentEvent, DocumentTarget};
+use crate::document::{DocumentChange, DocumentEvent, DocumentReconcileResult, DocumentTarget};
 use crate::metadata::MetadataEventRecord;
 use crate::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use crate::storage_entries::{
     commit_message_entry, create_acceptance_entry, create_projection_entries,
 };
-use crate::structs::{SyncQuarantineIdentity, SyncRejection};
+use crate::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 
 /// One replicated create or update waiting for the batch's single transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +94,7 @@ pub struct CreateBatchPlan {
     cursor_writes: Vec<(irokle::TopicId, Row)>,
     rejections: Vec<SyncRejection>,
     notes: Vec<CreateNote>,
+    followups: Option<FollowUpNode>,
 }
 
 impl CreateBatchPlan {
@@ -124,7 +126,15 @@ impl CreateBatchPlan {
             cursor_writes,
             rejections,
             notes,
+            followups: None,
         })
+    }
+
+    /// Also writes one follow-up row for `node`'s drain in the same transaction, with the events
+    /// it accepts in acceptance order, keyed by their sync identities.
+    pub fn queuing(mut self, node: Option<FollowUpNode>) -> Self {
+        self.followups = node;
+        self
     }
 
     fn is_empty(&self) -> bool {
@@ -284,6 +294,10 @@ impl RowPlan for CreateBatchPlan {
         let mut writes = Vec::new();
         let mut held = BTreeSet::new();
         let mut waiting = false;
+        // The drain projects the accepted events in this order, so an update follows its create;
+        // without follow-ups nothing is gathered.
+        let mut queued = (self.followups).map(|node| (node, DocumentReconcileResult::default()));
+        let mut identities = Vec::new();
         for candidate in &self.candidates {
             let apply = &candidate.apply;
             // A candidate that needs rows does not stop the others, so one read serves them all.
@@ -300,6 +314,11 @@ impl RowPlan for CreateBatchPlan {
                     writes.extend(candidate.entries.iter().cloned());
                     if with_revision {
                         writes.extend(candidate.revision.iter().cloned());
+                    }
+                    if let Some((_, queued)) = &mut queued {
+                        queued.targets.push(apply.target.clone());
+                        queued.metadata_create_events.push(apply.record.clone());
+                        identities.push(apply.identity);
                     }
                     outcome
                         .accepted
@@ -325,6 +344,19 @@ impl RowPlan for CreateBatchPlan {
         }
         if waiting {
             return Err(NeedsRows.into());
+        }
+        if let Some((node, queued)) = queued
+            && !identities.is_empty()
+        {
+            let mut documents = Vec::new();
+            for event in &queued.metadata_create_events {
+                let document_id = event.record.document_id;
+                if !documents.contains(&document_id) {
+                    documents.push(document_id);
+                }
+            }
+            writes.extend(order_rows(rows, &documents, followup_id(&identities))?);
+            writes.push(followup_row(&node, &identities, queued)?);
         }
         match quarantine_entries(rows, &rejections)? {
             Some(entries) => writes.extend(entries),

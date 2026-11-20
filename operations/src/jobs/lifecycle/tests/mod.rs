@@ -18,23 +18,23 @@ mod terminal;
 mod uncertain_commit;
 mod window;
 
-use aruna_core::UserId;
 use aruna_core::effects::{LaunchFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionSpec, JobId, JobRecord, WorkspaceMode,
-};
+use aruna_core::structs::execution::job::family::EffectiveResources;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::ExecutionSpec;
+use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use crate::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
+use crate::jobs::lifecycle::admit::here::{AcceptedSubmission, placement_failure};
 use crate::jobs::lifecycle::cancel::{CancelFamilyOperation, PublishDeletionOperation};
 use crate::jobs::lifecycle::family_reads::{
     FamilyLogOperation, FamilyReportOperation, FamilyStatusOperation, SessionJobOperation,
 };
-use crate::jobs::lifecycle::ids::SubmissionScope;
 use crate::jobs::lifecycle::launch_admit::{
     AcceptLaunchOperation, AdmitLaunchOperation, LaunchAnswer,
 };
@@ -43,7 +43,7 @@ use crate::jobs::lifecycle::submit_external::{ExternalSubmission, SubmitExternal
 use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::audit::AuditPage;
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
-use crate::jobs::submit::SubmitJobError;
+use aruna_core::job_request::{SubmissionScope, SubmitJobError};
 use aruna_drivers::driver::{DriverContext, drive};
 
 pub(super) fn resources() -> EffectiveResources {

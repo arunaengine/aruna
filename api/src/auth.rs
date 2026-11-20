@@ -658,7 +658,7 @@ pub(crate) async fn ensure_permission(
         auth,
         path,
         required_permission,
-        aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
+        aruna_core::request_policy::PolicyRequestExtras::rest(),
     )
     .await
 }
@@ -671,7 +671,7 @@ pub(crate) async fn ensure_permission_with(
     auth: &AuthContext,
     path: String,
     required_permission: Permission,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> ServerResult<()> {
     time_stage(
         "permission",
@@ -739,8 +739,7 @@ mod test {
         extract_auth_parts, handle_token, map_authorize_error,
     };
     use crate::error::{ServerError, TokenError};
-    use crate::server::ServerState;
-    use aruna_core::UserId;
+    use crate::server::state::ServerState;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::StorageError;
@@ -751,8 +750,10 @@ mod test {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
     use aruna_core::structs::identity::realm::OidcProviderConfig;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::auth::error::AuthorizeError;
     use aruna_operations::auth::revoke_token::{
@@ -803,7 +804,7 @@ mod test {
     async fn canonical_blob_path() {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let realm_id = RealmId::from_bytes(
             *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
                 .verifying_key()
@@ -1052,7 +1053,7 @@ mod test {
     async fn valid_token_required() {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
@@ -1479,7 +1480,8 @@ mod test {
     pub async fn test_token_capabilities() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
-        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
@@ -1659,7 +1661,8 @@ mod test {
     pub async fn unknown_user_rejected() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
-        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1779,7 +1782,8 @@ mod test {
     pub async fn test_token_validation() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
-        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
@@ -2089,7 +2093,8 @@ mod test {
     async fn untrusted_issuers_rejected() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
-        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
@@ -2146,7 +2151,8 @@ mod test {
     async fn delegated_token_accepted() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::generate().to_string());
-        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,

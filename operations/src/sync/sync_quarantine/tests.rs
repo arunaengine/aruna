@@ -2,16 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::acknowledge::AcknowledgeQuarantineOperation;
+use super::list::ListQuarantineOperation;
+use super::prune::PruneQuarantineOperation;
+use super::read::ReadQuarantineOperation;
 use super::*;
-use aruna_core::NodeId;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{
+use aruna_core::structs::sync_quarantine::{
     SyncQuarantineCapacity, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput,
     build_quarantine_entries, quarantine_row_entry, quarantine_usage_entry,
 };
@@ -20,7 +24,7 @@ use aruna_drivers::driver::{DriverContext, drive};
 use ulid::Ulid;
 
 fn context() -> (DriverContext, tempfile::TempDir) {
-    let (dir, context) = crate::testing::temp_context();
+    let (dir, context) = aruna_drivers::testing::temp_context();
     (context, dir)
 }
 
@@ -262,7 +266,7 @@ async fn prune_reclaims_capacity() {
     .unwrap_err();
     assert!(matches!(
         error,
-        aruna_core::structs::SyncQuarantineError::AtCapacity { .. }
+        aruna_core::structs::sync_quarantine::SyncQuarantineError::AtCapacity { .. }
     ));
 
     acknowledge(&ctx, 0).await;

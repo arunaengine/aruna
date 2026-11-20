@@ -3,19 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, FetchCursor, JobRecordFrame, LaunchFrame, NetEffect, PageLimit};
 use aruna_core::events::{JobRecordPage, JobRecordRejection, LaunchDecline};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::placement::holds_placement;
+use aruna_core::structs::execution::job::family::{
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind, LaunchIntent,
+    PhysicalExecutionState, SubmissionId,
+};
+use aruna_core::structs::execution::job::membership::membership::membership::membership::{
+    Membership, membership,
+};
 use aruna_core::structs::execution::job::record_keys::{id_key, record_key};
 use aruna_core::structs::execution::job::record_rows::{PendingNeed, from_bytes};
-use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind, LaunchIntent,
-    Membership, PhysicalExecutionState, SubmissionId, membership,
-};
 use aruna_core::structs::identity::group_delete::GroupWriteError;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
@@ -30,16 +33,17 @@ use super::family::{FamilyReadError, LoadFamilyOperation};
 use super::pages::{KeepPagesOperation, PageReadError, ServingNode};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::cancel::CancelLocalRunsOperation;
+use crate::jobs::lifecycle::cancel::CancelRunsOperation;
 use crate::jobs::lifecycle::launch_admit::{
     AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
 };
 use crate::jobs::lifecycle::membership::MembershipViewOperation;
-use crate::jobs::lifecycle::witness_arm::ArmFamilyOperation;
-use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
-use crate::metadata::transport_message_kind;
+use crate::jobs::lifecycle::witness::arm::ArmFamilyOperation;
 use crate::realm::load_config::config_unavailable;
 use crate::secrets::owner::WriterView;
+use aruna_core::metadata::protocol::{
+    JobPageReply, MetadataTransportMessage, transport_message_kind,
+};
 
 #[derive(Debug, PartialEq)]
 struct PageRequest {
@@ -460,7 +464,7 @@ impl ServeRecordOperation {
         }
         let family = self.accepted()?.family;
         self.step = ServeStep::Stopped;
-        let cancel = CancelLocalRunsOperation::new(family, self.serving, self.now_ms);
+        let cancel = CancelRunsOperation::new(family, self.serving, self.now_ms);
         Ok(Next::Call(IoCall::child(cancel)))
     }
 }
@@ -685,9 +689,9 @@ impl Operation for ServeLaunchOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::jobs::job_reads::tests::{child, is_child};
+    use crate::jobs::job::reads::tests::{child, is_child};
     use crate::tests::records::{Family, node};
-    use aruna_core::structs::execution::job::JobRecordBody;
+    use aruna_core::structs::execution::job::family::JobRecordBody;
 
     fn record_request(family: &Family) -> MetadataTransportMessage {
         let spec = family.spec();

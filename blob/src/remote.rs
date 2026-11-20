@@ -19,7 +19,7 @@ use aruna_core::repository::remote::{
 };
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::Hasher;
-use aruna_core::structs::execution::job::{ArtifactRef, RoCrateLimits};
+use aruna_core::structs::execution::job::input::{ArtifactRef, RoCrateLimits};
 use aruna_core::structs::storage::blob::{BackendLocation, HiddenBlobKey};
 use async_zip::base::write::ZipFileWriter;
 use async_zip::error::ZipError;

@@ -1,27 +1,25 @@
 //! Prunes job families whose index row is due: tombstone first, then the bodies page by page.
-//! This part holds the shared rows and the guarded commit.
+//! This part holds the shared rows.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::IoError;
 use aruna_core::keyspaces::{
     FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PRUNE_KEYSPACE,
     FAMILY_RECORD_KEYSPACE, LAUNCH_CLOSURE_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
 };
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::execution::job::family::JobFamilyId;
 use aruna_core::structs::execution::job::record_keys::{prune_due_key, prune_slot_key};
-use aruna_core::structs::execution::job::{JobDeletes, JobFamilyId, JobWrites};
+use aruna_core::structs::execution::job::rows::JobDeletes;
 use aruna_core::types::Value;
 use thiserror::Error;
 
+mod commit;
 mod family;
 mod pages;
-mod pass;
-
-pub use family::PruneFamilyOperation;
-pub use pass::{FamilyTimerOperation, PruneFamiliesOperation};
+pub mod pass;
 
 /// Due index rows one pass reads, and body rows one page transaction deletes.
 pub const FAMILY_PRUNE_PAGE: usize = 256;
@@ -51,7 +49,7 @@ impl From<aruna_core::errors::ConversionError> for PruneError {
 }
 
 /// What one pass over the due rows did.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FamilyPruneOutcome {
     /// Families whose last body page this pass deleted.
     pub pruned: usize,
@@ -86,81 +84,6 @@ pub(super) fn slot_of(value: Option<Value>) -> Option<u64> {
             .ok()
             .map(u64::from_be_bytes)
     })
-}
-
-#[derive(Debug, PartialEq)]
-enum CommitStep {
-    Guard,
-    Delete,
-    Write,
-}
-
-/// Deletes and writes rows in one transaction. With a guard, the family's slot is read inside it,
-/// so a writer that indexed the family meanwhile makes the commit refuse and the pass decides again.
-#[derive(Debug, PartialEq)]
-pub struct PruneCommitOperation {
-    guard: Option<(JobFamilyId, u64)>,
-    deletes: JobDeletes,
-    writes: JobWrites,
-    step: CommitStep,
-}
-
-impl PruneCommitOperation {
-    pub fn new(guard: Option<(JobFamilyId, u64)>, deletes: JobDeletes, writes: JobWrites) -> Self {
-        Self {
-            guard,
-            deletes,
-            writes,
-            step: CommitStep::Guard,
-        }
-    }
-
-    fn apply(&mut self) -> Next<bool> {
-        if !self.deletes.is_empty() {
-            self.step = CommitStep::Delete;
-            return Next::Call(IoCall::Delete(std::mem::take(&mut self.deletes)));
-        }
-        if !self.writes.is_empty() {
-            self.step = CommitStep::Write;
-            return Next::Call(IoCall::Write(std::mem::take(&mut self.writes)));
-        }
-        Next::Done(true)
-    }
-}
-
-impl Operation for PruneCommitOperation {
-    type Output = bool;
-    type Error = IoError;
-
-    fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
-    }
-
-    fn first(&mut self) -> Result<Next<bool>, IoError> {
-        match self.guard {
-            Some((family, _)) => {
-                let slot = (FAMILY_PRUNE_KEYSPACE.to_string(), prune_slot_key(&family));
-                Ok(Next::Call(IoCall::Read(vec![slot])))
-            }
-            None => Ok(self.apply()),
-        }
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-        match self.step {
-            CommitStep::Guard => {
-                let due_ms = self.guard.map(|(_, due_ms)| due_ms);
-                if slot_of(result.value()?) != due_ms {
-                    return Ok(Next::Done(false));
-                }
-                Ok(self.apply())
-            }
-            CommitStep::Delete | CommitStep::Write => {
-                result.done()?;
-                Ok(self.apply())
-            }
-        }
-    }
 }
 
 #[cfg(test)]

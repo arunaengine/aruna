@@ -7,7 +7,7 @@ use crate::jobs::repository::test_support::{
     NOW_MS, child, job_id, link, link_bytes, local_scope, owner_node,
 };
 use aruna_core::repository::ImportOptions;
-use aruna_core::structs::execution::job::{ImportRoCrateTarget, RoCrateLimits};
+use aruna_core::structs::execution::job::input::{ImportRoCrateTarget, RoCrateLimits};
 
 fn pull_state(latest: Option<&str>, auto_update: bool) -> LinkPull {
     LinkPull {

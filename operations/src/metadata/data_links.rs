@@ -17,7 +17,6 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::realm::NodeRealm;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -26,8 +25,9 @@ use aruna_core::structs::storage::data::link::{
     DataLink, LinkPosting, MAX_DOCUMENT_LINKS, MAX_LINK_SUBJECTS, document_key, posting_document,
     posting_key,
 };
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::distribution::inventory::index_key;
-use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::types::Key;
 use byteview::ByteView;
 use thiserror::Error;
@@ -35,7 +35,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_bounded};
-use crate::metadata::call_results::page_rows;
 
 const PAGE_SIZE: usize = 256;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -206,7 +205,7 @@ impl Operation for DocumentRowsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<Vec<u8>>>, DataLinkError> {
-        let (rows, next) = page_rows(result)?;
+        let (rows, next) = result.page()?;
         let keys = rows
             .into_iter()
             .filter_map(|(key, _)| key.get(16..).map(<[u8]>::to_vec));
@@ -306,7 +305,7 @@ impl Operation for LocalMembersOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, DataLinkError> {
         if self.sets.is_empty() {
-            let (rows, next) = page_rows(result)?;
+            let (rows, next) = result.page()?;
             self.seen += rows.len();
             self.next = next;
             for (_, value) in rows {
@@ -330,7 +329,7 @@ impl Operation for LocalMembersOperation {
                 .collect();
             return Ok(Next::Call(IoCall::Read(reads)));
         }
-        let values = all_values(result)?;
+        let values = result.values()?;
         for ((set_id, _), value) in std::mem::take(&mut self.sets).into_iter().zip(values) {
             let bucket = value
                 .map(|value| BucketInfo::from_bytes(&value))
@@ -436,7 +435,7 @@ impl Operation for AssociateVersionsOperation {
             }
             return Ok(Next::Call(IoCall::Read(reads)));
         }
-        let values = all_values(result)?;
+        let values = result.values()?;
         let candidates = std::mem::take(&mut self.candidates);
         let found: Vec<_> = (candidates.into_iter().zip(values))
             .filter(|(_, value)| value.is_some())
@@ -609,7 +608,7 @@ impl Operation for RetryUnverifiedOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<Option<Vec<u8>>>, DataLinkError> {
         match std::mem::replace(&mut self.stage, RetryStage::Settle) {
             RetryStage::Page => {
-                let (rows, next) = page_rows(result)?;
+                let (rows, next) = result.page()?;
                 self.next = next.map(|next| next.to_vec());
                 for (key, value) in rows {
                     if let Some((realm_id, version_id, document_id)) = unverified_parts(&key) {
@@ -634,7 +633,7 @@ impl Operation for RetryUnverifiedOperation {
             }
             RetryStage::Local(posting) => {
                 let reads = set_reads(&self.members, posting.version_id);
-                let values = all_values(result)?;
+                let values = result.values()?;
                 let local = (reads.into_iter().zip(values))
                     .find(|(_, value)| value.is_some())
                     .map(|((set_id, _), _)| set_id);

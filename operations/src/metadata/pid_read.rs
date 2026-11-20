@@ -2,23 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::PersistentIdMapping;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::persistent_id::PersistentIdMapping;
 use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::forward::routing::{ForwardHoldersOperation, HolderWriteError};
-use crate::forward::transport::{MetadataWriteError, write_error};
 use crate::metadata::api::MetadataApiError;
+use crate::metadata::forward::write::{MetadataWriteError, write_error};
 use crate::metadata::id_mapping::{parse_mapping_read, read_mapping_effect};
 use crate::metadata::persistent_id::forward::{pid_authority_node, pid_error};
-use crate::metadata::protocol::{
+use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, PersistentIdOutcome, PersistentIdRequest,
 };
-use crate::realm::load_config::config_unavailable;
 
 #[derive(Debug, PartialEq)]
 enum PidStep {

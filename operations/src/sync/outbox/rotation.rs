@@ -1,0 +1,151 @@
+//! Keeps one rotation of the bounded document sync drain and decides when the drain runs again:
+//! after a failure on the retry ladder, and after a closed rotation from what it left behind.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use aruna_core::id::NodeId;
+use irokle::TopicId;
+
+use crate::queue_backoff::retry_delay_ms;
+use crate::sync::shard_placement::DEFER_RETRY_AFTER;
+
+/// Outcome counts accumulated across the invocations of one rotation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RotationTotals {
+    pub examined: usize,
+    pub deleted: usize,
+    pub deferred: usize,
+    pub undeliverable: usize,
+    pub retry_invocations: usize,
+    pub invocations: u32,
+}
+
+/// One rotation of the bounded document sync drain: head to observed end across as many bounded
+/// invocations as it needs. Ordering blocks and outcome counts carry across them; holdership and
+/// publisher authority never do.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OutboxRotation {
+    /// Last key observed when this rotation opened.
+    pub boundary: Option<Vec<u8>>,
+    /// Last key observed in each independently ordered event-kind stream.
+    pub stream_boundaries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Where the next invocation resumes; `None` is the head.
+    pub cursor: Option<Vec<u8>>,
+    /// Topics whose FIFO is blocked for the rest of this rotation.
+    pub blocked_topics: HashSet<TopicId>,
+    /// Admin origin streams blocked for the rest of this rotation.
+    pub blocked_origins: HashSet<NodeId>,
+    /// Topics this node can never publish onto, for the rest of this rotation.
+    pub undeliverable_topics: HashSet<TopicId>,
+    pub totals: RotationTotals,
+    /// Continuations already spent without yielding through the timer.
+    pub continuations: u32,
+    /// Failed or unfinished drains since the last progress; it survives a closed rotation.
+    pub retry_attempts: u32,
+}
+
+impl OutboxRotation {
+    pub fn admits(&self, key: &[u8]) -> bool {
+        if !self.stream_boundaries.is_empty() {
+            return self
+                .stream_boundaries
+                .iter()
+                .find(|(prefix, _)| key.starts_with(prefix))
+                .is_some_and(|(_, boundary)| key <= boundary.as_slice());
+        }
+        self.boundary
+            .as_deref()
+            .is_none_or(|boundary| key <= boundary)
+    }
+
+    pub fn at_end(&self, cursor: Option<&[u8]>) -> bool {
+        cursor.is_some_and(|cursor| {
+            self.boundary
+                .as_deref()
+                .is_some_and(|boundary| cursor >= boundary)
+        })
+    }
+
+    /// Ends this rotation and answers its totals; the retry ladder stays.
+    pub fn close(&mut self) -> RotationTotals {
+        let totals = self.totals;
+        let retry_attempts = self.retry_attempts;
+        *self = Self {
+            retry_attempts,
+            ..Self::default()
+        };
+        totals
+    }
+
+    /// The wait before the next drain after a failed or unfinished one, on the retry ladder;
+    /// counts the attempt.
+    pub fn retry_after(&mut self) -> Duration {
+        let after = Duration::from_millis(retry_delay_ms(self.retry_attempts));
+        self.retry_attempts = self.retry_attempts.saturating_add(1);
+        after
+    }
+
+    /// Closes this rotation and decides the next drain from what it left behind: retried pages
+    /// run again on the ladder, deferred records after the defer delay, a clean rotation waits.
+    /// Deleted records are progress and restart the ladder.
+    pub fn close_plan(&mut self) -> (RotationTotals, Option<Duration>) {
+        let closed = self.close();
+        let pending = closed.retry_invocations > 0 || closed.deferred > 0;
+        if closed.deleted > 0 || !pending {
+            self.retry_attempts = 0;
+        }
+        let after = match (closed.retry_invocations, closed.deferred) {
+            (0, 0) => None,
+            (0, _) => Some(DEFER_RETRY_AFTER),
+            _ => Some(self.retry_after()),
+        };
+        (closed, after)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closing(totals: RotationTotals, retry_attempts: u32) -> OutboxRotation {
+        OutboxRotation {
+            totals,
+            retry_attempts,
+            ..OutboxRotation::default()
+        }
+    }
+
+    // Retried pages climb the ladder, deleted records restart it, deferred ones wait for the
+    // defer delay and a clean rotation waits for new records.
+    #[test]
+    fn closed_rotation_plans() {
+        let retried = RotationTotals {
+            retry_invocations: 1,
+            ..RotationTotals::default()
+        };
+        let mut rotation = closing(retried, 3);
+        let after = Some(Duration::from_millis(retry_delay_ms(3)));
+        assert_eq!(rotation.close_plan(), (retried, after));
+        assert_eq!(rotation.retry_attempts, 4);
+        let progressed = RotationTotals {
+            deleted: 2,
+            ..retried
+        };
+        let mut rotation = closing(progressed, 3);
+        let after = Some(Duration::from_millis(retry_delay_ms(0)));
+        assert_eq!(rotation.close_plan(), (progressed, after));
+        let deferred = RotationTotals {
+            deferred: 2,
+            ..RotationTotals::default()
+        };
+        let mut rotation = closing(deferred, 3);
+        assert_eq!(rotation.close_plan().1, Some(DEFER_RETRY_AFTER));
+        assert_eq!(rotation.retry_attempts, 3, "no progress keeps the ladder");
+        let mut rotation = closing(RotationTotals::default(), 3);
+        assert_eq!(rotation.close_plan().1, None);
+        assert_eq!(rotation.retry_attempts, 0);
+    }
+}

@@ -4,10 +4,11 @@
 
 use aruna_core::effects::{JobRecordFrame, PageLimit, StorageEffect};
 use aruna_core::keyspaces::JOB_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobRecordEnvelope, JobState, LogicalJobState, PhysicalExecutionState,
-    job_record_key,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, LogicalJobState, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::job_record_key;
 
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
@@ -121,9 +122,11 @@ async fn keeps_attempt_state() {
     // Family projection may settle its logical cache but never a physical attempt.
     let family = Family::new([3u8; 32]);
     let (_dir, context) = fixture(&family.config, family.holder.public()).await;
-    let mut logical = aruna_core::structs::execution::job::JobRecord::new(
+    let mut logical = aruna_core::structs::execution::job::local::JobRecord::new(
         family.job_id,
-        aruna_core::structs::execution::job::JobPayload::Execution(crate::tests::records::payload()),
+        aruna_core::structs::execution::job::input::JobPayload::Execution(
+            crate::tests::records::payload(),
+        ),
         crate::tests::records::user(),
         family.holder.public(),
         1_000,
@@ -144,7 +147,7 @@ async fn keeps_attempt_state() {
     let mut physical = logical.clone();
     physical.job_id = physical_id;
     physical.state = JobState::Running;
-    crate::jobs::store::test_calls::insert_job(&context, &physical)
+    aruna_test_support::jobs::insert_job(&context, &physical)
         .await
         .expect("physical row inserted");
 
@@ -156,12 +159,12 @@ async fn keeps_attempt_state() {
         LogicalJobState::Succeeded
     );
 
-    let stored = crate::jobs::store::test_calls::read_job_record(&context, family.job_id, None)
+    let stored = aruna_test_support::jobs::read_job_record(&context, family.job_id, None)
         .await
         .expect("job row read")
         .expect("job row exists");
     assert_eq!(stored.state, JobState::Succeeded);
-    let physical = crate::jobs::store::test_calls::read_job_record(&context, physical_id, None)
+    let physical = aruna_test_support::jobs::read_job_record(&context, physical_id, None)
         .await
         .expect("physical row read")
         .expect("physical row exists");

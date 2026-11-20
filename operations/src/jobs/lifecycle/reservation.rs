@@ -16,10 +16,17 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::values;
-use aruna_core::structs::execution::job::{
-    EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, LaunchIntent, RecordVerdict,
-    RunLink, run_crate_key,
+use aruna_core::structs::execution::job::family::{
+    EffectiveResources, JobFamilyRecord, LaunchIntent, RecordVerdict,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{JobRecord, RunLink, run_crate_key};
+use aruna_core::structs::execution::job::record_keys::{family_prefix, prune_rows, record_key};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
+};
+use aruna_core::structs::execution::job::rows::job_insert_entries;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Key, Value};
 
@@ -28,13 +35,8 @@ use ulid::Ulid;
 
 use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
-use crate::plugins::task_row::{TaskRow, task_place};
+use crate::plugins::task::row::{TaskRow, task_place};
 use crate::plugins::work::{Found, WorkLookup, WorkState};
-use aruna_core::structs::execution::job::job_insert_entries;
-use aruna_core::structs::execution::job::record_keys::{family_prefix, prune_rows, record_key};
-use aruna_core::structs::execution::job::record_rows::{
-    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
-};
 
 /// Reservations one capacity decision reads. A node cannot run more concurrent
 /// executions than this without its backend ceiling stopping it first.
@@ -144,7 +146,7 @@ impl ReserveExecutionOperation {
         }
     }
 
-    fn family(&self) -> aruna_core::structs::execution::job::JobFamilyId {
+    fn family(&self) -> aruna_core::structs::execution::job::family::JobFamilyId {
         self.config.receipt.envelope().family()
     }
 

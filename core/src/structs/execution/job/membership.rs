@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use ulid::Ulid;
 
 use super::family::{JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState};
-use crate::NodeId;
 use crate::admin_documents::{AdminDocumentClock, NodeInterval};
+use crate::id::NodeId;
 
 /// What this node's applied realm config says about a node a record cites.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

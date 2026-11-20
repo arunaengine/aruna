@@ -4,14 +4,14 @@
 
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::calls::IoError;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicationMode};
-use aruna_core::structs::{SyncMode, SyncStatusSnapshot};
+use aruna_core::structs::sync_relationship::{SyncMode, SyncStatusSnapshot};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::*;
@@ -20,7 +20,7 @@ fn realm() -> RealmId {
     RealmId::from_bytes([9; 32])
 }
 
-fn node(seed: u8) -> aruna_core::NodeId {
+fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 

@@ -148,7 +148,6 @@ impl BlobHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::BlobEffect;
     use aruna_core::events::BlobEvent;
@@ -158,6 +157,7 @@ mod tests {
     use aruna_core::structs::storage::encryption::{
         BlockCipher, BlockKeys, BucketKeyRef, public_key_of,
     };
+    use aruna_core::user::id::UserId;
     use bao_tree::ByteRanges;
     use bao_tree::io::fsm::{CreateOutboard, encode_ranges_validated};
     use bao_tree::io::outboard::PreOrderOutboard;
@@ -195,12 +195,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
         std::fs::create_dir(&root).unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let net = aruna_net::NetHandle::new(
-            aruna_net::NetConfig {
+            aruna_net::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
-                discovery_method: aruna_net::DiscoveryMethod::None,
-                relay_method: aruna_net::RelayMethod::None,
+                discovery_method: aruna_net::config::DiscoveryMethod::None,
+                relay_method: aruna_net::config::RelayMethod::None,
                 ..Default::default()
             },
             storage.clone(),

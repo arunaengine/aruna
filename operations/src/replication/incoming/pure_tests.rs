@@ -15,24 +15,25 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
-use crate::replication::protocol::{
-    MAX_VALUE_BYTES, MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
-};
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::{QuotaGate, QuotaGateError};
+use aruna_core::calls::CallRun;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
-use aruna_core::id::DhtKeyId;
+use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     OBJECT_METADATA_KEYSPACE, PATHS_INDEX_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation, Runnable, TransactionMode};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::replication_protocol::{
+    MAX_VALUE_BYTES, MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
+};
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
@@ -56,7 +57,7 @@ use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurg
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
@@ -176,17 +177,17 @@ fn envelope_rows(turn: &Turn) -> Vec<&(String, Key, Value)> {
 
 #[tokio::test]
 async fn refused_copy_absent() {
-    use crate::replication::protocol::VersionReplicationRequest;
     use crate::replication::version_replication::{ReplicateObjectError, ReplicateObjectOperation};
     use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
+    use aruna_core::replication_protocol::VersionReplicationRequest;
     use aruna_core::structs::storage::blob::VersionKey;
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyRef, EncryptionMode,
     };
     use aruna_core::structs::storage::format::PithosLayout;
     use aruna_core::structs::storage::replication_queue::ReplicationMode;
-    let (_source_dir, source_storage) = crate::tests::s3::test_storage();
-    let (target_dir, target_storage) = crate::tests::s3::test_storage();
+    let (_source_dir, source_storage) = aruna_test_support::s3::test_storage();
+    let (target_dir, target_storage) = aruna_test_support::s3::test_storage();
     let target_node = iroh::SecretKey::from_bytes(&[42; 32]).public();
     let stream_id = Ulid::from_parts(42, 42);
     let data = [7u8; 42];
@@ -280,7 +281,7 @@ async fn refused_copy_absent() {
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
     }
-    let mut source = ReplicateObjectOperation::new(VersionReplicationRequest {
+    let mut source = CallRun::new(ReplicateObjectOperation::new(VersionReplicationRequest {
         bucket: "bucket".to_string(),
         key: "dir/file.txt".to_string(),
         version_id: trace_version_id(),
@@ -288,8 +289,7 @@ async fn refused_copy_absent() {
         target_node_id: target_node,
         auth_context: make_manifest(ReplicationItemKind::Materialized).auth_context,
         mode: ReplicationMode::OnDemand,
-    })
-    .into_machine();
+    }));
     let mut effects = source.start();
     while matches!(effects.as_slice(), [Effect::Storage(_)]) {
         let Effect::Storage(effect) = effects.remove(0) else {
@@ -313,7 +313,7 @@ async fn refused_copy_absent() {
         IncomingVersionOperation::new(stream_id, target_node, test_realm_id(), manifest);
     target.manifest_policy = Some(target.target_authorization_path(test_group_id()));
     target.writer_policy = Some(target.target_authorization_path(test_group_id()));
-    let mut target = target.into_machine();
+    let mut target = CallRun::new(target);
     let mut effects = target.start();
     loop {
         match effects.as_slice() {
@@ -4101,7 +4101,7 @@ fn mapped_refuses_replicas() {
 fn keeps_pull_receipt() {
     use aruna_core::keyspaces::SYNC_RECEIPT_KEYSPACE;
     use aruna_core::structs::storage::distribution::DistributionBinding;
-    use aruna_core::structs::{ORIGIN_DEVICE_TAG, SYNC_VERSION_TAG, tagged_receipt};
+    use aruna_core::structs::synced_folder::{ORIGIN_DEVICE_TAG, SYNC_VERSION_TAG, tagged_receipt};
     let device = iroh::SecretKey::from_bytes(&[9; 32]).public();
     let pulled = Ulid::from_bytes([2; 16]);
     let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);

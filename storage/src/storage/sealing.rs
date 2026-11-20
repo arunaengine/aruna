@@ -142,7 +142,7 @@ pub(super) fn open_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FjallStorage;
+    use crate::storage::worker::FjallStorage;
     use aruna_core::events::Event;
 
     const CANARY: &[u8] = b"canary-9a7c";

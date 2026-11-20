@@ -7,23 +7,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structured_id::StructuredId;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::send_metadata_effect;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
-use aruna_operations::testing::process_materialization_batch;
-use aruna_operations::testing::replay_event_log;
-use aruna_operations::testing::send_metadata_effect;
-use aruna_storage::{FjallPersistPolicy, FjallStorage};
+use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::projection::replay_event_log;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -232,7 +234,7 @@ fn actor() -> Actor {
     let realm_id = RealmId([9u8; 32]);
     Actor {
         node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
-        user_id: aruna_core::UserId::local(Ulid::from_parts(9, 3), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(9, 3), realm_id),
         realm_id,
     }
 }

@@ -9,10 +9,7 @@ use crate::blob::import_rows::{
 };
 use crate::blob::migration::misplaced::KeyRule;
 use crate::blob::migration::shared::{MigrationError, routing_call, routing_result};
-use crate::s3::object::versions::{
-    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
-    ListVersionsResult,
-};
+use crate::s3::object::versions::{ListVersionsError, ListVersionsInput, ListVersionsOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
@@ -28,6 +25,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion, HashIndex,
     VersionKey,
 };
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
 use aruna_core::structs::storage::routing::{NodeRouting, RoutingSnapshot};
 use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
 use aruna_core::types::{GroupId, Key, Value};

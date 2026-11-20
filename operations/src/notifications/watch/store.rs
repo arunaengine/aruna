@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
@@ -10,21 +9,21 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
     WATCH_USER_CAP, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-    watch_subscription_prefix,
+    dirty_marker_write, watch_subscription_prefix,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
 use crate::notifications::watch::check::{WatchCheckError, WatchCheckOperation};
-use crate::notifications::watch::digest::dirty_marker_write;
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WatchReplication, WatchSubscriptionError, validated_subscription, watch_subscription_target,
     watch_upsert_replication,
 };
-use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox::record::{outbox_write_entry, schedule_drain_effect};
 
 /// What to store.
 #[derive(Clone, Debug, PartialEq)]
@@ -261,8 +260,8 @@ pub struct CreateWatchOperation {
 
 impl CreateWatchOperation {
     pub fn new(
-        watch_id: Ulid,
-        local: aruna_core::NodeId,
+        (watch_id, outbox_id): (Ulid, Ulid),
+        local: aruna_core::id::NodeId,
         owner: UserId,
         (path_prefix, event_mask): (String, WatchEventMask),
         authorization: WatchAuthorizationBinding,
@@ -276,7 +275,7 @@ impl CreateWatchOperation {
             now_ms,
             authorization,
         )?;
-        let replication = watch_upsert_replication(local, &subscription)?;
+        let replication = watch_upsert_replication((local, outbox_id), &subscription)?;
         Ok(Self {
             subscription,
             replication: Some(replication),
@@ -438,7 +437,7 @@ mod call_tests {
         let mut holder = StoreWatchOperation::create(subscription(), None);
         holder.replication = Some(
             crate::notifications::watch::records::watch_delete_replication(
-                crate::tests::locations::node_id(1),
+                (crate::tests::locations::node_id(1), Ulid::from_parts(9, 8)),
                 user(1, 2),
                 Ulid::from_parts(9, 9),
                 1_000,
@@ -466,7 +465,7 @@ mod call_tests {
         let binding = WatchAuthorizationBinding::default();
         let new = || {
             CreateWatchOperation::new(
-                Ulid::from_parts(4, 4),
+                (Ulid::from_parts(4, 4), Ulid::from_parts(4, 5)),
                 local,
                 user(1, 2),
                 (prefix.clone(), mask),

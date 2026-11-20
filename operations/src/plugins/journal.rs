@@ -79,8 +79,9 @@ enum JournalPhase {
     /// Reads the oldest kept rows, deleted a page at a time.
     Kept,
     DeletingKept,
+    /// Reads the source rows a page at a time; the old ones of each page go before the next.
     Sources(Scan),
-    DeletingSources,
+    DeletingSources(Option<Scan>),
 }
 
 impl PruneJournal {
@@ -91,6 +92,16 @@ impl PruneJournal {
             None,
             JOURNAL_PAGE,
         )
+    }
+
+    /// The next source page, or the end once the scan has no more.
+    fn sources_next(&mut self, scan: Option<Scan>) -> Next<usize> {
+        let Some(scan) = scan else {
+            return Next::Done(self.pruned);
+        };
+        let ask = scan.ask();
+        self.phase = JournalPhase::Sources(scan);
+        Next::Call(ask)
     }
 }
 
@@ -103,7 +114,7 @@ impl Operation for PruneJournal {
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
-        match std::mem::replace(&mut self.phase, JournalPhase::DeletingSources) {
+        match std::mem::replace(&mut self.phase, JournalPhase::DeletingSources(None)) {
             JournalPhase::Kept => {
                 let (rows, _) = page_of(answer)?;
                 let old: Vec<_> = (rows.into_iter())
@@ -127,11 +138,7 @@ impl Operation for PruneJournal {
                 Ok(Next::Call(Self::kept_page()))
             }
             JournalPhase::Sources(mut scan) => {
-                let Some(sources) = scan.take(answer)? else {
-                    let ask = scan.ask();
-                    self.phase = JournalPhase::Sources(scan);
-                    return Ok(Next::Call(ask));
-                };
+                let (sources, more) = scan.page(answer)?;
                 let old: Vec<_> = (sources.into_iter())
                     .filter(|(_, value)| {
                         let anchor = value.as_slice().try_into().map(u64::from_be_bytes);
@@ -142,11 +149,16 @@ impl Operation for PruneJournal {
                     .map(|(key, _)| (EVENT_JOURNAL_KEYSPACE, key))
                     .collect();
                 self.pruned += old.len();
+                let scan = more.then_some(scan);
+                if old.is_empty() {
+                    return Ok(self.sources_next(scan));
+                }
+                self.phase = JournalPhase::DeletingSources(scan);
                 Ok(Next::Call(delete_call(old)))
             }
-            JournalPhase::DeletingSources => {
+            JournalPhase::DeletingSources(scan) => {
                 done(answer)?;
-                Ok(Next::Done(self.pruned))
+                Ok(self.sources_next(scan))
             }
         }
     }
@@ -184,6 +196,30 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn sources_pruned_paged() {
+        // Each source page deletes its old rows before the next page is read.
+        let now = DEDUP_RETENTION_MS + JOURNAL_RETENTION_MS + 100;
+        let mut prune = prune_journal(now);
+        prune.first().unwrap();
+        let sources = prune.next(page_result(Vec::new(), None)).unwrap();
+        assert!(matches!(sources, Next::Call(IoCall::Page { .. })));
+        let old = (vec![SOURCE_ROW, 1], 1u64.to_be_bytes().to_vec());
+        let first = page_result(vec![old], Some(vec![SOURCE_ROW, 1]));
+        assert!(matches!(
+            prune.next(first).unwrap(),
+            Next::Call(IoCall::Delete(_))
+        ));
+        let next = prune.next(IoResult::Done).unwrap();
+        assert!(
+            matches!(next, Next::Call(IoCall::Page { .. })),
+            "then the next page"
+        );
+        let kept = (vec![SOURCE_ROW, 2], now.to_be_bytes().to_vec());
+        let last = prune.next(page_result(vec![kept], None)).unwrap();
+        assert_eq!(last, Next::Done(1));
+    }
+
     #[tokio::test]
     async fn retention_pruning() {
         let (_dir, ctx) = opened();
@@ -215,11 +251,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn local_create_once() {
         // The accepting node journals a creation in its batch; its projection adds nothing.
-        use crate::metadata::create_document::{
-            CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
-        };
+        use crate::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
         use crate::metadata::create_entry::CreateEntryOperation;
-        let fixture = crate::plugins::install::tests::Fixture::new().await;
+        use aruna_core::metadata::api::CreateDocumentPayload;
+        let fixture = aruna_test_support::plugins::Fixture::new().await;
         let mut ctx = fixture.ctx.clone();
         let dir = tempfile::tempdir().unwrap();
         let storage = fixture.ctx.storage_handle.clone();
@@ -253,7 +288,9 @@ pub(crate) mod tests {
         .await
         .unwrap();
         for _ in 0..3 {
-            crate::testing::drain_projection_queue(&ctx).await.unwrap();
+            aruna_test_support::projection::drain_projection_queue(&ctx)
+                .await
+                .unwrap();
         }
         let page = journal_page(JOURNAL_ROW, None, 10);
         let (kept, _) = drive(page, &ctx).await.unwrap();
@@ -286,16 +323,12 @@ pub(crate) mod tests {
             plan.next(page_result(page, None)).unwrap(),
             Next::Call(IoCall::Page { .. })
         ));
-        // A source row past the dedup horizon goes; a recent one stays.
+        // Source rows inside the dedup horizon stay, and a page with none older sends no delete.
+        const { assert!(100 <= 1 + DEDUP_RETENTION_MS) };
         let anchor = |at: u64| at.to_be_bytes().to_vec();
         let sources = vec![(b"s1".to_vec(), anchor(1)), (b"s2".to_vec(), anchor(99))];
         let next = plan.next(page_result(sources, None)).unwrap();
-        let expected = if 100 > 1 + DEDUP_RETENTION_MS { 1 } else { 0 };
-        let Next::Call(IoCall::Delete(keys)) = next else {
-            panic!("old source rows are deleted");
-        };
-        assert_eq!(keys.len(), expected);
-        assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1 + expected));
+        assert_eq!(next, Next::Done(1));
     }
 
     #[test]

@@ -5,13 +5,13 @@
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{
-    MetadataQueryMode, SearchHitResponse, map_api_error, map_query_mode, map_search_hit,
-};
+use crate::metadata::model::{MetadataQueryMode, SearchHitResponse};
+use crate::metadata::{map_api_error, map_query_mode, map_search_hit};
 use crate::routes::access::users::MIN_QUERY_CHARS;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_core::search::ObjectKeyMatch;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
 use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
@@ -22,8 +22,7 @@ use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,
 };
-use aruna_operations::s3::bucket::dataset::DatasetSummaryOperation;
-use aruna_operations::s3::object::search::ObjectKeyMatch;
+use aruna_operations::metadata::forward::read::DatasetSummaryOperation;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

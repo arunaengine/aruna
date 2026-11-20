@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
@@ -16,7 +17,7 @@ use aruna_core::plugin_runs::{
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_plugin_types::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -26,7 +27,7 @@ use super::grants::held_covers;
 use super::lifecycle::targets;
 use super::matcher::{Counting, Outbox, Target};
 use super::rows::{
-    Row, Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
+    Row, Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, unexpected, values,
 };
 use crate::realm::mutate_placement::node_kind;
@@ -223,11 +224,6 @@ impl Operation for StartReplay {
             }
         }
     }
-}
-
-/// Every replay key, for [`replay_page`].
-pub(crate) fn replay_scan() -> Scan {
-    Scan::new(PLUGIN_REPLAYS_KEYSPACE, vec![REPLAY_ROW])
 }
 
 /// One page of `page` rows of the replay at `key` in one transaction: forward rows for the newly
@@ -478,29 +474,55 @@ impl Operation for PlanReplay {
     }
 }
 
-/// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
-/// answers the rows read.
+/// What one replay pass did: the rows read, whether a replay has more, and the replay key the
+/// next pass starts after.
+#[derive(Debug, Default, PartialEq)]
+pub struct Replayed {
+    pub read: usize,
+    pub more: bool,
+    pub after: Option<Vec<u8>>,
+    /// Replays whose page failed; each keeps its row and comes again after the others.
+    pub failed: usize,
+}
+
+/// Continues the replays in key order after `after`, one journal page of `page` rows each, a
+/// page per transaction, and wraps once to the first replay. Every replay key page and journal
+/// page costs one of `pages`; while pages remain and a replay has more, another pass starts.
 #[derive(Debug, PartialEq)]
 pub struct RunReplays {
     now_ms: u64,
     page: usize,
     pages: usize,
-    scan: Option<Scan>,
+    /// The key this pass started after; after wrapping the pass stops at it.
+    start: Option<Vec<u8>>,
+    wrapped: bool,
+    /// The key the next key page starts after, while this sweep has one.
+    scan: Option<Option<Vec<u8>>>,
+    scanning: bool,
     keys: VecDeque<Vec<u8>>,
-    current: Option<(Vec<u8>, usize)>,
+    current: Option<Vec<u8>>,
+    last: Option<Vec<u8>>,
     read: usize,
+    pending: bool,
+    failed: usize,
 }
 
 impl RunReplays {
-    pub fn new(now_ms: u64, (page, pages): (usize, usize)) -> Self {
+    pub fn new(now_ms: u64, (page, pages): (usize, usize), after: Option<Vec<u8>>) -> Self {
         Self {
             now_ms,
             page,
             pages,
-            scan: Some(replay_scan()),
+            start: after.clone(),
+            wrapped: false,
+            scan: Some(after),
+            scanning: false,
             keys: VecDeque::new(),
             current: None,
+            last: None,
             read: 0,
+            pending: false,
+            failed: 0,
         }
     }
 
@@ -508,44 +530,93 @@ impl RunReplays {
         IoCall::child(replay_page(key, self.now_ms, self.page))
     }
 
-    /// The next page of the next replay, or the end.
-    fn next_replay(&mut self) -> Next<usize> {
-        while let Some(key) = self.keys.pop_front() {
-            if self.pages > 0 {
-                self.current = Some((key.clone(), 1));
+    /// The end of the pass; a failure keeps the position past the failed replay and asks for
+    /// the ordinary delay instead of the next tick at once.
+    fn done(&mut self, more: bool) -> Next<Replayed> {
+        let failed = self.failed;
+        let after = if more || failed > 0 {
+            self.last.take()
+        } else {
+            None
+        };
+        Next::Done(Replayed {
+            read: self.read,
+            more: more && failed == 0,
+            after,
+            failed,
+        })
+    }
+
+    /// The next key page or journal page, or the end once the pages are spent.
+    fn advance(&mut self) -> Next<Replayed> {
+        loop {
+            if let Some(key) = self.keys.pop_front() {
+                if self.wrapped && self.start.as_ref().is_some_and(|start| key > *start) {
+                    // The rest of this sweep was visited before the wrap.
+                    self.keys.clear();
+                    self.scan = None;
+                    continue;
+                }
+                if self.pages == 0 {
+                    return self.done(true);
+                }
+                self.pages -= 1;
+                self.current = Some(key.clone());
                 return Next::Call(self.page_of(key));
             }
+            if let Some(after) = self.scan.clone() {
+                if self.pages == 0 {
+                    return self.done(true);
+                }
+                self.pages -= 1;
+                self.scanning = true;
+                let limit = self.pages.max(1);
+                let keys = page_call(PLUGIN_REPLAYS_KEYSPACE, vec![REPLAY_ROW], after, limit);
+                return Next::Call(keys);
+            }
+            if !self.wrapped && self.start.is_some() {
+                self.wrapped = true;
+                self.scan = Some(None);
+                continue;
+            }
+            if self.pending && self.failed == 0 && self.pages > 0 {
+                (self.pending, self.start, self.wrapped) = (false, None, false);
+                self.scan = Some(None);
+                continue;
+            }
+            return self.done(self.pending);
         }
-        Next::Done(self.read)
     }
 }
 
 impl Operation for RunReplays {
-    type Output = usize;
+    type Output = Replayed;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Next<usize>, StoreError> {
-        let scan = self.scan.as_ref().ok_or(IoError::Unfinished)?;
-        Ok(Next::Call(scan.ask()))
+    fn first(&mut self) -> Result<Next<Replayed>, StoreError> {
+        Ok(self.advance())
     }
 
-    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
-        if let Some(scan) = self.scan.as_mut() {
-            let Some(rows) = scan.take(answer)? else {
-                return Ok(Next::Call(scan.ask()));
-            };
-            self.scan = None;
-            self.keys = rows.into_iter().map(|(key, _)| key).collect();
-            return Ok(self.next_replay());
+    fn next(&mut self, answer: IoResult) -> Result<Next<Replayed>, StoreError> {
+        if self.scanning {
+            // Only the keys of each page stay; the replay rows are read again page by page.
+            self.scanning = false;
+            let (rows, next) = page_of(answer)?;
+            self.keys.extend(rows.into_iter().map(|(key, _)| key));
+            self.scan = next.map(Some);
+            return Ok(self.advance());
         }
-        let (rows, ended) = answer.child::<(usize, bool), StoreError>()??;
-        self.read += rows;
-        let (key, done_pages) = self.current.take().ok_or(IoError::Unfinished)?;
-        if ended || done_pages >= self.pages {
-            return Ok(self.next_replay());
+        let key = self.current.take().ok_or(IoError::Unfinished)?;
+        match answer.child::<(usize, bool), StoreError>()? {
+            Ok((rows, ended)) => {
+                self.read += rows;
+                self.pending |= !ended;
+            }
+            // The failed replay keeps its row; the pass goes on with the next install.
+            Err(_) => self.failed += 1,
         }
-        self.current = Some((key.clone(), done_pages + 1));
-        Ok(Next::Call(self.page_of(key)))
+        self.last = Some(key);
+        Ok(self.advance())
     }
 }
 

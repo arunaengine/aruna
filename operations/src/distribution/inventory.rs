@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub(crate) use aruna_core::rows::outside_answer;
-use aruna_core::rows::outside_call;
+use aruna_core::rows::StagedCall;
+use aruna_core::rows::outside_answer;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoError, IoResult};
@@ -59,25 +59,6 @@ impl From<IoError> for InventoryError {
         match error {
             IoError::Storage(error) => Self::Storage(error),
             other => Self::Io(other),
-        }
-    }
-}
-
-/// A call of an embedded update: one for the host's transaction, or a read that runs outside
-/// it so that rows other writers change meanwhile never conflict the host's commit.
-#[derive(Debug, PartialEq)]
-pub enum StagedCall {
-    InTransaction(IoCall),
-    Outside(IoCall),
-}
-
-impl StagedCall {
-    /// The call a host operation makes; an outside read runs as its own child run, which never
-    /// joins the host's transaction.
-    pub fn into_call(self) -> IoCall {
-        match self {
-            Self::InTransaction(call) => call,
-            Self::Outside(call) => outside_call(call),
         }
     }
 }
@@ -147,7 +128,7 @@ enum Phase {
 
 /// Which inventory a contribution's position belongs to, so it is compared with that cursor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Walk {
+pub(crate) enum Walk {
     Versions,
     Uploads,
 }
@@ -874,7 +855,7 @@ fn add_counter(
 
 /// Routes each contribution to the rows the account names: the active or pending row, and
 /// the rebuild row when the contribution is behind that walk's cursor.
-pub(super) fn route(
+pub(crate) fn route(
     set_id: Ulid,
     range_id: Ulid,
     account: &RangeAccount,

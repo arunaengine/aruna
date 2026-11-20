@@ -4,9 +4,9 @@
 
 use std::collections::HashSet;
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, VALIDATION_STATUS_KEYSPACE};
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataRawRevision, MetadataValidationViolation,
@@ -17,7 +17,7 @@ use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::profile_shapes::{
     ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
 };
-use aruna_core::rows::{done, read_row, value};
+use aruna_core::rows::read_row;
 use aruna_core::storage_entries::{
     metadata_document_key, profile_validation_entry, profile_validation_key,
 };
@@ -31,16 +31,15 @@ use super::rules::{
     DCTERMS_CONFORMS_TO, DX_PROFILE, EVALUATOR_NAME, data_graph, has_type, not_profiled_status,
     objects, profile_tags, stale_status, submission_profile_tag,
 };
-use crate::metadata::api::export_types::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-use crate::metadata::call_results::effect_event;
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::forward::profile_export::ProfileExportOperation;
-use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::raw_events::{RawReadError, RawRevisionState};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::revision_read::{RawStateOperation, RawViewOperation, RawViewOutput};
 use aruna_core::errors::StorageReadError;
+use aruna_core::metadata::api::ExportMetadataResult;
+use aruna_core::metadata::protocol::MetadataReadError;
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
 const SCHEMA_ENCODING_FORMAT: &str = "http://schema.org/encodingFormat";
@@ -592,7 +591,7 @@ impl ProfileAssessOperation {
         // A node without the graph store keeps no shapes and fetches every time.
         if let Event::Metadata(MetadataEvent::ProfileShapes {
             shapes: Some(shapes),
-        }) = effect_event(result)?
+        }) = result.event()?
         {
             let profile = self.registered_profile(shapes)?;
             return self.evaluate(profile);
@@ -685,7 +684,7 @@ impl ProfileAssessOperation {
             .profile
             .take()
             .ok_or_else(|| MetadataError::Backend("the Profile is missing".to_string()))?;
-        let assessment = match checked(effect_event(result)?, Some(&profile.revision))? {
+        let assessment = match checked(result.event()?, Some(&profile.revision))? {
             Ok(report) => shacl_assessment(report, &profile.revision),
             Err(ProfileShaclError::Unsupported { rule, message }) => ProfileAssessment {
                 findings: vec![unsupported_finding(&rule, message, Some(&profile.revision))],
@@ -704,8 +703,7 @@ impl ProfileAssessOperation {
     }
 
     fn structure_checked(&mut self, result: IoResult) -> AssessTurn {
-        let report =
-            checked(effect_event(result)?, None)?.map_err(|error| shacl_failure(error, None))?;
+        let report = checked(result.event()?, None)?.map_err(|error| shacl_failure(error, None))?;
         Ok(Next::Done(MetadataProfilePreview {
             status: ProfileValidationStatus {
                 validated_at_ms: Some(self.now_ms),
@@ -777,7 +775,7 @@ impl Operation for ProfileAssessOperation {
             AssessStage::Cached => self.cached_read(result),
             AssessStage::Export => self.export_read(result),
             AssessStage::Store => {
-                effect_event(result)?;
+                result.event()?;
                 let profile = self
                     .profile
                     .take()
@@ -811,7 +809,8 @@ impl Operation for StoredStatusOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, MetadataError> {
-        let status = value(result)?
+        let status = result
+            .value()?
             .map(|value| {
                 postcard::from_bytes(&value)
                     .map_err(aruna_core::errors::ConversionError::from)
@@ -1107,7 +1106,7 @@ impl Operation for RevalidateCommitOperation {
     fn next(&mut self, result: IoResult) -> StatusTurn {
         match &mut self.stage {
             CommitStage::Fence => {
-                if value(result)?.is_none() {
+                if result.value()?.is_none() {
                     return Err(revision_changed());
                 }
                 let mut view = RawViewOperation::revision(self.document_id);
@@ -1124,7 +1123,7 @@ impl Operation for RevalidateCommitOperation {
                 self.raw_turn(turn)
             }
             CommitStage::Write => {
-                done(result)?;
+                result.done()?;
                 Ok(Next::Done(self.status.clone()))
             }
         }
@@ -1147,7 +1146,7 @@ fn profile_from_iri(iri: &str) -> Option<Ulid> {
         return None;
     }
     let id = Ulid::from_string(value).ok()?;
-    aruna_core::MetaResourceId::from_bytes(id.to_bytes()).ok()?;
+    aruna_core::structured_id::MetaResourceId::from_bytes(id.to_bytes()).ok()?;
     Some(id)
 }
 
@@ -1264,7 +1263,7 @@ mod tests {
     use crate::metadata::profile::rules::crate_is_profile;
     use aruna_core::effects::Effect;
     use aruna_core::metadata::CRATE_PROFILE_IRI;
-    use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
+    use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
     use craqle::{EncodedTerm, ShaclMessage};
 
     fn result(component: &str, severity: &str, path: Option<&str>) -> ShaclValidationResult {

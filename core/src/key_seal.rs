@@ -229,9 +229,9 @@ mod tests {
 
     #[test]
     fn matches_bucket_copy() {
-        use crate::UserId;
         use crate::structs::identity::realm::RealmId;
         use crate::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
+        use crate::user::id::UserId;
         use crate::vault_format::key_fingerprint;
         use std::str::FromStr;
         use ulid::Ulid;

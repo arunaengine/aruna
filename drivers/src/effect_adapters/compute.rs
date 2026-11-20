@@ -6,8 +6,8 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use aruna_compute::ExecutorBackend;
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::executor::ExecutorBackend;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::SessionConfig;
 use aruna_core::compute::effect::{
     AttemptEnd, BackendFacts, ComputeAnswer, ComputeEffect, ComputeRequest, OutputBody,

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::PLUGIN_CREATES_KEYSPACE;
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -11,19 +12,17 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::CallIntent;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use aruna_plugin_types::calls::{Created, ErrorKind, HostError};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::host_calls::{CallEnd, CallFailure, RecordCall};
-use super::host_steps::{Granted, ReadyCreate};
+use super::host::calls::{CallEnd, CallFailure, RecordCall};
+use super::host::steps::{Granted, ProceedPlan, ReadyCreate};
 use super::rows::{StoreError, decode, done, encode, read_call, row, values};
 use super::unavailable;
 use crate::auth::error::AuthorizeError;
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::forward::transport::MetadataWriteError;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::create_document::CreateDocumentError;
@@ -31,7 +30,9 @@ use crate::metadata::forward::authorized_create::CreateAuthorizedError;
 use crate::metadata::forward::authorized_create::PinnedCreateOperation;
 use crate::metadata::forward::pinned::PinnedCreate;
 use crate::metadata::forward::routed::read::RoutedReadOperation;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::update_document::UpdateDocumentError;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 /// How the key row of a create was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,6 +388,25 @@ impl FinishCreate {
             (None, Some(end)) => self.record(Err(end)),
             (None, None) => self.record(Err(CallEnd::Maybe("no outcome".to_string()))),
         }
+    }
+}
+
+/// Creates a checked new document from this node under the call's key and intent.
+#[derive(Debug, PartialEq)]
+pub struct CreatePlan {
+    pub network_node: Option<NodeId>,
+    pub key: String,
+    pub run_id: Ulid,
+    pub intent: CallIntent,
+}
+
+impl ProceedPlan for CreatePlan {
+    type Ready = ReadyCreate;
+    type Call = FinishCreate;
+
+    fn call(self, ready: ReadyCreate) -> FinishCreate {
+        let call = (self.run_id, self.intent);
+        FinishCreate::new(ready, self.network_node, &self.key, call)
     }
 }
 

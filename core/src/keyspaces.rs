@@ -54,8 +54,11 @@ pub const RAW_BUDGET_KEYSPACE: &str = "metadata_raw_budgets";
 pub const MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";
 pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs";
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
-/// Jobs that published a Git snapshot whose graph their finish batch has not stored yet.
+/// Jobs that published a Git snapshot whose graph their finish batch has not stored yet, and
+/// the ready capture marks the Git capture drain takes in sequence order.
 pub const MATERIALIZATION_CAPTURE_KEYSPACE: &str = "metadata_materialization_captures";
+/// The next capture sequence of each document, counted by the finishes that ready its marks.
+pub const CAPTURE_SEQUENCE_KEYSPACE: &str = "metadata_capture_sequences";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
 /// Reduced distribution records by set id, materialized from their admin reducer state.
@@ -101,6 +104,11 @@ pub const FILL_CLAIM_KEYSPACE: &str = "distribution_fill_claims";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
+/// Applied document reconciles whose follow-ups the node drain still runs, by reconcile id.
+pub const APPLIED_SYNC_KEYSPACE: &str = "document_applied_sync";
+/// The order queued follow-ups accepted a document's events in: a counter per document, and
+/// the id of each queued batch under the document and its sequence.
+pub const APPLIED_ORDER_KEYSPACE: &str = "document_applied_order";
 pub const OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
 pub const SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
@@ -139,6 +147,8 @@ pub const ASSISTANT_PROVIDER_KEYSPACE: &str = "assistant_providers";
 pub const PROVIDER_OWNER_KEYSPACE: &str = "assistant_provider_owner";
 pub const CHAT_HEAD_KEYSPACE: &str = "assistant_chat_heads";
 pub const CHAT_TURN_KEYSPACE: &str = "assistant_chat_turns";
+/// The live chat count and payload bytes of each user's assistant chats.
+pub const CHAT_TOTAL_KEYSPACE: &str = "assistant_chat_totals";
 /// The realm's central assistant provider on its holder node, one row.
 pub const CENTRAL_ASSISTANT_KEYSPACE: &str = "assistant_central";
 /// Central assistant calls of each user on the current UTC day, keyed by user.
@@ -307,6 +317,8 @@ pub const WEBHOOK_SETTINGS_KEYSPACE: &str = "notification_webhook_settings";
 pub const OWNER_SECRETS_KEYSPACE: &str = "owner_secrets";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
+/// Watch events producers queued for the notification drain to emit, by event id.
+pub const WATCH_OUTBOX_KEYSPACE: &str = "notification_watch_outbox";
 /// The newest deletion time of a bucket per recipient, which drops older notices about it.
 pub const NOTIFICATION_CUTOFF_KEYSPACE: &str = "notification_bucket_cutoff";
 
@@ -436,6 +448,8 @@ pub const LINK_SECRET_KEYSPACE: &str = "repository_link_secrets";
 pub const LINK_CONNECTOR_KEYSPACE: &str = "repository_link_connectors";
 /// Durable push checks per link id, drained by `TaskKey::DrainLinkQueue`.
 pub const LINK_QUEUE_KEYSPACE: &str = "repository_link_queue";
+/// Documents whose links need push checks, by change time; the link queue drain consumes them.
+pub const LINK_CHANGE_KEYSPACE: &str = "repository_link_changes";
 
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";
@@ -638,6 +652,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_JOB_KEYSPACE,
     DEAD_LETTER_KEYSPACE,
     MATERIALIZATION_CAPTURE_KEYSPACE,
+    CAPTURE_SEQUENCE_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
     DISTRIBUTION_KEYSPACE,
@@ -662,6 +677,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,
+    APPLIED_SYNC_KEYSPACE,
+    APPLIED_ORDER_KEYSPACE,
     OUTBOX_INDEX_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
     SYNC_CONFLICT_KEYSPACE,
@@ -687,6 +704,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PROVIDER_OWNER_KEYSPACE,
     CHAT_HEAD_KEYSPACE,
     CHAT_TURN_KEYSPACE,
+    CHAT_TOTAL_KEYSPACE,
     CENTRAL_ASSISTANT_KEYSPACE,
     ASSISTANT_USAGE_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE,
@@ -768,6 +786,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     OWNER_SECRETS_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
+    WATCH_OUTBOX_KEYSPACE,
     NOTIFICATION_CUTOFF_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
@@ -812,6 +831,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     LINK_SECRET_KEYSPACE,
     LINK_CONNECTOR_KEYSPACE,
     LINK_QUEUE_KEYSPACE,
+    LINK_CHANGE_KEYSPACE,
     JOB_KEYSPACE,
     SCHEDULE_INDEX_KEYSPACE,
     JOB_INDEX_KEYSPACE,

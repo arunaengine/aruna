@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
@@ -16,6 +15,7 @@ use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use tracing::warn;
 
 use crate::notifications::checks::{
@@ -176,9 +176,9 @@ impl ServeInboxOperation {
         };
         let input = self.input;
         let watch = (path_prefix, event_mask);
-        let watch_id = self.ids.mint(input.now_ms);
+        let ids = (self.ids.mint(input.now_ms), self.ids.mint(input.now_ms));
         let (local, user) = (input.local, self.user);
-        match CreateWatchOperation::new(watch_id, local, user, watch, authorization, input.now_ms) {
+        match CreateWatchOperation::new(ids, local, user, watch, authorization, input.now_ms) {
             Ok(create) => {
                 self.state = ServeState::Create;
                 Ok(Next::Call(IoCall::child(create)))
@@ -332,7 +332,14 @@ impl WatchEventsOperation {
     fn expanded(&mut self, outcome: Result<ExpandOutcome, ExpandError>) -> AnswerTurn {
         let outcome = match outcome {
             Ok(outcome) => outcome,
-            Err(error) => return reject(error.to_string()),
+            Err(ExpandError::Fatal(reason)) => return reject(reason),
+            // Nothing was stored: the sender keeps the events and delivers them again.
+            Err(error) => {
+                let reason = error.to_string();
+                return Ok(Next::Done(NotificationTransportMessage::Unavailable(
+                    reason,
+                )));
+            }
         };
         let recipients = outcome.inbox.recipients;
         let written = outcome.inbox.written as u32;

@@ -5,11 +5,10 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
-use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{InputSelection, InputSource};
+use aruna_core::structs::execution::job::input::{InputSelection, InputSource};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -17,20 +16,21 @@ use aruna_core::structs::storage::link::LinkTarget;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::submission_rules::{input_reference, source_error};
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::read_coordinator;
-use crate::jobs::read_access::{SourceObject, SourceReadError, SourceReadOperation};
-use crate::jobs::submit::SubmitJobError;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
 };
+use crate::s3::object::read_access::{SourceObject, SourceReadError, SourceReadOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::job_request::SubmitJobError;
 
 /// Who walks the inputs, in the realm this node serves, and where.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -454,7 +454,7 @@ mod tests {
     use super::*;
     use crate::tests::records::{node, user};
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::execution::job::InputMode;
+    use aruna_core::structs::execution::job::input::InputMode;
     use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
     use aruna_core::structs::storage::format::Compression;
 
@@ -506,7 +506,7 @@ mod tests {
 
     // An input on another node ends the walk at once; an unreadable head ends it unchanged.
     #[test]
-    fn walk_stops_without_link() {
+    fn stops_without_link() {
         let mut remote = input("a", "a");
         remote.source_node_id = Some(node(2));
         let mut elsewhere = FollowLinkOperation::new(caller(), remote.clone());
@@ -563,7 +563,7 @@ mod tests {
     // Every listed file is read-checked before it becomes an input below the directory path;
     // folder markers are skipped and a denied file refuses the directory.
     #[test]
-    fn directory_checks_each_file() {
+    fn checks_each_file() {
         let version = Ulid::from_parts(5, 5);
         let mut walk = directory();
         walk.group_id = Some(Ulid::from_parts(2, 2));

@@ -13,6 +13,7 @@ use super::admin::{AdminFollowUp, AdminOperationPlan, ConfigRunPlan};
 use super::create::PendingCreateApply;
 use super::distribution::{DistributionPlan, Handled, RetryParkedPlan};
 use super::events::{ApplyEventPlan, ApplyOutcome, family_target};
+use super::followups::{FollowUpNode, QueuedApply};
 use super::reconcile::net_answer;
 use super::validate::{ConfigSnapshot, ValidateAdminPlan};
 use super::{ApplyError, plan_call};
@@ -27,9 +28,10 @@ use crate::document::{
 use crate::effects::{Effect, NetEffect};
 use crate::metadata::GraphLifecycleRecord;
 use crate::operation::Operation;
+use crate::row_plan::RowPlan;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::record::PlacementRef;
-use crate::structs::{SyncQuarantineIdentity, SyncRejection};
+use crate::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 use crate::sync_checks::{EventScreen, screen_event};
 
 /// What applying one batch left for the reconcile pass.
@@ -109,6 +111,10 @@ pub struct ApplyBatchOperation {
     current: Option<BatchEvent>,
     outcome: BatchOutcome,
     run: Option<(DocumentTarget, Vec<AdminDocumentEvent>)>,
+    /// The last event of the run, whose identity keys the run's follow-up row.
+    run_identity: Option<SyncQuarantineIdentity>,
+    /// The node whose drain runs the follow-ups, stored with each apply when set.
+    followups: Option<FollowUpNode>,
     snapshot: Option<Arc<ConfigSnapshot>>,
     deferred: Vec<DeferredAdmin>,
     retrying: VecDeque<DeferredAdmin>,
@@ -136,6 +142,8 @@ impl ApplyBatchOperation {
                 ..BatchOutcome::default()
             },
             run: None,
+            run_identity: None,
+            followups: None,
             snapshot: None,
             deferred: Vec::new(),
             retrying: VecDeque::new(),
@@ -145,14 +153,39 @@ impl ApplyBatchOperation {
         }
     }
 
+    /// Stores each apply's follow-ups for `node`'s drain in the apply's own transaction.
+    pub fn queuing(mut self, node: Option<FollowUpNode>) -> Self {
+        self.followups = node;
+        self
+    }
+
     fn call(&mut self, wait: Wait, call: IoCall) -> BatchNext {
         self.wait = Some(wait);
         Ok(Next::Call(call))
     }
 
+    /// Runs `plan`, with the follow-up row of the event `identity` when this batch queues them.
+    fn apply_call<P>(&self, plan: P, identity: SyncQuarantineIdentity) -> IoCall
+    where
+        P: RowPlan<Error = ApplyError> + Clone + 'static,
+        P::Output: PartialEq + 'static,
+        QueuedApply<P>: RowPlan<Output = P::Output, Error = ApplyError> + Clone,
+    {
+        match self.followups {
+            Some(node) => plan_call(QueuedApply {
+                plan,
+                node,
+                identity,
+            }),
+            None => plan_call(plan),
+        }
+    }
+
     fn flush(&mut self, wait: Wait) -> Option<BatchNext> {
         let (target, events) = self.run.take()?;
-        Some(self.call(wait, plan_call(ConfigRunPlan { target, events })))
+        let identity = self.run_identity.take()?;
+        let call = self.apply_call(ConfigRunPlan { target, events }, identity);
+        Some(self.call(wait, call))
     }
 
     /// Moves to the next event, or to the end of the batch.
@@ -232,7 +265,8 @@ impl ApplyBatchOperation {
                     identity,
                     event,
                 };
-                self.call(Wait::Applied, plan_call(plan))
+                let call = self.apply_call(plan, identity);
+                self.call(Wait::Applied, call)
             }
         }
     }
@@ -284,6 +318,7 @@ impl ApplyBatchOperation {
             return match &mut self.run {
                 Some((target, events)) if *target == item.target => {
                     events.push(item.event.clone());
+                    self.run_identity = Some(item.identity);
                     self.finish_admin(&item);
                     self.advance()
                 }
@@ -298,17 +333,20 @@ impl ApplyBatchOperation {
                 target: item.target.clone(),
                 event: item.event.clone(),
             };
-            return self.call(Wait::Distributed(Box::new(item)), plan_call(plan));
+            let call = self.apply_call(plan, item.identity);
+            return self.call(Wait::Distributed(Box::new(item)), call);
         }
         let plan = AdminOperationPlan {
             target: item.target.clone(),
             event: item.event.clone(),
         };
-        self.call(Wait::AdminApplied(Box::new(item)), plan_call(plan))
+        let call = self.apply_call(plan, item.identity);
+        self.call(Wait::AdminApplied(Box::new(item)), call)
     }
 
     fn start_run(&mut self, item: AdminItem) -> BatchNext {
         self.run = Some((item.target.clone(), vec![item.event.clone()]));
+        self.run_identity = Some(item.identity);
         self.finish_admin(&item);
         self.advance()
     }
@@ -431,7 +469,8 @@ impl ApplyBatchOperation {
                     target: item.target.clone(),
                     event: item.event.clone(),
                 };
-                self.call(Wait::RetryApplied(Box::new(item)), plan_call(plan))
+                let call = self.apply_call(plan, item.identity);
+                self.call(Wait::RetryApplied(Box::new(item)), call)
             }
             AdminEventValidation::Rejected(reason) => {
                 warn!(topic_id = %self.topic_id, event_id = %item.event.event_id, %reason, "Rejecting deferred admin operation after prerequisite replay");
@@ -527,7 +566,7 @@ impl Operation for ApplyBatchOperation {
                 self.follow_up(follow, *item)
             }
             Wait::Synced(parked, item) => {
-                crate::rows::done(result)?;
+                result.done()?;
                 self.after_sync(parked, *item)
             }
             Wait::Parked(item) => {
@@ -552,7 +591,7 @@ impl Operation for ApplyBatchOperation {
                 self.retry_sync(follow.retry_parked, *item)
             }
             Wait::RetrySynced(parked, item) => {
-                crate::rows::done(result)?;
+                result.done()?;
                 self.retry_sync(parked, *item)
             }
             Wait::RetryParked(item) => {

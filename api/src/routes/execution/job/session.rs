@@ -14,22 +14,23 @@ use aruna_core::compute::session::{
     EndReason, EventKind, MAX_SCRATCH_BYTES, PendingInput, SessionAnswer, SessionError,
     SessionEvent, SessionRequest, SessionSnapshot, StagedInput,
 };
+use aruna_core::job_request::session_of;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    CopyJobSpec, ExecutionSpec, JobId, JobPayload, JobRecord, JobState,
-};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{CopyJobSpec, ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
 use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::jobs::lifecycle::ids::session_of;
-use aruna_operations::placement::policy::gate::{gate_decision, write_gate};
-use aruna_operations::placement::policy::{GateContext, GateOperation, PolicyGateError};
-use aruna_operations::s3::object::copy::{
-    CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
+use aruna_operations::placement::policy::gate::{
+    GateContext, GateOperation, PolicyGateError, gate_decision, write_gate,
 };
 use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::transfer::copy::{
+    CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
+};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};

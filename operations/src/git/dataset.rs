@@ -4,14 +4,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::{
     FileChangeKind, GitEffect, GitEvent, LfsObject, PendingMerge, StoredObject, ZERO_OID,
 };
+use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::repo_layout::{Layout, StoredFile, name_stored, unstored_paths};
-use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -27,15 +27,16 @@ use tracing::warn;
 use super::calls::{git_call, git_event};
 use super::objects::{self, Blob};
 use super::project::author;
-use super::{GitError, GitNode, download, lfs, location, publish};
+use super::{GitError, download, lfs, location, publish};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::AuthorizeOperation;
-use crate::auth::request_policy::PolicyRequestExtras;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::s3::object::copy::{
+use crate::transfer::copy::{
     CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopyResultData,
     CopySourceConditions,
 };
+use aruna_core::git::GitNode;
+use aruna_core::request_policy::PolicyRequestExtras;
 
 type Document = MetadataRegistryRecord;
 
@@ -495,8 +496,7 @@ impl Operation for WriteContentOperation {
         match self.content.take().ok_or(IoError::Unfinished)? {
             Content::Blob(bytes) => {
                 let size = bytes.len() as u64;
-                let chunks = futures_util::stream::iter([Ok::<_, StreamError>(bytes)]);
-                self.put(size, BackendStream::new(chunks))
+                self.put(size, BackendStream::once(bytes))
             }
             Content::Lfs(source) => {
                 let copy = objects::copy(&self.document, &source.sha256);

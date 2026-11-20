@@ -7,12 +7,12 @@ use std::sync::Arc;
 use aruna_api::auth::OidcValidator;
 use aruna_api::cors::CorsConfig;
 use aruna_api::csp::PortalCspConfig;
-use aruna_api::https::HostRoute;
 use aruna_api::https::listener::{CombinedListener, HttpsHandle};
-use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
+use aruna_api::s3::server::{S3Server, S3ServerHandle};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_core::device_wipe::DeviceWipe;
+use aruna_core::listener::{HostRoute, S3ServerTimeouts};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_drivers::driver::DriverContext;
@@ -23,8 +23,8 @@ use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, PortalConfig, StartupMode};
 use crate::portal;
+use aruna_config::{Config, PortalConfig, StartupMode};
 
 pub(crate) struct ServerBindings {
     pub(crate) rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
@@ -90,7 +90,7 @@ fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
         config.sync_storage_path.clone(),
         std::path::PathBuf::from(&config.blob_root),
     ]);
-    (crate::config::outermost_roots(&roots), unsupported)
+    (aruna_config::outermost_roots(&roots), unsupported)
 }
 
 /// The owner's replica cache budget from `ARUNA_DEVICE_CACHE_BYTES`, or the default.
@@ -153,7 +153,7 @@ struct SessionS3 {
     realm_id: aruna_core::structs::identity::realm::RealmId,
     node_id: iroh::PublicKey,
     key: aruna_core::credential_encryption::CredentialEncryptionKey,
-    rocrate_limits: aruna_core::structs::execution::job::RoCrateLimits,
+    rocrate_limits: aruna_core::structs::execution::job::input::RoCrateLimits,
 }
 
 /// Serves the node's S3 plane on the session bridge gateway too. A bind failure
@@ -251,6 +251,12 @@ async fn bind_all(
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     // Certificates and HTTPS sockets first: a failure here starts nothing.
     let mut https = crate::startup::https::prepare(config.https.as_ref()).await?;
+    if let Some(blob) = &driver_ctx.blob_handle {
+        blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
+            std::path::Path::new(&config.storage_path).join("git"),
+            std::env::current_exe()?,
+        )));
+    }
     #[cfg(unix)]
     crate::backup::serve(
         std::path::Path::new(&config.storage_path),
@@ -286,17 +292,11 @@ async fn bind_all(
         true => {
             let (roots, unsupported) = wipe_plan(config);
             // Reject unsafe wipe roots before startup and erase only their normalized paths.
-            let roots = crate::config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
+            let roots = aruna_config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
             Some(Arc::new(DeviceWipe::new(roots, unsupported)))
         }
         false => None,
     };
-    if let Some(blob) = &driver_ctx.blob_handle {
-        blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
-            std::path::Path::new(&config.storage_path).join("git"),
-            std::env::current_exe()?,
-        )));
-    }
     let mut state = ServerState::new(
         driver_ctx.clone(),
         config.realm_id,
@@ -553,15 +553,17 @@ mod tests {
     #[tokio::test]
     async fn session_exit_reports() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_tasks::shutdown::Shutdown;
 
         // A real session listener that stopped on its shutdown token is
         // reported, never treated as a node failure.
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -673,8 +675,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (config, storage) = crate::config::resolve_settings(
-            crate::settings::read_settings_from(&map).expect("settings parse"),
+        let (config, storage) = aruna_config::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await
         .expect("settings resolve");
@@ -737,7 +739,10 @@ mod tests {
         https: std::net::SocketAddr,
         redirect: std::net::SocketAddr,
         files: &[String; 2],
-    ) -> (crate::config::Config, aruna_storage::StorageHandle) {
+    ) -> (
+        aruna_config::Config,
+        aruna_storage::storage::handle::StorageHandle,
+    ) {
         let map: std::collections::BTreeMap<String, String> = [
             ("DATABASE_DIR", temp.join("store").to_str().expect("utf8")),
             ("SOCKET_ADDRESS", &rest.to_string()),
@@ -757,8 +762,8 @@ mod tests {
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-        crate::config::resolve_settings(
-            crate::settings::read_settings_from(&map).expect("settings parse"),
+        aruna_config::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await
         .expect("settings resolve")
@@ -770,8 +775,8 @@ mod tests {
     }
 
     async fn bind_error(
-        config: &crate::config::Config,
-        storage: aruna_storage::StorageHandle,
+        config: &aruna_config::Config,
+        storage: aruna_storage::storage::handle::StorageHandle,
     ) -> String {
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
@@ -839,7 +844,7 @@ mod tests {
             None,
             "127.0.0.1",
             std::sync::Arc::new(aruna_drivers::driver::DriverContext {
-                storage_handle: aruna_storage::StorageHandle::new().0,
+                storage_handle: aruna_storage::storage::handle::StorageHandle::new().0,
                 net_handle: None,
                 blob_handle: None,
                 graph_handle: None,
@@ -862,13 +867,15 @@ mod tests {
     #[tokio::test]
     async fn session_listener_completes() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -912,13 +919,15 @@ mod tests {
     #[tokio::test]
     async fn abort_awaits_children() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {
             storage_handle: storage,
             net_handle: None,

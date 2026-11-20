@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structs::storage::distribution::route::RouteError;
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
 use ulid::Ulid;
-
-use super::{DistributionSnapshot, RouteError};
 
 const SEPARATOR: char = '-';
 

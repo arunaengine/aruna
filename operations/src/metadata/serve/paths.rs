@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataError, MetadataQueryResults};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -15,19 +15,19 @@ use ulid::Ulid;
 
 use super::ServeNode;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::routing::holds_metadata_id;
-use crate::forward::transport::read_error;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export::VisibleRecordOperation;
 use crate::metadata::api::export_types::GetVisibleRequest;
 use crate::metadata::api::path::{LocalPathOperation, LookupPathOperation};
 use crate::metadata::api::path_types::{MetadataLookupRequest, MetadataLookupResult};
+use crate::metadata::forward::holders::holds_metadata_id;
+use crate::metadata::forward::write::read_error;
 use crate::metadata::local_query::LocalQueryOperation;
-use crate::metadata::protocol::{
-    MetadataPathCandidate, MetadataPathResolution, MetadataReadError, MetadataTransportMessage,
-};
 use crate::metadata::read_peer::ReadPeerOperation;
 use crate::realm::load_config::config_unavailable;
+use aruna_core::metadata::protocol::{
+    MetadataPathCandidate, MetadataPathResolution, MetadataReadError, MetadataTransportMessage,
+};
 
 /// The realm config read; a failed read is logged and counts as none.
 pub(super) fn read_config(result: IoResult) -> Result<Option<RealmConfigDocument>, IoError> {

@@ -10,7 +10,6 @@ use aruna_core::keyspaces::{
     BUCKET_CREATION_KEYSPACE, BUCKET_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::all_values;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::group_admin_path;
@@ -164,7 +163,7 @@ impl Operation for PutMetadataOperation {
         if let IoResult::Done = result {
             return Ok(Next::Done(()));
         }
-        Ok(Next::Call(self.write(all_values(result)?)?))
+        Ok(Next::Call(self.write(result.values()?)?))
     }
 
     fn transaction(&self) -> TransactionMode {
@@ -176,18 +175,18 @@ impl Operation for PutMetadataOperation {
 mod tests {
     use super::*;
     use crate::s3::bucket::dataset::BucketMetadataOperation;
-    use aruna_core::UserId;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};
     use std::time::SystemTime;
     use ulid::Ulid;
 
     async fn write(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-        crate::testing::write_value(&context.storage_handle, key_space, key, value).await;
+        aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
     }
 
     #[tokio::test]
@@ -195,8 +194,10 @@ mod tests {
         // Only an admin of the bucket's group writes its metadata, checked in the write itself.
         let temp = tempfile::tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                temp.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,

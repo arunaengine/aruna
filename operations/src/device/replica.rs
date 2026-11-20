@@ -9,7 +9,7 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
 use aruna_core::operation::Operation;
-use aruna_core::rows::{done, read_row};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
@@ -265,7 +265,7 @@ impl Operation for DeselectDocumentOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ReplicaRecord>, SelectionError> {
         if let Some(replica) = self.replica.take() {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(ReplicaRecord {
                 selected: false,
                 ..replica
@@ -314,7 +314,7 @@ impl Operation for TrackCreatedOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SelectionError> {
         if self.written {
-            done(result)?;
+            result.done()?;
             return Ok(Next::Done(()));
         }
         if read_replica_row(result)?.is_some() {
@@ -447,8 +447,8 @@ pub fn mark_edited(replica: &mut ReplicaRecord, local_clock: VectorClock) {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
 
     fn replica() -> ReplicaRecord {
         ReplicaRecord::new(

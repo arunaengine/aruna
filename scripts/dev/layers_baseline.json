@@ -1,67 +1,24 @@
 {
-  "async_lines": {
-    "abe": 1446,
-    "auth": 820,
-    "blob": 6614,
-    "connectors": 304,
-    "device": 5596,
-    "distribution": 5612,
-    "driver": 644,
-    "effect_adapters": 636,
-    "federation": 809,
-    "forward": 727,
-    "git": 4604,
-    "groups": 1031,
-    "jobs": 37934,
-    "metadata": 23576,
-    "node": 2105,
-    "notifications": 2955,
-    "onboarding": 320,
-    "placement": 1918,
-    "plugins": 7299,
-    "realm": 199,
-    "realm_vault": 275,
-    "replication": 3610,
-    "s3": 9887,
-    "session": 58,
-    "shard": 1070,
-    "staging": 1534,
-    "storage_read": 95,
-    "sync": 1223,
-    "tasks": 3356,
-    "users": 203
-  },
-  "clean_domains": [],
   "crate_allow": {
     "aruna-doctor": [
-      "aruna",
       "aruna-net",
       "aruna-tasks",
       "aruna-wire"
-    ],
-    "aruna-operations": [
-      "aruna-blob",
-      "aruna-drivers",
-      "aruna-graph",
-      "aruna-net",
-      "aruna-outbound",
-      "aruna-storage",
-      "aruna-tasks"
     ]
   },
   "structural": {
     "async_parallel": 0,
-    "core_clocks": 19,
-    "duplicate_groups": 5,
-    "group_cycle_modules": 18,
-    "group_mutual_pairs": 18,
+    "core_clocks": 0,
+    "duplicate_groups": 1,
+    "group_cycle_modules": 0,
+    "group_mutual_pairs": 0,
     "mixed_files": 0,
-    "pure_async_refs": 3,
-    "runner_refs": 0,
-    "silent_skips": 9,
-    "state_clones": 2,
-    "test_sleeps": 64,
-    "trigger_arms": 25,
-    "upward_refs": 220
+    "operation_clocks": 0,
+    "pure_async_refs": 0,
+    "silent_skips": 0,
+    "state_clones": 0,
+    "test_sleeps": 4,
+    "trigger_arms": 10,
+    "upward_refs": 0
   }
 }
