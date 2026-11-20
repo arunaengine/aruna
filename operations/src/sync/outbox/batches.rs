@@ -90,6 +90,16 @@ impl DrainSubBatch {
         })
     }
 
+    /// The entries at `indices` with their documents, to publish; `None` for an index outside.
+    pub fn select(&self, indices: &[usize]) -> Option<Self> {
+        let mut selected = self.sync_subset(indices)?;
+        if self.documents.len() == self.record_keys.len() {
+            let documents = indices.iter().map(|&index| self.documents.get(index).cloned());
+            selected.documents = documents.collect::<Option<_>>()?;
+        }
+        Some(selected)
+    }
+
     /// Ordering domains blocked together when a publish or sync leaves records
     /// behind.
     pub fn ordering_domains(&self) -> (Vec<TopicId>, Vec<NodeId>) {
@@ -100,16 +110,19 @@ impl DrainSubBatch {
     }
 }
 
-/// Sub-batches keyed by whether their records only sync and by their sorted peers.
-type PublishGroups = BTreeMap<(bool, Vec<NodeId>), (Vec<NodeId>, Vec<DrainSubBatch>)>;
-
 /// Groups records by peers into sub-batches and answers how many groups they formed. A record
 /// already published by this process goes into a sub-batch without documents, which only syncs.
+/// Sub-batches publish in order, and no record joins a sub-batch before one that holds an earlier
+/// record of its topic or admin origin, so each of them keeps the scan order.
 pub fn build_drain_batches(
     records: Vec<DrainRecord>,
     published: &BTreeSet<Vec<u8>>,
 ) -> (usize, Vec<DrainSubBatch>) {
-    let mut publish_groups: PublishGroups = BTreeMap::new();
+    let mut subbatches: Vec<DrainSubBatch> = Vec::new();
+    // The open sub-batch of each group, keyed by whether it only syncs and by its sorted peers.
+    let mut open: BTreeMap<(bool, Vec<NodeId>), usize> = BTreeMap::new();
+    let mut last_topic: BTreeMap<TopicId, usize> = BTreeMap::new();
+    let mut last_origin: BTreeMap<NodeId, usize> = BTreeMap::new();
     for (record_key, record, topic) in records {
         let origin = admin_origin(&record);
         let sync_only = published.contains(&record_key);
@@ -124,37 +137,41 @@ pub fn build_drain_batches(
         });
         let mut peer_key = record.peers.clone();
         sort_node_ids(&mut peer_key);
-        let (peers, subbatches) = publish_groups
-            .entry((sync_only, peer_key))
-            .or_insert_with(|| (record.peers.clone(), Vec::new()));
-        if subbatches
-            .last()
-            .is_none_or(|subbatch| subbatch.record_keys.len() >= DRAIN_SUBBATCH_RECORDS)
-        {
-            subbatches.push(DrainSubBatch {
-                peers: peers.clone(),
-                documents: Vec::new(),
-                topics: Vec::new(),
-                origins: Vec::new(),
-                targets: Vec::new(),
-                record_keys: Vec::new(),
-            });
-        }
-        let Some(subbatch) = subbatches.last_mut() else {
-            continue;
+        let origin_floor = origin.and_then(|origin| last_origin.get(&origin).copied());
+        let floor = last_topic.get(&topic).copied().max(origin_floor);
+        let group = (sync_only, peer_key);
+        let joins = open.get(&group).copied().filter(|&index| {
+            let full = subbatches[index].record_keys.len() >= DRAIN_SUBBATCH_RECORDS;
+            !full && floor.is_none_or(|floor| index >= floor)
+        });
+        let index = match joins {
+            Some(index) => index,
+            None => {
+                subbatches.push(DrainSubBatch {
+                    peers: record.peers.clone(),
+                    documents: Vec::new(),
+                    topics: Vec::new(),
+                    origins: Vec::new(),
+                    targets: Vec::new(),
+                    record_keys: Vec::new(),
+                });
+                let index = subbatches.len() - 1;
+                open.insert(group, index);
+                index
+            }
         };
+        let subbatch = &mut subbatches[index];
         subbatch.documents.extend(document);
         subbatch.topics.push(topic);
         subbatch.origins.push(origin);
         subbatch.targets.push(record.target);
         subbatch.record_keys.push(record_key);
+        last_topic.insert(topic, index);
+        if let Some(origin) = origin {
+            last_origin.insert(origin, index);
+        }
     }
-    let groups = publish_groups.len();
-    let subbatches = publish_groups
-        .into_values()
-        .flat_map(|(_, subbatches)| subbatches)
-        .collect();
-    (groups, subbatches)
+    (open.len(), subbatches)
 }
 
 /// The document sync publication of one outbox record.
@@ -290,6 +307,15 @@ impl DrainInvocation {
         }
     }
 
+    /// Takes in what publishing left. Its blocks hold for the rest of this invocation at once, so
+    /// a later page cannot publish or relay past a record that has to wait.
+    pub fn merge_outcome(&mut self, outcome: DrainSyncOutcome) {
+        let defer = &mut self.defer;
+        defer.deferred_topics.extend(outcome.blocked_topics.iter().copied());
+        defer.blocked_origins.extend(outcome.blocked_origins.iter().copied());
+        self.outcome.merge(outcome);
+    }
+
     /// Whether records past this invocation's cursor wait for a later one.
     pub fn has_unvisited(&self) -> bool {
         !self.reached_end && !self.read_failed
@@ -378,5 +404,80 @@ impl DrainInvocation {
             retry = retry,
             "Document sync outbox drain summary"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+
+    use crate::sync::outbox::record::new_identified_record;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn record(seq: u8, peer: NodeId, topic: TopicId) -> DrainRecord {
+        let event_id = Ulid::from_parts(1, u128::from(seq));
+        let current = DocumentSyncRevision {
+            generation: 1,
+            event_id,
+            actor: node(9),
+            updated_at_ms: 1,
+        };
+        let change = DocumentChange {
+            base: None,
+            current,
+            kind: DocumentChangeKind::Upsert,
+            placement: PlacementRef::NIL,
+        };
+        let event = DocumentOutboxEvent::Upsert {
+            bytes: vec![seq],
+            change,
+        };
+        let target = DocumentTarget::Group {
+            group_id: Ulid::from_parts(7, u128::from(seq)),
+        };
+        let (peers, placement) = (vec![peer], PlacementRef::NIL);
+        let record =
+            new_identified_record(event_id, node(9), target, peers, event, placement, false);
+        (vec![seq], record, topic)
+    }
+
+    // A later record of a topic never publishes before an earlier one, whatever its peers; an
+    // unrelated record still joins the open sub-batch of its peers.
+    #[test]
+    fn topic_order_kept() {
+        let mut peers = vec![node(1), node(2)];
+        sort_node_ids(&mut peers);
+        let (first, second) = (peers[0], peers[1]);
+        let (topic, other) = (TopicId::hash(b"topic"), TopicId::hash(b"other"));
+        let records = vec![
+            record(1, second, topic),
+            record(2, first, topic),
+            record(3, second, other),
+        ];
+        let (groups, batches) = build_drain_batches(records, &BTreeSet::new());
+        assert_eq!(groups, 2);
+        let keys: Vec<_> = batches.iter().map(|batch| batch.record_keys.clone()).collect();
+        assert_eq!(keys, vec![vec![vec![1], vec![3]], vec![vec![2]]]);
+    }
+
+    // A failed publish blocks its domains for the rest of the invocation at once.
+    #[test]
+    fn blocks_reach_invocation() {
+        let mut invocation = DrainInvocation::new(&OutboxRotation::default());
+        let topic = TopicId::hash(b"topic");
+        let outcome = DrainSyncOutcome {
+            retry_needed: true,
+            blocked_topics: vec![topic],
+            blocked_origins: vec![node(3)],
+            ..DrainSyncOutcome::default()
+        };
+        invocation.merge_outcome(outcome);
+        assert!(invocation.defer.deferred_topics.contains(&topic));
+        assert!(invocation.defer.blocked_origins.contains(&node(3)));
+        assert!(invocation.outcome.retry_needed);
     }
 }

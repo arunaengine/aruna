@@ -87,7 +87,7 @@ impl PublishBatchesOperation {
     /// the one before it.
     fn advance(&mut self) -> PublishTurn {
         loop {
-            let Some(mut batch) = self.batches.pop_front() else {
+            let Some(batch) = self.batches.pop_front() else {
                 return match self.awaiting.take() {
                     Some(last) => self.sync_alone(last),
                     None => Ok(Next::Done(std::mem::take(&mut self.out))),
@@ -99,6 +99,9 @@ impl PublishBatchesOperation {
                     None => continue,
                 }
             }
+            let Some(mut batch) = self.without_blocked(batch) else {
+                continue;
+            };
             let documents = std::mem::take(&mut batch.documents);
             let peers = batch.peers.clone();
             let publish = DocumentEffect::PublishDocuments { documents, peers };
@@ -119,6 +122,27 @@ impl PublishBatchesOperation {
                 form: GroupForm::Window,
             })));
         }
+    }
+
+    /// Leaves out the entries whose topic or admin origin an earlier failure of this run
+    /// blocked: they stay in the outbox for a retry and keep their own domains blocked.
+    fn without_blocked(&mut self, batch: DrainSubBatch) -> Option<DrainSubBatch> {
+        let outcome = &self.out.outcome;
+        let blocked = |index: usize| {
+            let topic = batch.topics.get(index);
+            let origin = batch.origins.get(index).copied().flatten();
+            topic.is_some_and(|topic| outcome.blocked_topics.contains(topic))
+                || origin.is_some_and(|origin| outcome.blocked_origins.contains(&origin))
+        };
+        let (held, kept): (Vec<usize>, Vec<usize>) =
+            (0..batch.record_keys.len()).partition(|&index| blocked(index));
+        if held.is_empty() {
+            return Some(batch);
+        }
+        if let Some(held) = batch.sync_subset(&held) {
+            self.block(held.ordering_domains());
+        }
+        (!kept.is_empty()).then(|| batch.select(&kept)).flatten()
     }
 
     fn sync_batch(&mut self, batch: DrainSubBatch) -> SyncBatchOperation {
@@ -383,6 +407,36 @@ mod tests {
         };
         assert_eq!(done.published, vec![b"one".to_vec()]);
         assert_eq!(done.deleted, vec![b"one".to_vec()]);
+    }
+
+    // After a failed publish, a later sub-batch leaves out the entries of the blocked topic and
+    // publishes the rest.
+    #[test]
+    fn blocked_entries_skipped() {
+        let mut second = batch(b"one");
+        let other = batch(b"two");
+        second.documents.extend(other.documents);
+        second.topics.extend(other.topics);
+        second.origins.extend(other.origins);
+        second.targets.extend(other.targets);
+        second.record_keys.extend(other.record_keys);
+        let mut run = PublishBatchesOperation::new(serving(), vec![batch(b"one"), second]);
+        run.first().unwrap();
+        let failed = net(DocumentNetEvent::Error {
+            target: None,
+            error: "down".to_string(),
+        });
+        let Ok(Next::Call(IoCall::Effect(effect))) = run.next(failed) else {
+            panic!("the second sub-batch publishes what is not blocked");
+        };
+        let documents = match *effect {
+            Effect::Net(NetEffect::DocumentSync(DocumentEffect::PublishDocuments {
+                documents,
+                ..
+            })) => documents,
+            _ => panic!("expected a publish"),
+        };
+        assert_eq!(documents.len(), 1);
     }
 
     // The second publish runs together with the first batch's sync; a failed publish blocks its

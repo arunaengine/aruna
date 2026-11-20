@@ -516,7 +516,7 @@ impl Operation for DrainPageOperation {
                 match published {
                     Ok(done) => {
                         page.invocation.publish_elapsed += done.publish_elapsed;
-                        page.invocation.outcome.merge(done.outcome);
+                        page.invocation.merge_outcome(done.outcome);
                         page.published.extend(done.published);
                         page.deleted.extend(done.deleted);
                     }
@@ -527,7 +527,7 @@ impl Operation for DrainPageOperation {
                             "Publishing document sync batches broke off"
                         );
                         page.invocation.publish_elapsed += elapsed;
-                        page.invocation.outcome.merge(blocked);
+                        page.invocation.merge_outcome(blocked);
                     }
                 }
                 self.finished()
