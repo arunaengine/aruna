@@ -74,6 +74,7 @@ SMALL_DOMAINS = {
     "operations/src/plugins": "coherent ownership scope",
     "operations/src/plugins/copy": "grouped shared-prefix domain",
     "operations/src/plugins/host": "grouped shared-prefix domain",
+    "operations/src/plugins/work": "grouped shared-prefix domain",
     "operations/src/relay/tool": "grouped shared-prefix domain",
     "operations/src/replication/incoming": "grouped shared-prefix domain",
     "operations/src/s3": "coherent ownership scope",

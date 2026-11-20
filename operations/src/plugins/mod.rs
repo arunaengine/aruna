@@ -53,7 +53,6 @@ pub mod sweep;
 pub mod transfer_steps;
 pub mod waiting;
 pub mod work;
-pub mod work_calls;
 
 use aruna_plugin_types::calls::{ErrorKind, HostError};
 

@@ -56,7 +56,7 @@ use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
 use super::waiting::RecheckWaiting;
 use super::work::WorkRow;
-use super::work_calls::{JobOutputs, JobRow};
+use super::work::calls::{JobOutputs, JobRow};
 use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use aruna_drivers::driver::{DriverContext, drive};

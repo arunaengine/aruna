@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod calls;
+
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -1007,5 +1009,5 @@ fn identity_at(key: &[u8]) -> Option<Identity> {
 }
 
 #[cfg(test)]
-#[path = "work_tests.rs"]
+#[path = "tests.rs"]
 pub(crate) mod tests;

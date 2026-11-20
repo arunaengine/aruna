@@ -18,13 +18,13 @@ use aruna_plugin_types::calls::{ErrorKind, HostError, ObjectInfo, ObjectPage};
 use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
-use super::account::{read_user_call, read_user_result};
-use super::check::{Authorize, CallError, check_identity, config_unavailable, matching};
-use super::grants::InstallScope;
-use super::marks::is_marked;
-use super::rows::StoreError;
-use super::unavailable;
-use super::work::{WorkRow, read_work};
+use super::super::account::{read_user_call, read_user_result};
+use super::super::check::{Authorize, CallError, check_identity, config_unavailable, matching};
+use super::super::grants::InstallScope;
+use super::super::marks::is_marked;
+use super::super::rows::StoreError;
+use super::super::unavailable;
+use super::{WorkRow, read_work};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 
 /// Outputs of one page.
@@ -380,5 +380,5 @@ impl Operation for JobOutputs {
 }
 
 #[cfg(test)]
-#[path = "work_calls_tests.rs"]
+#[path = "calls_tests.rs"]
 mod tests;

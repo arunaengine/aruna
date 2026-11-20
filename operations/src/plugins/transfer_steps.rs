@@ -23,7 +23,7 @@ use super::objects::{LocalObject, Unmarked};
 use super::outgoing::whole_text;
 use super::rows::StoreError;
 use super::work::{Send, WorkChange, WorkRow, decided, retried, update_work};
-use super::work_calls::TransferGrants;
+use super::work::calls::TransferGrants;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };

@@ -20,7 +20,7 @@ use super::host::steps::{AdmitCall, NativeCall};
 use super::job_work::CancelWork;
 use super::state::{ReadState, read_state};
 use super::submit::WorkRequest;
-use super::work_calls::JobOutputs;
+use super::work::calls::JobOutputs;
 use crate::jobs::records::pages::ServingNode;
 
 /// The call an admitted host call makes for the checked install at the run's time, and the error
