@@ -129,6 +129,9 @@ impl Worker {
         let replays = RunReplays::new(now_ms, (JOURNAL_PAGE, REPLAY_PAGES), after);
         match drive(replays, &self.ctx).await {
             Ok(replayed) => {
+                if replayed.failed > 0 {
+                    warn!(failed = replayed.failed, "Plugin event replays failed and wait");
+                }
                 self.replaying.store(replayed.more, Ordering::Relaxed);
                 if let Ok(mut after) = self.replay_after.lock() {
                     *after = replayed.after;

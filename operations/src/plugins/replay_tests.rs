@@ -373,6 +373,7 @@ fn replays_pages_bounded() {
         read: 4,
         more: true,
         after: Some(b"r1".to_vec()),
+        failed: 0,
     };
     assert_eq!(replays.next(key_page(&[b"r1"])), Ok(Next::Done(spent)));
 }
@@ -396,8 +397,31 @@ fn replays_take_turns() {
         read: 12,
         more: true,
         after: Some(b"r2".to_vec()),
+        failed: 0,
     };
     assert_eq!(replays.next(ended), Ok(Next::Done(spent)));
+}
+
+#[test]
+fn failed_replay_waits() {
+    // A failing replay neither stops the pass nor asks for the next tick at once; the position
+    // goes past it, so the other installs come first.
+    let mut replays = RunReplays::new(9, (10, 5), None);
+    replays.first().unwrap();
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<(usize, bool), _>(
+        StoreError("unreadable".into()),
+    )));
+    replays.next(failed).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]), "the next install goes on");
+    let more = child_result(Ok::<_, StoreError>((3usize, false)));
+    let done = Replayed {
+        read: 3,
+        more: false,
+        after: Some(b"r2".to_vec()),
+        failed: 1,
+    };
+    assert_eq!(replays.next(more), Ok(Next::Done(done)));
 }
 
 #[test]
@@ -425,6 +449,7 @@ fn cursor_wraps_once() {
         read: 2,
         more: false,
         after: None,
+        failed: 0,
     };
     assert_eq!(replays.next(ended()), Ok(Next::Done(done)));
 }

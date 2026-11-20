@@ -139,6 +139,32 @@ async fn prunes_old_hooks() {
 }
 
 #[test]
+fn removed_hooks_paged() {
+    // A removing install's delivery ids go a page at a time, each before the next is read.
+    let install = Ulid::from_parts(1, 1);
+    let mut plan = PruneHooks {
+        cutoff: 100,
+        removing: vec![install],
+        phase: HooksPhase::Times,
+        pruned: 0,
+    };
+    plan.first().unwrap();
+    let no_old = plan.next(page_result(Vec::new(), None)).unwrap();
+    assert_eq!(no_old, Next::Call(delete_call(Vec::new())));
+    assert!(matches!(plan.next(IoResult::Done).unwrap(), Next::Call(IoCall::Page { .. })));
+    let id = hook_key(install, "d1");
+    let page = page_result(vec![(id.clone(), encode(&7u64).unwrap())], Some(id.clone()));
+    let Next::Call(IoCall::Delete(keys)) = plan.next(page).unwrap() else {
+        panic!("the page's ids go before the next page");
+    };
+    assert_eq!(keys.len(), 2);
+    let Next::Call(IoCall::Page { after, .. }) = plan.next(IoResult::Done).unwrap() else {
+        panic!("expected the next page of the install");
+    };
+    assert_eq!(after.map(|after| after.to_vec()), Some(id));
+}
+
+#[test]
 fn old_hooks_go() {
     let install = Ulid::from_parts(1, 1);
     let mut plan = PruneHooks {

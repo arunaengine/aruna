@@ -97,3 +97,26 @@ fn sweep_by_standing() {
     assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(2));
     assert!(plan.next(IoResult::Done).is_err());
 }
+
+#[test]
+fn sweep_deletes_paged() {
+    // A table read in pages deletes each page's rows before the next page is read.
+    let removing = Ulid::from_parts(1, 1);
+    let mut plan = SweepEvents {
+        installs: BTreeMap::from([(removing, Standing::Removing)]),
+        now_ms: 9,
+        phase: SweepPhase::Scanning(Table::Replays, Table::Replays.scan()),
+        deletes: Vec::new(),
+        dropped: 0,
+    };
+    let key = [&b"r"[..], &removing.to_bytes()].concat();
+    plan.first().unwrap();
+    let first = page_result(vec![(key.clone(), Vec::new())], Some(key.clone()));
+    let gone = vec![(PLUGIN_REPLAYS_KEYSPACE, key.clone())];
+    assert_eq!(plan.next(first).unwrap(), Next::Call(delete_call(gone)));
+    let Next::Call(IoCall::Page { space, after, .. }) = plan.next(IoResult::Done).unwrap() else {
+        panic!("expected the next page of the same table");
+    };
+    assert_eq!(space, PLUGIN_REPLAYS_KEYSPACE);
+    assert_eq!(after.map(|after| after.to_vec()), Some(key));
+}

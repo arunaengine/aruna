@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 /// Bucket holders read per page before the pending request is announced to them.
-const HOLDER_PAGE: usize = 256;
+pub(super) const HOLDER_PAGE: usize = 256;
 
 impl KeyOperation {
     /// Checks the bucket-wide request bindings that do not depend on the recipient.
@@ -518,7 +518,31 @@ impl KeyOperation {
     }
     /// Reads the bucket holders, including a caller who holds the bucket key.
     pub(super) fn holders(&mut self) -> Option<KeyTurn> {
-        self.holder_page(None)
+        let snapshot = self.snapshot.as_ref()?;
+        self.role_holders = snapshot.holders.iter().copied().collect();
+        self.explicit_started = false;
+        Some(self.role_batch())
+    }
+    /// Tells the role holders in chunks of `HOLDER_PAGE`, then reads the explicit holders.
+    fn role_batch(&mut self) -> KeyTurn {
+        while !self.role_holders.is_empty() {
+            let take = self.role_holders.len().min(HOLDER_PAGE);
+            let chunk: Vec<UserId> = self.role_holders.drain(..take).collect();
+            let notices = match self.notices(chunk) {
+                Ok(notices) => notices,
+                Err(error) => return self.fail(error),
+            };
+            if !notices.is_empty() {
+                self.notify = true;
+                self.state = State::HolderWrite;
+                return Ok(Next::Call(IoCall::Write(notices)));
+            }
+        }
+        self.explicit_started = true;
+        match self.holder_page(None) {
+            Some(turn) => turn,
+            None => self.flush(),
+        }
     }
     /// One page of bucket holders after the holder key `after`.
     fn holder_page(&mut self, after: Option<Key>) -> Option<KeyTurn> {
@@ -532,18 +556,12 @@ impl KeyOperation {
             limit: HOLDER_PAGE,
         })))
     }
-    /// Tells the explicit holders of one page, and with the first page the role holders, that
-    /// the member waits for keys; each page's notices are written before the next page is read.
+    /// Tells the explicit holders of one page that the member waits for keys; each page's
+    /// notices are written before the next page is read, and the told set keeps users apart.
     pub(super) fn holders_read(&mut self, page: (Vec<(Key, Value)>, Option<Key>)) -> KeyTurn {
         let (values, next) = page;
-        let Some(snapshot) = self.snapshot.as_ref() else {
-            return self.fail(KeyError::Missing);
-        };
-        // Until someone was told, the role holders join; telling one user twice is impossible.
-        let mut holders: Vec<UserId> = match self.notified.is_empty() {
-            true => snapshot.holders.iter().copied().collect(),
-            false => Vec::new(),
-        };
+        self.explicit_started = true;
+        let mut holders = Vec::new();
         for (_, value) in values {
             match BucketHolder::from_bytes(&value) {
                 Ok(holder) if holder.origin == HolderOrigin::Explicit => {
@@ -565,8 +583,11 @@ impl KeyOperation {
         self.state = State::HolderWrite;
         Ok(Next::Call(IoCall::Write(notices)))
     }
-    /// The next holder page, or the remaining writes once every page was told.
+    /// The next role holder chunk or holder page, or the remaining writes once all were told.
     pub(super) fn holders_written(&mut self) -> KeyTurn {
+        if !self.explicit_started {
+            return self.role_batch();
+        }
         match (self.holder_next.take()).and_then(|after| self.holder_page(Some(after))) {
             Some(turn) => turn,
             None => self.flush(),

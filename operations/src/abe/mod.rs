@@ -155,6 +155,9 @@ pub struct KeyOperation {
     /// The holders told of this request, and the holder page that follows the one written.
     notified: std::collections::BTreeSet<aruna_core::user::id::UserId>,
     holder_next: Option<Key>,
+    /// The role holders still to tell, in bounded chunks before the explicit holder pages.
+    role_holders: std::collections::VecDeque<aruna_core::user::id::UserId>,
+    explicit_started: bool,
     quiet: bool,
     managed: bool,
     result: Option<KeyResult>,
@@ -194,6 +197,8 @@ impl KeyOperation {
             notify: false,
             notified: Default::default(),
             holder_next: None,
+            role_holders: Default::default(),
+            explicit_started: false,
             quiet: false,
             managed: false,
             result: None,
@@ -220,11 +225,14 @@ impl KeyOperation {
             .max_by_key(|k| (k.created_at_ms, k.record_id))
     }
     fn settings_read(&mut self, value: Option<Value>) -> KeyTurn {
-        let settings = BucketEncryption::from_row(value.as_deref()).ok();
-        let Some(key) = settings.as_ref().and_then(|s| s.active_key()) else {
+        // Settings that do not decode or validate fail; only decoded ones without a key need none.
+        let Ok(settings) = BucketEncryption::from_row(value.as_deref()) else {
+            return self.fail(AbeError::Context);
+        };
+        let Some(key) = settings.active_key() else {
             return self.fail(KeyError::Missing);
         };
-        self.managed = settings.is_some_and(|s| s.mode == EncryptionMode::NodeManaged);
+        self.managed = settings.mode == EncryptionMode::NodeManaged;
         if let KeyAction::Publish(grant) = &self.action
             && grant.context.request.parameters.key != key
         {
@@ -464,8 +472,12 @@ impl Operation for KeyOperation {
         match self.state {
             State::Bucket => {
                 let [value] = values::<1>(result)?;
-                let Some(info) = value.as_ref().and_then(|v| BucketInfo::from_bytes(v).ok()) else {
+                // Only an absent bucket is `Missing`; one that does not decode fails.
+                let Some(value) = value else {
                     return self.fail(KeyError::Missing);
+                };
+                let Ok(info) = BucketInfo::from_bytes(&value) else {
+                    return self.fail(AbeError::Context);
                 };
                 self.info = Some(info);
                 self.state = State::Settings;
@@ -557,6 +569,31 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_rows_fail() {
+        // A stored bucket or settings row that does not decode is an error, never a skip.
+        let realm_id = RealmId([1; 32]);
+        let user_id = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let action = KeyAction::Member(user_id);
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        operation.first().unwrap();
+        let garbage = || IoResult::Values(vec![Some(Value::from(vec![0xff; 3]))]);
+        assert_eq!(operation.next(garbage()), Err(KeyError::Abe(AbeError::Context)));
+        operation.state = State::Settings;
+        let unreadable = operation.settings_read(Some(Value::from(vec![0xff; 3])));
+        assert_eq!(unreadable, Err(KeyError::Abe(AbeError::Context)));
+        let absent = IoResult::Values(vec![None]);
+        operation.state = State::Bucket;
+        assert_eq!(operation.next(absent), Err(KeyError::Missing));
+    }
+
+    #[test]
     fn missing_records_unprepared() {
         // An absent authorization, parameter or epoch row is no vanished bucket.
         let realm_id = RealmId([1; 32]);
@@ -573,6 +610,72 @@ mod tests {
         let mut values = vec![None; 8];
         values[7] = Some(Value::from(b"user".to_vec()));
         assert_eq!(operation.snapshot_read(values), Err(KeyError::Unprepared));
+    }
+
+    /// A request of user 5 in realm 1 for a bucket whose snapshot names `holders`.
+    fn holder_fixture(
+        holders: std::collections::BTreeSet<aruna_core::user::id::UserId>,
+    ) -> KeyOperation {
+        let realm_id = RealmId([1; 32]);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let auth = AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        operation.info = Some(BucketInfo {
+            group_id: Ulid::from_bytes([8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: None,
+        });
+        operation.snapshot = Some(Snapshot {
+            parameters: AbeParameters {
+                realm_id,
+                node_id: node,
+                key: BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1),
+                fingerprint: [7; 32],
+                parameters: vec![9; 3],
+            },
+            epoch: 1,
+            revisions: Vec::new(),
+            rules: PermissionRules::from_roles(Vec::new(), None).unwrap(),
+            holder: false,
+            holders,
+            policies: false,
+            due: false,
+            checks: Default::default(),
+        });
+        operation
+    }
+
+    #[test]
+    fn role_holders_chunked() {
+        // Many role holders are told in bounded writes before the explicit holder pages.
+        let realm_id = RealmId([1; 32]);
+        let holders = (0..300u128)
+            .map(|n| aruna_core::user::id::UserId::new(Ulid::from_parts(1, n), realm_id))
+            .collect();
+        let mut operation = holder_fixture(holders);
+        let Some(Ok(Next::Call(IoCall::Write(first)))) = operation.holders() else {
+            panic!("expected the first chunk");
+        };
+        assert_eq!(first.len(), requests::HOLDER_PAGE);
+        let Ok(Next::Call(IoCall::Write(rest))) = operation.next(IoResult::Done) else {
+            panic!("expected the rest of the role holders");
+        };
+        assert_eq!(rest.len(), 300 - requests::HOLDER_PAGE);
+        let turn = operation.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))), "then the explicit pages");
     }
 
     #[test]
