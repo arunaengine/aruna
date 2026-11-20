@@ -197,7 +197,9 @@ impl Operation for ConnectOperation {
                     TransferError::Retryable("node credential key unavailable".into())
                 })?;
                 let token = token.map_err(TransferError::Permanent)?;
-                Ok(Next::Done(self.opened(&view, Some(token.expose().to_string()))?))
+                Ok(Next::Done(
+                    self.opened(&view, Some(token.expose().to_string()))?,
+                ))
             }
             ConnectStep::Secret(view) => {
                 let secret = parse_secret_read(result.event()?).map_err(|_| {

@@ -137,7 +137,8 @@ impl<T> Walk<T> {
         {
             let last = frame.last.clone();
             let fresh = |child: &Child<T>| {
-                last.as_deref().is_none_or(|last| child.name.as_str() > last)
+                last.as_deref()
+                    .is_none_or(|last| child.name.as_str() > last)
             };
             frame.children.extend(children.into_iter().filter(fresh));
             frame.more = more;
@@ -297,7 +298,8 @@ mod tests {
                 Step::List(directory) => {
                     let from = walk.resume_name().map(ToOwned::to_owned);
                     let keep = |child: &Child<()>| {
-                        from.as_deref().is_none_or(|from| child.name.as_str() >= from)
+                        from.as_deref()
+                            .is_none_or(|from| child.name.as_str() >= from)
                     };
                     let mut names: Vec<_> = children(&directory).into_iter().filter(keep).collect();
                     names.sort_by(|left, right| left.name.cmp(&right.name));

@@ -62,7 +62,9 @@ pub async fn arm_unless_stored(
             }
         };
         if let Some(admission) = admission {
-            let (event, _) = task_handle.shorten_owned(key.clone(), *after, admission).await;
+            let (event, _) = task_handle
+                .shorten_owned(key.clone(), *after, admission)
+                .await;
             return event;
         }
     }

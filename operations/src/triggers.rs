@@ -1645,7 +1645,10 @@ mod tests {
         let mut idle = timer_operation(&TaskKey::PublishRegistration, &input()).unwrap();
         let next = TimerPlan::from(Some(PUBLISH_INTERVAL));
         assert_eq!(idle.first(), Ok(Next::Done(next.clone())));
-        assert_eq!(RenewalTimerOperation::rearm(Err(IoError::Unfinished)), Ok(next));
+        assert_eq!(
+            RenewalTimerOperation::rearm(Err(IoError::Unfinished)),
+            Ok(next)
+        );
     }
 
     #[test]
