@@ -462,8 +462,7 @@ impl BlobHandler {
             .await
         {
             Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: committed,
-                ..
+                txn_id: committed, ..
             }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
@@ -595,8 +594,7 @@ impl BlobHandler {
             .await
         {
             Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: committed,
-                ..
+                txn_id: committed, ..
             }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
@@ -932,8 +930,7 @@ impl BlobHandler {
             .await
         {
             Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: committed,
-                ..
+                txn_id: committed, ..
             }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
@@ -1040,8 +1037,7 @@ impl BlobHandler {
             .await
         {
             Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: committed,
-                ..
+                txn_id: committed, ..
             }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
@@ -1267,8 +1263,7 @@ impl BlobHandler {
             .await;
         match event {
             Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: committed,
-                ..
+                txn_id: committed, ..
             }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)

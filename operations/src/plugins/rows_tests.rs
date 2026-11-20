@@ -49,7 +49,9 @@ fn pages_handed_over() {
     // Each page leaves the scan at once, so a long scan holds one page at a time.
     let mut scan = Scan::new(SPACE, b"p".to_vec());
     let first = vec![(b"p1".to_vec(), b"1".to_vec())];
-    let (rows, more) = scan.page(page_result(first.clone(), Some(b"p1".to_vec()))).unwrap();
+    let (rows, more) = scan
+        .page(page_result(first.clone(), Some(b"p1".to_vec())))
+        .unwrap();
     assert_eq!((rows, more), (first, true));
     assert!(scan.rows.is_empty());
     let IoCall::Page { after, .. } = scan.ask() else {

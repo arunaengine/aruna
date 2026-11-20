@@ -1849,7 +1849,9 @@ async fn evict_node(
 
 /// Enrollment whose secret this node claimed, so an eviction can retire it.
 async fn claimed_enrollment(state: &Arc<ServerState>, node_id: &str) -> ServerResult<Option<Ulid>> {
-    let claimed = secrets_where(state, |entry| entry.state.claimed_node_id() == Some(node_id));
+    let claimed = secrets_where(state, |entry| {
+        entry.state.claimed_node_id() == Some(node_id)
+    });
     Ok((claimed.await?.into_iter().next()).map(|entry| entry.record.enrollment_id))
 }
 

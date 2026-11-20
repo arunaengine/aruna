@@ -2333,8 +2333,7 @@ async fn commit_storage_txn(
     let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id });
     match send_storage_effect(storage, commit, op_id, stage, "commit").await {
         Ok(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: committed,
-            ..
+            txn_id: committed, ..
         })) if committed == txn_id => {
             owner.finish();
             Ok(())

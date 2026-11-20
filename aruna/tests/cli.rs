@@ -168,7 +168,11 @@ async fn data_round_trip() -> TestResult<()> {
         let open: Vec<&str> = (open.uploads().iter())
             .filter_map(|upload| upload.upload_id())
             .collect();
-        assert_eq!(open, [foreign_id.as_str()], "only the other upload stays open");
+        assert_eq!(
+            open,
+            [foreign_id.as_str()],
+            "only the other upload stays open"
+        );
 
         let listing = cli_json(&config, &["ls", "cli-data/up"]).await?;
         let keys: Vec<&str> = listing["objects"]

@@ -1649,8 +1649,7 @@ pub(super) async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: committed,
-            ..
+            txn_id: committed, ..
         }) => {
             assert_eq!(committed, txn_id);
         }
@@ -2216,8 +2215,7 @@ async fn write_during_transaction() {
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: committed,
-            ..
+            txn_id: committed, ..
         }) => {
             assert_eq!(committed, txn_id);
         }

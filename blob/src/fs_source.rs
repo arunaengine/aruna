@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::walk::{Child, Step, Walk};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::offered_directory::{
@@ -13,7 +14,6 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use bytes::Bytes;
-use crate::walk::{Child, Step, Walk};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
@@ -492,7 +492,12 @@ pub(crate) mod tests {
             if !truncated {
                 break;
             }
-            after = paths.last().unwrap().split('/').map(ToOwned::to_owned).collect();
+            after = paths
+                .last()
+                .unwrap()
+                .split('/')
+                .map(ToOwned::to_owned)
+                .collect();
         }
         assert_eq!(paths, ["a.txt", "b/a/y.txt", "b/x.txt", "c.txt"]);
     }
@@ -705,9 +710,10 @@ pub(crate) mod tests {
             .unwrap();
         std::os::unix::fs::symlink(root.path(), root.path().join("nested/loop")).unwrap();
 
-        let (entries, truncated) = list_local(&access(root.path(), ""), Vec::new(), 100, true, true)
-            .await
-            .unwrap();
+        let (entries, truncated) =
+            list_local(&access(root.path(), ""), Vec::new(), 100, true, true)
+                .await
+                .unwrap();
         assert!(!truncated);
         let paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, vec!["nested/inner.txt"]);

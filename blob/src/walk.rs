@@ -21,7 +21,10 @@ pub(crate) enum Step<T> {
     /// The children of this directory path, handed back through [`Walk::listed`].
     List(String),
     /// The next path in walk order.
-    Entry { path: String, child: Child<T> },
+    Entry {
+        path: String,
+        child: Child<T>,
+    },
     Done,
 }
 
@@ -119,7 +122,9 @@ pub(crate) fn walk_after(
     let base = base.trim_matches('/');
     let below = match base.is_empty() {
         true => Some(path),
-        false => path.strip_prefix(base).and_then(|rest| rest.strip_prefix('/')),
+        false => path
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('/')),
     };
     let below = below.filter(|rest| !rest.is_empty()).ok_or_else(|| {
         StagingSourceError::InvalidListing("the cursor lies outside the listed path".to_string())
@@ -188,7 +193,10 @@ mod tests {
     #[test]
     fn walks_name_order() {
         let (paths, _) = walked(&[], true);
-        assert_eq!(paths, ["a", "a/m", "a/m/x.txt", "a/z.txt", "a-c", "b.txt", "c"]);
+        assert_eq!(
+            paths,
+            ["a", "a/m", "a/m/x.txt", "a/z.txt", "a-c", "b.txt", "c"]
+        );
         let (paths, _) = walked(&[], false);
         assert_eq!(paths, ["a", "a-c", "b.txt", "c"]);
     }

@@ -4,11 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::{EgressGuard, REDIRECT_HOPS};
+use crate::walk::{Child, Step, Walk};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::structs::execution::source_access::{SourceEntry, SourceEntryKind};
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
-use crate::walk::{Child, Step, Walk};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 

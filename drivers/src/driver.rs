@@ -401,8 +401,7 @@ impl TransactionTracker {
             (
                 Some(TransactionEffect::Commit(txn_id)),
                 Event::Storage(StorageEvent::TransactionCommitted {
-                    txn_id: committed,
-                    ..
+                    txn_id: committed, ..
                 }),
             ) if txn_id == *committed => {
                 self.states.remove(&txn_id);

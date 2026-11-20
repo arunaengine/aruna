@@ -181,7 +181,11 @@ mod tests {
         ));
         let opened = child(Ok(KeyResult::Opened(Vec::new())));
         // The next bucket page follows once the page's buckets have their requests.
-        let Ok(Next::Call(IoCall::Page { after: asked, limit, .. })) = operation.next(opened)
+        let Ok(Next::Call(IoCall::Page {
+            after: asked,
+            limit,
+            ..
+        })) = operation.next(opened)
         else {
             panic!("expected the next bucket page");
         };

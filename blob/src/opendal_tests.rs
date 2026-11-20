@@ -810,7 +810,9 @@ async fn fallback_walk_bounded() {
         refused,
         Err(StagingSourceError::InvalidListing(_))
     ));
-    let (entries, _) = list_walking(&operator, walk(), &request, 100).await.unwrap();
+    let (entries, _) = list_walking(&operator, walk(), &request, 100)
+        .await
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, "prefix/z.txt");
 }
