@@ -153,14 +153,17 @@ fn fetch_range(
 }
 
 /// Emit every regular file below `prefix` as NUL-terminated absolute container
-/// paths, then an empty record and the count, so the caller can reject a
-/// truncated listing. Symlinks are skipped to stay inside the workspace.
+/// paths, then an empty record and the count, so the caller can reject a truncated
+/// listing. Symlinks, also in the prefix itself, are skipped to stay in the workspace.
 fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let relative = safe_absolute(prefix)?;
     let root = workspace.canonicalize()?;
-    let mut pending = vec![root.join(&relative)];
+    let mut pending = match crosses_link(&root, &relative)? {
+        true => Vec::new(),
+        false => vec![root.join(&relative)],
+    };
     let mut listed = 0u64;
     // Starts at the widest terminator record so it always fits under the bound.
     let mut written = 32u64;
@@ -207,6 +210,21 @@ fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Res
     writer.write_all(listed.to_string().as_bytes())?;
     writer.write_all(&[0])?;
     writer.flush()
+}
+
+/// Whether `relative` below `root` passes a symlink; a missing component passes none.
+fn crosses_link(root: &Path, relative: &Path) -> io::Result<bool> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match current.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
 }
 
 fn compare_marker(marker: &Path, sentinel: &Path) -> io::Result<()> {
@@ -439,6 +457,22 @@ mod tests {
         let mut empty = Vec::new();
         list_files(&workspace, "/absent", &mut empty).unwrap();
         assert_eq!(empty, b"\x000\x00");
+    }
+
+    #[test]
+    fn skips_linked_prefix() {
+        // A prefix that is, or lies below, a link lists nothing from outside the workspace.
+        let directory = tempfile::tempdir().unwrap();
+        let (workspace, outside) = (directory.path().join("workspace"), directory.path().join("o"));
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("sub/secret.txt"), b"s").unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("out")).unwrap();
+        for prefix in ["/out", "/out/sub"] {
+            let mut listed = Vec::new();
+            list_files(&workspace, prefix, &mut listed).unwrap();
+            assert_eq!(listed, b"\x000\x00", "{prefix}");
+        }
     }
 
     #[test]
