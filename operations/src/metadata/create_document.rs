@@ -1603,7 +1603,10 @@ mod tests {
                                 error: StorageError::TransactionConflict,
                             }
                         } else {
-                            StorageEvent::TransactionCommitted { txn_id }
+                            StorageEvent::TransactionCommitted {
+                                txn_id,
+                                sequence: 1,
+                            }
                         }
                     }
                     StorageEffect::AbortTransaction { txn_id } => {

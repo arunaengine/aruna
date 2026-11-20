@@ -8,7 +8,7 @@ use std::fmt::Debug;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use aruna_core::events::Event;
+use aruna_core::events::{Event, StorageEvent};
 
 /// How much the recorder keeps: at most `total_bytes` of text, oldest records dropped first,
 /// and at most `entry_bytes` of text per record.
@@ -18,8 +18,8 @@ pub struct RecordLimits {
     pub entry_bytes: usize,
 }
 
-/// One recorded step. `sequence` orders every record of every run on this node, so the
-/// storage commits that runs saw acknowledged are ordered too.
+/// One recorded step. `sequence` orders the records as runs received their steps; the storage
+/// commit order is the `commit` of the commit events.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub sequence: u64,
@@ -40,9 +40,11 @@ pub enum Entry {
         input_bytes: usize,
         entropy: u128,
     },
+    /// `commit` is the storage's sequence of an acknowledged commit, numbered when it applied.
     Event {
         label: &'static str,
         detail_bytes: usize,
+        commit: Option<u64>,
     },
     Ended {
         outcome: &'static str,
@@ -131,9 +133,14 @@ fn started(operation: &'static str, input: &dyn Debug, entropy: u128, cap: usize
 fn delivered(event: &Event, cap: usize) -> Entry {
     let detail_bytes = debug_bytes(event, cap);
     let label = event.label();
+    let commit = match event {
+        Event::Storage(StorageEvent::TransactionCommitted { sequence, .. }) => Some(*sequence),
+        _ => None,
+    };
     Entry::Event {
         label,
         detail_bytes,
+        commit,
     }
 }
 
@@ -262,6 +269,20 @@ mod tests {
             assert!(!text.contains("105, 110, 98"), "{text}");
         }
         assert!(matches!(entries[1], Entry::Event { detail_bytes, .. } if detail_bytes > 0));
+    }
+
+    #[test]
+    fn commit_sequence_kept() {
+        let committed = Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: ulid::Ulid::from(3_u128),
+            sequence: 9,
+        });
+        for (event, sequence) in [(committed, Some(9)), (Event::Delayed, None)] {
+            let Entry::Event { commit, .. } = delivered(&event, 4096) else {
+                panic!("an event is recorded as one");
+            };
+            assert_eq!(commit, sequence);
+        }
     }
 
     // A large result is counted only up to the per-record bound; its text is never kept.

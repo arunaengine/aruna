@@ -227,7 +227,10 @@ fn transaction_commits_outcome() {
         &[storage(commit)]
     );
     assert!(!operation.is_complete());
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    let committed = StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+        sequence: 1,
+    };
     assert!(operation.step(Event::Storage(committed)).is_empty());
     assert_eq!(
         operation.finalize(),
@@ -288,7 +291,10 @@ fn snapshot_reads_only() {
         operation.step(Event::Storage(page)).as_slice(),
         &[storage(commit)]
     );
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    let committed = StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+        sequence: 1,
+    };
     assert!(operation.step(Event::Storage(committed)).is_empty());
     assert!(matches!(operation.finalize(), Ok(seen) if seen.len() == 3));
 
@@ -713,7 +719,10 @@ fn calls_after_commit() {
         operation.step(Event::Storage(written)).as_slice(),
         &[storage(commit)]
     );
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    let committed = StorageEvent::TransactionCommitted {
+        txn_id: txn(),
+        sequence: 1,
+    };
     let delete = StorageEffect::BatchDelete {
         deletes: vec![("rows".to_string(), key("old"))],
         txn_id: None,

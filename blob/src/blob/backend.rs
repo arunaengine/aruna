@@ -461,9 +461,10 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -593,9 +594,10 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -929,9 +931,10 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                ..
+            }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
                 Ok(())
@@ -1036,9 +1039,10 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                ..
+            }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
                 Ok(ReleaseUpdate::Applied)
@@ -1262,9 +1266,10 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await;
         match event {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }

@@ -340,6 +340,7 @@ fn bulk_full_rejects() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1184,7 +1185,10 @@ fn delivery_finishes_commit() {
 
     super::worker::FjallStorage::deliver_response(
         response_tx,
-        StorageEvent::TransactionCommitted { txn_id },
+        StorageEvent::TransactionCommitted {
+            txn_id,
+            sequence: 1,
+        },
         "commit_transaction",
         "transaction_committed",
     );
@@ -1335,6 +1339,7 @@ fn unknown_commit_runs() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1346,7 +1351,10 @@ fn unknown_commit_runs() {
     let event = storage.commit_transaction(txn_id);
     assert!(matches!(
         &event,
-        StorageEvent::TransactionCommitted { txn_id: committed } if *committed == txn_id
+        StorageEvent::TransactionCommitted {
+            txn_id: committed,
+            sequence: 1,
+        } if *committed == txn_id
     ));
     assert!(storage.txns.is_empty());
     assert!(storage.observe_cleanup(
@@ -1389,6 +1397,7 @@ fn unknown_commit_retires() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1440,6 +1449,7 @@ fn retry_skips_queued() {
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1588,7 +1598,7 @@ fn terminal_entry_frees() {
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
         super::handle::CleanupEntry {
-            kind: super::handle::CleanupKind::Committed,
+            kind: super::handle::CleanupKind::Committed(1),
             attempts: 0,
             queued: false,
         },
@@ -1638,7 +1648,10 @@ pub(super) async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }) => {
+        Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: committed,
+            ..
+        }) => {
             assert_eq!(committed, txn_id);
         }
         other => panic!("unexpected storage event: {other:?}"),
@@ -2202,7 +2215,10 @@ async fn write_during_transaction() {
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }) => {
+        Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: committed,
+            ..
+        }) => {
             assert_eq!(committed, txn_id);
         }
         other => panic!("unexpected storage event: {other:?}"),
@@ -2431,6 +2447,26 @@ fn commit_counts_deletes() {
 
     storage.process_effect(StorageEffect::CommitTransaction { txn_id });
     assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(1));
+}
+
+#[test]
+fn commits_numbered() {
+    let dir = tempdir().unwrap();
+    let (handle, _receivers) = StorageHandle::new();
+    let mut storage = worker(&dir, &handle);
+    let mut commit = |read: bool| {
+        let StorageEvent::TransactionStarted { txn_id } =
+            storage.process_effect(StorageEffect::StartTransaction { read })
+        else {
+            panic!("transaction starts");
+        };
+        match storage.process_effect(StorageEffect::CommitTransaction { txn_id }) {
+            StorageEvent::TransactionCommitted { sequence, .. } => sequence,
+            other => panic!("the commit failed: {other:?}"),
+        }
+    };
+    // Write commits take the next number; a read-only one answers the last write commit.
+    assert_eq!([commit(false), commit(false), commit(true)], [1, 2, 2]);
 }
 
 #[test]
