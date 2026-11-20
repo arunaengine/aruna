@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -48,14 +47,6 @@ const HOME: &str = "https://aruna-engine.org/";
 const VOCABULARIES: [&str; 3] = ["terms/", "invenio/", "profiles/repository/"];
 /// The node route that picks the page of a w3id path, under the realm's API base path.
 const NODE_ROUTE: &str = "w3id";
-/// A data id newer nodes redirect without any lookup, so the answer tells only the route apart.
-const ROUTE_CHECK: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-/// How long a realm's route check is kept.
-const ROUTES_SECS: u64 = 600;
-/// How long a failed route check waits before the next one; the older routes serve meanwhile.
-const RETRY_SECS: u64 = 60;
-/// How long a running route check holds off others, well above the probe timeout.
-const CHECKING_SECS: u64 = 10;
 /// v2 minted `https://w3id.org/aruna/{ULID}` on both sites; the w3id rule sent it to the first.
 const V2: Legacy = Legacy {
     page: "https://aruna-engine.org/objects/",
@@ -96,13 +87,11 @@ pub enum Holding {
     Undecided,
 }
 
-/// Realm nodes answer their PID routes, v2 sites their resources route.
+/// Realm nodes answer their w3id route, v2 sites their resources route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Realm,
     Legacy,
-    /// The route check of a realm node: holding means the node serves the w3id route.
-    Routes,
 }
 
 /// One asked site: the redirect target if it holds the id, who it is, and what it said.
@@ -155,14 +144,6 @@ type SharedLimiter = RateLimiter<NotKeyed, InMemoryState, RequestClock, NoOpMidd
 type ClientLimiter =
     RateLimiter<IpAddr, DashMapStateStore<IpAddr>, RequestClock, NoOpMiddleware<Nanos>>;
 
-/// The routes a realm's nodes serve: the w3id route of newer nodes, or only the PID, Profile and
-/// data resolve routes of older ones, which newer nodes keep serving too.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Routes {
-    W3id,
-    Legacy,
-}
-
 /// What a realm node is sent: a document, a Profile or a canonical data id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Item {
@@ -172,35 +153,22 @@ enum Item {
 }
 
 impl Item {
-    /// The node route and path below it.
-    fn route(&self, routes: Routes) -> (&'static str, String) {
-        match (self, routes) {
-            (Self::Document(id), Routes::W3id) => (NODE_ROUTE, id.to_string()),
-            (Self::Profile(id), Routes::W3id) => (NODE_ROUTE, format!("profile/{id}")),
-            (Self::Data(path), Routes::W3id) => (NODE_ROUTE, format!("data/{path}")),
-            (Self::Document(id), Routes::Legacy) => ("pid", id.to_string()),
-            (Self::Profile(id), Routes::Legacy) => ("profile", id.to_string()),
-            (Self::Data(path), Routes::Legacy) => ("resolve", path.clone()),
+    /// The path below the node's w3id route; every node of a current realm serves it.
+    fn route(&self) -> String {
+        match self {
+            Self::Document(id) => id.to_string(),
+            Self::Profile(id) => format!("profile/{id}"),
+            Self::Data(path) => format!("data/{path}"),
         }
     }
-}
-
-/// What is known about a realm's routes at one API URL, until a time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RouteState {
-    Known(Routes),
-    /// One check runs; others use the older routes instead of starting their own.
-    Checking,
-    /// The last check got no answer; the older routes serve until it may run again.
-    Failed,
 }
 
 /// A kept guess. A winning realm is kept by id and its target rebuilt from the live
 /// registration on each use, so withdrawal, lease expiry and URL changes apply at once.
 #[derive(Clone)]
 enum Kept {
-    /// A realm and the routes its holding node answered on.
-    Realm(RealmId, Routes),
+    /// The realm whose node held the id.
+    Realm(RealmId),
     Fixed(Answer),
 }
 
@@ -209,8 +177,6 @@ pub struct Resolver {
     /// The realm of ids that name none, such as content hashes; used only while approved.
     default_realm: Option<RealmId>,
     cache: Mutex<LruCache<String, (Kept, u64)>>,
-    /// The routes each approved realm serves, with the API URL they were checked at.
-    routes: Mutex<HashMap<RealmId, (Url, RouteState, u64)>>,
     clock: RequestClock,
     guesses: SharedLimiter,
     clients: ClientLimiter,
@@ -277,7 +243,6 @@ impl Resolver {
                     .allow_burst(NonZeroU32::new(CLIENT_BURST).expect("nonzero burst")),
                 clock.clone(),
             ),
-            routes: Mutex::new(HashMap::new()),
             clock,
             client_source,
         }
@@ -295,7 +260,7 @@ impl Resolver {
             Shape::Data(realm, path) => match realm.or(self.default_realm) {
                 Some(realm) => {
                     let item = Item::Data(path);
-                    self.direct(realm, &item, now, None, &probe).await
+                    self.direct(realm, &item, now).await
                 }
                 None => Answer::NotFound("no realm resolves this identifier"),
             },
@@ -313,20 +278,8 @@ impl Resolver {
         admitted
     }
 
-    /// A redirect to an approved realm's node route, without asking it about the id. `kept`
-    /// names the routes a holding node answered on; the older ones every node serves stay.
-    async fn direct<P, F>(
-        &self,
-        realm: RealmId,
-        item: &Item,
-        now: u64,
-        kept: Option<Routes>,
-        probe: &P,
-    ) -> Answer
-    where
-        P: Fn(Url, Source) -> F,
-        F: Future<Output = Holding>,
-    {
+    /// A redirect to an approved realm's node route, without asking it about the id.
+    async fn direct(&self, realm: RealmId, item: &Item, now: u64) -> Answer {
         match self.registry.store.may_resolve(&realm) {
             Ok(ResolveGate::Allowed) => {}
             Ok(ResolveGate::Retired) => {
@@ -340,11 +293,7 @@ impl Resolver {
             Ok(None) => return Answer::NotFound("realm not publicly reachable"),
             Err(error) => return storage_failed(error),
         };
-        let routes = match kept {
-            Some(Routes::Legacy) => Routes::Legacy,
-            _ => self.routes(&entry, now, probe).await,
-        };
-        match entry_target(&entry, item, routes) {
+        match entry_target(&entry, item) {
             Some(target) => Answer::Redirect(target),
             None => Answer::NotFound("realm not publicly reachable"),
         }
@@ -362,7 +311,7 @@ impl Resolver {
             Shape::Profile(id) => (format!("profile/{id}"), *id, Item::Profile(*id)),
             _ => return Answer::NotFound("not an Aruna identifier"),
         };
-        if let Some(answer) = self.cached(&key, &item, now, &probe).await {
+        if let Some(answer) = self.cached(&key, &item, now).await {
             return answer;
         }
         if !self.admit(client, now) || self.guesses.check().is_err() {
@@ -371,7 +320,7 @@ impl Resolver {
         // A ULID with the reserved placement handle was never minted by a v3 realm.
         let structured = MetaResourceId::from_str(&id.to_string()).is_ok();
         let realms = match structured {
-            true => match self.realm_targets(now, &probe).await {
+            true => match self.realm_targets(now).await {
                 Ok(targets) => targets,
                 Err(error) => return storage_failed(error),
             },
@@ -385,9 +334,9 @@ impl Resolver {
         let probe = &probe;
         let asks: Vec<_> = realms
             .iter()
-            .map(|(realm, entry, routes)| self.ask_realm(*realm, entry, *routes, &item, probe))
+            .map(|(realm, entry)| ask_realm(*realm, entry, &item, probe))
             .collect();
-        let realm_answers: Vec<(RealmId, Routes, String, Holding)> = futures::stream::iter(asks)
+        let realm_answers: Vec<(RealmId, String, Holding)> = futures::stream::iter(asks)
             .buffered(PROBE_SLOTS)
             .collect::<Vec<_>>()
             .await
@@ -402,7 +351,7 @@ impl Resolver {
         }
         let mut answers: Vec<Asked> = realm_answers
             .iter()
-            .map(|(_, _, target, holding)| (target.clone(), Source::Realm, *holding))
+            .map(|(_, target, holding)| (target.clone(), Source::Realm, *holding))
             .collect();
         let legacy_answers: Vec<Asked> = futures::stream::iter(asked)
             .map(|(target, url, source)| async move { (target, source, probe(url, source).await) })
@@ -420,9 +369,9 @@ impl Resolver {
         let kept = match &answer {
             Answer::Redirect(target) => realm_answers
                 .iter()
-                .find(|(_, _, realm_target, _)| realm_target == target)
-                .map_or(Kept::Fixed(answer.clone()), |(realm, routes, _, _)| {
-                    Kept::Realm(*realm, *routes)
+                .find(|(_, realm_target, _)| realm_target == target)
+                .map_or(Kept::Fixed(answer.clone()), |(realm, _, _)| {
+                    Kept::Realm(*realm)
                 }),
             _ => Kept::Fixed(answer.clone()),
         };
@@ -436,11 +385,7 @@ impl Resolver {
     }
 
     /// A kept answer; a kept realm that is no longer redirectable is dropped and guessed again.
-    async fn cached<P, F>(&self, key: &str, item: &Item, now: u64, probe: &P) -> Option<Answer>
-    where
-        P: Fn(Url, Source) -> F,
-        F: Future<Output = Holding>,
-    {
+    async fn cached(&self, key: &str, item: &Item, now: u64) -> Option<Answer> {
         let kept = {
             let mut cache = self.cache.lock().ok()?;
             match cache.get(key) {
@@ -454,8 +399,8 @@ impl Resolver {
         };
         match kept {
             Kept::Fixed(answer) => Some(answer),
-            Kept::Realm(realm, routes) => {
-                match self.direct(realm, item, now, Some(routes), probe).await {
+            Kept::Realm(realm) => {
+                match self.direct(realm, item, now).await {
                     Answer::Redirect(target) => Some(Answer::Redirect(target)),
                     _ => {
                         if let Ok(mut cache) = self.cache.lock() {
@@ -468,16 +413,8 @@ impl Resolver {
         }
     }
 
-    /// Each approved realm with a live lease and the routes it serves, the default first.
-    async fn realm_targets<P, F>(
-        &self,
-        now: u64,
-        probe: &P,
-    ) -> Result<Vec<(RealmId, Entry, Routes)>, StoreError>
-    where
-        P: Fn(Url, Source) -> F,
-        F: Future<Output = Holding>,
-    {
+    /// Each approved realm with a live lease, the default first.
+    async fn realm_targets(&self, now: u64) -> Result<Vec<(RealmId, Entry)>, StoreError> {
         // The store reads block, so they run on the blocking pool instead of a request worker.
         let registry = Arc::clone(&self.registry);
         let resolvable = tokio::task::spawn_blocking(move || registry.store.resolvable(now))
@@ -487,108 +424,34 @@ impl Resolver {
             .map(|entry| (entry.registration.payload.descriptor.payload.realm_id, entry))
             .collect();
         approved.sort_by_key(|(realm, _)| Some(*realm) != self.default_realm);
-        let targets = futures::stream::iter(approved)
-            .map(|(realm, entry)| async move {
-                let routes = self.routes(&entry, now, probe).await;
-                (realm, entry, routes)
-            })
-            .buffered(PROBE_SLOTS)
-            .collect()
-            .await;
-        Ok(targets)
-    }
-
-    /// Asks one realm about `item`. A 404 on the w3id route may come from an older node behind
-    /// the same address, so the older route decides; if it holds, the route check is dropped.
-    async fn ask_realm<P, F>(
-        &self,
-        realm: RealmId,
-        entry: &Entry,
-        routes: Routes,
-        item: &Item,
-        probe: &P,
-    ) -> Option<(RealmId, Routes, String, Holding)>
-    where
-        P: Fn(Url, Source) -> F,
-        F: Future<Output = Holding>,
-    {
-        let target = entry_target(entry, item, routes)?;
-        let holding = probe(Url::parse(&target).ok()?, Source::Realm).await;
-        if routes == Routes::Legacy || holding != Holding::Absent {
-            return Some((realm, routes, target, holding));
-        }
-        let target = entry_target(entry, item, Routes::Legacy)?;
-        let holding = probe(Url::parse(&target).ok()?, Source::Realm).await;
-        // Drop only the stale route check this ask relied on; a newer check or cooldown stays.
-        let api_url = &entry.registration.payload.descriptor.payload.api_url;
-        if holding == Holding::Holds
-            && let Ok(mut known) = self.routes.lock()
-            && known.get(&realm).is_some_and(|(url, state, _)| {
-                url == api_url && matches!(state, RouteState::Known(Routes::W3id))
-            })
-        {
-            known.remove(&realm);
-        }
-        Some((realm, Routes::Legacy, target, holding))
-    }
-
-    /// Which routes the realm's nodes serve, kept per API URL. Only a node that answers the
-    /// route check counts as newer; any other answer means the older routes, which both serve.
-    async fn routes<P, F>(&self, entry: &Entry, now: u64, probe: &P) -> Routes
-    where
-        P: Fn(Url, Source) -> F,
-        F: Future<Output = Holding>,
-    {
-        let api_url = &entry.registration.payload.descriptor.payload.api_url;
-        let realm = entry.registration.payload.descriptor.payload.realm_id;
-        {
-            let Ok(mut known) = self.routes.lock() else {
-                return Routes::Legacy;
-            };
-            match known.get(&realm) {
-                Some((url, state, until)) if url == api_url && *until > now => {
-                    return match state {
-                        RouteState::Known(routes) => *routes,
-                        RouteState::Checking | RouteState::Failed => Routes::Legacy,
-                    };
-                }
-                _ => {
-                    let checking = (api_url.clone(), RouteState::Checking, now + CHECKING_SECS);
-                    known.insert(realm, checking);
-                }
-            }
-        }
-        let check = Item::Data(ROUTE_CHECK.to_string());
-        let url =
-            entry_target(entry, &check, Routes::W3id).and_then(|target| Url::parse(&target).ok());
-        let holding = match url {
-            Some(url) => probe(url, Source::Routes).await,
-            None => Holding::Absent,
-        };
-        let (state, until) = match holding {
-            Holding::Holds => (RouteState::Known(Routes::W3id), now + ROUTES_SECS),
-            Holding::Absent => (RouteState::Known(Routes::Legacy), now + ROUTES_SECS),
-            Holding::Unavailable | Holding::Undecided => (RouteState::Failed, now + RETRY_SECS),
-        };
-        if let Ok(mut known) = self.routes.lock() {
-            known.insert(realm, (api_url.clone(), state, until));
-        }
-        match state {
-            RouteState::Known(routes) => routes,
-            RouteState::Checking | RouteState::Failed => Routes::Legacy,
-        }
+        Ok(approved)
     }
 }
 
-/// The node route for `item` under the entry's API URL.
-fn entry_target(entry: &Entry, item: &Item, routes: Routes) -> Option<String> {
+/// Asks one realm's node about `item` on its w3id route.
+async fn ask_realm<P, F>(
+    realm: RealmId,
+    entry: &Entry,
+    item: &Item,
+    probe: &P,
+) -> Option<(RealmId, String, Holding)>
+where
+    P: Fn(Url, Source) -> F,
+    F: Future<Output = Holding>,
+{
+    let target = entry_target(entry, item)?;
+    let holding = probe(Url::parse(&target).ok()?, Source::Realm).await;
+    Some((realm, target, holding))
+}
+
+/// The node's w3id route for `item` under the entry's API URL.
+fn entry_target(entry: &Entry, item: &Item) -> Option<String> {
     let api_url = &entry.registration.payload.descriptor.payload.api_url;
     // w3id.org would send the redirect back here; refusing it keeps every chain finite.
     if api_url.host_str() == Some("w3id.org") {
         return None;
     }
-    let (route, path) = item.route(routes);
-    resolve_target(api_url, route, &path)
+    resolve_target(api_url, NODE_ROUTE, &item.route())
 }
 
 fn storage_failed(error: StoreError) -> Answer {
@@ -624,13 +487,12 @@ fn decide(answers: &[Asked]) -> Answer {
 }
 
 /// A realm holds an id when its node redirects to a page or reports it withdrawn; a v2 site
-/// when it serves the resource or refuses it as not public; a node serves the w3id route when
-/// it redirects the route check. A 503, as during startup or an authority failure, is no absence.
+/// when it serves the resource or refuses it as not public. A 503, as during startup or an
+/// authority failure, is no absence.
 pub fn holding(source: Source, status: StatusCode) -> Holding {
     match (source, status.as_u16()) {
         (Source::Realm, 301 | 302 | 303 | 307 | 308 | 410) => Holding::Holds,
         (Source::Legacy, 200 | 400) => Holding::Holds,
-        (Source::Routes, 307) => Holding::Holds,
         (_, 404) => Holding::Absent,
         _ => Holding::Unavailable,
     }
@@ -643,7 +505,7 @@ pub async fn probe(egress: &EgressGuard, url: Url, source: Source) -> Holding {
     };
     let accept = match source {
         Source::Realm => "application/ld+json",
-        Source::Legacy | Source::Routes => "application/json",
+        Source::Legacy => "application/json",
     };
     match request
         .header("accept", accept)
@@ -793,21 +655,13 @@ async fn resolve_owned(
 ) -> Response {
     let rest = uri.path().strip_prefix("/realm/").unwrap_or_default();
     let client = resolver.client_source.address(&headers, peer.ip());
-    let egress = &resolver.registry.egress;
-    let probe = |url, source| probe(egress, url, source);
-    let answer = resolver
-        .owned(rest, unix_timestamp_secs(), client, &probe)
-        .await;
+    let answer = resolver.owned(rest, unix_timestamp_secs(), client).await;
     respond(answer)
 }
 
 impl Resolver {
     /// `{realm-id}/{path}` of a namespace the realm owns, sent to that realm only.
-    async fn owned<P, F>(&self, rest: &str, now: u64, client: IpAddr, probe: &P) -> Answer
-    where
-        P: Fn(Url, Source) -> F,
-        F: Future<Output = Holding>,
-    {
+    async fn owned(&self, rest: &str, now: u64, client: IpAddr) -> Answer {
         if !self.admit(client, now) {
             return Answer::Busy;
         }
@@ -823,7 +677,7 @@ impl Resolver {
             Shape::Data(_, path) => Item::Data(path),
             _ => return Answer::NotFound("not an Aruna identifier"),
         };
-        self.direct(realm, &item, now, None, probe).await
+        self.direct(realm, &item, now).await
     }
 }
 
