@@ -45,7 +45,9 @@ impl Operation for PresenceTimerOperation {
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<TimerPlan>, IoError> {
-        Ok(Next::Call(IoCall::child(GetConfigOperation::new(self.realm_id))))
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<TimerPlan>, IoError> {
@@ -112,7 +114,9 @@ mod tests {
         let mut joining = PresenceTimerOperation::new(realm(), node());
         joining.first().unwrap();
         let missing = Err::<RealmConfigDocument, _>(GetConfigError::DocumentNotFound);
-        joining.next(IoResult::Child(ChildOutcome::new(missing))).unwrap();
+        joining
+            .next(IoResult::Child(ChildOutcome::new(missing)))
+            .unwrap();
         let announced = IoResult::Child(ChildOutcome::new(Ok::<(), AnnouncePresenceError>(())));
         assert_eq!(joining.next(announced), refresh);
     }
