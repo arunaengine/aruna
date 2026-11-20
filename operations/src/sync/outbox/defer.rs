@@ -81,6 +81,15 @@ pub fn partition_drain_records(
             deferred.push((record_key, record, topic));
             continue;
         }
+        // A topic a failure blocked holds every later record, shared or shard, and the origin of
+        // a held admin record with it.
+        if defer.deferred_topics.contains(&topic) {
+            if let Some(origin) = admin_origin(&record) {
+                defer.blocked_origins.insert(origin);
+            }
+            deferred.push((record_key, record, topic));
+            continue;
+        }
         if !record.target.uses_shard_topic() {
             match publishes_shared {
                 true => to_publish.push((record_key, record, topic)),

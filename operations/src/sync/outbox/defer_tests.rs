@@ -136,6 +136,29 @@ fn admin_origin_blocks() {
     assert!(defer.blocked_origins.contains(&origin));
 }
 
+// A topic a failure blocked holds a later shared-topic record too, and a held admin record
+// blocks its origin for the records after it.
+#[test]
+fn shared_topic_blocked() {
+    let topic = TopicId::hash(b"shared-topic");
+    let mut defer = DrainDeferState::default();
+    defer.deferred_topics.insert(topic);
+    let mut shared = shard_topic_record(1);
+    shared.target = DocumentTarget::RealmConfig {
+        realm_id: RealmId([3; 32]),
+    };
+    let origin = node(4);
+    let records = vec![
+        (b"shared".to_vec(), shared, topic),
+        (b"admin".to_vec(), admin_record(origin, 1), topic),
+    ];
+    let (to_publish, deferred, undeliverable) =
+        partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
+    assert!(to_publish.is_empty() && undeliverable.is_empty());
+    assert_eq!(deferred.len(), 2);
+    assert!(defer.blocked_origins.contains(&origin));
+}
+
 #[test]
 fn topic_block_spans() {
     let topic = TopicId::hash(b"blocked-topic-pages");
