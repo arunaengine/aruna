@@ -1697,3 +1697,42 @@ impl BoundaryHarness {
         shutdown_net(&self.net).await;
     }
 }
+
+// A realm config that cannot be decoded postpones the drain instead of reading as absent, where
+// the bootstrap rules would let a record publish without verified membership.
+#[tokio::test]
+async fn unreadable_config_waits() {
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let realm_id = RealmId::from_bytes([66u8; 32]);
+    let load = || super::outbox::load_drain_config(&context, realm_id);
+    assert!(matches!(load().await, Ok(None)));
+
+    let written = storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(realm_id.as_bytes().to_vec()),
+            value: ByteView::from(vec![0xff]),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        written,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    assert!(load().await.is_err());
+
+    let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    write_realm_config(&storage, realm_id, &config, node(1)).await;
+    assert!(matches!(load().await, Ok(Some(_))));
+}
