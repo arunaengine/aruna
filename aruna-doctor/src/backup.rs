@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use crate::storage::{ImportKeyspaceState, ensure_target_path};
+use crate::storage::{
+    ImportKeyspaceState, ensure_target_path, keyspace_name, publish_dir, staging_dir,
+};
 use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
 use aruna_core::structs::storage::broken::StorageCheck;
 use aruna_storage::snapshot::{GIT_KEYSPACE, PREFIXES};
@@ -108,45 +110,12 @@ fn receive_backup(
 pub fn restore_backup(backup: &Path, target: &Path) -> Result<SnapshotStats, SnapshotError> {
     ensure_target_path(target)?;
     let mut reader = SnapshotReader::new(BufReader::new(File::open(backup)?))?;
-    let parent = match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
     // Every error drops the staging directory, which removes it.
-    let staging = staging_dir(parent)?;
+    let staging = staging_dir(target)?;
     restore_into(&mut reader, staging.path())?;
     publish_dir(staging.path(), target)?;
     let _published = staging.keep();
     Ok(reader.stats())
-}
-
-/// An empty directory in `parent` that only its owner may enter.
-fn staging_dir(parent: &Path) -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix(".restore-");
-    #[cfg(unix)]
-    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
-    builder.tempdir_in(parent)
-}
-
-/// Moves the finished `staging` directory to `target`, refusing even an empty directory that
-/// appeared there meanwhile; Windows refuses to rename over a directory by itself.
-fn publish_dir(staging: &Path, target: &Path) -> Result<(), SnapshotError> {
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    let moved = {
-        use rustix::fs::{CWD, RenameFlags, renameat_with};
-        renameat_with(CWD, staging, CWD, target, RenameFlags::NOREPLACE)
-            .map_err(std::io::Error::from)
-    };
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    let moved = std::fs::rename(staging, target);
-    match moved {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(SnapshotError::TargetPathExists(target.to_path_buf()))
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 /// Writes all records into the new directory `target` and closes its databases again.
@@ -246,11 +215,7 @@ fn open_section(
     }
     for (index, prefix) in PREFIXES.iter().enumerate() {
         if let Some(keyspace) = name.strip_prefix(prefix) {
-            if keyspace.is_empty() || keyspace.len() > usize::from(u8::MAX) {
-                return Err(SnapshotError::InvalidStructure(
-                    "invalid keyspace name in backup",
-                ));
-            }
+            let keyspace = keyspace_name(keyspace)?;
             let keyspace = databases[index].keyspace(keyspace, KeyspaceCreateOptions::default)?;
             return Ok(Section::Store(index, ImportKeyspaceState::new(keyspace)));
         }
@@ -518,7 +483,7 @@ mod tests {
         std::fs::create_dir(&staging).unwrap();
         let raced = dir.path().join("raced");
         std::fs::create_dir(&raced).unwrap();
-        let refused = super::publish_dir(&staging, &raced);
+        let refused = crate::storage::publish_dir(&staging, &raced);
         assert!(matches!(
             refused,
             Err(super::SnapshotError::TargetPathExists(_))

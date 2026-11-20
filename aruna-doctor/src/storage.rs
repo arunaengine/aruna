@@ -80,6 +80,8 @@ pub fn snapshot_database(
     Ok(stats)
 }
 
+/// Imports a snapshot into a new database at `target_db_path`. It is built in an owner-only
+/// staging folder and published only after the footer checked, so a failed import can retry.
 pub fn import_new_database(
     snapshot_path: impl AsRef<Path>,
     target_db_path: impl AsRef<Path>,
@@ -90,7 +92,26 @@ pub fn import_new_database(
 
     let file = File::open(snapshot_path)?;
     let mut reader = SnapshotReader::new(BufReader::new(file))?;
-    let db = OptimisticTxDatabase::builder(target_db_path)
+    // Every error drops the staging directory, which removes it.
+    let staging = staging_dir(target_db_path)?;
+    import_into(&mut reader, staging.path())?;
+    publish_dir(staging.path(), target_db_path)?;
+    let _published = staging.keep();
+    let stats = reader.stats();
+    Ok(ImportStats {
+        snapshot_created_unix: stats.created_unix_seconds,
+        keyspace_count: stats.keyspace_count,
+        entry_count: stats.entry_count,
+        target_path: target_db_path.to_path_buf(),
+    })
+}
+
+/// Writes every record into a new database at `target` and closes it again.
+fn import_into(
+    reader: &mut SnapshotReader<impl std::io::Read>,
+    target: &Path,
+) -> Result<(), SnapshotError> {
+    let db = OptimisticTxDatabase::builder(target)
         .manual_journal_persist(true)
         .open()?;
     let mut keyspace_state: Option<ImportKeyspaceState> = None;
@@ -98,7 +119,7 @@ pub fn import_new_database(
     while let Some(record) = reader.next_record()? {
         match record {
             SnapshotRecord::Keyspace(name) => {
-                let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
+                let keyspace = db.keyspace(keyspace_name(&name)?, KeyspaceCreateOptions::default)?;
                 keyspace_state = Some(ImportKeyspaceState::new(keyspace));
             }
             SnapshotRecord::Entry { key, value } => {
@@ -115,13 +136,18 @@ pub fn import_new_database(
     }
 
     db.persist(PersistMode::Buffer)?;
-    let stats = reader.stats();
-    Ok(ImportStats {
-        snapshot_created_unix: stats.created_unix_seconds,
-        keyspace_count: stats.keyspace_count,
-        entry_count: stats.entry_count,
-        target_path: target_db_path.to_path_buf(),
-    })
+    Ok(())
+}
+
+/// A bare Fjall keyspace name from a snapshot: Fjall asserts a name is nonempty and at most 255
+/// bytes, so a damaged one must fail the import instead.
+pub(crate) fn keyspace_name(name: &str) -> Result<&str, SnapshotError> {
+    if name.is_empty() || name.len() > usize::from(u8::MAX) {
+        return Err(SnapshotError::InvalidStructure(
+            "invalid keyspace name in snapshot",
+        ));
+    }
+    Ok(name)
 }
 
 pub(crate) fn unix_now() -> Result<u64, SnapshotError> {
@@ -186,6 +212,40 @@ impl ImportKeyspaceState {
     }
 }
 
+/// An empty directory beside `target` that only its owner may enter, uniquely named so a crashed
+/// run leaves nothing that blocks the next one.
+pub(crate) fn staging_dir(target: &Path) -> std::io::Result<tempfile::TempDir> {
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".restore-");
+    #[cfg(unix)]
+    builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    builder.tempdir_in(parent)
+}
+
+/// Moves the finished `staging` directory to `target`, refusing even an empty directory that
+/// appeared there meanwhile; Windows refuses to rename over a directory by itself.
+pub(crate) fn publish_dir(staging: &Path, target: &Path) -> Result<(), SnapshotError> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    let moved = {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, staging, CWD, target, RenameFlags::NOREPLACE)
+            .map_err(std::io::Error::from)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    let moved = std::fs::rename(staging, target);
+    match moved {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(SnapshotError::TargetPathExists(target.to_path_buf()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
     if target_db_path.exists() {
         return Err(SnapshotError::TargetPathExists(
@@ -243,6 +303,25 @@ mod tests {
     use tempfile::tempdir;
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
+
+    // A bare keyspace name Fjall would refuse fails the import instead of panicking, and the
+    // failed import leaves nothing at its destination, so it can be retried there.
+    #[test]
+    fn bad_name_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("imported");
+        for name in [String::new(), "k".repeat(256)] {
+            let mut writer = aruna_storage::snapshot::SnapshotWriter::new(Vec::new(), 1).unwrap();
+            writer.begin_keyspace(&name).unwrap();
+            writer.end_keyspace().unwrap();
+            let file = dir.path().join("bad.snapshot");
+            std::fs::write(&file, writer.finish().unwrap().0).unwrap();
+            assert!(import_new_database(&file, &target).is_err());
+            assert!(!target.exists(), "a failed import publishes nothing");
+        }
+        let staged = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(staged, 1, "only the snapshot file is left");
+    }
 
     // Large values commit once their bytes reach the limit, long before the entry limit.
     #[test]
