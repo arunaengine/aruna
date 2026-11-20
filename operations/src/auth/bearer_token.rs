@@ -390,7 +390,9 @@ impl DecodeTokenOperation {
 
     /// Checks the signature with `key`, then the claims and the revocation state.
     fn check_signed(&mut self, trusted: &HashSet<RealmId>, key: &DecodingKey) -> DecodeTurn {
-        let validation = Validation::new(Algorithm::EdDSA);
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        // The library would judge expiry by the host clock; the claims are judged at the stamp.
+        validation.validate_exp = false;
         let claims = decode::<TokenClaims>(&self.token, key, &validation)?.claims;
         validate_bearer_claims(trusted, now_secs(self.now_ms), &claims)?;
         // The issuing realm from the verified claims, so a foreign token is judged

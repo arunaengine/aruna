@@ -620,7 +620,7 @@ impl<P: Operation> Drive for ParentRun<'_, P> {
     fn start(&mut self) -> Effects {
         let entropy = clock::next_entropy();
         let now = clock::stamp_time();
-        self.1 = recorder::begin(type_name::<CallRun<P>>(), now, || format!("{:?}", self.0));
+        self.1 = recorder::begin(type_name::<CallRun<P>>(), now, &*self.0);
         self.0.stamp(now);
         self.0.seed(entropy);
         self.0.start()
@@ -650,7 +650,7 @@ impl Drive for SubRun<'_> {
         let entropy = clock::next_entropy();
         let now = clock::stamp_time();
         let name = type_name_of_val(&*self.0);
-        self.1 = recorder::begin(name, now, || format!("{:?}", self.0));
+        self.1 = recorder::begin(name, now, &*self.0);
         self.0.stamp(now);
         self.0.seed(entropy);
         self.0.start()
@@ -1227,7 +1227,7 @@ pub(crate) fn drive_suboperation<'a>(
             );
             let event = operation.finalize();
             if let Some(run) = record {
-                recorder::end(run, unix_timestamp_millis(), || format!("{event:?}"));
+                recorder::end(run, unix_timestamp_millis(), event.label(), &event);
             }
             event
         }
@@ -1239,7 +1239,8 @@ pub(crate) fn drive_suboperation<'a>(
 /// Records the outcome of a recorded run.
 fn record_end<T: std::fmt::Debug, E: std::fmt::Debug>(record: Option<u64>, result: &Result<T, E>) {
     if let Some(run) = record {
-        recorder::end(run, unix_timestamp_millis(), || format!("{result:?}"));
+        let outcome = if result.is_ok() { "Ok" } else { "Err" };
+        recorder::end(run, unix_timestamp_millis(), outcome, result);
     }
 }
 

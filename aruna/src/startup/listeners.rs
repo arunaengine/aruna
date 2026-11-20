@@ -251,6 +251,12 @@ async fn bind_all(
     let is_initial_boot = !matches!(config.startup_mode, StartupMode::Provisioned);
     // Certificates and HTTPS sockets first: a failure here starts nothing.
     let mut https = crate::startup::https::prepare(config.https.as_ref()).await?;
+    if let Some(blob) = &driver_ctx.blob_handle {
+        blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
+            std::path::Path::new(&config.storage_path).join("git"),
+            std::env::current_exe()?,
+        )));
+    }
     #[cfg(unix)]
     crate::backup::serve(
         std::path::Path::new(&config.storage_path),
@@ -291,12 +297,6 @@ async fn bind_all(
         }
         false => None,
     };
-    if let Some(blob) = &driver_ctx.blob_handle {
-        blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
-            std::path::Path::new(&config.storage_path).join("git"),
-            std::env::current_exe()?,
-        )));
-    }
     let mut state = ServerState::new(
         driver_ctx.clone(),
         config.realm_id,

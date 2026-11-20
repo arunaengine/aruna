@@ -67,8 +67,12 @@ impl OwnedEventsOperation {
             return Ok(Next::Done(Owned::new()));
         }
         self.stage = OwnedStage::Batches;
-        let rows = (self.batches.iter())
-            .map(|id| (APPLIED_SYNC_KEYSPACE.to_string(), Key::from(id.to_bytes().to_vec())));
+        let rows = (self.batches.iter()).map(|id| {
+            (
+                APPLIED_SYNC_KEYSPACE.to_string(),
+                Key::from(id.to_bytes().to_vec()),
+            )
+        });
         Ok(Next::Call(IoCall::Read(rows.collect())))
     }
 }

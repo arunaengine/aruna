@@ -1715,7 +1715,7 @@ async fn unreadable_config_waits() {
         outbound_handle: None,
     });
     let realm_id = RealmId::from_bytes([66u8; 32]);
-    let load = || super::outbox::load_drain_config(&context, realm_id);
+    let load = || crate::tasks::incoming::outbox::load_drain_config(&context, realm_id);
     assert!(matches!(load().await, Ok(None)));
 
     let written = storage

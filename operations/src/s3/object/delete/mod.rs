@@ -512,17 +512,23 @@ impl DeleteObjectOperation {
 
     fn versions_read(&mut self, values: Vec<(Key, Value)>) -> Turn {
         let target_version_id = self.target_id()?;
-        self.latest_remaining = values
+        // An unreadable surviving version stops the delete, so no older head replaces it.
+        let remaining = values
             .into_iter()
-            .filter_map(|(key, value)| {
-                let version_key = VersionKey::from_bytes(key.as_ref()).ok()?;
+            .map(|(key, value)| {
+                let version_key = VersionKey::from_bytes(key.as_ref())?;
                 if version_key.version_id == target_version_id {
-                    return None;
+                    return Ok(None);
                 }
-                let version = BlobVersion::from_bytes(value.as_ref()).ok()?;
-                Some(VersionSummary::from_blob_version(&version_key, &version))
+                let version = BlobVersion::from_bytes(value.as_ref())?;
+                Ok(Some(VersionSummary::from_blob_version(
+                    &version_key,
+                    &version,
+                )))
             })
-            .max_by_key(|summary| summary.version_id);
+            .collect::<Result<Vec<_>, ConversionError>>()?;
+        let remaining = remaining.into_iter().flatten();
+        self.latest_remaining = remaining.max_by_key(|summary| summary.version_id);
         let replacement_version_id = self
             .latest_remaining
             .as_ref()

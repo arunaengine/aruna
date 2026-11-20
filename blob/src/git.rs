@@ -98,6 +98,11 @@ impl GitStore {
         time_stage("git_document_lock", self.documents.lock(document_id)).await
     }
 
+    /// Waits from blocking code for the lock every effect on repository `id` runs under.
+    pub fn hold_repository(&self, id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.locks.mutex(id).blocking_lock_owned()
+    }
+
     /// The document lock when it is free; reads use it to avoid waiting for a running snapshot.
     pub fn try_lock(&self, document_id: ulid::Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.documents.try_lock(document_id)
@@ -383,7 +388,7 @@ impl GitStore {
 /// Records the settings last applied, so a configured repository needs no Git process.
 const SETTINGS: &str = "aruna-settings";
 
-fn settings(hooks: &str) -> [(&'static str, &str); 7] {
+fn settings(hooks: &str) -> [(&'static str, &str); 8] {
     [
         ("core.hooksPath", hooks),
         ("http.receivepack", "true"),
@@ -393,6 +398,8 @@ fn settings(hooks: &str) -> [(&'static str, &str); 7] {
         ("core.logAllRefUpdates", "true"),
         // The repository is a cache rebuilt from the replicated records, so it skips disk syncs.
         ("core.fsync", "none"),
+        // An automatic repack after a push runs inside the push, under the repository lock.
+        ("gc.autoDetach", "false"),
     ]
 }
 

@@ -9,70 +9,89 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
-use aruna_core::task::{PersistedTaskTimer, TaskEffect};
+use aruna_core::task::{PersistedTaskTimer, TaskEffect, TaskEvent};
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::task_timers::delete_timer_key;
 use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use tracing::warn;
 
 const RESTORE_PAGE_SIZE: usize = 256;
 
-pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let mut start_after = None;
+/// Where a timer restoration stopped: the row after which a retry starts, and why.
+#[derive(Debug)]
+pub struct RestoreStopped {
+    pub resume_after: Option<ByteView>,
+    pub error: String,
+}
+
+/// Re-arms the persisted timers after the row `start_after`, page by page. A failed page or a
+/// timer the scheduler refused stops it there, so a retry resumes without skipping a row. A timer
+/// only moves earlier, so a retry never pushes back a newer live deadline.
+pub async fn restore_task_timers(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    start_after: Option<ByteView>,
+) -> Result<(), RestoreStopped> {
+    let mut accepted = start_after;
     loop {
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: TASK_TIMER_KEYSPACE.to_string(),
                 prefix: None,
-                start: start_after.take().map(IterStart::After),
+                start: accepted.clone().map(IterStart::After),
                 limit: RESTORE_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
-
+        let stopped = |resume_after, error| {
+            Err(RestoreStopped {
+                resume_after,
+                error,
+            })
+        };
         let (values, next_start_after) = match event {
             Event::Storage(StorageEvent::IterResult {
                 values,
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to restore persisted task timers");
-                return;
+                return stopped(accepted, error.to_string());
             }
-            other => {
-                warn!(event = ?other, "Unexpected event while restoring persisted task timers");
-                return;
-            }
+            other => return stopped(accepted, format!("unexpected storage event: {other:?}")),
         };
 
         for (key_bytes, value) in values {
-            let record = match postcard::from_bytes::<PersistedTaskTimer>(&value) {
-                Ok(record) => record,
+            match postcard::from_bytes::<PersistedTaskTimer>(&value) {
+                Ok(record) => {
+                    let after = Duration::from_millis(
+                        record
+                            .due_unix_millis
+                            .saturating_sub(unix_timestamp_millis()),
+                    );
+                    let event = task_handle
+                        .send_effect(Effect::Task(TaskEffect::ShortenTimer {
+                            key: record.key,
+                            after,
+                        }))
+                        .await;
+                    if let Event::Task(TaskEvent::Error { message, .. }) = event {
+                        return stopped(accepted, message);
+                    }
+                }
                 Err(error) => {
                     warn!(error = %error, "Failed to decode persisted task timer");
-                    delete_timer_key(storage, key_bytes).await;
-                    continue;
+                    if let Err(error) = delete_timer_key(storage, key_bytes.clone()).await {
+                        warn!(%error, "Failed to delete an undecodable persisted task timer");
+                    }
                 }
-            };
-            let after = Duration::from_millis(
-                record
-                    .due_unix_millis
-                    .saturating_sub(unix_timestamp_millis()),
-            );
-            let event = task_handle
-                .send_effect(Effect::Task(TaskEffect::ResetTimer {
-                    key: record.key,
-                    after,
-                }))
-                .await;
-            if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
-                warn!(message = %message, "Failed to restore persisted task timer");
             }
+            accepted = Some(key_bytes);
         }
 
         match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => break,
+            Some(next) => accepted = Some(next),
+            None => return Ok(()),
         }
     }
 }
@@ -128,12 +147,122 @@ mod tests {
             }))
             .await;
 
-        restore_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle, None)
+            .await
+            .expect("timers restore");
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
             .expect("restored timer should fire");
 
         assert_eq!(*observed.lock().await, Some(key));
+    }
+
+    // A failed page stops the restoration with its resume point instead of ending it as done, and
+    // a retry from there arms the timer.
+    #[tokio::test]
+    async fn failed_page_resumes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_millis(1),
+        };
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("timer persists");
+        let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_page = move |effect: &StorageEffect| {
+            let page = matches!(effect, StorageEffect::Iter { .. });
+            page && !failed.swap(true, std::sync::atomic::Ordering::SeqCst)
+        };
+        let flaky = aruna_test_support::metadata::refusing_when(storage.clone(), first_page);
+        let task_handle = TaskHandle::new();
+        let observed = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingHandler {
+                observed: observed.clone(),
+                notify: notify.clone(),
+            }))
+            .await;
+
+        let restored = restore_task_timers(&flaky, &task_handle, None).await;
+        let stopped = restored.expect_err("the failed page stops the restoration");
+        assert_eq!(stopped.resume_after, None);
+        restore_task_timers(&flaky, &task_handle, stopped.resume_after)
+            .await
+            .expect("the retry restores");
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("restored timer should fire");
+        assert_eq!(*observed.lock().await, Some(key));
+    }
+
+    // A fired timer removes only a due row: a replacement written for the key after the firing
+    // stays, so a restart still finds the accepted wakeup.
+    #[tokio::test]
+    async fn fired_keeps_replacement() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = |after| TaskEffect::ResetTimer {
+            key: key.clone(),
+            after,
+        };
+        let later = reset(Duration::from_secs(3600));
+        persist_task_effect(&storage, &later)
+            .await
+            .expect("timer persists");
+
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_some()
+        );
+
+        let due = reset(Duration::ZERO);
+        persist_task_effect(&storage, &due)
+            .await
+            .expect("timer persists");
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key).await;
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_none()
+        );
+    }
+
+    // A cancellation whose row could not be deleted fails, so no caller acknowledges it while the
+    // row would schedule the work again at the next restart.
+    #[tokio::test]
+    async fn failed_cancel_errs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &reset)
+            .await
+            .expect("timer persists");
+        let refused = aruna_test_support::metadata::refusing(storage.clone(), TASK_TIMER_KEYSPACE);
+
+        let cancel = TaskEffect::CancelTimer { key: key.clone() };
+        assert!(persist_task_effect(&refused, &cancel).await.is_err());
+        assert!(
+            read_timer(&storage, &key)
+                .await
+                .expect("timer reads")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -178,7 +307,9 @@ mod tests {
         assert!(shortened_timer.due_unix_millis < reset_timer.due_unix_millis);
 
         let task_handle = TaskHandle::new();
-        restore_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle, None)
+            .await
+            .expect("timers restore");
         let aruna_core::task::TaskEvent::TimerScheduled { after, .. } =
             task_handle.schedule_idle_timer(key, Duration::ZERO).await
         else {
@@ -349,7 +480,9 @@ mod tests {
             }))
             .await;
 
-        restore_task_timers(&storage, &task_handle).await;
+        restore_task_timers(&storage, &task_handle, None)
+            .await
+            .expect("timers restore");
         tokio::time::timeout(Duration::from_secs(1), notify.notified())
             .await
             .expect("restored timer should fire");

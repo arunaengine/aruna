@@ -174,6 +174,10 @@ struct Minted {
 }
 
 fn linked_token() -> Minted {
+    minted_at(FIXED_NOW)
+}
+
+fn minted_at(now: u64) -> Minted {
     let key = SigningKey::from_bytes(&[13; 32]);
     let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
     let local = UserId::local(ulid::Ulid::from_bytes([1; 16]), realm_id);
@@ -181,7 +185,6 @@ fn linked_token() -> Minted {
         ulid::Ulid::from_bytes([2; 16]),
         RealmId::from_bytes([14; 32]),
     );
-    let now = FIXED_NOW;
     let token = mint_token(
         &CreateTokenConfig {
             time: now,
@@ -242,6 +245,19 @@ fn linked_login_checked() {
         unlinked.next(owner_answer(None)),
         Err(ArunaBearerError::TokenRevoked)
     ));
+}
+
+#[test]
+fn expiry_uses_stamp() {
+    // An old token is judged at the stamped time only, so it is valid up to its expiry.
+    let minted = minted_at(1_000_000_000);
+    let expiry_ms = (minted.now + 600) * 1000;
+    let mut live = decoding(&minted, RevocationCheck::Skipped);
+    live.stamp(expiry_ms);
+    assert!(matches!(live.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let mut late = decoding(&minted, RevocationCheck::Skipped);
+    late.stamp(expiry_ms + 1000);
+    assert!(matches!(late.first(), Err(ArunaBearerError::Expired)));
 }
 
 #[test]

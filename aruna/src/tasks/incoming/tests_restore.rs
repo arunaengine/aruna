@@ -411,6 +411,115 @@ async fn refused_cleanup_kept() {
     assert_eq!(applied, vec![queued]);
 }
 
+// An applied drain that asks for a retry keeps a live wake when its timer cannot be stored: the
+// fired timer's row is gone, and the applied rows wait on that wake.
+#[tokio::test]
+async fn applied_retry_kept() {
+    use aruna_core::document::{
+        AppliedStep, AppliedSync, DocumentReconcileResult, applied_sync_entry,
+    };
+    use aruna_operations::node::applied_drain::APPLIED_RETRY_AFTER;
+    use aruna_test_support::metadata::refusing;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    // A logged create the projection cannot read fails the follow-up at its projection wake.
+    let result = DocumentReconcileResult {
+        targets: vec![DocumentTarget::MetadataCreateEvent {
+            document_id: Ulid::from_parts(31, 1),
+            event_id: Ulid::from_parts(31, 2),
+        }],
+        ..DocumentReconcileResult::default()
+    };
+    let applied = AppliedSync {
+        id: Ulid::from_parts(31, 3),
+        node_id: node(31),
+        realm_id: None,
+        result,
+        next: AppliedStep::Metadata,
+    };
+    let row = applied_sync_entry(&applied).expect("row encodes");
+    aruna_drivers::testing::write_entries(&storage, vec![row]).await;
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: refusing(storage.clone(), TASK_TIMER_KEYSPACE),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+
+    handler.run_trigger(TaskKey::DrainAppliedSync).await;
+
+    let shorten = TaskEffect::ShortenTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::from_secs(10_000),
+    };
+    let Event::Task(TaskEvent::TimerScheduled { after, .. }) =
+        task_handle.send_effect(Effect::Task(shorten)).await
+    else {
+        panic!("expected timer scheduled");
+    };
+    assert!(
+        after <= APPLIED_RETRY_AFTER,
+        "the retry stays armed in memory"
+    );
+}
+
+// A timer change waits while another change of the same key holds it, so its row and the
+// scheduler take both changes in one order.
+#[tokio::test]
+async fn timer_change_waits() {
+    use aruna_storage::task_timers::{hold_change, read_timer};
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let context = Arc::new(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(TaskHandle::new()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    let key = TaskKey::RefreshBlobHolders;
+    let other = TaskEffect::ResetTimer {
+        key: key.clone(),
+        after: Duration::from_secs(5),
+    };
+    let held = hold_change(&other).await;
+
+    let rearm = handler.reschedule_timer(key.clone(), Duration::from_secs(60));
+    tokio::pin!(rearm);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut rearm)
+            .await
+            .is_err()
+    );
+    assert!(
+        read_timer(&storage, &key)
+            .await
+            .expect("timer reads")
+            .is_none()
+    );
+
+    drop(held);
+    assert!(rearm.await);
+    assert!(
+        read_timer(&storage, &key)
+            .await
+            .expect("timer reads")
+            .is_some()
+    );
+}
+
 #[tokio::test]
 async fn drain_reconcile_wakes() {
     let temp_dir = tempdir().expect("temp dir");
