@@ -145,10 +145,7 @@ use aruna_operations::queue_backoff::retry_delay_ms;
 use aruna_operations::replication::drain::{
     ProcessBatchOperation, REPLICATION_RETRY_AFTER, RestoreDrainOperation,
 };
-use aruna_operations::replication::mirror_repair::REPAIR_RETRY_AFTER;
-use aruna_operations::replication::mirror_repair::drain::{
-    DrainRepairsOperation, RestoreTimerOperation,
-};
+use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_operations::replication::page::deliver::MetadataPages;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{
@@ -810,9 +807,7 @@ impl OperationsTaskHandler {
                 self.drain_job_queue().await;
             }),
             TaskKey::PruneJobs => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainMirrorRepair => Box::pin(async move {
-                self.drain_mirror_repair().await;
-            }),
+            TaskKey::DrainMirrorRepair => Box::pin(self.run_trigger(key)),
             TaskKey::SweepHiddenBlobs => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCleanupQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainReclaimQueue => Box::pin(async move {

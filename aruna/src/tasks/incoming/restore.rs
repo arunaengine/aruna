@@ -683,33 +683,6 @@ impl OperationsTaskHandler {
             }
         }
     }
-
-    pub(super) async fn drain_mirror_repair(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
-                .await;
-            return;
-        };
-        let drain = DrainRepairsOperation::new(net_handle.node_id());
-        match drive(drain, self.context.as_ref()).await {
-            Ok(result) if result.has_more_due => {
-                self.reschedule_timer(TaskKey::DrainMirrorRepair, Duration::ZERO)
-                    .await;
-            }
-            Ok(result) => {
-                if let Some(after) = result.next_due_after {
-                    self.reschedule_timer(TaskKey::DrainMirrorRepair, after)
-                        .await;
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainMirrorRepair, %error, "Failed to drain sync mirror repair queue");
-                self.reschedule_timer(TaskKey::DrainMirrorRepair, REPAIR_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
-
 }
 
 impl OperationsTaskHandler {
@@ -729,7 +702,6 @@ impl OperationsTaskHandler {
             self.reschedule_timer(TaskKey::DrainLinkQueue, after).await;
         }
     }
-
 }
 
 impl OperationsTaskHandler {

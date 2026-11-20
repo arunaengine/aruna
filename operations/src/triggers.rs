@@ -46,6 +46,8 @@ use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
 use crate::plugins::work::PruneKeepingWork;
+use crate::replication::mirror_repair::drain::DrainRepairsOperation;
+use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 
@@ -167,6 +169,38 @@ pub enum TimerOperation {
     DrainCaptures(CaptureDrainOperation),
     SettleJobTerminals(SettleTerminalsOperation),
     PruneJobs(PruneKeepingWork),
+    DrainMirrorRepair(DrainRepairsOperation),
+    /// A timer this node cannot run yet, which only plans its next run.
+    Wait(WaitOperation),
+}
+
+/// A timer run that only plans the next run, for a node that lacks what the timer needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaitOperation {
+    plan: TimerPlan,
+}
+
+impl WaitOperation {
+    pub fn after(after: Option<Duration>) -> Self {
+        let plan = TimerPlan::from(after);
+        Self { plan }
+    }
+}
+
+impl Operation for WaitOperation {
+    type Output = TimerPlan;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<TimerPlan>, IoError> {
+        Ok(Next::Done(self.plan.clone()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<TimerPlan>, IoError> {
+        Err(IoError::Unexpected {
+            expected: "no call",
+            got: result.label(),
+        })
+    }
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -228,6 +262,10 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::PruneJobs => Some(TimerOperation::PruneJobs(PruneKeepingWork::new(
             JOB_PRUNE_PAGE,
         ))),
+        TaskKey::DrainMirrorRepair => Some(match input.local_node {
+            Some(node_id) => TimerOperation::DrainMirrorRepair(DrainRepairsOperation::new(node_id)),
+            None => TimerOperation::Wait(WaitOperation::after(Some(REPAIR_RETRY_AFTER))),
+        }),
         _ => None,
     }
 }
@@ -252,6 +290,8 @@ macro_rules! each_timer {
             TimerOperation::DrainCaptures($operation) => $body,
             TimerOperation::SettleJobTerminals($operation) => $body,
             TimerOperation::PruneJobs($operation) => $body,
+            TimerOperation::DrainMirrorRepair($operation) => $body,
+            TimerOperation::Wait($operation) => $body,
         }
     };
 }
@@ -504,6 +544,27 @@ impl TimerRun for PruneKeepingWork {
             false => outcome.next_due_after.map_or(PRUNE_POLL_AFTER, poll),
         };
         Ok(TimerPlan::from(Some(after)))
+    }
+}
+
+impl TimerRun for DrainRepairsOperation {
+    /// More due repairs run at once, the next one when it is due; a failed pass retries later.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let drained = result.map_err(|error| TimerFailure {
+            retry_after: REPAIR_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        let after = match drained.has_more_due {
+            true => Some(Duration::ZERO),
+            false => drained.next_due_after,
+        };
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for WaitOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
     }
 }
 
@@ -777,6 +838,7 @@ impl Operation for PeerOperation {
 mod tests {
     use super::*;
     use crate::blob::hidden::HiddenSweepOutcome;
+    use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
     use crate::jobs::prune::JobPruneOutcome;
     use crate::jobs::lifecycle::LifecycleError;
     use crate::s3::object::metadata::ReferenceRefreshError;
@@ -918,6 +980,23 @@ mod tests {
         let error = crate::jobs::prune::PruneError("boom".to_string());
         let failed = PruneKeepingWork::rearm(Err(error));
         assert_eq!(failed.unwrap_err().retry_after, PRUNE_RETRY_AFTER);
+    }
+
+    #[test]
+    fn mirror_repair_plans() {
+        // Without a network node the timer only waits; more due repairs run at once.
+        let mut waiting = timer_operation(&TaskKey::DrainMirrorRepair, &input()).unwrap();
+        let retry = TimerPlan::from(Some(REPAIR_RETRY_AFTER));
+        assert_eq!(waiting.first(), Ok(Next::Done(retry)));
+        let more = SyncMirrorResult {
+            has_more_due: true,
+            ..SyncMirrorResult::default()
+        };
+        let plan = DrainRepairsOperation::rearm(Ok(more)).unwrap();
+        assert_eq!(plan.after, Some(Duration::ZERO));
+        let error = SyncMirrorError::Mirror("boom".to_string());
+        let failed = DrainRepairsOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, REPAIR_RETRY_AFTER);
     }
 
     #[test]
