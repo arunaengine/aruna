@@ -70,6 +70,7 @@ SMALL_DOMAINS = {
     "operations/src/metadata/profile": "grouped shared-prefix domain",
     "operations/src/placement": "coherent ownership scope",
     "operations/src/plugins": "coherent ownership scope",
+    "operations/src/relay/tool": "grouped shared-prefix domain",
     "operations/src/replication/incoming": "grouped shared-prefix domain",
     "operations/src/s3": "coherent ownership scope",
     "operations/src/shard/restore": "grouped shared-prefix domain",

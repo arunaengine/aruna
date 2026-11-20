@@ -9,7 +9,7 @@ use crate::tests::distributed::{
 };
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::relay::tool::{Holder, pick_node};
-use aruna_operations::relay::tool_route::HolderSearchOperation;
+use aruna_operations::relay::tool::route::HolderSearchOperation;
 use axum::http::StatusCode;
 use serde_json::json;
 use std::time::Duration;

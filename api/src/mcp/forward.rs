@@ -15,7 +15,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::relay::tool::{RouteError, ToolCall, ToolCallOperation, ToolRefusal};
-use aruna_operations::relay::tool_route::{Missed, ToolNodeOperation, ToolRoute, ToolRouteError};
+use aruna_operations::relay::tool::route::{Missed, ToolNodeOperation, ToolRoute, ToolRouteError};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 use serde::de::DeserializeOwned;

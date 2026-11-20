@@ -16,7 +16,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::route::ReadRoute;
 use thiserror::Error;
 
-use super::tool::{Holder, RouteError, add_holder, pick_node, search_done};
+use super::{Holder, RouteError, add_holder, pick_node, search_done};
 use crate::distribution::guard::GuardError;
 use crate::distribution::resolve::key_holders;
 use crate::distribution::routing::route_read;
@@ -307,5 +307,5 @@ impl Operation for ToolNodeOperation {
 }
 
 #[cfg(test)]
-#[path = "tool_route_tests.rs"]
+#[path = "route_tests.rs"]
 mod tests;
