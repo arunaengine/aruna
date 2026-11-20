@@ -1,4 +1,5 @@
-//! Raises the open file soft limit to the hard limit at process start.
+//! Raises the open file soft limit to the hard limit at process start, as the stores keep
+//! many files open.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

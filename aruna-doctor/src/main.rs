@@ -43,7 +43,7 @@ mod tokens;
 
 #[tokio::main]
 async fn main() -> Result<(), CliError> {
-    aruna::limits::raise_open_files();
+    aruna_storage::limits::raise_open_files();
     let args = Cli::parse();
 
     match args.command {

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use aruna::portal::update_artifact;
 use aruna_config::PortalArtifactConfig;
+use aruna_config::portal::update_artifact;
 use serde::Deserialize;
 use std::path::PathBuf;
 

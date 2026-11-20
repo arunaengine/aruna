@@ -18,12 +18,15 @@ aruna-drivers = { workspace = true }
 aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
 aruna-storage = { workspace = true }
+aruna-wire = { workspace = true }
 irokle = { workspace = true }
 base64 = { workspace = true }
 byteview = { workspace = true }
+chrono = { workspace = true }
 crypto_box = { workspace = true }
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
+flate2 = { workspace = true }
 hex = { workspace = true }
 ipnet = { workspace = true }
 iroh = { workspace = true }
@@ -32,6 +35,8 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

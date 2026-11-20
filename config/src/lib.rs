@@ -6,6 +6,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod identity;
+pub mod portal;
 pub mod settings;
 
 use aruna_api::s3::server::S3ServerTimeouts;

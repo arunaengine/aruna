@@ -76,9 +76,6 @@ ulid = { workspace = true }
 byteview = { workspace = true }
 rand = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
-
 [dev-dependencies]
 aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-api = { workspace = true, features = ["test-hooks"] }

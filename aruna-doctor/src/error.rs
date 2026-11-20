@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::explorer::ExplorerError;
-use aruna::portal::PortalArtifactError;
 use aruna_config::SetupError;
+use aruna_config::portal::PortalArtifactError;
 use aruna_core::onboarding::OnboardingSecretError;
 use aruna_operations::auth::create_token::CreateTokenError;
 use aruna_storage::errors::StorageLibError;
