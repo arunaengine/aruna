@@ -196,7 +196,7 @@ impl SendTask {
     /// A resend checks its stored request again on every input, paged ones read back here, so a
     /// grant withdrawn since the first send stops it before any holder, this node too, admits it.
     fn rescreen(&mut self, prepared: Box<(RealmConfigDocument, TaskSubmission)>) -> SendNext {
-        let Some(manifest) = prepared.1.request.input_pages.clone() else {
+        let Some(manifest) = prepared.1.request.input_pages else {
             let spec = prepared.1.request.spec.clone();
             return self.screen(prepared, spec);
         };
