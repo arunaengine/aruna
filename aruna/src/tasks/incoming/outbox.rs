@@ -68,8 +68,9 @@ impl OutboxDrainer {
         }
     }
 
-    /// Runs one bounded invocation of the open rotation.
-    pub async fn run_once(&self) {
+    /// Runs one bounded invocation of the open rotation. A drainer runs one at a time, as the
+    /// scheduler runs one drain per timer, so two calls never share the rotation it keeps.
+    pub async fn run_once(&mut self) {
         self.handler.drain_sync_outbox().await;
     }
 
