@@ -1116,7 +1116,7 @@ mod tests {
     async fn keeps_live_session() {
         // An early or failed refresh keeps the held pair, which works until its expiry, and
         // takes no new session that could evict another transfer's.
-        let replies: [fn(&str) -> (u16, String); 2] = [early_refresh, failed_refresh];
+        let replies: [Reply; 2] = [early_refresh, failed_refresh];
         for reply in replies {
             let (base, seen) = serve(reply).await;
             let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);

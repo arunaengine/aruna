@@ -522,10 +522,8 @@ impl Operation for ServeRecordOperation {
                 let Ok(Some(view)) = result.child::<Option<WriterView>, IoError>()? else {
                     return self.fail(ServeError::Unavailable);
                 };
-                let launches = attached.iter().filter_map(launch_of);
-                let checked: Result<(), ServeError> = launches
-                    .map(|launch| scheduler_member(&view, launch))
-                    .collect();
+                let mut launches = attached.iter().filter_map(launch_of);
+                let checked = launches.try_for_each(|launch| scheduler_member(&view, launch));
                 match checked {
                     Ok(()) => self.append(*record, attached),
                     Err(error) => self.fail(error),
