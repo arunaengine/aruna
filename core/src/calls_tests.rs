@@ -765,13 +765,7 @@ impl std::io::Write for Captured {
 
 #[test]
 fn refused_wake_logged() {
-    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || Captured(sink.clone()))
-        .with_ansi(false)
-        .finish();
-    let _logged = tracing::subscriber::set_default(subscriber);
+    let (logs, _logged) = capture_logs();
     let wake = TaskEffect::ShortenTimer {
         key: TaskKey::DrainAppliedSync,
         after: Duration::ZERO,
@@ -789,6 +783,36 @@ fn refused_wake_logged() {
     let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("A call after the commit failed"), "{logs}");
     assert!(logs.contains("queue full"), "{logs}");
+}
+
+/// The logs of this thread, until the returned guard drops.
+fn capture_logs() -> (
+    std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Captured(sink.clone()))
+        .with_ansi(false)
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+// A child after the commit that ends with its error is logged without its private details.
+#[test]
+fn failed_child_logged() {
+    let (logs, _logged) = capture_logs();
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::child(script(Vec::new()))];
+    let mut operation = run(procedure, false);
+    assert_eq!(operation.start().len(), 1, "the child is started");
+    let failed = ChildOutcome::new::<u8, IoError>(Err(IoError::Codec("secret".to_string())));
+    assert!(operation.step(Event::Child(failed)).is_empty());
+    assert_eq!(operation.finalize(), Ok(Vec::new()), "the outcome stays");
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("A call after the commit failed"), "{logs}");
+    assert!(!logs.contains("secret"), "{logs}");
 }
 
 #[test]
