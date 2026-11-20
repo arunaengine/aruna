@@ -19,10 +19,9 @@ enum DeleteStep {
     Delete,
 }
 
-/// Removes a finished run of `user_id`: its row, list index and every local row pruning removes.
-/// An execution run goes only once its deletion was `recorded` in its replicated family, whose
-/// records stay. Any other settled job leaves the list and becomes due for pruning, which removes
-/// its rows page by page, as staging rows can be too many for one transaction.
+/// Removes a finished run of `user_id` with its list index and pruned rows; an execution run goes
+/// once its deletion is `recorded` in its family. Another settled job leaves the list and is
+/// pruned page by page, as its staging rows may not fit one transaction.
 #[derive(Debug, PartialEq)]
 pub(crate) struct DeleteRunOperation {
     user_id: UserId,

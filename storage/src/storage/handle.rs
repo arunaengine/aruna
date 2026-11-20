@@ -15,7 +15,7 @@ use aruna_core::effects::{Effect, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::realm_vault::{RealmKeys, RealmVaultError};
 use aruna_core::telemetry::record_stage;
 use async_trait::async_trait;

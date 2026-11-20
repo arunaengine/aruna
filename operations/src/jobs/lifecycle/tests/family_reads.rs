@@ -120,8 +120,8 @@ async fn reads_kind_only() {
 #[tokio::test]
 async fn resolves_session_alias() {
     use super::session_job;
-    use crate::jobs::job_reads::tests::{read_owned_job, read_report_routed};
-    use crate::jobs::job_reports::{JobReportLookup, ReportQuery};
+    use crate::jobs::job::reads::tests::{read_owned_job, read_report_routed};
+    use crate::jobs::job::reports::{JobReportLookup, ReportQuery};
     use crate::jobs::route::JobRouteError;
 
     let family = Family::new([7u8; 32]);

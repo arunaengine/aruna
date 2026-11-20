@@ -18,8 +18,8 @@ use crate::metadata::materialization_queue::{
 };
 use crate::metadata::prune_jobs::DuePrune;
 use crate::metadata::prune_queue::{
-    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, GraphDrainResult, MetadataGraphError,
-    PruneBatchOperation, jobs_queued,
+    GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, GraphDrainResult, MetadataGraphError, PruneBatchOperation,
+    jobs_queued,
 };
 use crate::triggers::TimerInput;
 
@@ -137,7 +137,9 @@ impl Operation for PruneRunOperation {
     fn next(&mut self, result: IoResult) -> RunTurn {
         if self.stage == QueueStage::Probe {
             return match result.child::<DuePrune, IoError>()? {
-                Ok(due) => Ok(Next::Done((!due.jobs.is_empty()).then_some(GRAPH_POLL_AFTER))),
+                Ok(due) => Ok(Next::Done(
+                    (!due.jobs.is_empty()).then_some(GRAPH_POLL_AFTER),
+                )),
                 Err(error) => {
                     warn!(error = ?error, "Failed to probe metadata graph prune jobs");
                     Ok(Next::Done(Some(GRAPH_RETRY_AFTER)))
@@ -202,9 +204,15 @@ mod tests {
         let mut run = MaterializationRunOperation::new(&TimerInput::new(1_000, None));
         assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
         let drained = child(Ok::<_, MetadataMaterializationError>(idle));
-        assert!(matches!(run.next(drained), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            run.next(drained),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let waiting = child(Ok::<_, MetadataMaterializationError>(true));
-        assert_eq!(run.next(waiting), Ok(Next::Done(Some(MATERIALIZATION_POLL_AFTER))));
+        assert_eq!(
+            run.next(waiting),
+            Ok(Next::Done(Some(MATERIALIZATION_POLL_AFTER)))
+        );
         let mut prune = PruneRunOperation::new(&TimerInput::new(1_000, None));
         assert!(matches!(prune.first(), Ok(Next::Call(IoCall::Child(_)))));
         let error = MetadataGraphError::Conversion("broken".to_string());

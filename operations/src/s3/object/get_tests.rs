@@ -833,7 +833,7 @@ async fn bound_connector_used() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -1016,7 +1016,7 @@ async fn drift_creates_successor() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
@@ -2057,7 +2057,7 @@ async fn historical_drift_fails() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
     let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

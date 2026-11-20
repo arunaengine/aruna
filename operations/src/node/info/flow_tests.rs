@@ -8,7 +8,7 @@ use aruna_core::compute::quota::ResourceTotals;
 use aruna_core::events::Event;
 use aruna_core::heartbeat::RunningJobs;
 use aruna_core::id::NodeId;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::types::GroupId;
@@ -42,8 +42,8 @@ use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::keyspaces::{
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE,
 };
-use aruna_core::node_state::DrainStateOperation;
-use aruna_core::node_state::SetDrainOperation;
+use aruna_core::node::state::DrainStateOperation;
+use aruna_core::node::state::SetDrainOperation;
 use aruna_core::placement::held_buckets;
 use aruna_core::placement::resolver::build_view;
 use aruna_core::storage_entries::metadata_registry_key;

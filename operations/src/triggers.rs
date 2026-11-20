@@ -10,16 +10,16 @@ use std::time::Duration;
 use aruna_core::alpn::Alpn;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::ResourceEnvelope;
 use aruna_core::document::ShardTransportMessage;
 use aruna_core::git::GitNode;
-use aruna_core::compute::ResourceEnvelope;
 use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRequest;
 use aruna_core::native_reference::{
     NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
 };
-use aruna_core::node_facts::NodeFacts;
+use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
@@ -852,14 +852,22 @@ fn device_plan(outcome: DrainOutcome, defer: Duration, again: Duration) -> Timer
 impl TimerRun for crate::device::sync::outbox::DrainOutboxOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         let outcome = result.unwrap_or(DrainOutcome::Deferred);
-        Ok(device_plan(outcome, UPLOAD_DEFER_AFTER, UPLOAD_CONTINUE_AFTER))
+        Ok(device_plan(
+            outcome,
+            UPLOAD_DEFER_AFTER,
+            UPLOAD_CONTINUE_AFTER,
+        ))
     }
 }
 
 impl TimerRun for DrainPublishOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         let outcome = result.unwrap_or(DrainOutcome::Deferred);
-        Ok(device_plan(outcome, PUBLISH_DEFER_AFTER, PUBLISH_CONTINUE_AFTER))
+        Ok(device_plan(
+            outcome,
+            PUBLISH_DEFER_AFTER,
+            PUBLISH_CONTINUE_AFTER,
+        ))
     }
 }
 
@@ -1073,7 +1081,9 @@ impl PeerRun for ServeManifestOperation {
 impl PeerRun for JobRequestOperation {
     /// A request this node cannot finish is answered as unavailable.
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<PeerAnswer, PeerFailure> {
-        Ok(PeerAnswer::Job(result.unwrap_or_else(JobAnswer::unavailable)))
+        Ok(PeerAnswer::Job(
+            result.unwrap_or_else(JobAnswer::unavailable),
+        ))
     }
 }
 
@@ -1450,8 +1460,16 @@ mod tests {
         // The metadata queues run on the bulk lane; other timers stay on the request lane.
         let materialize = timer_operation(&TaskKey::DrainMaterializationQueue, &input());
         assert!(materialize.unwrap().bulk_lane());
-        assert!(timer_operation(&TaskKey::DrainPruneQueue, &input()).unwrap().bulk_lane());
-        assert!(!timer_operation(&TaskKey::PruneJobs, &input()).unwrap().bulk_lane());
+        assert!(
+            timer_operation(&TaskKey::DrainPruneQueue, &input())
+                .unwrap()
+                .bulk_lane()
+        );
+        assert!(
+            !timer_operation(&TaskKey::PruneJobs, &input())
+                .unwrap()
+                .bulk_lane()
+        );
         let failed = PruneRunOperation::rearm(Err(IoError::Unfinished));
         assert_eq!(failed.unwrap_err().retry_after, GRAPH_RETRY_AFTER);
     }
@@ -1462,8 +1480,14 @@ mod tests {
         assert!(needs_cluster(&TaskKey::DrainWitnessQueue));
         assert!(!needs_cluster(&TaskKey::PruneJobs));
         let retry = Ok(TimerPlan::from(Some(WITNESS_RETRY_AFTER)));
-        assert_eq!(WitnessDrainOperation::rearm(Err(IoError::Unfinished)), retry);
-        assert_eq!(WitnessDrainOperation::rearm(Ok(false)), Ok(TimerPlan::default()));
+        assert_eq!(
+            WitnessDrainOperation::rearm(Err(IoError::Unfinished)),
+            retry
+        );
+        assert_eq!(
+            WitnessDrainOperation::rearm(Ok(false)),
+            Ok(TimerPlan::default())
+        );
     }
 
     #[test]
@@ -1574,8 +1598,13 @@ mod tests {
         };
         let manifest = peer_operation(&peer_request(Alpn::Shard, PeerRequest::Manifest(request)));
         assert!(matches!(manifest, Some(PeerOperation::Manifest(_))));
-        let dropped = Err(crate::node::heartbeat::HeartbeatError::Io(IoError::Unfinished));
-        assert_eq!(ReceiveHeartbeatOperation::answer(dropped), Ok(PeerAnswer::Kept));
+        let dropped = Err(crate::node::heartbeat::HeartbeatError::Io(
+            IoError::Unfinished,
+        ));
+        assert_eq!(
+            ReceiveHeartbeatOperation::answer(dropped),
+            Ok(PeerAnswer::Kept)
+        );
         let Ok(PeerAnswer::Manifest(ManifestAnswer::Reject(_))) =
             ServeManifestOperation::answer(Err(IoError::Unfinished))
         else {
@@ -1596,7 +1625,10 @@ mod tests {
             range: None,
         };
         let native = peer_request(Alpn::NativeReference, PeerRequest::Native(request));
-        assert!(matches!(peer_operation(&native), Some(PeerOperation::Native(_))));
+        assert!(matches!(
+            peer_operation(&native),
+            Some(PeerOperation::Native(_))
+        ));
         assert!(peer_operation(&peer_input(Alpn::JobControl, b"frame")).is_none());
         let job = JobRequestOperation::answer(Err(IoError::Unfinished));
         let unavailable = JobAnswer::unavailable(IoError::Unfinished);

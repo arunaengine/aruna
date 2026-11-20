@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::plugins::host_calls::call_intent;
+use crate::plugins::host::calls::call_intent;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::{page_result, values_result};
 use aruna_core::plugin_runs::RunState;

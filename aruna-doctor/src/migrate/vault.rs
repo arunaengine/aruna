@@ -8,7 +8,7 @@ use crate::explorer::ExplorerError;
 use aruna_core::compute::SecretBytes;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes};
 use aruna_core::keyspaces::{BACKEND_SECRET_KEYSPACE, SOURCE_SECRET_KEYSPACE};
-use aruna_core::node_vault::{NodeVaultKey, VaultEntry, VaultPurpose};
+use aruna_core::node::vault::{NodeVaultKey, VaultEntry, VaultPurpose};
 use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
 use aruna_core::structs::storage::group_backend::GroupStorageSecret;
 use aruna_storage::storage::sealing::row_aad;

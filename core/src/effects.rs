@@ -14,7 +14,7 @@ use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
 use crate::metadata::AuthToken;
 use crate::metadata::MetadataEffect;
-use crate::node_vault::VaultEntry;
+use crate::node::vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::execution::job::family::{JobRecordEnvelope, JobRecordKind};

@@ -18,8 +18,8 @@ use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
 use super::check::{CallError, RunScope};
-use super::host_calls::version_id;
-use super::host_steps::{Granted, GrantedCall};
+use super::host::calls::version_id;
+use super::host::steps::{Granted, GrantedCall};
 use super::marks::{MARKED, is_marked};
 use super::rows::{StoreError, mapped_child};
 use super::unavailable;

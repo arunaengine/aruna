@@ -18,7 +18,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::user::id::UserId;
 
-use super::admit_here::{
+use super::admit::here::{
     AcceptedSubmission, AdmitHereOperation, LocalAdmission, placement_failure,
 };
 use super::advertised::{Advertised, AdvertisementsOperation};
@@ -30,7 +30,7 @@ use super::submission_rules::{caller_of, family_view, is_device, pin_outputs, re
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{PageReadError, StoreEntriesOperation};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::submit_execution::validate_execution;
+use crate::jobs::submit::execution::validate_execution;
 use aruna_core::job_request::{
     self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError, mint_configured_job,
     store_workspace,
@@ -416,7 +416,7 @@ mod tests {
 
     // Only a complete read proves that no executor carries a required label.
     #[test]
-    fn label_needs_full_read() {
+    fn label_reads_fully() {
         let config = Family::new([4; 32]).config;
         let answer = |unread| {
             let mut submit = operation();

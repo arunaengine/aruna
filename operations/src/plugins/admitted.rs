@@ -15,12 +15,12 @@ use ulid::Ulid;
 
 use super::check::{CallError, RunScope};
 use super::grants::object_path;
-use super::host_calls::{CallFailure, ObjectInfoCall, ObjectListCall, StateCall, StateChange};
-use super::host_steps::{AdmitCall, NativeCall};
+use super::host::calls::{CallFailure, ObjectInfoCall, ObjectListCall, StateCall, StateChange};
+use super::host::steps::{AdmitCall, NativeCall};
 use super::job_work::CancelWork;
 use super::state::{ReadState, read_state};
 use super::submit::WorkRequest;
-use super::work_calls::JobOutputs;
+use super::work::calls::JobOutputs;
 use crate::jobs::records::pages::ServingNode;
 
 /// The call an admitted host call makes for the checked install at the run's time, and the error

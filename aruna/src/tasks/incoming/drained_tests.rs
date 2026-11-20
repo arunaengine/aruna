@@ -27,7 +27,7 @@ use aruna_operations::groups::backends::{backend_key, index_key, record_writes};
 
 fn context(root: &str) -> DriverContext {
     let storage_handle = aruna_storage::storage::worker::FjallStorage::open(root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     DriverContext {
         storage_handle,
         net_handle: None,

@@ -751,7 +751,7 @@ mod tests {
 
     // A node names its own keys only, and a failed request adds nothing.
     #[test]
-    fn answers_filtered_by_node() {
+    fn filters_by_node() {
         let auth = AuthContext::anonymous(REALM);
         let target = WaitTarget::Content { blake3: [1; 32] };
         let job = JobId::from_bytes([3; 16]);

@@ -13,7 +13,7 @@ use aruna_core::plugin_runs::RunTrigger;
 use aruna_drivers::driver::drive;
 use aruna_operations::plugins::dispatch::StartRun;
 use aruna_operations::plugins::grants::short_path;
-use aruna_operations::plugins::host_calls::call_intent;
+use aruna_operations::plugins::host::calls::call_intent;
 use aruna_operations::plugins::install::InstallCaller;
 use aruna_operations::plugins::intents::unknown_row;
 use aruna_operations::plugins::lifecycle::{RemoveInstall, SetGrants, SetPaused};

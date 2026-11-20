@@ -2801,7 +2801,7 @@ fn capacity_not_conflict() {
 
 // A listing reads the record of an index row that carries none, and a short page ends it.
 #[test]
-fn list_reads_bare_rows() {
+fn list_reads_bare() {
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     let record = queued_record(job_id(1_000));
@@ -2948,7 +2948,7 @@ fn delete_removes_run() {
 
 // Only the claim token holder writes and deletes a running job's rows.
 #[test]
-fn rows_fenced_by_claim() {
+fn claim_fences_rows() {
     use super::job_rows::PutRowsOperation;
     use super::mutation::{run_in_memory, seeded_rows};
     let token = Ulid::from_bytes([5u8; 16]);
@@ -2985,7 +2985,7 @@ fn rows_fenced_by_claim() {
 
 // A running job adds report entries under its claim; a settled report is frozen.
 #[test]
-fn entries_need_live_claim() {
+fn entries_need_claim() {
     use super::job_rows::PutEntryOperation;
     use super::mutation::{run_in_memory, seeded_rows};
     let token = Ulid::from_bytes([5u8; 16]);
@@ -3063,7 +3063,7 @@ fn intent_takes_epoch() {
 
 // A control change writes both rows; a job without an intent has no control to change.
 #[test]
-fn control_changes_with_job() {
+fn control_follows_job() {
     use super::attempt_intent::RecordIntentOperation;
     use super::control_mutation::MutateControlOperation;
     use super::mutation::{run_in_memory, seeded_rows};

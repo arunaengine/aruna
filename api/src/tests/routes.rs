@@ -32,7 +32,7 @@ use utoipa_axum::router::OpenApiRouter;
 pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let directory = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     (directory, storage)
 }
 

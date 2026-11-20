@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use aruna_core::federation::valid_federation_url;
-use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts};
+use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts, cors_allows};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
@@ -1184,10 +1184,8 @@ fn https_env(
     check_hosts(&api, s3.as_ref(), portal.as_ref())?;
     if let Some(portal) = &portal {
         let origin = portal.origin().ascii_serialization();
-        // The api's CORS rule: `*` allows every origin, and a listed origin may end in a slash.
-        let mut allowed = (settings.cors_allowed_origins.iter())
-            .map(|allowed| allowed.trim().trim_end_matches('/'));
-        if !allowed.any(|allowed| allowed == "*" || allowed == origin) {
+        let allowed = settings.cors_allowed_origins.iter().map(String::as_str);
+        if !cors_allows(allowed, &origin) {
             return Err(invalid_config_value(
                 "CORS_ALLOWED_ORIGINS",
                 settings.cors_allowed_origins.join(","),

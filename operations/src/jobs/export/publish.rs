@@ -34,7 +34,7 @@ use crate::jobs::run_rows::{
     SettledEntryOperation, SettledRowsOperation, job_state_key, state_row,
 };
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::jobs::submit_local::SubmitLocalOperation;
+use crate::jobs::submit::local::SubmitLocalOperation;
 use crate::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, profile_verdict,
 };

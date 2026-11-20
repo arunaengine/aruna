@@ -215,7 +215,7 @@ async fn node_checks_relay() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     node_secret(&fixture, "x-signature", 0).await;
     assert_eq!(relay(here).await, Some(false));
     node_secret(&fixture, "Authorization", 1).await;

@@ -27,7 +27,7 @@ use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, CheckNodeBinding
 use super::check::RunScope;
 use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
 use super::copies::Assembled;
-use super::copy_rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
+use super::copy::rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
 use super::decide::DecideBatch;
 use super::dispatch::{EnqueueTimers, HookAuthorization, StartError, StartRun, VerifyHook};
 use super::finished::NotifyDue;
@@ -56,7 +56,7 @@ use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
 use super::waiting::RecheckWaiting;
 use super::work::WorkRow;
-use super::work_calls::{JobOutputs, JobRow};
+use super::work::calls::{JobOutputs, JobRow};
 use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use aruna_drivers::driver::{DriverContext, drive};

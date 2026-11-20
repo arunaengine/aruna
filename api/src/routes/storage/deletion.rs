@@ -944,7 +944,7 @@ pub async fn control_purge(
     axum::extract::Path((job_id, action)): axum::extract::Path<(String, String)>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     use crate::job_service::cancel_owned_job;
-    use aruna_operations::jobs::job_cancel::CancelJobOutcome;
+    use aruna_operations::jobs::job::cancel::CancelJobOutcome;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
     let record = crate::job_service::read_job_record(&context, job_id)

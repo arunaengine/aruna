@@ -27,11 +27,11 @@ use super::family::{FamilyReadError, LoadFamilyOperation};
 use super::pages::{KeepPagesOperation, PageReadError, ServingNode};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::cancel::CancelLocalRunsOperation;
+use crate::jobs::lifecycle::cancel::CancelRunsOperation;
 use crate::jobs::lifecycle::launch_admit::{
     AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
 };
-use crate::jobs::lifecycle::witness_arm::ArmFamilyOperation;
+use crate::jobs::lifecycle::witness::arm::ArmFamilyOperation;
 use crate::realm::load_config::config_unavailable;
 use aruna_core::metadata::protocol::{
     JobPageReply, MetadataTransportMessage, transport_message_kind,
@@ -364,7 +364,7 @@ impl ServeRecordOperation {
         }
         let family = self.accepted()?.family;
         self.step = ServeStep::Stopped;
-        let cancel = CancelLocalRunsOperation::new(family, self.serving, self.now_ms);
+        let cancel = CancelRunsOperation::new(family, self.serving, self.now_ms);
         Ok(Next::Call(IoCall::child(cancel)))
     }
 }
@@ -528,7 +528,7 @@ impl Operation for ServeLaunchOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::jobs::job_reads::tests::{child, is_child};
+    use crate::jobs::job::reads::tests::{child, is_child};
     use crate::tests::records::{Family, node};
     use aruna_core::structs::execution::job::family::JobRecordBody;
 

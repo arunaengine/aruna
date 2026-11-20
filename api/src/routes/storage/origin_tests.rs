@@ -585,7 +585,7 @@ async fn by_version(
     if let Some(named) = named {
         let value = named.to_string().parse().unwrap();
         headers.insert(
-            aruna_operations::s3::object::member_rest::RELAY_NODE_HEADER,
+            aruna_operations::s3::object::member::rest::RELAY_NODE_HEADER,
             value,
         );
     }

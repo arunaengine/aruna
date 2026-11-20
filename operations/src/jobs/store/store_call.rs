@@ -279,7 +279,7 @@ mod tests {
 
     // A lost conflict pauses, runs a fresh child, and the pause grows.
     #[test]
-    fn conflict_pauses_then_retries() {
+    fn pauses_then_retries() {
         let mut store = call();
         store.first().expect("the first attempt starts");
         for pause in [1, 2, 4] {

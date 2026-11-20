@@ -271,7 +271,7 @@ pub(crate) fn intent_keys(rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::host_calls::call_intent;
+    use crate::plugins::host::calls::call_intent;
     use crate::plugins::rows::tests::{page_result, values_result};
     use crate::plugins::rows::{delete_rows, scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;

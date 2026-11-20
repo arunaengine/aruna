@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::api::CreateDocumentPayload;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::placement::resolver::{build_view, resolve_holders};
 use aruna_core::reducer::AdminDocumentState;

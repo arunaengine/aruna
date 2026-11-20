@@ -20,7 +20,7 @@ use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
-use aruna_operations::jobs::submit_local::SubmitLocalOperation;
+use aruna_operations::jobs::submit::local::SubmitLocalOperation;
 use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::revision_read::RawViewOperation;
@@ -812,7 +812,7 @@ async fn scaffold_link_checked() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn admins_read_pushes() -> Result<(), Box<dyn std::error::Error>> {
     use crate::job_calls::{read_job_routed, read_report_routed};
-    use aruna_operations::jobs::job_reports::JobReportLookup;
+    use aruna_operations::jobs::job::reports::JobReportLookup;
 
     let fixture = build_fixture(false).await?;
     let server = remote(LINK_TOKEN).await;

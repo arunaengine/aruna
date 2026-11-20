@@ -20,21 +20,21 @@ use aruna_core::structs::storage::storage_purge::StoragePurgeSpec;
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_drivers::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::job_artifacts::{ArtifactRouteOperation, RoutedArtifact};
-use aruna_operations::jobs::job_cancel::{CancelJobOutcome, RoutedCancelOutcome};
-use aruna_operations::jobs::job_cancel::{CancelOwnedOperation, RoutedCancelOperation};
-use aruna_operations::jobs::job_delete::DeleteOwnedOperation;
-use aruna_operations::jobs::job_reads::{JobOwnerOperation, OwnedJobOperation};
-use aruna_operations::jobs::job_reports::{JobReportLookup, ReportQuery};
-use aruna_operations::jobs::job_reports::{ReportRouteOperation, SessionReasonOperation};
-use aruna_operations::jobs::job_routes::{RecordRouteOperation, StatusRouteOperation};
+use aruna_operations::jobs::job::artifacts::{ArtifactRouteOperation, RoutedArtifact};
+use aruna_operations::jobs::job::cancel::{CancelJobOutcome, RoutedCancelOutcome};
+use aruna_operations::jobs::job::cancel::{CancelOwnedOperation, RoutedCancelOperation};
+use aruna_operations::jobs::job::delete::DeleteOwnedOperation;
+use aruna_operations::jobs::job::reads::{JobOwnerOperation, OwnedJobOperation};
+use aruna_operations::jobs::job::reports::{JobReportLookup, ReportQuery};
+use aruna_operations::jobs::job::reports::{ReportRouteOperation, SessionReasonOperation};
+use aruna_operations::jobs::job::routes::{RecordRouteOperation, StatusRouteOperation};
 use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
 use aruna_operations::jobs::runs::{ReadRunOperation, RunReadError, RunView};
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
 use aruna_operations::jobs::store::row_calls;
-use aruna_operations::jobs::submit_local::{DedupLookupOperation, SubmitLocalOperation};
+use aruna_operations::jobs::submit::local::{DedupLookupOperation, SubmitLocalOperation};
 
 /// Jobs the serving node owns for this user. Listings are per origin by contract.
 pub async fn list_owned_jobs(

@@ -214,7 +214,7 @@ async fn drain_retries_queueing() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let net_handle = make_net_handle(realm_id, &storage, [26u8; 32]).await;
     let node_id = net_handle.node_id();
 

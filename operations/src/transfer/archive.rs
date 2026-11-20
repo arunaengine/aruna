@@ -32,7 +32,7 @@ use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::list::ListedObject;
-use crate::s3::object::member_read::{
+use crate::s3::object::member::read::{
     MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
 };
 use crate::s3::object::pages::{

@@ -45,11 +45,9 @@ enum QuotaStep {
     After,
 }
 
-/// Standing-quota decision before one submission is admitted. A denial applies only to a FRESH
-/// claim and an overshoot after convergence cancels nothing; an unavailable view fails
-/// admission closed and an understated view is denied. The group view is the local demand
-/// merged with the fresh heartbeats of the other sync-eligible members, read between two
-/// reads of the group revision: a concurrent admission that moved the group reads it again.
+/// Standing-quota decision for a FRESH claim; an overshoot after convergence cancels nothing, and
+/// an unavailable or understated view denies. The view is local demand plus fresh member
+/// heartbeats, read between two group revision reads; a moved revision reads it again.
 #[derive(Debug, PartialEq)]
 pub(crate) struct QuotaCheckOperation {
     config: RealmConfigDocument,
@@ -284,7 +282,7 @@ mod pure_tests {
 
     // An uncapped group reads nothing; a capped one decides against a settled revision.
     #[test]
-    fn decides_on_settled_view() {
+    fn decides_settled_view() {
         assert_eq!(check(None).first(), Ok(Next::Done((None, None))));
         let mut capped = check(Some(4));
         assert!(matches!(capped.first(), Ok(Next::Call(IoCall::Read(_)))));

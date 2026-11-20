@@ -775,7 +775,7 @@ mod tests {
 
     // An unreadable version record counts as no hash, so only a reference could still pass.
     #[test]
-    fn unread_hash_needs_reference() {
+    fn hash_needs_reference() {
         let mut operation = capture();
         operation.first().expect("head");
         calls_child(operation.next(child(Ok::<_, HeadObjectError>(head()))));
@@ -785,7 +785,7 @@ mod tests {
 
     // Metadata an earlier input of the bucket read is not read again.
     #[test]
-    fn known_database_skips_read() {
+    fn database_skips_read() {
         let mut operation = CaptureInputOperation::new(caller(), input("k"), Some(None));
         operation.step = CaptureStep::Bucket(Readable {
             located: Located {

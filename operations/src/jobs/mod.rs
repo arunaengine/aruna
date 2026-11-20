@@ -14,12 +14,7 @@ pub mod handed_imports;
 pub mod harvest;
 pub mod import;
 mod import_listing;
-pub mod job_artifacts;
-pub mod job_cancel;
-pub mod job_delete;
-pub mod job_reads;
-pub mod job_reports;
-pub mod job_routes;
+pub mod job;
 pub mod key_locks;
 pub mod key_wake;
 pub mod lifecycle;
@@ -47,8 +42,6 @@ pub mod store;
 #[cfg(test)]
 mod submission_tests;
 pub mod submit;
-pub mod submit_execution;
-pub mod submit_local;
 pub mod workflow;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.

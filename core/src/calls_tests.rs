@@ -116,8 +116,8 @@ fn read_a() -> IoCall {
 #[test]
 fn effects_join_transaction() {
     // A passed-through storage effect without a transaction id runs in the operation's one.
-    let entry = crate::node_vault::VaultEntry::new(
-        crate::node_vault::VaultPurpose::NamedSecret,
+    let entry = crate::node::vault::VaultEntry::new(
+        crate::node::vault::VaultPurpose::NamedSecret,
         ulid::Ulid::from_parts(1, 1),
     );
     let delete = StorageEffect::VaultDelete {

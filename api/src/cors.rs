@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::routes::federation::export::INTENT_HEADER;
+use aruna_core::listener::{cors_allows, cors_origin};
 use aruna_operations::federation::import::GRANT_HEADER;
 use axum::http::Method;
 use http::HeaderMap;
@@ -52,7 +53,7 @@ impl CorsConfig {
         let mut allowed_origins = Vec::new();
         let mut allow_any = false;
         for origin in origins {
-            let origin = origin.trim().trim_end_matches('/');
+            let origin = cors_origin(&origin);
             if origin.is_empty() {
                 continue;
             }
@@ -87,9 +88,9 @@ impl CorsConfig {
         origin
             .to_str()
             .map(|origin| {
-                let origin = origin.trim_end_matches('/');
-                self.allowed_origins.iter().any(|allowed| allowed == origin)
-                    || (self.allow_desktop && DESKTOP_ORIGINS.contains(&origin))
+                let allowed = self.allowed_origins.iter().map(String::as_str);
+                cors_allows(allowed, origin)
+                    || (self.allow_desktop && DESKTOP_ORIGINS.contains(&cors_origin(origin)))
             })
             .unwrap_or(false)
     }

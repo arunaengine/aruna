@@ -237,7 +237,7 @@ mod tests {
 
     // A note writes the row and retires its intents while the rule and every guard still hold.
     #[test]
-    fn writes_while_guards_hold() {
+    fn writes_under_guards() {
         let rule = rule();
         let rule_row = (
             row(BACKEND_IMPORT_KEYSPACE, &rule.key()),

@@ -1,5 +1,5 @@
 //! The listener settings the node configuration and the api share: the public host routes, the
-//! S3 listener deadlines and the REST body limit.
+//! CORS origin rule, the S3 listener deadlines and the REST body limit.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -13,6 +13,20 @@ pub const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The total lifetime of one streamed S3 request, by default.
 pub const STREAM_LIFETIME_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// A CORS origin as it is compared: without surrounding space or a trailing slash.
+pub fn cors_origin(entry: &str) -> &str {
+    entry.trim().trim_end_matches('/')
+}
+
+/// Whether the configured CORS `entries` admit `origin`: `*` admits every origin, and any other
+/// entry the one origin it names.
+pub fn cors_allows<'a>(entries: impl IntoIterator<Item = &'a str>, origin: &str) -> bool {
+    let origin = cors_origin(origin);
+    (entries.into_iter())
+        .map(cors_origin)
+        .any(|entry| entry == "*" || entry == origin)
+}
 
 /// Listener deadlines of the S3 plane: how long a connection may stay silent
 /// before its first request, how long a request or response may make no I/O
@@ -126,5 +140,24 @@ impl HostRoutes {
     /// Whether a route is configured.
     pub fn contains(&self, route: HostRoute) -> bool {
         self.origins.iter().any(|origin| origin.route == route)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cors_allows;
+
+    #[test]
+    fn cors_rule_matches() {
+        let origin = "https://portal.example.org";
+        assert!(cors_allows([" https://portal.example.org/ "], origin));
+        assert!(cors_allows(["https://other.example.org", "*"], origin));
+        assert!(cors_allows(
+            ["https://portal.example.org"],
+            "https://portal.example.org/"
+        ));
+        assert!(!cors_allows(["https://other.example.org"], origin));
+        assert!(!cors_allows(["https://portal.example.org:8443"], origin));
+        assert!(!cors_allows([], origin));
     }
 }

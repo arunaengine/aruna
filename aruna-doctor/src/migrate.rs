@@ -27,7 +27,7 @@ use aruna_core::keyspaces::{
     SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
     USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     ForwardRow, JOURNAL_ROW, PENDING_ROW, PluginRun, RUN_ROW, SourceEvent,
@@ -1075,7 +1075,7 @@ mod tests {
         FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::node_vault::NodeVaultKey;
+    use aruna_core::node::vault::NodeVaultKey;
     use aruna_core::structs::execution::job::family::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
@@ -1477,7 +1477,7 @@ mod tests {
         assert!(read(&path, BACKEND_SECRET_KEYSPACE).is_empty());
         let vault = read(&path, NODE_VAULT_KEYSPACE);
         let key = NodeVaultKey::derive(&[11u8; 32]);
-        let opened = |entry: aruna_core::node_vault::VaultEntry| {
+        let opened = |entry: aruna_core::node::vault::VaultEntry| {
             let row = &vault[&entry.key()];
             assert!(!row.windows(11).any(|window| window == b"canary-7e21"));
             key.open(entry, row).unwrap().expose().to_vec()

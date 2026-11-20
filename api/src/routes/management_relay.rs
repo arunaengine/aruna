@@ -21,7 +21,7 @@ use aruna_operations::relay::management::{
 use aruna_operations::relay::targets::{
     CoordinatorTarget, CoordinatorTargetOperation, HolderTargetOperation, PeerTargetsOperation,
 };
-use aruna_operations::s3::object::member_rest;
+use aruna_operations::s3::object::member::rest;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
@@ -34,7 +34,7 @@ use tracing::{debug, warn};
 
 /// The nodes a relayed call passed, comma-separated. Anyone can send it, so it never makes a
 /// node answer a call it would relay; it only stops a call that would circle.
-pub const RELAY_HOP_HEADER: HeaderName = HeaderName::from_static(member_rest::RELAY_HOP_HEADER);
+pub const RELAY_HOP_HEADER: HeaderName = HeaderName::from_static(rest::RELAY_HOP_HEADER);
 
 /// Realm membership changes rarely, so the resolved targets are reused inside
 /// this window instead of re-reading realm state per request.

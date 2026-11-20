@@ -18,7 +18,7 @@ use super::call::{
     start_read,
 };
 use super::targets::{RealmNodes, RealmNodesOperation, TargetError};
-use crate::s3::object::member_rest::{API_PREFIX, RELAY_HOP_HEADER};
+use crate::s3::object::member::rest::{API_PREFIX, RELAY_HOP_HEADER};
 
 const RELAY_TIMEOUT: Duration = Duration::from_secs(30);
 const RELAY_TARGET_LIMIT: usize = 3;

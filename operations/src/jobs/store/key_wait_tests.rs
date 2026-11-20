@@ -296,7 +296,7 @@ fn claimed_rows(seed: u8) -> (crate::jobs::store::mutation::Rows, JobId, Ulid) {
 
 // Parking writes the wait rows with the parked job; the last satisfied key wakes it again.
 #[test]
-fn parks_and_wakes_rows() {
+fn parks_then_wakes() {
     use crate::jobs::store::mutation::run_in_memory;
     let (mut rows, job_id, token) = claimed_rows(11);
     let first = wait("a", 8);

@@ -17,9 +17,9 @@ use aruna_core::jobs::JobRunOutcome;
 use aruna_drivers::driver::drive;
 use aruna_drivers::jobs::context::JobContext;
 use aruna_operations::jobs::persistent_id::{MintPidOperation, RegisterIdentifiersOperation};
-use aruna_operations::notifications::email_job::EmailJobOperation;
+use aruna_operations::notifications::email::job::EmailJobOperation;
 use aruna_operations::notifications::settings::{DeliveryOutcome, delivery_outcome};
-use aruna_operations::notifications::webhook_job::WebhookJobOperation;
+use aruna_operations::notifications::webhook::job::WebhookJobOperation;
 
 /// Payload dispatch, mirroring how the task handler matches `TaskKey`. Execution
 /// payloads never reach here: the runtime routes them to the fenced external path

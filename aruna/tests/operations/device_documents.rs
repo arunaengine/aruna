@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmNodeKind;

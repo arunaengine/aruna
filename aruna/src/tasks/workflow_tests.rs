@@ -1178,7 +1178,7 @@ async fn session_end_succeeds() {
     assert!(stored.report_digest.is_some());
     assert_eq!(session.finished().await, EndReason::Ended);
     assert!(registry.sessions().get(&job_id.to_string()).is_none());
-    let query = aruna_operations::jobs::job_reports::ReportQuery {
+    let query = aruna_operations::jobs::job::reports::ReportQuery {
         expected_digest: None,
         last_key: None,
         limit: 10,
@@ -1186,7 +1186,7 @@ async fn session_end_succeeds() {
     let report = read_owned_report(&ctx, stored.created_by, job_id, query)
         .await
         .unwrap();
-    let aruna_operations::jobs::job_reports::JobReportLookup::Ready { rows, .. } = report else {
+    let aruna_operations::jobs::job::reports::JobReportLookup::Ready { rows, .. } = report else {
         panic!("ended session report must be readable");
     };
     assert_eq!(rows.len(), 1);
@@ -2234,10 +2234,10 @@ async fn read_owned_report(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    query: aruna_operations::jobs::job_reports::ReportQuery,
-) -> Result<aruna_operations::jobs::job_reports::JobReportLookup, String> {
+    query: aruna_operations::jobs::job::reports::ReportQuery,
+) -> Result<aruna_operations::jobs::job::reports::JobReportLookup, String> {
     let now_ms = unix_timestamp_millis();
-    let read = aruna_operations::jobs::job_reports::JobReportOperation::owned(
+    let read = aruna_operations::jobs::job::reports::JobReportOperation::owned(
         user_id, job_id, query, now_ms,
     );
     drive(read, context).await.map_err(|error| error.0)

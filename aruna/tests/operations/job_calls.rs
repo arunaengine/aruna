@@ -33,16 +33,16 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_PRUNE_PAGE;
 use aruna_operations::jobs::drain::JobClassBudget;
 use aruna_operations::jobs::drain::{DrainError, DrainJobsOperation, JobDrainResult};
-use aruna_operations::jobs::job_artifacts::{ArtifactRangeOperation, ArtifactRead};
-use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
-use aruna_operations::jobs::job_cancel::{CancelOwnedOperation, RoutedCancelOperation};
-use aruna_operations::jobs::job_reads::OwnedJobOperation;
-use aruna_operations::jobs::job_reports::JobReportLookup;
-use aruna_operations::jobs::job_reports::{ReportQuery, ReportRouteOperation};
-use aruna_operations::jobs::job_routes::{RecordRouteOperation, StatusRouteOperation};
+use aruna_operations::jobs::job::artifacts::{ArtifactRangeOperation, ArtifactRead};
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::job::cancel::{CancelOwnedOperation, RoutedCancelOperation};
+use aruna_operations::jobs::job::reads::OwnedJobOperation;
+use aruna_operations::jobs::job::reports::JobReportLookup;
+use aruna_operations::jobs::job::reports::{ReportQuery, ReportRouteOperation};
+use aruna_operations::jobs::job::routes::{RecordRouteOperation, StatusRouteOperation};
 use aruna_operations::jobs::prune::{JobPruneOutcome, PruneJobsOperation};
 use aruna_operations::jobs::route::{JobRouteError, RoutedJobStatus};
-use aruna_operations::jobs::submit_local::SubmitLocalOperation;
+use aruna_operations::jobs::submit::local::SubmitLocalOperation;
 
 pub async fn read_owned_job(
     context: &DriverContext,

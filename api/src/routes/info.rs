@@ -16,7 +16,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
 use aruna_core::heartbeat::seen_recently;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::placement::transition::transition_health;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};

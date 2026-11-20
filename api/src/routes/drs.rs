@@ -13,7 +13,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::blob_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::holder_choice::PickHolderOperation;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node::state::ReadInfoOperation;
 use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};

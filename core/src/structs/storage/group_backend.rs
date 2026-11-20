@@ -4,7 +4,7 @@
 
 use crate::compute::SecretBytes;
 use crate::errors::ConversionError;
-use crate::node_vault::{VaultEntry, VaultPurpose};
+use crate::node::vault::{VaultEntry, VaultPurpose};
 use crate::structs::storage::cleanup::CleanupStrategy;
 use crate::types::GroupId;
 use crate::user::id::UserId;

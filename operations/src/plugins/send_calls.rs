@@ -16,8 +16,8 @@ use ulid::Ulid;
 
 use super::check::{CallError, RunScope};
 use super::held::{ReadyConnection, ReadyRequest};
-use super::host_calls::{CallEnd, CallFailure, RecordCall, begun_reply};
-use super::host_steps::{ConnectionAsk, NativeCall};
+use super::host::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
+use super::host::steps::{ConnectionAsk, NativeCall};
 use super::intents::{Begun, begin};
 use super::outgoing::{SendConnection, stored_whole, too_large, whole_text};
 use super::rows::StoreError;

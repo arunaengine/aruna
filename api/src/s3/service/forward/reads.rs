@@ -10,7 +10,7 @@ use aruna_core::member_read::MemberBody;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::drive;
-use aruna_operations::s3::object::member_read::{
+use aruna_operations::s3::object::member::read::{
     MemberCallOperation, MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
     MemberTextOperation,
 };
@@ -28,7 +28,7 @@ use super::{passed_headers, passed_query, refused_error, unix_secs};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 use crate::s3::service::ArunaS3Service;
-use aruna_operations::s3::object::member_read::{
+use aruna_operations::s3::object::member::read::{
     MemberRequest as ForwardRequest, MemberTarget as Forward,
 };
 

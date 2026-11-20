@@ -10,7 +10,6 @@ pub(crate) mod manifest;
 pub(crate) mod pull;
 pub mod recovery;
 pub mod restore;
-pub mod restore_plan;
 pub mod verify;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};

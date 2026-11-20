@@ -33,7 +33,7 @@ use tracing::{info, warn};
 
 use super::artifacts::{ArtifactError, managers};
 use super::copies_needed;
-use super::copy_rows::{StoreCopy, chunk_count, chunk_of};
+use super::copy::rows::{StoreCopy, chunk_count, chunk_of};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::mutate_placement::is_management;

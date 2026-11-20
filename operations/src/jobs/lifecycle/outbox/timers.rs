@@ -17,7 +17,7 @@ use tracing::warn;
 use super::drain::DrainOutboxOperation;
 use super::{OUTBOX_RETRY_AFTER, schedule_outbox_drain};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::witness_arm::schedule_witness_drain;
+use crate::jobs::lifecycle::witness::arm::schedule_witness_drain;
 
 /// The timers to arm, with the witness drain only while witness deadlines are stored.
 pub fn lifecycle_timers(witness_pending: bool) -> Vec<Effect> {
@@ -76,10 +76,12 @@ impl Operation for FamilyTimerOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<Duration>>, IoError> {
-        let remaining = result.child::<bool, LifecycleError>()?.unwrap_or_else(|error| {
-            warn!(error = %error, "Job family outbox drain failed");
-            true
-        });
+        let remaining = result
+            .child::<bool, LifecycleError>()?
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "Job family outbox drain failed");
+                true
+            });
         Ok(Next::Done(remaining.then_some(OUTBOX_RETRY_AFTER)))
     }
 }
@@ -105,7 +107,7 @@ mod tests {
 
     // A stored witness deadline brings the witness drain back with the outbox drain.
     #[test]
-    fn witness_timer_needs_rows() {
+    fn witness_needs_rows() {
         let mut timers = LifecycleTimersOperation;
         assert!(matches!(
             timers.first(),

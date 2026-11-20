@@ -55,7 +55,7 @@ fn context() -> (TempDir, DriverContext) {
     let dir = tempfile::tempdir().unwrap();
     let storage_handle =
         aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let context = DriverContext {
         storage_handle,
         net_handle: None,

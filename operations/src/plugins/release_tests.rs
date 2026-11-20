@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::Secret;
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::secrets::{ResponseExposure, SecretFields, SecretKind, SecretSettings, UseRule};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AuditIndex, audit_prefix};
 use aruna_core::user::id::UserId;

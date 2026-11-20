@@ -32,7 +32,7 @@ pub(crate) fn vault_context() -> (TempDir, DriverContext) {
     let tempdir = tempdir().unwrap();
     let storage_handle =
         storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     (tempdir, test_context(storage_handle))
 }
 

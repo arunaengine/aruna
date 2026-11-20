@@ -1,6 +1,5 @@
-//! Decides one launch offer at the execution target: spec, submitter, placement and fit are
-//! checked, the receipt is signed and committed with its reservation; a replay answers with the
-//! stored receipt and a family that already ran here is declined.
+//! Decides one launch offer at the target: checks spec, submitter, placement and fit, then signs
+//! and commits the receipt with its reservation; a replay answers it, a rerun family is declined.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -15,7 +14,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, ExecutionSignEvent, LaunchDecline, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::node_state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::scheduling::PlannedInput;
@@ -34,7 +33,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
-use super::cancel::FlagLocalRunOperation;
+use super::cancel::FlagRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
 use super::outbox::schedule_outbox_drain;
@@ -454,7 +453,7 @@ impl Operation for AcceptLaunchOperation {
         let admitted = matches!(self.decision, Some(Ok(_)));
         match self.cancel.filter(|_| admitted) {
             Some(job_id) => {
-                let flag = FlagLocalRunOperation::new(job_id, self.serving, self.now_ms);
+                let flag = FlagRunOperation::new(job_id, self.serving, self.now_ms);
                 Ok(Next::Call(IoCall::child(flag)))
             }
             None => self.wake(),

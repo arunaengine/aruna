@@ -34,7 +34,7 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::listener::S3ServerTimeouts;
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::onboarding::{
     CreateSecretRequest, CreateSecretResponse, OnboardingMode, OnboardingPhase,
 };

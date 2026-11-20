@@ -23,8 +23,8 @@ use crate::shard::recovery::{
     PhaseOutcome, RecoveryBaseline, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass,
     RecoveryRotation, RecoveryStatus, RecoveryStop, apply_recovery_pass,
 };
+use crate::shard::restore::plan::{ShardRestoreCursor, sync_eligible_node};
 use crate::shard::restore::{RestorePassOperation, RestoredPass};
-use crate::shard::restore_plan::{ShardRestoreCursor, sync_eligible_node};
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 pub const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -431,7 +431,7 @@ mod tests {
 
     use super::*;
     use crate::shard::recovery::RecoveryState;
-    use crate::shard::restore_plan::ShardRestorePass;
+    use crate::shard::restore::plan::ShardRestorePass;
 
     fn node() -> NodeId {
         iroh::SecretKey::from_bytes(&[1; 32]).public()

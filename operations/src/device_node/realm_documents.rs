@@ -22,7 +22,7 @@ use aruna_core::keyspaces::{
     NODE_NAME_KEYSPACE, NODE_PLACE_KEYSPACE, REALM_MARKER_KEYSPACE, REALM_REMOVAL_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::node_state::{InstallInfoOperation, NodeInfoError};
+use aruna_core::node::state::{InstallInfoOperation, NodeInfoError};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};

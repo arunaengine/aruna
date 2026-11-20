@@ -86,8 +86,10 @@ impl OperationsInboundHandler {
             debug!(peer = %peer, "Dropping inbound peer stream without net handle");
             return;
         };
-        let Some(PeerRead { request, slot: _slot }) =
-            read_peer(alpn, &mut stream, peer, net_handle).await
+        let Some(PeerRead {
+            request,
+            slot: _slot,
+        }) = read_peer(alpn, &mut stream, peer, net_handle).await
         else {
             return;
         };
@@ -310,7 +312,7 @@ async fn peer_request(
                 unix_timestamp_millis(),
             );
             let admit =
-                aruna_operations::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
+                aruna_operations::jobs::lifecycle::admit::forwarded::AdmitForwardedOperation::new(
                     peer,
                     auth_token,
                     submission_id,
