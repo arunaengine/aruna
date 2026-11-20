@@ -4,16 +4,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Mutex;
 
 use aruna_core::federation::{RealmTotals, Registration, Signed};
 use aruna_core::structs::identity::realm::RealmId;
-use fjall::{Database, Keyspace, KeyspaceCreateOptions};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::admin::{AdminError, AdminState, AuditRecord, ResolveGate, transition};
+use crate::admin::{AdminError, AdminState, AuditRecord, RealmStatus, ResolveGate, transition};
 use crate::verify::RouteProblem;
 
 /// An entry leaves the listing this long after its last renewal.
@@ -22,6 +23,25 @@ pub const LEASE_SECS: u64 = 72 * 3600;
 pub const STALE_SECS: u64 = 24 * 3600;
 /// Largest accepted clock skew of a realm ahead of the registry.
 pub const MAX_FUTURE_SECS: u64 = 300;
+/// Listing index ranks: approved realms list before listed ones.
+const APPROVED_RANK: u8 = 0;
+const LISTED_RANK: u8 = 1;
+
+/// The listing index key of a realm: its rank, then its realm id.
+fn listing_key(rank: u8, realm_id: &RealmId) -> Vec<u8> {
+    let mut key = vec![rank];
+    key.extend_from_slice(realm_id.as_bytes());
+    key
+}
+
+/// The listing rank of a realm with an entry; hidden and retired realms are not listed.
+fn listing_rank(state: &AdminState) -> Option<u8> {
+    match state.status {
+        RealmStatus::Approved => Some(APPROVED_RANK),
+        RealmStatus::Listed => Some(LISTED_RANK),
+        RealmStatus::Hidden | RealmStatus::Retired => None,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -71,6 +91,8 @@ pub struct Store {
     names: Keyspace,
     /// The latest self-reported totals per realm, apart from the entry.
     totals: Keyspace,
+    /// One row per realm with an entry the public listing shows, ranked approved first.
+    listing: Keyspace,
     /// Serializes the issue-time check with the write that follows it.
     writer: Mutex<()>,
 }
@@ -84,6 +106,7 @@ impl Store {
         let audit = db.keyspace("audit", KeyspaceCreateOptions::default)?;
         let names = db.keyspace("names", KeyspaceCreateOptions::default)?;
         let totals = db.keyspace("totals", KeyspaceCreateOptions::default)?;
+        let listing = db.keyspace("listing", KeyspaceCreateOptions::default)?;
         Ok(Self {
             db,
             entries,
@@ -92,6 +115,7 @@ impl Store {
             audit,
             names,
             totals,
+            listing,
             writer: Mutex::new(()),
         })
     }
@@ -132,6 +156,8 @@ impl Store {
             realm_id.as_bytes().to_vec(),
             postcard::to_allocvec(&issued_at)?,
         );
+        let rank = listing_rank(&self.admin(realm_id)?);
+        self.place_listing(&mut batch, realm_id, rank);
         let name = &entry.registration.payload.descriptor.payload.name;
         let mut names = self.names(realm_id)?;
         if names.last().is_none_or(|last| last.name != *name) {
@@ -157,6 +183,7 @@ impl Store {
         let mut batch = self.db.batch();
         batch.remove(&self.entries, realm_id.as_bytes().to_vec());
         batch.remove(&self.totals, realm_id.as_bytes().to_vec());
+        self.place_listing(&mut batch, realm_id, None);
         batch.insert(
             &self.issued,
             realm_id.as_bytes().to_vec(),
@@ -207,24 +234,43 @@ impl Store {
         Ok(entries)
     }
 
-    /// Every realm the public listing shows, in realm id order: a leased entry whose admin state
-    /// is listed, with that state and the realm's totals, read in one pass over the entries.
-    pub fn listings(&self, now: u64) -> Result<Vec<Listed>, StoreError> {
-        let mut listed = Vec::new();
-        for item in self.entries.iter() {
-            let (_, value) = item.into_inner()?;
-            let entry = decode_entry(&value)?;
-            if !leased(&entry, now) {
-                continue;
+    /// One page of the public listing after the index key `after`: approved realms first, then
+    /// listed ones, each in realm id order, with their admin state and totals. At most `limit`
+    /// index rows are read; `next` is the last of them while more may follow.
+    pub fn listing_page(
+        &self,
+        now: u64,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<Listed>, Option<Vec<u8>>), StoreError> {
+        let start = after.map_or(Bound::Unbounded, |after| Bound::Excluded(after.to_vec()));
+        let (mut listed, mut read) = (Vec::new(), 0);
+        for item in self.listing.range::<Vec<u8>, _>((start, Bound::Unbounded)) {
+            let (key, _) = item.into_inner()?;
+            read += 1;
+            let realm = key.get(1..).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+            let realm_id = RealmId::from_bytes(realm.ok_or(StoreError::NotFound)?);
+            // An entry whose lease ended keeps its row until a write changes it.
+            if let Some(entry) = self.entry(&realm_id, now)? {
+                listed.push((entry, self.admin(&realm_id)?, self.totals(&realm_id)?));
             }
-            let realm_id = entry.registration.payload.descriptor.payload.realm_id;
-            let admin = self.admin(&realm_id)?;
-            if admin.listed() {
-                let totals = self.totals(&realm_id)?;
-                listed.push((entry, admin, totals));
+            if read == limit {
+                return Ok((listed, Some(key.to_vec())));
             }
         }
-        Ok(listed)
+        Ok((listed, None))
+    }
+
+    /// Puts the realm's listing row where `rank` places it, or removes it for `None`.
+    fn place_listing(&self, batch: &mut OwnedWriteBatch, realm_id: &RealmId, rank: Option<u8>) {
+        for other in [APPROVED_RANK, LISTED_RANK] {
+            if Some(other) != rank {
+                batch.remove(&self.listing, listing_key(other, realm_id));
+            }
+        }
+        if let Some(rank) = rank {
+            batch.insert(&self.listing, listing_key(rank, realm_id), Vec::<u8>::new());
+        }
     }
 
     /// Every leased entry the resolver may send identifiers to, in realm id order, read in one
@@ -342,6 +388,11 @@ impl Store {
             postcard::to_allocvec(&after)?,
         );
         batch.insert(&self.audit, key, postcard::to_allocvec(&record)?);
+        let rank = match self.entries.contains_key(realm_id.as_bytes())? {
+            true => listing_rank(&after),
+            false => None,
+        };
+        self.place_listing(&mut batch, realm_id, rank);
         batch.commit()?;
         Ok(after)
     }
@@ -592,7 +643,7 @@ pub(crate) mod tests {
         let store = Store::open(dir.path()).unwrap();
         let realm = realm_id();
         store.register(&realm, &entry(100, 100), 100).unwrap();
-        let listed = store.listings(100).unwrap();
+        let (listed, _) = store.listing_page(100, None, 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(
             (listed[0].1.status, &listed[0].2),
@@ -607,7 +658,7 @@ pub(crate) mod tests {
         store.update_admin(&realm, approved, "test", 101).unwrap();
         assert_eq!(store.resolvable(101).unwrap().len(), 1);
         let expired = 100 + LEASE_SECS;
-        assert!(store.listings(expired).unwrap().is_empty());
+        assert!(store.listing_page(expired, None, 10).unwrap().0.is_empty());
         assert!(store.resolvable(expired).unwrap().is_empty());
 
         let hidden = AdminState {
@@ -615,7 +666,74 @@ pub(crate) mod tests {
             ..AdminState::default()
         };
         store.update_admin(&realm, hidden, "test", 102).unwrap();
-        assert!(store.listings(102).unwrap().is_empty());
+        assert!(store.listing_page(102, None, 10).unwrap().0.is_empty());
+    }
+
+    /// A registration of the realm whose management key has `seed`.
+    fn seeded_entry(seed: u8, at: u64) -> (RealmId, Entry) {
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let realm = RealmId::from_bytes(key.verifying_key().to_bytes());
+        let signer = NodeCapabilities::management_node(key).unwrap();
+        let descriptor = RealmDescriptor {
+            realm_id: realm,
+            name: format!("Realm {seed}"),
+            description: String::new(),
+            api_url: Url::parse("https://realm.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://realm.example.org").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
+            issued_at: 1,
+        };
+        let registration = Registration {
+            descriptor: Signed::sign(descriptor, &signer).unwrap(),
+            kpis: RealmKpis {
+                live_datasets: None,
+                groups: None,
+                nodes_configured: None,
+            },
+            observed_at: at,
+            issued_at: at,
+        };
+        let entry = Entry {
+            registration: Signed::sign(registration, &signer).unwrap(),
+            received_at: at,
+            verified: false,
+            problems: Vec::new(),
+        };
+        (realm, entry)
+    }
+
+    #[test]
+    fn listing_pages_ranked() {
+        // Pages list approved realms first and follow status changes; a hidden one leaves.
+        use crate::admin::RealmStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (first, entry) = seeded_entry(7, 100);
+        store.register(&first, &entry, 100).unwrap();
+        let (second, entry) = seeded_entry(8, 100);
+        store.register(&second, &entry, 100).unwrap();
+        let last = if first.as_bytes() > second.as_bytes() { first } else { second };
+        let approved = AdminState {
+            status: RealmStatus::Approved,
+            ..AdminState::default()
+        };
+        store.update_admin(&last, approved, "test", 101).unwrap();
+        let realm = |listed: &Listed| listed.0.registration.payload.descriptor.payload.realm_id;
+        let (page, next) = store.listing_page(101, None, 1).unwrap();
+        assert_eq!(page.iter().map(realm).collect::<Vec<_>>(), [last]);
+        let (page, _) = store.listing_page(101, next.as_deref(), 1).unwrap();
+        assert_ne!(page.iter().map(realm).collect::<Vec<_>>(), [last]);
+        let hidden = AdminState {
+            status: RealmStatus::Hidden,
+            ..AdminState::default()
+        };
+        store.update_admin(&last, hidden, "test", 102).unwrap();
+        let (page, _) = store.listing_page(102, None, 10).unwrap();
+        assert!(page.iter().all(|listed| realm(listed) != last));
+        store.withdraw(&first, 103, 103).unwrap();
+        store.withdraw(&second, 103, 103).unwrap();
+        assert!(store.listing_page(103, None, 10).unwrap().0.is_empty());
     }
 
     #[test]
