@@ -97,13 +97,10 @@ async fn restore_timer(
     };
     let now_ms = unix_timestamp_millis();
     let after = Duration::from_millis(current.due_unix_millis.saturating_sub(now_ms));
-    let shorten = TaskEffect::ShortenTimer {
-        key: current.key,
-        after,
-    };
-    let stamp = Some(current.due_unix_millis);
-    match task_handle.send_stamped(shorten, stamp).await {
-        Event::Task(TaskEvent::Error { message, .. }) => Err(message),
+    // The row already exists, so its own admission arms the wake and its firing deletes it.
+    let admission = current.admission;
+    match task_handle.shorten_owned(current.key, after, admission).await {
+        (Event::Task(TaskEvent::Error { message, .. }), _) => Err(message),
         _ => Ok(()),
     }
 }
@@ -114,6 +111,7 @@ mod tests {
     use aruna_core::effects::Effect;
     use aruna_core::handle::Handle;
     use aruna_core::task::TaskKey;
+    use aruna_drivers::effect_adapters::task::change_timer;
     use aruna_storage::storage::worker::FjallStorage;
     use aruna_storage::task_timers::{persist_task_effect, read_timer};
     use aruna_tasks::InboundTaskHandler;
@@ -197,6 +195,7 @@ mod tests {
         let stale = |key: &TaskKey| PersistedTaskTimer {
             key: key.clone(),
             due_unix_millis: unix_timestamp_millis(),
+            admission: 9,
         };
         let cancelled = TaskKey::RefreshBlobHolders;
         let cancel = TaskEffect::CancelTimer {
@@ -239,6 +238,7 @@ mod tests {
         let fired = PersistedTaskTimer {
             key: key.clone(),
             due_unix_millis: unix_timestamp_millis().saturating_sub(10_000),
+            admission: 5,
         };
         let row = StorageEffect::Write {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
@@ -254,9 +254,88 @@ mod tests {
         persist_task_effect(&storage, &replacement)
             .await
             .expect("row written");
-        let stamp = Some(fired.due_unix_millis);
+        let stamp = Some(fired.admission);
         aruna_storage::task_timers::delete_persisted_timer(&storage, &key, stamp).await;
         assert!(read_timer(&storage, &key).await.expect("reads").is_some());
+    }
+
+    /// Admits a firing and holds it: its stamp is kept, and the run never ends.
+    struct HeldFiring {
+        stamp: Arc<Mutex<Option<u64>>>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for HeldFiring {
+        async fn handle_timer(&self, _key: TaskKey) {}
+
+        async fn handle_firing(&self, _key: TaskKey, stamp: Option<u64>) {
+            *self.stamp.lock().await = stamp;
+            self.notify.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+
+    // A shorten that arrives after the scheduler admitted a firing, but before that firing
+    // deleted its row, arms a new admission whose row the old firing cannot delete.
+    #[tokio::test]
+    async fn shorten_after_dispatch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let stamp = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        let firing = HeldFiring {
+            stamp: stamp.clone(),
+            notify: notify.clone(),
+        };
+        task_handle.set_inbound_handler(Arc::new(firing)).await;
+        let key = TaskKey::PublishRegistration;
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::ZERO,
+        };
+        change_timer(&storage, Some(&task_handle), reset, false).await;
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the first wake is admitted");
+        let shorten = TaskEffect::ShortenTimer {
+            key: key.clone(),
+            after: Duration::from_secs(10),
+        };
+        change_timer(&storage, Some(&task_handle), shorten, false).await;
+
+        let fired = *stamp.lock().await;
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, fired).await;
+        let row = read_timer(&storage, &key).await.expect("reads");
+        let row = row.expect("the shortened wake keeps its row");
+        assert_ne!(Some(row.admission), fired);
+    }
+
+    // Two resets with the same deadline are two admissions: the first one's firing leaves the
+    // row the second one wrote.
+    #[tokio::test]
+    async fn equal_resets_owned() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        let reset = || TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        change_timer(&storage, Some(&task_handle), reset(), false).await;
+        let first = read_timer(&storage, &key).await.expect("reads");
+        let first = first.expect("row");
+        change_timer(&storage, Some(&task_handle), reset(), false).await;
+        let second = read_timer(&storage, &key).await.expect("reads");
+        let second = second.expect("row");
+        assert_ne!(first.admission, second.admission);
+        let stamp = Some(first.admission);
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, stamp).await;
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), Some(second));
     }
 
     // A row that stopped decoding is deleted only while it still does not decode, so a timer a
@@ -333,8 +412,8 @@ mod tests {
         assert_eq!(*observed.lock().await, Some(key));
     }
 
-    // A fired timer removes only a due row: a replacement written for the key after the firing
-    // stays, so a restart still finds the accepted wakeup.
+    // A fired timer removes only the row its admission owns: a firing without one, or of another
+    // admission, leaves a due row for the wake that owns it.
     #[tokio::test]
     async fn fired_keeps_replacement() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -350,7 +429,7 @@ mod tests {
             .await
             .expect("timer persists");
 
-        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, None).await;
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, Some(7)).await;
         assert!(
             read_timer(&storage, &key)
                 .await
@@ -363,6 +442,10 @@ mod tests {
             .await
             .expect("timer persists");
         aruna_storage::task_timers::delete_persisted_timer(&storage, &key, None).await;
+        let unstamped = read_timer(&storage, &key).await.expect("timer reads");
+        assert!(unstamped.is_some(), "a firing without an admission owns no row");
+        let owner = Some(aruna_storage::task_timers::NO_ADMISSION);
+        aruna_storage::task_timers::delete_persisted_timer(&storage, &key, owner).await;
         assert!(
             read_timer(&storage, &key)
                 .await

@@ -1,35 +1,88 @@
-//! Persists each timer effect before handing it to the task handle, so a restart still sees it.
+//! Applies each timer change to its durable row and the task handle, so a restart still sees it
+//! and only the firing of the admission that owns a row deletes it.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::events::Event;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
-use aruna_storage::task_timers::{hold_change, persist_stamped};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::task_timers::{
+    NO_ADMISSION, hold_change, persist_task_effect, timer_has_row, write_owned,
+};
+use aruna_tasks::TaskHandle;
+use tracing::warn;
 
+use crate::clock::next_entropy;
 use crate::driver::DriverContext;
 
 pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -> Event {
+    let (storage, task_handle) = (&context.storage_handle, context.task_handle.as_ref());
+    let keep_live = kept_in_memory(&effect);
+    Box::pin(change_timer(storage, task_handle, effect, keep_live)).await
+}
+
+/// Applies one timer change to its durable row and the scheduler, holding the key's change lock
+/// until the scheduler took it. Each arming is a new admission that owns the row it writes; a
+/// shorten the scheduler answers with an earlier live wake leaves that wake's row. With
+/// `keep_live` the scheduler is armed even when the row cannot be written.
+pub async fn change_timer(
+    storage: &StorageHandle,
+    task_handle: Option<&TaskHandle>,
+    effect: TaskEffect,
+    keep_live: bool,
+) -> Event {
     // The row and the scheduler see changes of one key in the same order.
     let _held = hold_change(&effect).await;
-    let kept = kept_in_memory(&effect);
-    let stamp = match persist_stamped(&context.storage_handle, &effect).await {
-        Ok(stamp) => stamp,
-        Err(_) if kept => None,
-        Err(message) => {
-            return Event::Task(TaskEvent::Error {
-                key: task_effect_key(&effect),
-                message,
-            });
+    let admission = next_admission();
+    let key = task_effect_key(&effect);
+    let refused = |message| Event::Task(TaskEvent::Error { key, message });
+    if let TaskEffect::ShortenTimer { key, after } = &effect
+        && timer_has_row(&effect)
+    {
+        let Some(task_handle) = task_handle else {
+            return refused_handle();
+        };
+        let (event, armed) = task_handle.shorten_owned(key.clone(), *after, admission).await;
+        if armed && let Err(message) = write_owned(storage, key, *after, admission).await {
+            warn!(key = ?key, %message, "Timer kept in memory only");
+            if !keep_live {
+                return refused(message);
+            }
         }
-    };
-    if let Some(task_handle) = &context.task_handle {
-        Box::pin(task_handle.send_stamped(effect, stamp)).await
-    } else {
-        Event::Task(TaskEvent::Error {
-            key: None,
-            message: NO_TASK_HANDLE.to_string(),
-        })
+        return event;
     }
+    if timer_has_row(&effect) {
+        let written = match &effect {
+            TaskEffect::ResetTimer { key, after } => {
+                write_owned(storage, key, *after, admission).await
+            }
+            _ => persist_task_effect(storage, &effect).await,
+        };
+        if let Err(message) = written {
+            if !keep_live {
+                return refused(message);
+            }
+            warn!(key = ?task_effect_key(&effect), %message, "Timer kept in memory only");
+        }
+    }
+    match task_handle {
+        Some(task_handle) => task_handle.send_stamped(effect, Some(admission)).await,
+        None => refused_handle(),
+    }
+}
+
+/// The error of a timer change on a node without a task handle.
+fn refused_handle() -> Event {
+    Event::Task(TaskEvent::Error {
+        key: None,
+        message: NO_TASK_HANDLE.to_string(),
+    })
+}
+
+/// A new scheduler admission, distinct from every other one and from [`NO_ADMISSION`].
+fn next_admission() -> u64 {
+    let entropy = next_entropy();
+    ((entropy ^ (entropy >> 64)) as u64).max(NO_ADMISSION + 1)
 }
 
 /// Whether a change arms an audit record retry, which runs from memory when storage cannot

@@ -48,35 +48,55 @@ pub async fn hold_timer(key: &TaskKey) -> tokio::sync::MutexGuard<'static, ()> {
     TIMER_LOCKS[index].lock().await
 }
 
-/// Writes or deletes the durable row a timer effect implies; a timer that re-arms from other
-/// state, or lives in memory only, has none.
+/// The admission of a row no scheduler admission wrote, such as a fixture's.
+pub const NO_ADMISSION: u64 = 0;
+
+/// Writes or deletes the durable row a timer effect implies, outside the scheduler: a written row
+/// belongs to [`NO_ADMISSION`]. A timer that re-arms from other state, or lives in memory only,
+/// has none.
 pub async fn persist_task_effect(
     storage: &StorageHandle,
     effect: &TaskEffect,
 ) -> Result<(), String> {
-    persist_stamped(storage, effect).await.map(|_| ())
+    if !timer_has_row(effect) {
+        return Ok(());
+    }
+    match effect {
+        TaskEffect::ResetTimer { key, after } => {
+            write_owned(storage, key, *after, NO_ADMISSION).await
+        }
+        TaskEffect::ShortenTimer { key, after } => shorten_timer(storage, key, *after).await,
+        TaskEffect::CancelTimer { key } => delete_timer(storage, key).await,
+        _ => Ok(()),
+    }
 }
 
-/// [`persist_task_effect`], answering the due time of the row the change leaves: the stamp the
-/// scheduler carries to the firing, so that firing deletes this row and no newer one.
-pub async fn persist_stamped(
-    storage: &StorageHandle,
-    effect: &TaskEffect,
-) -> Result<Option<u64>, String> {
-    if timer_is_restored(effect) || timer_is_ephemeral(effect) {
-        return Ok(None);
-    }
+/// Whether a timer change has a durable row to write or delete.
+pub fn timer_has_row(effect: &TaskEffect) -> bool {
+    let changes_row = matches!(
+        effect,
+        TaskEffect::ResetTimer { .. }
+            | TaskEffect::ShortenTimer { .. }
+            | TaskEffect::CancelTimer { .. }
+    );
+    changes_row && !timer_is_restored(effect) && !timer_is_ephemeral(effect)
+}
 
-    match effect {
-        TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await.map(Some),
-        TaskEffect::ShortenTimer { key, after } => {
-            shorten_timer(storage, key, *after).await.map(Some)
-        }
-        TaskEffect::CancelTimer { key } => delete_timer(storage, key).await.map(|_| None),
-        TaskEffect::ScheduleIdleTimer { .. }
-        | TaskEffect::AbortRunningHandlers { .. }
-        | TaskEffect::Pull(_) => Ok(None),
-    }
+/// Writes the row of the wake scheduler admission `admission` armed for `key`, due after
+/// `after`; only the firing of that admission deletes it.
+pub async fn write_owned(
+    storage: &StorageHandle,
+    key: &TaskKey,
+    after: Duration,
+    admission: u64,
+) -> Result<(), String> {
+    let due_unix_millis = due_at_millis(after)?;
+    let record = PersistedTaskTimer {
+        key: key.clone(),
+        due_unix_millis,
+        admission,
+    };
+    write_record(storage, &record).await
 }
 
 // Queue-backed tasks below re-arm from durable state, so their timer writes remain
@@ -122,14 +142,16 @@ fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     matches!(key, TaskKey::LockBucket { .. })
 }
 
-/// Deletes the row of a timer that fired: the row its `stamp` names, or without a stamp a row
-/// that is due. A row a later change wrote for the key stays. Best effort: a row that survives
-/// only fires the work once more after a restart.
+/// Deletes the row of a timer that fired, only if the firing's admission `stamp` owns it: a row a
+/// later admission wrote for the key stays, and a firing without a stamp owns no row. Best
+/// effort: a row that survives only fires the work once more after a restart.
 pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey, stamp: Option<u64>) {
+    let Some(stamp) = stamp else {
+        return;
+    };
     let _held = hold_timer(key).await;
-    let fired = |due: u64| stamp.map_or(due <= unix_timestamp_millis(), |stamp| due == stamp);
     let due = match read_timer(storage, key).await {
-        Ok(row) => row.is_some_and(|row| fired(row.due_unix_millis)),
+        Ok(row) => row.is_some_and(|row| row.admission == stamp),
         Err(error) => {
             warn!(error = %error, key = ?key, "Failed to read a fired task timer");
             return;
@@ -140,44 +162,15 @@ pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey, stam
     }
 }
 
-async fn write_timer(
-    storage: &StorageHandle,
-    key: &TaskKey,
-    after: Duration,
-) -> Result<u64, String> {
-    let due_unix_millis = due_at_millis(after)?;
-    write_record(
-        storage,
-        &PersistedTaskTimer {
-            key: key.clone(),
-            due_unix_millis,
-        },
-    )
-    .await?;
-    Ok(due_unix_millis)
-}
-
 async fn shorten_timer(
     storage: &StorageHandle,
     key: &TaskKey,
     after: Duration,
-) -> Result<u64, String> {
+) -> Result<(), String> {
     let requested_due_at = due_at_millis(after)?;
     match read_timer(storage, key).await? {
-        Some(existing) if existing.due_unix_millis <= requested_due_at => {
-            Ok(existing.due_unix_millis)
-        }
-        _ => {
-            write_record(
-                storage,
-                &PersistedTaskTimer {
-                    key: key.clone(),
-                    due_unix_millis: requested_due_at,
-                },
-            )
-            .await?;
-            Ok(requested_due_at)
-        }
+        Some(existing) if existing.due_unix_millis <= requested_due_at => Ok(()),
+        _ => write_owned(storage, key, after, NO_ADMISSION).await,
     }
 }
 

@@ -111,6 +111,8 @@ pub struct PersistedTaskTimer {
     pub key: TaskKey,
     #[serde(rename = "due_at_unix_millis")]
     pub due_unix_millis: u64,
+    /// The scheduler admission that owns this row: only the firing of that admission deletes it.
+    pub admission: u64,
 }
 
 /// The message of the error a task effect gets on a node without a task handler.

@@ -12,7 +12,7 @@ pub mod queue_lag;
 mod session;
 pub(crate) mod shard;
 mod storage;
-mod task;
+pub mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
