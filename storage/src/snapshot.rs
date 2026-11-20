@@ -318,6 +318,15 @@ impl<R: Read> SnapshotReader<R> {
 
     /// The next record, or `None` once the footer matched and no bytes follow it.
     pub fn next_record(&mut self) -> Result<Option<SnapshotRecord>, SnapshotError> {
+        self.next_with(|_| Ok(None::<std::io::Sink>))
+    }
+
+    /// Like [`Self::next_record`], but when `sink` answers a writer for an entry's key, the value
+    /// streams into it piece by piece and the returned entry holds an empty value.
+    pub fn next_with<W: Write>(
+        &mut self,
+        sink: impl FnOnce(&[u8]) -> Result<Option<W>, SnapshotError>,
+    ) -> Result<Option<SnapshotRecord>, SnapshotError> {
         if self.finished {
             return Ok(None);
         }
@@ -338,7 +347,13 @@ impl<R: Read> SnapshotReader<R> {
                 };
                 self.hasher.update(&[tag]);
                 let key = self.read_hashed_bytes()?;
-                let value = self.read_hashed_bytes()?;
+                let value = match sink(&key)? {
+                    Some(mut out) => {
+                        self.copy_hashed(&mut out)?;
+                        Vec::new()
+                    }
+                    None => self.read_hashed_bytes()?,
+                };
                 self.open_entries = Some(count + 1);
                 self.entry_count += 1;
                 Ok(Some(SnapshotRecord::Entry { key, value }))
@@ -421,14 +436,34 @@ impl<R: Read> SnapshotReader<R> {
         Ok(u64::from_be_bytes(bytes))
     }
 
+    /// Reads a length-prefixed field; memory grows with the bytes that arrive, never with the
+    /// length a corrupt stream claims.
     fn read_hashed_bytes(&mut self) -> Result<Vec<u8>, SnapshotError> {
         let len = self.read_hashed_u64()?;
-        let len = usize::try_from(len).map_err(|_| SnapshotError::LengthOverflow(len))?;
-        let mut bytes = vec![0_u8; len];
-        self.input.read_exact(&mut bytes)?;
+        let mut bytes = Vec::new();
+        let read = (&mut self.input).take(len).read_to_end(&mut bytes)?;
+        if read as u64 != len {
+            return Err(cut_field());
+        }
         self.hasher.update(&bytes);
         Ok(bytes)
     }
+
+    fn copy_hashed(&mut self, out: &mut impl Write) -> Result<(), SnapshotError> {
+        let len = self.read_hashed_u64()?;
+        let mut out = Hashed {
+            out,
+            hasher: &mut self.hasher,
+        };
+        if std::io::copy(&mut (&mut self.input).take(len), &mut out)? != len {
+            return Err(cut_field());
+        }
+        Ok(())
+    }
+}
+
+fn cut_field() -> SnapshotError {
+    std::io::Error::new(ErrorKind::UnexpectedEof, "a snapshot field ended early").into()
 }
 
 fn read_array<const N: usize>(input: &mut impl Read) -> Result<[u8; N], std::io::Error> {
@@ -477,6 +512,35 @@ mod tests {
             panic!("a short source fails the entry");
         };
         assert_eq!(early.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn claimed_length_bounded() {
+        let mut bytes = sample_stream()[..27].to_vec();
+        bytes.push(1);
+        bytes.extend_from_slice(&(1_u64 << 40).to_be_bytes());
+        bytes.extend_from_slice(b"ab");
+        assert!(matches!(read_all(&bytes), Err(SnapshotError::Io(_))));
+    }
+
+    #[test]
+    fn streams_entry_value() {
+        let bytes = sample_stream();
+        let mut reader = SnapshotReader::new(&bytes[..]).unwrap();
+        let mut sunk = Vec::new();
+        let mut records = Vec::new();
+        while let Some(record) = reader
+            .next_with(|key| Ok((key == b"k2").then_some(&mut sunk)))
+            .unwrap()
+        {
+            records.push(record);
+        }
+        let streamed = SnapshotRecord::Entry {
+            key: b"k2".to_vec(),
+            value: Vec::new(),
+        };
+        assert_eq!(records[2], streamed);
+        assert_eq!(sunk, b"v2");
     }
 
     #[test]

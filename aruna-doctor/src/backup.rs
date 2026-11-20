@@ -98,7 +98,7 @@ fn receive_backup(
     writer.flush()?;
     writer.get_ref().sync_all()?;
     let mut reader = SnapshotReader::new(BufReader::new(File::open(partial)?))?;
-    while reader.next_record()?.is_some() {}
+    while reader.next_with(|_| Ok(Some(std::io::sink())))?.is_some() {}
     Ok((bytes, reader.stats()))
 }
 
@@ -131,15 +131,26 @@ fn restore_into(
     let git_root = target.join("git");
     let mut section = None;
 
-    while let Some(record) = reader.next_record()? {
+    loop {
+        // Git files stream to disk; store entries are held, as Fjall takes whole values.
+        let git = matches!(section, Some(Section::Git));
+        let record = reader.next_with(|key| {
+            if git {
+                git_file(&git_root, key)
+            } else {
+                Ok(None)
+            }
+        })?;
+        let Some(record) = record else {
+            break;
+        };
         match record {
             SnapshotRecord::Keyspace(name) => section = Some(open_section(&databases, &name)?),
             SnapshotRecord::Entry { key, value } => match section.as_mut() {
                 Some(Section::Store(index, state)) => {
                     state.insert(&databases[*index], key, value)?
                 }
-                Some(Section::Git) => write_git(&git_root, &key, &value)?,
-                None => {}
+                Some(Section::Git) | None => {}
             },
             SnapshotRecord::EndKeyspace => {
                 if let Some(Section::Store(_, mut state)) = section.take() {
@@ -222,8 +233,9 @@ fn open_section(
     ))
 }
 
-/// Writes one Git entry below `root`; a key ending in `/` is a directory.
-fn write_git(root: &Path, key: &[u8], value: &[u8]) -> Result<(), SnapshotError> {
+/// Makes one Git entry below `root` and opens a file entry for its value; a key ending in `/` is
+/// a directory.
+fn git_file(root: &Path, key: &[u8]) -> Result<Option<File>, SnapshotError> {
     let relative = std::str::from_utf8(key)
         .map_err(|_| SnapshotError::InvalidStructure("non UTF-8 Git path in backup"))?;
     let path = Path::new(relative);
@@ -233,13 +245,12 @@ fn write_git(root: &Path, key: &[u8], value: &[u8]) -> Result<(), SnapshotError>
     let path = root.join(path);
     if relative.ends_with('/') {
         std::fs::create_dir_all(path)?;
-        return Ok(());
+        return Ok(None);
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, value)?;
-    Ok(())
+    Ok(Some(File::create(path)?))
 }
 
 #[cfg(test)]
