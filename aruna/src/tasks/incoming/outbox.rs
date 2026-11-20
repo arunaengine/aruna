@@ -79,3 +79,15 @@ impl OutboxDrainer {
         (rotation.totals.examined, rotation.cursor.is_some())
     }
 }
+
+/// Kicks the installed document-sync drain owner without replacing an existing
+/// persisted retry deadline.
+pub async fn drive_sync_drain(context: Arc<DriverContext>) {
+    if context.task_handle.is_none() {
+        warn!("Cannot kick document sync outbox drain without task handle");
+        return;
+    }
+    if let Err(error) = drive(OutboxTimerOperation::new(), context.as_ref()).await {
+        warn!(%error, "Failed to restore document sync outbox timer");
+    }
+}

@@ -8,7 +8,6 @@ use crate::tasks::incoming::restore::start_task_queues;
 use aruna_clock::testing::poll_until;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_drivers::testing::freeze_clock;
-use aruna_operations::sync::outbox::rotation::RotationTotals;
 
 #[test]
 fn outbox_upsert_revision() {
