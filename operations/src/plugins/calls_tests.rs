@@ -580,8 +580,7 @@ pub async fn run_replays(
     now_ms: u64,
     pages: (usize, usize),
 ) -> Result<usize, StoreError> {
-    let (read, _) = drive(RunReplays::new(now_ms, pages), ctx).await?;
-    Ok(read)
+    Ok(drive(RunReplays::new(now_ms, pages, None), ctx).await?.read)
 }
 
 pub async fn read_config(

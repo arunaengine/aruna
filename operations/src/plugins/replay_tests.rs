@@ -222,7 +222,8 @@ async fn cut_replay_continues() {
     plan_replays(&fixture.ctx, &config, local, now, no_clock)
         .await
         .unwrap();
-    assert_eq!(run_replays(&fixture.ctx, now, (1, 1)).await, Ok(1));
+    // One key page and one journal page of one row.
+    assert_eq!(run_replays(&fixture.ctx, now, (1, 2)).await, Ok(1));
     // After a restart the replay reads on from its last row.
     assert_eq!(
         run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await,
@@ -348,52 +349,67 @@ fn moved_record_updates() {
     );
 }
 
+fn key_page(keys: &[&[u8]]) -> IoResult {
+    let rows = keys.iter().map(|key| (key.to_vec(), Vec::new())).collect();
+    crate::plugins::rows::tests::page_result(rows, None)
+}
+
 #[test]
 fn replays_pages_bounded() {
-    let key = (b"r1".to_vec(), Vec::new());
-    let page = crate::plugins::rows::tests::page_result(vec![key], None);
-    let mut replays = RunReplays::new(9, (10, 2));
-    assert!(matches!(
-        replays.first(),
-        Ok(Next::Call(IoCall::Page { .. }))
-    ));
-    assert!(matches!(
-        replays.next(page),
-        Ok(Next::Call(IoCall::Child(_)))
-    ));
+    // The key page and every journal page cost one page; a spent budget names where to go on.
+    let mut replays = RunReplays::new(9, (10, 3), None);
+    assert!(matches!(replays.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let turn = replays.next(key_page(&[b"r1"]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     let more = child_result(Ok::<_, StoreError>((4usize, false)));
-    assert!(matches!(
-        replays.next(more),
-        Ok(Next::Call(IoCall::Child(_)))
-    ));
-    let last = child_result(Ok::<_, StoreError>((1usize, false)));
-    assert_eq!(
-        replays.next(last),
-        Ok(Next::Done((5, true))),
-        "the page bound ends it, with more to read"
-    );
+    assert!(matches!(replays.next(more), Ok(Next::Call(IoCall::Page { .. }))));
+    let spent = Replayed {
+        read: 4,
+        more: true,
+        after: Some(b"r1".to_vec()),
+    };
+    assert_eq!(replays.next(key_page(&[b"r1"])), Ok(Next::Done(spent)));
 }
 
 #[test]
 fn replays_take_turns() {
     // Each replay reads a page in turn, so a long replay cannot hold back the others.
-    let keys = [(b"r1".to_vec(), Vec::new()), (b"r2".to_vec(), Vec::new())];
-    let page = crate::plugins::rows::tests::page_result(keys.to_vec(), None);
-    let mut replays = RunReplays::new(9, (10, 3));
+    let mut replays = RunReplays::new(9, (10, 3), None);
     replays.first().unwrap();
-    replays.next(page).unwrap();
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
     assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
     let more = || child_result(Ok::<_, StoreError>((10usize, false)));
     replays.next(more()).unwrap();
-    assert_eq!(
-        replays.current.as_deref(),
-        Some(&b"r2"[..]),
-        "then the other one"
-    );
+    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]), "then the other one");
     let ended = child_result(Ok::<_, StoreError>((2usize, true)));
-    replays.next(ended).unwrap();
-    assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
-    assert_eq!(replays.next(more()), Ok(Next::Done((22, true))));
+    let spent = Replayed {
+        read: 12,
+        more: true,
+        after: Some(b"r2".to_vec()),
+    };
+    assert_eq!(replays.next(ended), Ok(Next::Done(spent)));
+}
+
+#[test]
+fn cursor_wraps_once() {
+    // A pass goes on after the last replay of the previous one, then wraps to the first once.
+    let mut replays = RunReplays::new(9, (10, 10), Some(b"r1".to_vec()));
+    let Ok(Next::Call(IoCall::Page { after, .. })) = replays.first() else {
+        panic!("expected the key page after the cursor");
+    };
+    assert_eq!(after.map(|key| key.to_vec()), Some(b"r1".to_vec()));
+    replays.next(key_page(&[b"r2"])).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]));
+    let ended = || child_result(Ok::<_, StoreError>((1usize, true)));
+    assert!(matches!(replays.next(ended()), Ok(Next::Call(IoCall::Page { .. }))));
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]), "then the first one");
+    let done = Replayed {
+        read: 2,
+        more: false,
+        after: None,
+    };
+    assert_eq!(replays.next(ended()), Ok(Next::Done(done)));
 }
 
 mod replay_pass {
