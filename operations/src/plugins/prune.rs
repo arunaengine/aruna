@@ -143,8 +143,10 @@ enum HooksPhase {
     Times,
     /// Deletes a page of old rows; `true` when more old rows may follow.
     DeletingOld(bool),
+    /// Reads a removing install's delivery ids a page at a time.
     Removing(Scan),
-    DeletingRemoved,
+    /// Deletes one page of them; the scan goes on while it has more.
+    DeletingRemoved(Option<Scan>),
 }
 
 impl PruneHooks {
@@ -174,7 +176,7 @@ impl Operation for PruneHooks {
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
-        match std::mem::replace(&mut self.phase, HooksPhase::DeletingRemoved) {
+        match std::mem::replace(&mut self.phase, HooksPhase::DeletingRemoved(None)) {
             HooksPhase::Times => {
                 let (rows, next) = page_of(answer)?;
                 let total = rows.len();
@@ -200,11 +202,8 @@ impl Operation for PruneHooks {
                 Ok(self.next_removing())
             }
             HooksPhase::Removing(mut scan) => {
-                let Some(rows) = scan.take(answer)? else {
-                    let ask = scan.ask();
-                    self.phase = HooksPhase::Removing(scan);
-                    return Ok(Next::Call(ask));
-                };
+                let (rows, more) = scan.page(answer)?;
+                self.phase = HooksPhase::DeletingRemoved(more.then_some(scan));
                 let (mut ids, mut times) = (Vec::new(), Vec::new());
                 for (key, value) in rows {
                     if let (Ok(at), Some(rest)) = (decode::<u64>(&value), key.get(1..)) {
@@ -217,9 +216,14 @@ impl Operation for PruneHooks {
                 ids.append(&mut times);
                 Ok(Next::Call(delete_call(ids)))
             }
-            HooksPhase::DeletingRemoved => {
+            HooksPhase::DeletingRemoved(scan) => {
                 done(answer)?;
-                Ok(self.next_removing())
+                let Some(scan) = scan else {
+                    return Ok(self.next_removing());
+                };
+                let ask = scan.ask();
+                self.phase = HooksPhase::Removing(scan);
+                Ok(Next::Call(ask))
             }
         }
     }
