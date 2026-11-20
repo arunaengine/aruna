@@ -616,11 +616,16 @@ fn plan_rows(
     for finished in finished {
         match finished {
             FinishedMaterializationJob::Completed(job) => {
-                let mut stored = false;
+                let mut ready = false;
                 if let Some(status) = job.status {
                     let current = guard_status(snapshot, &planned, status.document_id);
+                    // A newer event not materialized yet leaves this graph the newest one made.
+                    ready = current.is_some_and(|current| {
+                        current.event_id > status.event_id
+                            && current.state != MaterializationState::Materialized
+                    });
                     if should_write_final(current, &status) {
-                        stored = true;
+                        ready = true;
                         superseding.insert(status.document_id, status.event_id);
                         plan.writes.extend(job.iri_index_writes);
                         plan.deletes.extend(job.link_deletes);
@@ -637,7 +642,7 @@ fn plan_rows(
                         && let Some(raw_state_write) = job.raw_state_write
                     {
                         // A late merge keeps the newer status but stores the graph it published.
-                        stored = true;
+                        ready = true;
                         plan.writes.push(raw_state_write);
                     }
                 }
@@ -648,9 +653,9 @@ fn plan_rows(
                 if let Some(document_job_key) = job.document_job_key {
                     let mark = ByteView::from(document_job_key.clone());
                     let space = MATERIALIZATION_CAPTURE_KEYSPACE.to_string();
-                    // The finish that stores the graph marks its capture ready, and the mark stays
-                    // until the drain took the snapshot; a job that stored no graph drops its mark.
-                    match job.capture.filter(|_| stored) {
+                    // The finish that stores the graph, or keeps it the newest made, marks its
+                    // capture ready; the mark stays until the drain took the snapshot.
+                    match job.capture.filter(|_| ready) {
                         Some(mut capture) => {
                             capture.ready = true;
                             let value = ByteView::from(capture.to_bytes()?);

@@ -549,6 +549,40 @@ fn finish_readies_mark() {
     assert!(deletes.contains(&mark));
 }
 
+// A newer event still pending wins the status guard, but the graph this job made stays the
+// newest one materialized, so the finish makes its capture ready and leaves the status alone.
+#[test]
+fn pending_readies_capture() {
+    let capture = CaptureMark {
+        materialized_at_ms: 40,
+        event_id: ids().1,
+        jsonld: "{}".to_string(),
+        ready: false,
+    };
+    let mut done = CompletedMaterializationJob::without_rows(job_key(), sidecar_key(), None);
+    done.status = Some(materialization_success_status(&job(1), &event(), None, 50));
+    done.capture = Some(capture.clone());
+    let newer = create_event(ids().0, Ulid::from_parts(32, 1), "newer");
+    let pending = MaterializationStatusRecord::pending(&newer, 45);
+    let (_, _, pending) = materialization_status_entry(&pending).unwrap();
+    let mut commit = CommitFinishOperation::new(vec![FinishedMaterializationJob::Completed(done)]);
+    commit.first().unwrap();
+    let written = commit.next(IoResult::Values(vec![Some(pending)]));
+    let Ok(Next::Call(IoCall::Write(writes))) = written else {
+        panic!("expected the finish writes, got {written:?}");
+    };
+    let ready = CaptureMark {
+        ready: true,
+        ..capture
+    };
+    let row = (
+        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+        Key::from(sidecar_key()),
+        Value::from(ready.to_bytes().unwrap()),
+    );
+    assert_eq!(writes, vec![row]);
+}
+
 fn drain_result(turn: MaterializationTurn<MetadataDrainResult>) -> MetadataDrainResult {
     match turn {
         Ok(Next::Done(result)) => result,
