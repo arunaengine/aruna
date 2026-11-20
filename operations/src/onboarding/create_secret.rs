@@ -45,7 +45,8 @@ pub struct CreateSecretOperation {
     input: CreateSecretInput,
     stage: Stage,
     pages: PrefixPages,
-    now: u64,
+    /// The runner's clock in Unix seconds, the unit secrets store their expiry in.
+    now_secs: u64,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -89,7 +90,7 @@ impl CreateSecretOperation {
             input,
             stage: Stage::Config,
             pages: secret_pages(),
-            now: 0,
+            now_secs: 0,
         }
     }
 
@@ -124,7 +125,7 @@ impl CreateSecretOperation {
         }
         // Unclaimed secrets already occupy a slot: two mints followed by
         // two enrollments would otherwise cross the cap.
-        let scope = (owner, self.input.record.enrollment_id, self.now);
+        let scope = (owner, self.input.record.enrollment_id, self.now_secs);
         self.stage = Stage::Count(SlotCount::new(cap, enrolled, scope));
         Ok(Next::Call(self.pages.call()))
     }
@@ -147,7 +148,8 @@ impl CreateSecretOperation {
 pub(crate) struct SlotCount {
     cap: u32,
     enrolled: Vec<String>,
-    /// The owner, the secret being created or reserved, and the time that decides expiry.
+    /// The owner, the secret being created or reserved, and the time in Unix seconds that
+    /// decides expiry, the unit of `OnboardingSecretRecord::expires_at`.
     scope: (UserId, Ulid, u64),
     /// Secrets counted by the pages already read.
     pending: u32,
@@ -263,7 +265,7 @@ impl Operation for CreateSecretOperation {
     }
 
     fn stamp(&mut self, now_ms: u64) {
-        self.now = now_ms;
+        self.now_secs = now_ms / 1000;
     }
 
     fn first(&mut self) -> CreateTurn {
@@ -505,6 +507,30 @@ mod tests {
         for _ in 0..count {
             write_secret(context, &device_record(owner)).await;
         }
+    }
+
+    // A live secret with a real expiry holds its slot: the mint compares expiry in seconds, not
+    // against the runner's milliseconds, which would make every secret look expired.
+    #[tokio::test]
+    async fn cap_counts_live() {
+        let owner = UserId::local(Ulid::generate(), realm());
+        let (_dir, context) = context_with_cap(Some(1), &[]).await;
+        let now_secs = aruna_core::time::unix_timestamp_millis() / 1000;
+        let live = || OnboardingSecretRecord {
+            expires_at: now_secs + 3600,
+            ..device_record(owner)
+        };
+        let mint_live = |record| {
+            drive(
+                CreateSecretOperation::new(CreateSecretInput { record }),
+                &context,
+            )
+        };
+        mint_live(live()).await.expect("the first device mints");
+        assert!(matches!(
+            mint_live(live()).await,
+            Err(CreateSecretError::DeviceCapExceeded { limit: 1 })
+        ));
     }
 
     // Only a live secret holds a slot: an expired one counts only while an enrollment finalizes it.
