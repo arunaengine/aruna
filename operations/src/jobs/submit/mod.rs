@@ -2,6 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod execution;
+pub mod local;
+
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};

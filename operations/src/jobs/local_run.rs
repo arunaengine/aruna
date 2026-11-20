@@ -21,7 +21,7 @@ use ulid::Ulid;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
-use crate::jobs::submit_execution::{ExecutionSubmission, SubmitExecutionOperation};
+use crate::jobs::submit::execution::{ExecutionSubmission, SubmitExecutionOperation};
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,

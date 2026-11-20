@@ -64,6 +64,7 @@ SMALL_DOMAINS = {
     "operations/src/jobs/lifecycle/witness": "grouped shared-prefix domain",
     "operations/src/jobs/staging": "grouped shared-prefix domain",
     "operations/src/jobs/store": "coherent ownership scope",
+    "operations/src/jobs/submit": "grouped shared-prefix domain",
     "operations/src/metadata/provenance": "grouped shared-prefix domain",
     "operations/src/metadata/api/links": "grouped shared-prefix domain",
     "operations/src/metadata/forward": "grouped shared-prefix domain",

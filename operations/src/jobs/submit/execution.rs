@@ -20,7 +20,7 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::user::id::UserId;
 use tracing::warn;
 
-use super::submit::{SubmitJobOperation, SubmitJobSpec};
+use super::{SubmitJobOperation, SubmitJobSpec};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, mint_configured_job, mint_job_id};
 

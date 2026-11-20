@@ -43,7 +43,7 @@ use crate::jobs::export::snapshot::CrateJsonOperation;
 use crate::jobs::repository::links::LinkError;
 use crate::jobs::repository::pull::{PullRunningOperation, SettleImportOperation};
 use crate::jobs::repository::{TransferError, is_reference};
-use crate::jobs::submit_local::SubmitLocalOperation;
+use crate::jobs::submit::local::SubmitLocalOperation;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentResult,
 };

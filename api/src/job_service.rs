@@ -34,7 +34,7 @@ use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
 use aruna_operations::jobs::store::mutation_error::JobMutationError;
 use aruna_operations::jobs::store::row_calls;
-use aruna_operations::jobs::submit_local::{DedupLookupOperation, SubmitLocalOperation};
+use aruna_operations::jobs::submit::local::{DedupLookupOperation, SubmitLocalOperation};
 
 /// Jobs the serving node owns for this user. Listings are per origin by contract.
 pub async fn list_owned_jobs(

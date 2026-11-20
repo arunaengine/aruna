@@ -20,7 +20,7 @@ use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::links::{ChangeLinkOperation, LinkChange};
-use aruna_operations::jobs::submit_local::SubmitLocalOperation;
+use aruna_operations::jobs::submit::local::SubmitLocalOperation;
 use aruna_operations::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_operations::metadata::delete_document::DeleteDocumentOperation;
 use aruna_operations::metadata::revision_read::RawViewOperation;

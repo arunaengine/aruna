@@ -30,7 +30,7 @@ use super::submission_rules::{caller_of, family_view, is_device, pin_outputs, re
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{PageReadError, StoreEntriesOperation};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::submit_execution::validate_execution;
+use crate::jobs::submit::execution::validate_execution;
 use aruna_core::job_request::{
     self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError, mint_configured_job,
     store_workspace,
