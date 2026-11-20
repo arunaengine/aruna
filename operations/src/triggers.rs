@@ -83,6 +83,7 @@ use crate::replication::catch_up::CatchUpCursors;
 use crate::replication::drain_timer::ReplicationTimerOperation;
 use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
 use crate::replication::mirror_repair::drain::DrainRepairsOperation;
+use crate::s3::bucket::audit_retry::AuditTimerOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
@@ -283,6 +284,7 @@ pub enum TimerOperation {
     MaintainRanges(RangeTimerOperation),
     PublishRegistration(RenewalTimerOperation),
     DrainLinkQueue(LinkRunOperation),
+    RecordAudit(AuditTimerOperation),
     RefreshBlobHolders(HoldersTimerOperation),
     DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
@@ -450,6 +452,10 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             let drain = LinkRunOperation::new(scope);
             Some(TimerOperation::DrainLinkQueue(drain))
         }
+        TaskKey::RecordAudit { .. } => {
+            let store = AuditTimerOperation::new(key.clone());
+            Some(TimerOperation::RecordAudit(store))
+        }
         TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
             input,
         ))),
@@ -517,6 +523,7 @@ macro_rules! each_timer {
             TimerOperation::MaintainRanges($operation) => $body,
             TimerOperation::PublishRegistration($operation) => $body,
             TimerOperation::DrainLinkQueue($operation) => $body,
+            TimerOperation::RecordAudit($operation) => $body,
             TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
@@ -886,6 +893,12 @@ impl TimerRun for RenewalTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         let after = result.unwrap_or(Some(PUBLISH_INTERVAL));
         Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for AuditTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
     }
 }
 

@@ -707,15 +707,8 @@ impl OperationsTaskHandler {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
                 }
             }),
-            key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
-                use aruna_operations::s3::bucket::audit_retry::{AUDIT_RETRY, StoreAuditOperation};
-                // The key change already applies; only its record waits for storage.
-                let store = StoreAuditOperation::new(key.clone());
-                if let Err(error) = drive(store, &self.context).await {
-                    warn!(error = %error, "Bucket key audit record still not stored");
-                    self.keep_retrying(key, AUDIT_RETRY).await;
-                }
-            }),
+            // The key change already applies; only its record waits for storage.
+            TaskKey::RecordAudit { .. } => Box::pin(self.run_trigger(key)),
             TaskKey::DeliverKeyWakes => Box::pin(self.run_trigger(key)),
             TaskKey::PublishRegistration => Box::pin(self.run_trigger(key)),
             TaskKey::PruneConnectorReferences => Box::pin(self.run_trigger(key)),
