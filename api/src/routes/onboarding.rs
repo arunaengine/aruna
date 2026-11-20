@@ -10,8 +10,7 @@ use aruna_core::id::NodeId;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateSecretRequest,
     CreateSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
-    OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode, issuer_proof_message,
-    node_proof_message,
+    OnboardingSecretRecord, RequestedOnboardingMode, issuer_proof_message, node_proof_message,
 };
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
@@ -29,6 +28,7 @@ use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
 use aruna_operations::onboarding::expiry_page::ExpiryPageOperation;
+use aruna_operations::onboarding::live_page::LivePageOperation;
 use aruna_operations::onboarding::finalize_bootstrap::{
     BootstrapFinalizeError, BootstrapFinalizeInput, FinalizeBootstrapOperation,
 };
@@ -253,35 +253,14 @@ async fn enforce_enrollment_policies(
     .map_err(|_| ServerError::Forbidden)
 }
 
-/// Removes the expired secrets that no enrollment finishes, soonest expiry first; the expiry
-/// index ends the walk at the first secret that is still valid.
-async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
-    let now = now_timestamp();
-    let mut after = None;
-    loop {
-        let page = drive(ExpiryPageOperation::new(after, 256), &state.get_ctx())
-            .await
-            .map_err(|err| ServerError::InternalError(err.into()))?;
-        for secret in page.entries {
-            if secret.record.expires_at >= now {
-                return Ok(());
-            }
-            if !matches!(&secret.state, OnboardingSecretState::Finalizing { .. }) {
-                drive(
-                    DeleteSecretOperation::new(DeleteSecretInput {
-                        enrollment_id: secret.record.enrollment_id,
-                    }),
-                    &state.get_ctx(),
-                )
-                .await
-                .map_err(map_delete_error)?;
-            }
-        }
-        match page.next {
-            Some(next) => after = Some(next),
-            None => return Ok(()),
-        }
-    }
+/// Prunes the expired secrets of the first expiry page that no enrollment finishes, so a mint
+/// frees what lapsed without walking a whole backlog; later pages go with later requests.
+async fn prune_head(state: &Arc<ServerState>) -> ServerResult<()> {
+    let head = LivePageOperation::new(now_timestamp(), None, 256);
+    drive(head, &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.into()))?;
+    Ok(())
 }
 
 #[utoipa::path(
@@ -375,7 +354,7 @@ pub async fn create_onboarding_secret(
             owner: auth.user_id,
         },
     };
-    prune_stale_secrets(&state).await?;
+    prune_head(&state).await?;
 
     let ttl = request
         .expires_in_seconds
@@ -479,7 +458,7 @@ node serves it, and every other node relays the call to one.
 
 **Behavior**
 - The secret value itself is never returned, because only its hash was kept when it was minted.
-- Expired secrets that are not mid-enrollment are discarded before the list is built.
+- Expired secrets of the returned page that are not mid-enrollment are discarded and left out.
 - The list comes in pages of `limit` secrets (1 to 1000, 100 by default); `next_cursor`
   continues it, soonest expiry first across pages.
 - The list is this management node's own state, not a realm-wide fan-out."#,
@@ -529,9 +508,10 @@ pub async fn list_onboarding_secrets(
         }
         None => None,
     };
-    prune_stale_secrets(&state).await?;
+    // The page's own expired secrets are pruned and left out; finalizing ones stay listed.
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
-    let page = drive(ExpiryPageOperation::new(after, limit), &state.get_ctx())
+    let page = LivePageOperation::new(now_timestamp(), after, limit);
+    let page = drive(page, &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.into()))?;
 
