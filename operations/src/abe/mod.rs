@@ -155,6 +155,9 @@ pub struct KeyOperation {
     /// The holders told of this request, and the holder page that follows the one written.
     notified: std::collections::BTreeSet<aruna_core::user::id::UserId>,
     holder_next: Option<Key>,
+    /// The role holders still to tell, in bounded chunks before the explicit holder pages.
+    role_holders: std::collections::VecDeque<aruna_core::user::id::UserId>,
+    explicit_started: bool,
     quiet: bool,
     managed: bool,
     result: Option<KeyResult>,
@@ -194,6 +197,8 @@ impl KeyOperation {
             notify: false,
             notified: Default::default(),
             holder_next: None,
+            role_holders: Default::default(),
+            explicit_started: false,
             quiet: false,
             managed: false,
             result: None,
@@ -605,6 +610,72 @@ mod tests {
         let mut values = vec![None; 8];
         values[7] = Some(Value::from(b"user".to_vec()));
         assert_eq!(operation.snapshot_read(values), Err(KeyError::Unprepared));
+    }
+
+    /// A request of user 5 in realm 1 for a bucket whose snapshot names `holders`.
+    fn holder_fixture(
+        holders: std::collections::BTreeSet<aruna_core::user::id::UserId>,
+    ) -> KeyOperation {
+        let realm_id = RealmId([1; 32]);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let auth = AuthContext {
+            user_id: user,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let action = KeyAction::Request(KeyScope::Subtree("foo/".into()));
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        operation.info = Some(BucketInfo {
+            group_id: Ulid::from_bytes([8; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: None,
+        });
+        operation.snapshot = Some(Snapshot {
+            parameters: AbeParameters {
+                realm_id,
+                node_id: node,
+                key: BucketKeyRef::new(Ulid::from_bytes([4; 16]), 1),
+                fingerprint: [7; 32],
+                parameters: vec![9; 3],
+            },
+            epoch: 1,
+            revisions: Vec::new(),
+            rules: PermissionRules::from_roles(Vec::new(), None).unwrap(),
+            holder: false,
+            holders,
+            policies: false,
+            due: false,
+            checks: Default::default(),
+        });
+        operation
+    }
+
+    #[test]
+    fn role_holders_chunked() {
+        // Many role holders are told in bounded writes before the explicit holder pages.
+        let realm_id = RealmId([1; 32]);
+        let holders = (0..300u128)
+            .map(|n| aruna_core::user::id::UserId::new(Ulid::from_parts(1, n), realm_id))
+            .collect();
+        let mut operation = holder_fixture(holders);
+        let Some(Ok(Next::Call(IoCall::Write(first)))) = operation.holders() else {
+            panic!("expected the first chunk");
+        };
+        assert_eq!(first.len(), requests::HOLDER_PAGE);
+        let Ok(Next::Call(IoCall::Write(rest))) = operation.next(IoResult::Done) else {
+            panic!("expected the rest of the role holders");
+        };
+        assert_eq!(rest.len(), 300 - requests::HOLDER_PAGE);
+        let turn = operation.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))), "then the explicit pages");
     }
 
     #[test]
