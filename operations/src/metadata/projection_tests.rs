@@ -1431,3 +1431,82 @@ fn timer_needs_marker() {
         Ok(Next::Call(effect_call(schedule_projection(Duration::ZERO))))
     );
 }
+
+// A pending marker and the event log both hold a create event that a queued applied batch still
+// owns. The marker drain and the log replay leave it to the applied drain, which projects the
+// document's batches in acceptance order; once the batch is gone the drain projects it.
+#[tokio::test]
+async fn owned_recovery_waits() {
+    use aruna_core::document::{
+        AppliedStep, AppliedSync, DocumentReconcileResult, applied_sync_entry, order_entry_key,
+    };
+    use aruna_core::keyspaces::{APPLIED_ORDER_KEYSPACE, APPLIED_SYNC_KEYSPACE};
+
+    let dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let event = create_event();
+    let document_id = event.record.document_id;
+    let marker = pending_projection_key(document_id, event.event_id);
+    let batch = AppliedSync {
+        id: Ulid::from_parts(31, 1),
+        node_id: node(1),
+        realm_id: None,
+        result: DocumentReconcileResult {
+            metadata_create_events: vec![event.clone()],
+            ..DocumentReconcileResult::default()
+        },
+        next: AppliedStep::Metadata,
+    };
+    let entry = order_entry_key(document_id, 0);
+    write_entries(
+        &storage,
+        vec![
+            create_event_entry(&event).expect("event log entry"),
+            (
+                PENDING_PROJECTION_KEYSPACE.to_string(),
+                marker.clone(),
+                ByteView::from(Vec::new()),
+            ),
+            applied_sync_entry(&batch).expect("batch row"),
+            (
+                APPLIED_ORDER_KEYSPACE.to_string(),
+                entry.clone(),
+                ByteView::from(batch.id.to_bytes().to_vec()),
+            ),
+        ],
+    )
+    .await;
+    let context = DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+
+    let result = drain_projection_queue(&context).await.expect("drain runs");
+    assert_eq!((result.markers_examined, result.projected), (1, 0));
+    assert!(pending_marker_exists(&storage, marker.to_vec()).await);
+    let replayed = drive(ReplayPageOperation::new(None, None), &context).await;
+    assert_eq!(replayed.expect("replay runs").0, 0);
+
+    let batch_key = ByteView::from(batch.id.to_bytes().to_vec());
+    for (space, key) in [
+        (APPLIED_SYNC_KEYSPACE, batch_key),
+        (APPLIED_ORDER_KEYSPACE, entry),
+    ] {
+        let deleted = storage
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: space.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(deleted, Event::Storage(StorageEvent::DeleteResult { .. })));
+    }
+    let result = drain_projection_queue(&context).await.expect("drain runs");
+    assert_eq!(result.projected, 1);
+}

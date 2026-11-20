@@ -44,6 +44,7 @@ use ulid::Ulid;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::deletion_guard::metadata_call;
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
+use crate::metadata::owned_events::{Owned, OwnedEventsOperation};
 use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::metadata::repository::{
     create_materialization_entries, create_outbox_entries, create_outbox_record,
@@ -1267,18 +1268,23 @@ impl Operation for ProjectLoggedOperation {
 }
 
 /// One drain pass of the pending projection queue: projects the events of the first page of
-/// markers and deletes malformed and orphan markers.
+/// markers and deletes malformed and orphan markers. Events a queued applied batch owns stay for
+/// the applied drain, which projects them in acceptance order; a page of only those reads on.
 #[derive(Debug, PartialEq)]
 pub struct DrainProjectionOperation {
     local_node: Option<NodeId>,
     stage: DrainStage,
     has_more: bool,
+    after: Option<Key>,
+    /// Markers left for the applied drain; they count as examined.
+    deferred: usize,
 }
 
 #[derive(Debug, PartialEq)]
 enum DrainStage {
     Page,
     Malformed(Vec<(Ulid, Ulid)>),
+    Owned(Vec<(Ulid, Ulid)>),
     Project,
 }
 
@@ -1298,7 +1304,28 @@ impl DrainProjectionOperation {
             local_node,
             stage: DrainStage::Page,
             has_more: false,
+            after: None,
+            deferred: 0,
         }
+    }
+
+    fn page(&mut self) -> DrainTurn {
+        self.stage = DrainStage::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.clone(),
+            limit: PROJECTION_PAGE_SIZE,
+        }))
+    }
+
+    fn check_owned(&mut self, targets: Vec<(Ulid, Ulid)>) -> DrainTurn {
+        if targets.is_empty() {
+            return self.project(targets);
+        }
+        let owned = OwnedEventsOperation::new(targets.iter().map(|(document_id, _)| *document_id));
+        self.stage = DrainStage::Owned(targets);
+        Ok(Next::Call(IoCall::child(owned)))
     }
 
     fn project(&mut self, targets: Vec<(Ulid, Ulid)>) -> DrainTurn {
@@ -1313,12 +1340,7 @@ impl Operation for DrainProjectionOperation {
     type Error = MetadataProjectionError;
 
     fn first(&mut self) -> DrainTurn {
-        Ok(Next::Call(IoCall::Page {
-            space: PENDING_PROJECTION_KEYSPACE.to_string(),
-            prefix: Key::from(Vec::new()),
-            after: None,
-            limit: PROJECTION_PAGE_SIZE,
-        }))
+        self.page()
     }
 
     fn next(&mut self, result: IoResult) -> DrainTurn {
@@ -1326,6 +1348,7 @@ impl Operation for DrainProjectionOperation {
             DrainStage::Page => {
                 let (rows, next) = result.page()?;
                 self.has_more = next.is_some();
+                self.after = next;
                 let mut targets = Vec::with_capacity(rows.len());
                 let mut malformed = Vec::new();
                 for (key, _) in rows {
@@ -1338,19 +1361,29 @@ impl Operation for DrainProjectionOperation {
                     }
                 }
                 if malformed.is_empty() {
-                    return self.project(targets);
+                    return self.check_owned(targets);
                 }
                 self.stage = DrainStage::Malformed(targets);
                 Ok(Next::Call(IoCall::Delete(malformed)))
             }
             DrainStage::Malformed(targets) => {
                 result.done()?;
+                self.check_owned(targets)
+            }
+            DrainStage::Owned(mut targets) => {
+                let owned = result.child::<Owned, IoError>()??;
+                let examined = targets.len();
+                targets.retain(|target| !owned.contains(target));
+                self.deferred = self.deferred.saturating_add(examined - targets.len());
+                if targets.is_empty() && self.has_more {
+                    return self.page();
+                }
                 self.project(targets)
             }
             DrainStage::Project => {
                 let logged = result.child::<LoggedProjection, MetadataProjectionError>()??;
                 Ok(Next::Done(PendingProjectionResult {
-                    markers_examined: logged.existing,
+                    markers_examined: logged.existing.saturating_add(self.deferred),
                     projected: logged.projected,
                     has_more: self.has_more,
                 }))
@@ -1360,12 +1393,15 @@ impl Operation for DrainProjectionOperation {
 }
 
 /// Replays one page of the event log into the projection; answers what it projected and where
-/// the next page starts, so a shell can stop at a page boundary.
+/// the next page starts, so a shell can stop at a page boundary. Events a queued applied batch
+/// owns are left to the applied drain, which projects them in acceptance order.
 #[derive(Debug, PartialEq)]
 pub struct ReplayPageOperation {
     after: Option<Key>,
     local_node: Option<NodeId>,
     next: Option<Key>,
+    /// The page's events while the owned ones are looked up.
+    events: Option<Vec<MetadataEventRecord>>,
     projecting: bool,
 }
 
@@ -1375,6 +1411,7 @@ impl ReplayPageOperation {
             after,
             local_node,
             next: None,
+            events: None,
             projecting: false,
         }
     }
@@ -1398,14 +1435,22 @@ impl Operation for ReplayPageOperation {
             let projected = result.child::<usize, MetadataProjectionError>()??;
             return Ok(Next::Done((projected, self.next.take())));
         }
+        if let Some(mut events) = self.events.take() {
+            let owned = result.child::<Owned, IoError>()??;
+            events.retain(|event| !owned.contains(&(event.record.document_id, event.event_id)));
+            self.projecting = true;
+            let project = ProjectEventsOperation::new(events, self.local_node);
+            return Ok(Next::Call(IoCall::child(project)));
+        }
         let (rows, next) = result.page()?;
         self.next = next;
         let events = (rows.iter())
             .map(|(_, value)| decode::<MetadataEventRecord>(value))
             .collect::<Result<Vec<_>, _>>()?;
-        self.projecting = true;
-        let project = ProjectEventsOperation::new(events, self.local_node);
-        Ok(Next::Call(IoCall::child(project)))
+        let documents = events.iter().map(|event| event.record.document_id);
+        let owned = OwnedEventsOperation::new(documents);
+        self.events = Some(events);
+        Ok(Next::Call(IoCall::child(owned)))
     }
 }
 

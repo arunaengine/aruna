@@ -28,6 +28,7 @@ pub(crate) mod live_records;
 pub mod local_query;
 pub mod materialization_queue;
 pub(crate) mod object_version;
+pub mod owned_events;
 pub mod persistent_id;
 pub mod pid_read;
 pub(crate) mod pid_transition;
