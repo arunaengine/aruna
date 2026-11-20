@@ -35,6 +35,7 @@ use aruna_operations::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
 };
 use aruna_operations::onboarding::list_secrets::{ListSecretsOperation, SecretPage};
+use aruna_operations::onboarding::read_secret::ReadSecretOperation;
 use aruna_operations::onboarding::reserve_secret::ReserveSecretError;
 use aruna_operations::realm::ensure_config::EnsureConfigError;
 use axum::extract::{Path, State};
@@ -621,17 +622,10 @@ pub async fn get_secret_status(
 ) -> ServerResult<(StatusCode, Json<OnboardingSecretResponse>)> {
     let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::BadRequest)?;
     let caller = auth.clone().ok_or(ServerError::Unauthorized)?;
-    let mut after = None;
-    let entry = loop {
-        let page = secret_page(&state, after).await?;
-        let mut entries = page.entries.into_iter();
-        let found = entries.find(|entry| entry.record.enrollment_id == enrollment_id);
-        match (found, page.next) {
-            (Some(entry), _) => break entry,
-            (None, Some(next)) => after = Some(next),
-            (None, None) => return Err(ServerError::NotFound),
-        }
-    };
+    let entry = drive(ReadSecretOperation::new(enrollment_id), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.into()))?
+        .ok_or(ServerError::NotFound)?;
 
     // The owner polls its own device; anybody else needs the admin path. A
     // refusal answers 404 so the route cannot confirm a foreign secret exists.
