@@ -49,6 +49,12 @@ fn value(bytes: Option<Vec<u8>>) -> IoResult {
     IoResult::Values(vec![bytes.map(Into::into)])
 }
 
+/// What a start reads: the bucket row and the saved count, if any.
+fn bucket_rows(saved: Option<&CoverageCount>) -> IoResult {
+    let saved = saved.map(|count| count.to_bytes().unwrap().into());
+    IoResult::Values(vec![Some(b"bucket".to_vec().into()), saved])
+}
+
 #[test]
 fn start_queues_count() {
     let mut start = StartCountOperation::new("photos".to_string(), None);
@@ -56,7 +62,7 @@ fn start_queues_count() {
     start.seed(5);
     assert_eq!(start.transaction(), TransactionMode::Write);
     assert!(matches!(start.first(), Ok(Next::Call(IoCall::Read(_)))));
-    let Ok(Next::Call(IoCall::Write(rows))) = start.next(value(Some(b"bucket".to_vec()))) else {
+    let Ok(Next::Call(IoCall::Write(rows))) = start.next(bucket_rows(None)) else {
         panic!("the record and the queue entry are written");
     };
     let spaces: Vec<&str> = rows.iter().map(|(space, _, _)| space.as_str()).collect();
@@ -82,7 +88,7 @@ fn start_joins_run() {
     start.stamp(7);
     start.seed(5);
     start.first().unwrap();
-    let Ok(Next::Call(IoCall::Write(rows))) = start.next(value(Some(b"bucket".to_vec()))) else {
+    let Ok(Next::Call(IoCall::Write(rows))) = start.next(bucket_rows(None)) else {
         panic!("the record and the queue entry are written");
     };
     let written = CoverageCount::from_bytes(rows[0].2.as_ref()).unwrap();
@@ -92,17 +98,45 @@ fn start_joins_run() {
     assert_eq!((restarted.observed, restarted.run), (0, Some(run)));
 }
 
+// Run ids order the starts of a bucket: a delayed start leaves a later run, a start of the saved
+// run answers with its count, and only a later run replaces it.
+#[test]
+fn start_order_kept() {
+    let saved = CoverageCount {
+        run: Some(Ulid::from_parts(9, 1)),
+        observed: 4,
+        ..CoverageCount::new(9)
+    };
+    let starts = [
+        (8, Err(StartCountError::Superseded)),
+        (9, Ok(Next::Done(saved.clone()))),
+    ];
+    for (time, answer) in starts {
+        let run = Some(Ulid::from_parts(time, 1));
+        let mut start = StartCountOperation::new("photos".to_string(), run);
+        start.first().unwrap();
+        assert_eq!(start.next(bucket_rows(Some(&saved))), answer);
+    }
+    let later = Some(Ulid::from_parts(10, 1));
+    let mut start = StartCountOperation::new("photos".to_string(), later);
+    start.first().unwrap();
+    let replaced = start.next(bucket_rows(Some(&saved)));
+    assert!(matches!(replaced, Ok(Next::Call(IoCall::Write(_)))));
+}
+
 // A coordinator a start missed holds its previous run or no count; either leaves the answer.
 #[test]
 fn other_runs_dropped() {
     let (old, new) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
     let runs = [Some(new), Some(old), None, Some(new)];
-    assert_eq!(current_run(None, &runs), Some(new));
+    assert_eq!(current_run(None, &[Some(new), None]), Ok(Some(new)));
     assert_eq!(other_runs(Some(new), &runs), [1, 2]);
-    // A caller polls the run its start answered with, even when a newer one exists.
-    assert_eq!(current_run(Some(old), &runs), Some(old));
+    // Without an asked run, coordinators on different runs leave no choice.
+    assert_eq!(current_run(None, &runs), Err(vec![old, new]));
+    // A caller polls the run its start answered with.
+    assert_eq!(current_run(Some(old), &runs), Ok(Some(old)));
     assert_eq!(other_runs(Some(old), &runs), [0, 2, 3]);
-    assert_eq!(current_run(None, &[None, None]), None);
+    assert_eq!(current_run(None, &[None, None]), Ok(None));
     assert!(other_runs(None, &[None, None]).is_empty());
 }
 
@@ -135,7 +169,8 @@ fn read_filters_run() {
 fn missing_bucket_refused() {
     let mut start = StartCountOperation::new("photos".to_string(), None);
     start.first().unwrap();
-    assert_eq!(start.next(value(None)), Err(StartCountError::NoSuchBucket));
+    let rows = IoResult::Values(vec![None, None]);
+    assert_eq!(start.next(rows), Err(StartCountError::NoSuchBucket));
 }
 
 #[test]

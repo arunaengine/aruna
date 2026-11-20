@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::VecDeque;
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -38,6 +39,8 @@ pub enum StartCountError {
     Conversion(#[from] ConversionError),
     #[error("The specified bucket does not exist.")]
     NoSuchBucket,
+    #[error("a coverage count run ordered after this one holds the bucket")]
+    Superseded,
     #[error("the coverage count did not start: {0}")]
     Io(IoError),
 }
@@ -61,8 +64,9 @@ fn decode_count(value: Option<Value>) -> Result<Option<CoverageCount>, Conversio
         .transpose()
 }
 
-/// Replaces the bucket's saved count with one started at the run's time and wakes the migration
-/// task once the record committed. The count joins `run`, or a run it mints when none is given.
+/// Replaces the bucket's saved count with one of `run`, or of a run it mints, and wakes the
+/// migration task once it committed. Run ids order the starts: a saved count of a later run stays
+/// and refuses the start, one of the same run answers as it is.
 #[derive(Debug, PartialEq)]
 pub struct StartCountOperation {
     bucket: String,
@@ -85,10 +89,17 @@ impl StartCountOperation {
     }
 }
 
-/// The run a distributed count reports: the one asked for, else the newest any coordinator holds.
-/// Only nodes mint runs, so the newest id is the latest start.
-pub fn current_run(wanted: Option<Ulid>, runs: &[Option<Ulid>]) -> Option<Ulid> {
-    wanted.or_else(|| runs.iter().flatten().max().copied())
+/// The run a distributed count reports: the one asked for, else the one every coordinator with a
+/// count holds. Without an asked run, different runs leave no choice; the error names them.
+pub fn current_run(wanted: Option<Ulid>, runs: &[Option<Ulid>]) -> Result<Option<Ulid>, Vec<Ulid>> {
+    if wanted.is_some() {
+        return Ok(wanted);
+    }
+    let seen: BTreeSet<Ulid> = runs.iter().flatten().copied().collect();
+    match seen.len() {
+        0 | 1 => Ok(seen.first().copied()),
+        _ => Err(seen.into_iter().collect()),
+    }
 }
 
 /// The positions of coordinator counts outside `current`; once a run is known, a coordinator
@@ -150,10 +161,11 @@ impl Operation for StartCountOperation {
     fn first(&mut self) -> Result<Next<CoverageCount>, StartCountError> {
         let started = self.record.started_at_ms;
         self.record.run = Some(self.record.run.unwrap_or_else(|| self.ids.mint(started)));
-        Ok(Next::Call(read_row(
-            S3_BUCKET_KEYSPACE,
-            count_key(&self.bucket),
-        )))
+        let key = count_key(&self.bucket);
+        Ok(Next::Call(IoCall::Read(vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (COVERAGE_COUNT_KEYSPACE.to_string(), key),
+        ])))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<CoverageCount>, StartCountError> {
@@ -164,8 +176,21 @@ impl Operation for StartCountOperation {
                 calls: vec![wake_migration()],
             });
         }
-        if result.value()?.is_none() {
+        let [bucket, stored] = <[_; 2]>::try_from(result.values()?).map_err(|_| {
+            StartCountError::Io(IoError::Unexpected {
+                expected: "the bucket and its count",
+                got: "another number of rows",
+            })
+        })?;
+        if bucket.is_none() {
             return Err(StartCountError::NoSuchBucket);
+        }
+        if let Some(stored) = decode_count(stored)? {
+            match stored.run.cmp(&self.record.run) {
+                Ordering::Greater => return Err(StartCountError::Superseded),
+                Ordering::Equal => return Ok(Next::Done(stored)),
+                Ordering::Less => {}
+            }
         }
         let key = count_key(&self.bucket);
         let value = self.record.to_bytes()?;
