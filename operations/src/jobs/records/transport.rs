@@ -27,7 +27,7 @@ use super::family::{FamilyReadError, LoadFamilyOperation};
 use super::pages::{KeepPagesOperation, PageReadError, ServingNode};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::cancel::CancelLocalRunsOperation;
+use crate::jobs::lifecycle::cancel::CancelRunsOperation;
 use crate::jobs::lifecycle::launch_admit::{
     AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
 };
@@ -364,7 +364,7 @@ impl ServeRecordOperation {
         }
         let family = self.accepted()?.family;
         self.step = ServeStep::Stopped;
-        let cancel = CancelLocalRunsOperation::new(family, self.serving, self.now_ms);
+        let cancel = CancelRunsOperation::new(family, self.serving, self.now_ms);
         Ok(Next::Call(IoCall::child(cancel)))
     }
 }

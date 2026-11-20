@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
-use super::cancel::FlagLocalRunOperation;
+use super::cancel::FlagRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
 use super::outbox::schedule_outbox_drain;
@@ -453,7 +453,7 @@ impl Operation for AcceptLaunchOperation {
         let admitted = matches!(self.decision, Some(Ok(_)));
         match self.cancel.filter(|_| admitted) {
             Some(job_id) => {
-                let flag = FlagLocalRunOperation::new(job_id, self.serving, self.now_ms);
+                let flag = FlagRunOperation::new(job_id, self.serving, self.now_ms);
                 Ok(Next::Call(IoCall::child(flag)))
             }
             None => self.wake(),
