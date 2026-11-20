@@ -10,8 +10,8 @@ use serde_json::json;
 use super::*;
 use crate::plugins::fixtures::{self, is_child, node};
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::work::SendBoundary;
 use crate::plugins::work::tests::proposed;
+use aruna_core::install_work::SendBoundary;
 
 fn version() -> Ulid {
     Ulid::from_parts(5, 5)

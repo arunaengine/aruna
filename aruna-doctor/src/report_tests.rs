@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{JobRecords, build_report};
+use aruna_core::install_work::{
+    Binding, Identity, WorkKind, WorkRow, WorkState, index_key, row_key,
+};
 use aruna_core::keyspaces::{
     FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE,
     PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
@@ -20,9 +23,6 @@ use aruna_core::structs::execution::job::local::{
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, PendingNeed, PendingRecord};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::{NodeId, UserId};
-use aruna_operations::plugins::work::{
-    Binding, Identity, WorkKind, WorkRow, WorkState, index_key, row_key,
-};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
 use std::collections::BTreeMap;
 use std::path::Path;

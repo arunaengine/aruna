@@ -11,8 +11,8 @@ use super::*;
 use crate::plugins::fixtures::{self, config_result, is_child};
 use crate::plugins::rows::encode;
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::work::{Identity, WorkState, row_key};
 use crate::tests::records::{Family, local_ingress};
+use aruna_core::install_work::{Identity, WorkState, row_key};
 
 fn task(kind: WorkKind) -> WorkRow {
     let ids = (Ulid::from_parts(3, 3), Ulid::from_parts(4, 4));

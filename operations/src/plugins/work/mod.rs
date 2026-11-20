@@ -12,10 +12,9 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::input::{JobPayload, PluginWorkSpec};
-use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, OutputObject};
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload};
 use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
@@ -27,74 +26,14 @@ use super::rows::{
 use crate::jobs::prune::{
     DueJobs, JobPruneOutcome, PruneDueOperation, PruneError, PruneJobsOperation,
 };
+use aruna_core::install_work::{
+    FinalState, Found, Identity, SendBoundary, Summary, WORK_INDEX, WORK_ROW, WorkKind, WorkLookup,
+    WorkRow, WorkState, index_key, row_key,
+};
 
 /// The row of a work under its key.
 pub(crate) fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
     Ok(row(PLUGIN_WORK_KEYSPACE, key, encode(work)?))
-}
-
-/// Row kinds of the work keyspace: the work by install and identity, and its identity by work id.
-pub const WORK_ROW: u8 = b'w';
-pub const WORK_INDEX: u8 = b'i';
-
-/// What names one work across calls: the run and the ordinal of the call that started it, so a
-/// rerun of that run gets the same work back.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Identity {
-    Call { run_id: Ulid, ordinal: u32 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkKind {
-    Copy,
-    Download,
-    Upload,
-    Recipe,
-}
-
-/// What the work was approved under; a later manifest digest stops it before it runs.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Binding {
-    pub digest: String,
-    pub revision: u64,
-    pub recipe: Option<String>,
-}
-
-/// A transfer's request as resolved when the work started, without any secret, so the work
-/// still runs after its run was pruned.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RequestContext {
-    pub connection: String,
-    /// The connection's base URL resolved from the run's saved settings.
-    pub base: String,
-    pub method: String,
-    pub path: String,
-    pub query: Vec<(String, String)>,
-    pub headers: Vec<(String, String)>,
-}
-
-/// `Reserved` until its job is known, then `Dispatched`, and `Settled` once the summary is kept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WorkState {
-    Reserved,
-    Dispatched,
-    Settled,
-}
-
-/// How far a sending attempt came; an attempt that finds `Sending` never sends again.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SendBoundary {
-    Sending {
-        attempt: u32,
-    },
-    /// The answer: its status and its reply as exposed when stored, absent when too large, and
-    /// the bytes and version sent.
-    Sent {
-        status: u16,
-        reply: Option<String>,
-        bytes: u64,
-        version: Ulid,
-    },
 }
 
 /// What an attempt that sends may do, from the boundary earlier attempts left.
@@ -111,98 +50,6 @@ pub enum Send {
         bytes: u64,
         version: Ulid,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FinalState {
-    Succeeded,
-    Failed,
-    Cancelled,
-    /// The outcome cannot be known; nothing is tried again.
-    Unknown,
-}
-
-/// What a settled work answers after its job record is gone.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Summary {
-    pub state: FinalState,
-    /// The object path the work reads: a copy's source or an upload's object.
-    pub source: Option<String>,
-    /// The object path or prefix the work writes: a copy or download target, a recipe's outputs.
-    pub target: Option<String>,
-    pub message: Option<String>,
-    pub bytes: Option<u64>,
-    pub version_id: Option<Ulid>,
-    /// The answer status of an upload, and its reply as exposed when it was stored.
-    pub status: Option<u16>,
-    pub reply: Option<String>,
-    pub exit_code: Option<i32>,
-    pub outputs: Vec<OutputObject>,
-    pub report: Option<String>,
-}
-
-/// One work of an install on its receiver.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WorkRow {
-    /// The account of the install that wrote it; a reinstall under the same id has another one.
-    pub account: UserId,
-    pub work_id: Ulid,
-    pub kind: WorkKind,
-    /// The object path the work reads: a copy's source or an upload's object.
-    pub source: Option<String>,
-    /// The object path or prefix the work writes: a copy or download target, a recipe's outputs.
-    pub target: Option<String>,
-    /// BLAKE3 of the stable arguments, never of generated ids.
-    pub digest: [u8; 32],
-    pub binding: Binding,
-    pub context: Option<RequestContext>,
-    /// The run that started it; an audit reference only, the run may be pruned first.
-    pub run_id: Ulid,
-    /// The version a copy or download writes, minted once.
-    pub version_id: Option<Ulid>,
-    pub job: Option<JobId>,
-    pub state: WorkState,
-    pub boundary: Option<SendBoundary>,
-    pub summary: Option<Summary>,
-    pub notified: bool,
-    pub cancel: bool,
-    pub created_ms: u64,
-    pub settled_ms: Option<u64>,
-}
-
-impl WorkRow {
-    /// A new row `work_id` of `install` in state `Reserved`.
-    pub fn reserved(
-        install: &PluginInstall,
-        kind: WorkKind,
-        (run_id, work_id): (Ulid, Ulid),
-        now_ms: u64,
-    ) -> Self {
-        Self {
-            account: install.account,
-            work_id,
-            kind,
-            source: None,
-            target: None,
-            digest: [0; 32],
-            binding: Binding {
-                digest: install.digest.clone(),
-                revision: install.revision,
-                recipe: None,
-            },
-            context: None,
-            run_id,
-            version_id: None,
-            job: None,
-            state: WorkState::Reserved,
-            boundary: None,
-            summary: None,
-            notified: false,
-            cancel: false,
-            created_ms: now_ms,
-            settled_ms: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -228,19 +75,6 @@ pub enum Reserve {
     Fresh,
     /// An earlier call with the same arguments wrote it.
     Earlier,
-}
-
-pub fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreError> {
-    Ok([&[WORK_ROW][..], &install_id.to_bytes(), &encode(identity)?].concat())
-}
-
-pub fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
-    [
-        &[WORK_INDEX][..],
-        &install_id.to_bytes(),
-        &work_id.to_bytes(),
-    ]
-    .concat()
 }
 
 /// Writes `proposed` for `identity` in one transaction, or adopts the row an earlier call with the
@@ -388,52 +222,6 @@ impl Operation for ReserveWork {
                 Ok(Next::Done((*proposed, Reserve::Fresh)))
             }
         }
-    }
-}
-
-/// A sub-plan that reads the row of work `work_id` of an install and its key, through the index.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkLookup {
-    install_id: Ulid,
-    work_id: Ulid,
-    /// The row key the index named, once read.
-    key: Option<Vec<u8>>,
-}
-
-/// What a lookup needs next, or the row it found.
-#[derive(Debug, PartialEq)]
-pub enum Found {
-    Ask(IoCall),
-    Row(Option<(Vec<u8>, WorkRow)>),
-}
-
-impl WorkLookup {
-    pub fn new(install_id: Ulid, work_id: Ulid) -> Self {
-        Self {
-            install_id,
-            work_id,
-            key: None,
-        }
-    }
-
-    pub fn ask(&self) -> IoCall {
-        let index = index_key(self.install_id, self.work_id);
-        read_call(vec![(PLUGIN_WORK_KEYSPACE, index)])
-    }
-
-    pub fn take(&mut self, answer: IoResult) -> Result<Found, StoreError> {
-        let [value] = values::<1>(answer)?;
-        let Some(value) = value else {
-            return Ok(Found::Row(None));
-        };
-        let Some(key) = self.key.take() else {
-            self.key = Some(value.clone());
-            return Ok(Found::Ask(read_call(vec![(PLUGIN_WORK_KEYSPACE, value)])));
-        };
-        let row: WorkRow = decode(&value)?;
-        Ok(Found::Row(
-            (row.work_id == self.work_id).then_some((key, row)),
-        ))
     }
 }
 
@@ -829,24 +617,6 @@ pub(crate) fn summary_of(record: Option<&JobRecord>) -> Option<Summary> {
         summary.version_id = *version_id;
     }
     Some(summary)
-}
-
-impl Summary {
-    pub(crate) fn of(state: FinalState) -> Self {
-        Self {
-            state,
-            source: None,
-            target: None,
-            message: None,
-            bytes: None,
-            version_id: None,
-            status: None,
-            reply: None,
-            exit_code: None,
-            outputs: Vec::new(),
-            report: None,
-        }
-    }
 }
 
 /// Reads every work row.

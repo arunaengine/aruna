@@ -17,11 +17,12 @@ use ulid::Ulid;
 use super::super::check::CallError;
 use super::super::install::{config_answer, config_call};
 use super::super::rows::{Rows, StoreError, decode, scan_rows};
+use super::super::work::{WorkChange, install_at, update_work, work_scan};
 use super::cancel::CancelTask;
 use super::send::SendTask;
 use super::settle::{Followup, SettleTask, Settled};
-use super::super::work::{WorkChange, WorkKind, WorkRow, install_at, update_work, work_scan};
 use crate::jobs::lifecycle::submit_external::IngressNode;
+use aruna_core::install_work::{WorkKind, WorkRow};
 
 #[derive(Debug, PartialEq)]
 enum PassPhase {

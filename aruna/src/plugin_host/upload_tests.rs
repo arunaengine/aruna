@@ -14,12 +14,10 @@ use serde_json::json;
 
 use super::*;
 use crate::plugin_host::plugin_work::run_plugin_work;
+use aruna_core::install_work::{Identity, RequestContext, SendBoundary, WorkKind};
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::testing::{seed_bucket, with_blob};
-use aruna_operations::plugins::work::{
-    Identity, RequestContext, SendBoundary, WorkChange, WorkKind, begin_send, read_work, reserve,
-    update_work,
-};
+use aruna_operations::plugins::work::{WorkChange, begin_send, read_work, reserve, update_work};
 use aruna_operations::s3::object::put::PutObjectOperation;
 use aruna_operations::testing_objects::put_config;
 use aruna_test_support::plugins::Fixture;

@@ -7,7 +7,7 @@ use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::submit::WorkRequest;
 use crate::plugins::test_support::{edit_work, request, scope};
-use crate::plugins::work::{FinalState, WorkState};
+use aruna_core::install_work::{FinalState, WorkState};
 use aruna_core::structs::execution::job::local::OutputObject;
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::ready;
@@ -145,8 +145,8 @@ mod operations {
 
     fn key_of(row: &WorkRow) -> Vec<u8> {
         let run_id = row.work_id;
-        let identity = crate::plugins::work::Identity::Call { run_id, ordinal: 0 };
-        crate::plugins::work::row_key(fixtures::install().install_id, &identity).unwrap()
+        let identity = aruna_core::install_work::Identity::Call { run_id, ordinal: 0 };
+        aruna_core::install_work::row_key(fixtures::install().install_id, &identity).unwrap()
     }
 
     fn scanned(rows: &[WorkRow]) -> IoResult {

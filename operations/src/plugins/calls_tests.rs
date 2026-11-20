@@ -55,10 +55,10 @@ use super::secret_use::{OpenSealed, ReleaseSecret, Sealed, SelectSecret, Selecte
 use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
 use super::waiting::RecheckWaiting;
-use super::work::WorkRow;
 use super::work::calls::{JobOutputs, JobRow};
 use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::install_work::WorkRow;
 use aruna_drivers::driver::{DriverContext, drive};
 
 fn local_of(ctx: &DriverContext) -> Option<NodeId> {

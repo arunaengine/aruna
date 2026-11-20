@@ -18,9 +18,10 @@ use serde_json::json;
 
 use super::*;
 use crate::plugin_host::plugin_work::run_plugin_work;
+use aruna_core::install_work::{Identity, RequestContext, WorkKind};
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::testing::{seed_bucket, with_blob};
-use aruna_operations::plugins::work::{Identity, RequestContext, WorkKind, reserve};
+use aruna_operations::plugins::work::reserve;
 use aruna_operations::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::job_context;

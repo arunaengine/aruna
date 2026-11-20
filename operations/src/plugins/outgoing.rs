@@ -20,7 +20,7 @@ use serde_json::Value;
 use url::Url;
 
 use super::unavailable;
-use super::work::RequestContext;
+use aruna_core::install_work::RequestContext;
 
 /// Query or header pairs by name and value.
 type Pairs<'a> = &'a [(String, String)];

@@ -5,6 +5,7 @@
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
 use aruna_core::compute::quota::JobReservationRecord;
+use aruna_core::install_work::{WORK_ROW, WorkRow, WorkState, index_key};
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
     COMPUTE_DEPARTURE_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE,
@@ -29,7 +30,6 @@ use aruna_core::structs::execution::job::local::{
 use aruna_core::structs::execution::job::record_rows::{
     OutboxEntry, PendingRecord, ProjectionCache,
 };
-use aruna_operations::plugins::work::{WORK_ROW, WorkRow, WorkState, index_key};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
