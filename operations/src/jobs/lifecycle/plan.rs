@@ -1110,7 +1110,7 @@ mod tests {
     fn signal_needs_room() {
         use super::super::deferred::DeferKind;
         use aruna_core::compute::ExecutorAvailability;
-        use aruna_core::structs::execution::job::family::{EffectiveResources, LAUNCH_WINDOW_MS};
+        use aruna_core::structs::execution::job::family::EffectiveResources;
         let target = node(1);
         let mut executor = docker(target);
         executor.limits.max_concurrent = Some(2);
@@ -1170,6 +1170,7 @@ mod tests {
     #[test]
     fn reoffer_needs_screening() {
         use super::super::deferred::DeferKind;
+        use aruna_core::structs::execution::job::family::LAUNCH_WINDOW_MS;
         let (config, _) = realm(1);
         let spec = Family::new([5u8; 32]).spec();
         let mut planning = round(&config, &spec, &[]);

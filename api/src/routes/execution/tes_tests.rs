@@ -232,12 +232,7 @@ fn maps_submit_errors() {
     // must keep the status the native submit surface answers with.
     use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
     use aruna_core::job_request::SubmitJobError;
-    use aruna_core::structs::execution::job::family::{
-        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
-        SubmissionId,
-    };
     use aruna_core::structs::execution::job::input::CompositionError;
-    use aruna_core::structs::execution::job::local::{JobProgress, OutputObject, WorkspaceMode};
     use aruna_core::structured_id::clock_health::ClockHealthError;
 
     let cases = [
@@ -1016,6 +1011,11 @@ fn view_projections() {
 /// The replicated family behind one succeeded distributed task.
 fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+        SubmissionId,
+    };
+    use aruna_core::structs::execution::job::local::{JobProgress, WorkspaceMode};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_operations::jobs::lifecycle::report::FamilyReport;
@@ -1197,6 +1197,7 @@ fn family_pins_inputs() {
 
 #[test]
 fn family_preserves_versions() {
+    use aruna_core::structs::execution::job::family::LogicalJobState;
     // TES preserves canonical output versions and reports none before canonical success.
 
     let report = family_fixture();
