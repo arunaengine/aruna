@@ -108,8 +108,12 @@ fn retry_only_open() {
     let emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), holders);
     let mut emit = emit.only(Some(vec![node_id(3)]));
     emit.first().unwrap();
-    let unread = child::<RealmConfigDocument, _>(Err(GetConfigError::DocumentNotFound));
-    emit.next(unread).unwrap();
+    let mut config = single_server();
+    config.ensure_node(node_id(2), RealmNodeKind::Server);
+    config.ensure_node(node_id(3), RealmNodeKind::Server);
+    emit.next(child::<_, GetConfigError>(Ok(config))).unwrap();
+    let empty = child::<_, WatchSubscriptionError>(Ok(WatchPage::default()));
+    emit.next(empty).unwrap();
     assert_eq!(emit.state, EmitState::Forward(node_id(3)));
 }
 
@@ -141,6 +145,29 @@ fn rebuild_keeps_holders() {
     let failed = GetConfigError::StorageError(StorageError::Timeout);
     let failed = child::<RealmConfigDocument, _>(Err(failed));
     assert_eq!(unread.next(failed), Ok(Next::Done(vec![node_id(3)])));
+}
+
+/// A retry sends to no saved holder while the realm config cannot be read, not even one the
+/// interest table still lists, and never to a key the realm now enrolls as a user device.
+#[test]
+fn retry_needs_membership() {
+    let retrying = || {
+        let emit = EmitWatchOperation::new(event(user(1, 2)), node_id(1), vec![node_id(3)]);
+        let mut emit = emit.only(Some(vec![node_id(3)]));
+        emit.first().unwrap();
+        emit
+    };
+    let mut unread = retrying();
+    let failed = GetConfigError::StorageError(StorageError::Timeout);
+    let failed = child::<RealmConfigDocument, _>(Err(failed));
+    assert_eq!(unread.next(failed), Ok(Next::Done(vec![node_id(3)])));
+
+    let mut device = single_server();
+    device.ensure_node(node_id(3), RealmNodeKind::User { owner: user(1, 2) });
+    let mut enrolled = retrying();
+    enrolled.next(child::<_, GetConfigError>(Ok(device))).unwrap();
+    let empty = child::<_, WatchSubscriptionError>(Ok(WatchPage::default()));
+    assert_eq!(enrolled.next(empty), Ok(Next::Done(Vec::new())));
 }
 
 /// A holder that refuses the event settles it: a refusal does not pass on a later run.

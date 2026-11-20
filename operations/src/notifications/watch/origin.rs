@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{WatchEvent, watch_path_matches};
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use tracing::warn;
@@ -53,7 +53,8 @@ pub(crate) struct EmitWatchOperation {
     holders: Vec<NodeId>,
     /// On a retry, the holders an earlier delivery left open; the others already settled.
     only: Option<Vec<NodeId>>,
-    /// On a retry, its remote holders still in the realm; `None` until the realm config is read.
+    /// On a retry, its remote holders that are still sync-eligible realm members; `None` until
+    /// the realm config is read.
     members: Option<Vec<NodeId>>,
     config: Option<RealmConfigDocument>,
     pending: VecDeque<NodeId>,
@@ -97,9 +98,13 @@ impl EmitWatchOperation {
         match config {
             Ok(config) => {
                 let local = self.local;
+                // A key the realm now lists as a user device is no holder, whoever it was.
+                let eligible = |holder: &NodeId| {
+                    (config.node_kind(holder)).is_some_and(RealmNodeKind::is_sync_eligible)
+                };
                 self.members = (self.only.as_ref()).map(|only| {
                     (only.iter().copied())
-                        .filter(|holder| *holder != local && config.has_node(*holder))
+                        .filter(|holder| *holder != local && eligible(holder))
                         .collect()
                 });
                 self.config = Some(config);
@@ -170,9 +175,9 @@ impl EmitWatchOperation {
         self.deliver()
     }
 
-    /// Orders the holders, then delivers to each once. A retry goes to its saved holders still
-    /// in the realm whatever the interest table matches now, as a failed rebuild may empty it;
-    /// without the realm config only the table vouches for one, and the others stay open.
+    /// Orders the holders, then delivers to each once. A retry goes to its saved holders that are
+    /// still sync-eligible members whatever the interest table matches now, as a failed rebuild
+    /// may empty it; without the realm config it sends to none of them and keeps them open.
     fn deliver(&mut self) -> Turn {
         let mut holders = std::mem::take(&mut self.holders);
         if let Some(only) = &self.only {
@@ -183,10 +188,8 @@ impl EmitWatchOperation {
                     holders.extend(members);
                 }
                 None => {
-                    let unvouched = (only.iter())
-                        .filter(|holder| **holder != local && !holders.contains(holder));
-                    self.open.extend(unvouched);
-                    holders.retain(|holder| only.contains(holder));
+                    self.open.extend(only.iter().filter(|holder| **holder != local));
+                    holders.retain(|holder| *holder == local && only.contains(holder));
                 }
             }
         }
