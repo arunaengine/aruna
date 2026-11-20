@@ -154,14 +154,17 @@ impl Scan {
     }
 }
 
-/// The values of these rows, read on their own.
+/// The values of these rows, read on their own; only test fixtures read rows this way.
+#[cfg(any(test, feature = "test-hooks"))]
 pub fn read_rows(reads: Vec<(&'static str, Vec<u8>)>) -> ReadRows {
     ReadRows(Some(read_call(reads)))
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, PartialEq)]
 pub struct ReadRows(Option<IoCall>);
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl Operation for ReadRows {
     type Output = Vec<Option<Vec<u8>>>;
     type Error = StoreError;
