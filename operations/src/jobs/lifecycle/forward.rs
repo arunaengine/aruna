@@ -15,7 +15,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::SubmissionId;
 use tracing::{debug, warn};
 
-use super::admit_here::AcceptedSubmission;
+use super::admit::here::AcceptedSubmission;
 use aruna_core::job_request::{RequestIdentity, SubmissionRequest, SubmitJobError};
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,

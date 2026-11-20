@@ -20,7 +20,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use super::admit_forwarded::GroupWriteOperation;
+use super::admit::forwarded::GroupWriteOperation;
 use super::alias::AliasFamilyOperation;
 use super::family_reads::{FamilyProjectionOperation, FamilyView};
 use super::routing::decidable;

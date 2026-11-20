@@ -14,7 +14,7 @@ use aruna_core::structs::execution::job::input::{CapturedInput, ExecutionSpec, I
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
-use super::admit_here::placement_failure;
+use super::admit::here::placement_failure;
 use super::input_capture::{CaptureCaller, CaptureInputsOperation};
 use super::input_walk::{
     ExpandDirectoryOperation, FollowLinkOperation, InputCaller, RangeHolderOperation,

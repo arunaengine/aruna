@@ -14,7 +14,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 
-use super::admit_here::placement_failure;
+use super::admit::here::placement_failure;
 use super::input_capture::{CaptureCaller, CaptureInputsOperation};
 use super::input_walk::{FollowLinkOperation, InputCaller};
 use super::submission_rules::{fits, peer_refusal, refusal_of, resolver_admits};

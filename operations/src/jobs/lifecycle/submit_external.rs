@@ -18,7 +18,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::user::id::UserId;
 
-use super::admit_here::{
+use super::admit::here::{
     AcceptedSubmission, AdmitHereOperation, LocalAdmission, placement_failure,
 };
 use super::advertised::{Advertised, AdvertisementsOperation};

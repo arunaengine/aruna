@@ -32,7 +32,7 @@ use super::super::LifecycleError;
 use super::super::launch_admit::{AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided};
 use super::super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
-use super::super::witness::arm::WitnessExplain;
+use super::arm::WitnessExplain;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;

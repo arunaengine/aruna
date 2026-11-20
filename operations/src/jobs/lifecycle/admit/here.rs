@@ -24,12 +24,12 @@ use aruna_core::structs::execution::job::record_rows::ProjectionCache;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use tracing::{debug, warn};
 
-use super::LifecycleError;
-use super::admit::{
+use super::super::LifecycleError;
+use super::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission,
 };
-use super::outbox::schedule_outbox_drain;
-use super::witness::arm::ArmFamilyOperation;
+use super::super::outbox::schedule_outbox_drain;
+use super::super::witness::arm::ArmFamilyOperation;
 use crate::jobs::quota::{QuotaCheckOperation, QuotaError, QuotaVerdict};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::project::{
@@ -62,7 +62,7 @@ pub struct AcceptedSubmission {
 }
 
 /// Maps a failed admission to what the submitter is told.
-pub(super) fn admission_error(error: LifecycleError) -> SubmitJobError {
+pub(in crate::jobs::lifecycle) fn admission_error(error: LifecycleError) -> SubmitJobError {
     match error {
         LifecycleError::IdempotencyConflict { existing_job_id } => {
             SubmitJobError::JobPlanConflict { existing_job_id }
@@ -91,14 +91,14 @@ fn unavailable(error: impl std::fmt::Display) -> SubmitJobError {
 /// current; otherwise the family is reduced once from its records. A family this node cannot
 /// fully reduce is reported as indeterminate.
 #[derive(Debug, PartialEq)]
-pub(super) struct ObservedStateOperation {
+pub(in crate::jobs::lifecycle) struct ObservedStateOperation {
     family: JobFamilyId,
     now_ms: u64,
     reducing: bool,
 }
 
 impl ObservedStateOperation {
-    pub(super) fn new(family: JobFamilyId, now_ms: u64) -> Self {
+    pub(in crate::jobs::lifecycle) fn new(family: JobFamilyId, now_ms: u64) -> Self {
         Self {
             family,
             now_ms,
@@ -163,16 +163,16 @@ impl Operation for ObservedStateOperation {
 
 /// One submission this node admits as the holder of its family.
 #[derive(Debug, PartialEq)]
-pub(super) struct LocalAdmission {
-    pub(super) request: SubmissionRequest,
-    pub(super) identity: RequestIdentity,
-    pub(super) config: RealmConfigDocument,
-    pub(super) local: NodeId,
+pub(in crate::jobs::lifecycle) struct LocalAdmission {
+    pub(in crate::jobs::lifecycle) request: SubmissionRequest,
+    pub(in crate::jobs::lifecycle) identity: RequestIdentity,
+    pub(in crate::jobs::lifecycle) config: RealmConfigDocument,
+    pub(in crate::jobs::lifecycle) local: NodeId,
     /// The alias minted for this accept.
-    pub(super) job_id: JobId,
-    pub(super) now_ms: u64,
+    pub(in crate::jobs::lifecycle) job_id: JobId,
+    pub(in crate::jobs::lifecycle) now_ms: u64,
     /// The fresh heartbeats the quota's group view merges.
-    pub(super) fresh: BTreeMap<NodeId, HeldHeartbeat>,
+    pub(in crate::jobs::lifecycle) fresh: BTreeMap<NodeId, HeldHeartbeat>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -189,7 +189,7 @@ enum AdmitStep {
 /// settles on the reduced claim without the quota view, a lost transaction decides it again.
 /// Scheduling and replication arm only after the durable claim, so no round names an absent family.
 #[derive(Debug, PartialEq)]
-pub(super) struct AdmitHereOperation {
+pub(in crate::jobs::lifecycle) struct AdmitHereOperation {
     admission: LocalAdmission,
     claim: Option<SubmissionClaim>,
     spec_frame: Option<JobRecordFrame>,
@@ -202,7 +202,7 @@ pub(super) struct AdmitHereOperation {
 type AdmitNext = Result<Next<AcceptedSubmission>, SubmitJobError>;
 
 impl AdmitHereOperation {
-    pub(super) fn new(admission: LocalAdmission) -> Self {
+    pub(in crate::jobs::lifecycle) fn new(admission: LocalAdmission) -> Self {
         Self {
             admission,
             claim: None,

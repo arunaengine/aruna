@@ -29,7 +29,7 @@ use aruna_operations::jobs::command::{
     ExecutionTarget, InputMode as CommandInputMode, SubmitExecutionCommand,
     WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
+use aruna_operations::jobs::lifecycle::admit::here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::family_reads::{FamilyReportOperation, SessionJobOperation};
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,

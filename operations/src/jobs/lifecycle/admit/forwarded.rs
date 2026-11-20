@@ -18,12 +18,12 @@ use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::types::GroupId;
 use tracing::warn;
 
-use super::admit_here::{AcceptedSubmission, placement_failure};
-use super::resolve_inputs::{ResolveInputsOperation, ResolvedInputs};
-use super::submission_rules::{
+use super::here::{AcceptedSubmission, placement_failure};
+use super::super::resolve_inputs::{ResolveInputsOperation, ResolvedInputs};
+use super::super::submission_rules::{
     forwarded_request_fits, is_device, peer_refusal, pin_outputs, refusal_of,
 };
-use super::submit_external::IngressNode;
+use super::super::submit_external::IngressNode;
 use crate::auth::check_permissions::CheckPermissionsConfig;
 use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
@@ -36,14 +36,14 @@ use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 
 /// Whether the caller may write in a group: its grants, then the request policies.
 #[derive(Debug, PartialEq)]
-pub(super) struct GroupWriteOperation {
+pub(in crate::jobs::lifecycle) struct GroupWriteOperation {
     check: CheckPermissionsConfig,
     group_id: GroupId,
     compiling: bool,
 }
 
 impl GroupWriteOperation {
-    pub(super) fn new(auth: &AuthContext, group_id: GroupId, local: NodeId) -> Self {
+    pub(in crate::jobs::lifecycle) fn new(auth: &AuthContext, group_id: GroupId, local: NodeId) -> Self {
         let check = CheckPermissionsConfig {
             auth_context: auth.clone(),
             path: group_permission_path(auth.realm_id, group_id, local),

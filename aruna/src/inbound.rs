@@ -291,7 +291,7 @@ async fn peer_request(
                 unix_timestamp_millis(),
             );
             let admit =
-                aruna_operations::jobs::lifecycle::admit_forwarded::AdmitForwardedOperation::new(
+                aruna_operations::jobs::lifecycle::admit::forwarded::AdmitForwardedOperation::new(
                     peer,
                     auth_token,
                     submission_id,

@@ -39,7 +39,7 @@ use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::jobs::drain::JobClassBudget;
 use aruna_operations::jobs::job_cancel::RoutedCancelOutcome;
-use aruna_operations::jobs::lifecycle::admit_here::{AcceptedSubmission, placement_failure};
+use aruna_operations::jobs::lifecycle::admit::here::{AcceptedSubmission, placement_failure};
 use aruna_operations::jobs::lifecycle::submit_external::{
     ExternalSubmission, SubmitExternalOperation,
 };
