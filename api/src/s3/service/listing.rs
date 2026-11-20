@@ -20,7 +20,7 @@ use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
 use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::list::{
-    ListBucketInput as LOV2I, ListContinuationToken, decode_list_token, encode_list_token,
+    ListBucketInput, ListContinuationToken, decode_list_token, encode_list_token,
 };
 use aruna_operations::s3::object::visible::{
     HiddenCursor, LinkShows, ListingKeys, NextPage, RecordSource, VisibleError,
@@ -188,7 +188,7 @@ impl ArunaS3Service {
     /// share session may read; a page that stopped among hidden entries continues sealed.
     pub(super) async fn run_object_listing(
         &self,
-        input: LOV2I,
+        input: ListBucketInput,
         (owner, reader): (Option<Owner>, Option<&UserAccess>),
         url_encoded: bool,
         (scope, access): (Option<&SubpathScope>, Option<BucketAccess>),
