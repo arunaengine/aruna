@@ -9,7 +9,6 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::backoff::capped_backoff;
 use aruna_core::document::{
     DocumentEffect, DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord,
     DocumentSyncPublish, DocumentTarget,
@@ -62,9 +61,7 @@ use aruna_operations::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation,
 };
 use aruna_operations::blob::holders::RefreshHoldersOperation;
-use aruna_operations::blob::reclaim_sweep::{
-    RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, ReclaimSweepOperation,
-};
+use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
 use aruna_operations::device::publish_queue::DrainOutcome;
 use aruna_operations::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER};
@@ -252,9 +249,6 @@ pub(crate) struct OperationsTaskHandler {
     // What each converted timer keeps between runs; the operations decide on it. Loss on
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
-    // Where a capped reclaim sweep resumes. Loss on restart is fine: the next
-    // sweep starts from the head and reaches the tail over the ticks after it.
-    reclaim_cursor: std::sync::Mutex<Option<Key>>,
     // Where the replication drain's bootstrap work goes on. Loss on restart is fine: the
     // next drain starts at the first set and range.
     catch_up: std::sync::Mutex<CatchUpCursors>,
@@ -401,7 +395,6 @@ impl OperationsTaskHandler {
             rocrate_limits: RoCrateLimits::default(),
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
-            reclaim_cursor: std::sync::Mutex::new(None),
             catch_up: std::sync::Mutex::default(),
             wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
@@ -635,41 +628,6 @@ impl OperationsTaskHandler {
             .remove(key);
     }
 
-    fn reclaim_start(&self) -> Option<Key> {
-        self.reclaim_cursor
-            .lock()
-            .expect("reclaim cursor mutex poisoned")
-            .clone()
-    }
-
-    fn set_reclaim_start(&self, cursor: Option<Key>) {
-        *self
-            .reclaim_cursor
-            .lock()
-            .expect("reclaim cursor mutex poisoned") = cursor;
-    }
-
-    /// Keeps `base` for the first attempt, then doubles each further one up to
-    /// `max`, counting attempts in the shared in-memory ladder.
-    fn retry_ladder(&self, key: &TaskKey, base: Duration, max: Duration) -> Duration {
-        let mut backoff = self
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned");
-        match backoff.entry(key.clone()) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(0);
-                base
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                let attempts = entry.get().saturating_add(1);
-                entry.insert(attempts);
-                // The former helper stopped doubling after seven attempts; that stays.
-                capped_backoff(base, max, attempts.min(7), 0)
-            }
-        }
-    }
-
     /// Re-arms `key` at its current backoff interval and records the attempt.
     async fn reschedule_with_backoff(&self, key: TaskKey) -> bool {
         let after = self.backoff_after(&key);
@@ -802,11 +760,7 @@ impl OperationsTaskHandler {
     /// the selected timer's future stays on the stack while its work runs.
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
     async fn run_trigger(&self, key: TaskKey) {
-        let memory = (self.timer_memory.lock())
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
+        let memory = self.kept_memory(&key);
         let input = TimerInput {
             now_ms: unix_timestamp_millis(),
             local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
@@ -842,6 +796,15 @@ impl OperationsTaskHandler {
             // Its persisted timer is gone and durable rows wait on it, so a live wake stays.
             self.keep_retrying(key, after).await;
         }
+    }
+
+    /// What a timer kept from its last run, empty for its first run since the start.
+    fn kept_memory(&self, key: &TaskKey) -> TimerMemory {
+        (self.timer_memory.lock())
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Stores what a timer keeps until its next run; an empty memory is dropped.

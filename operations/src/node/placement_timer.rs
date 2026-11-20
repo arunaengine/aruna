@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::node_facts::NodeFacts;
@@ -18,9 +17,6 @@ use crate::placement::process_placements::{
 };
 use crate::sync::shard_placement::{PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX};
 use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
-
-/// Ladder steps after which the pull retry stops doubling.
-const LADDER_STEPS: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq)]
 enum PlacementStage {
@@ -64,18 +60,7 @@ impl PlacementTimerOperation {
             // New holders only need their co-holders to apply the same config, so the ladder
             // starts prompt and never jumps to the placement interval.
             PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
-                let steps = self.memory.attempts;
-                let after = match steps {
-                    0 => PULL_RETRY_AFTER,
-                    steps => capped_backoff(
-                        PULL_RETRY_AFTER,
-                        PULL_RETRY_MAX,
-                        steps.min(LADDER_STEPS),
-                        0,
-                    ),
-                };
-                let mut memory = self.memory.clone();
-                memory.attempts = steps.saturating_add(1);
+                let (after, memory) = self.memory.next_retry(PULL_RETRY_AFTER, PULL_RETRY_MAX);
                 TimerPlan {
                     after: Some(after),
                     memory,

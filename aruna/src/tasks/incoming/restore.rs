@@ -974,47 +974,26 @@ impl OperationsTaskHandler {
             .await;
     }
 
-    fn reclaim_sweep(&self) -> ReclaimSweepOperation {
-        let catalog = node_routing(&self.context).catalog;
-        ReclaimSweepOperation::new(catalog, SystemTime::now(), self.reclaim_start())
-    }
-
     pub(super) async fn drain_blob_reclaim(&self) {
         let key = TaskKey::DrainReclaimQueue;
-        // A failed candidate earns the fast retry, then doubles up to the normal interval, so a permanently
-        // failing one cannot hold a one-minute rescan of the whole queue forever.
-        let (after, drained) = match drive(self.reclaim_sweep(), &self.context).await {
-            Ok(outcome) => {
-                self.set_reclaim_start(outcome.next_start_after);
-                match (outcome.capped, outcome.failed) {
-                    (true, _) => {
-                        self.reset_backoff(&key);
-                        (RECLAIM_SWEEP_RETRY, false)
-                    }
-                    (false, 0) => {
-                        self.reset_backoff(&key);
-                        (RECLAIM_SWEEP_AFTER, true)
-                    }
-                    (false, _) => (
-                        self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                        true,
-                    ),
-                }
-            }
-            Err(error) => {
-                warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
-                (
-                    self.retry_ladder(&key, RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER),
-                    false,
-                )
-            }
-        };
+        let memory = self.kept_memory(&key);
+        let catalog = node_routing(&self.context).catalog;
+        let start = memory.cursor.clone().map(Key::from);
+        let sweep = ReclaimSweepOperation::new(catalog, SystemTime::now(), start);
+        let outcome = drive(sweep, &self.context).await;
+        if let Err(error) = &outcome {
+            warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
+        }
+        let (plan, drained) = reclaim_plan(outcome.as_ref().ok(), &memory);
+        self.keep_memory(&key, plan.memory);
         // Removal walks whole keyspaces too, so it only rides a sweep that
         // reached the end of the queue, never the fast retries behind a backlog.
         if drained && let Err(error) = remove_drained_backends(&self.context).await {
             warn!(error = %error, "Failed to remove drained storage backends");
         }
-        self.reschedule_timer(key, after).await;
+        if let Some(after) = plan.after {
+            self.reschedule_timer(key, after).await;
+        }
     }
 
     pub(super) async fn sweep_hidden_blobs(&self) {

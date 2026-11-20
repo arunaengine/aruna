@@ -7,6 +7,7 @@ use std::fmt::Display;
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
+use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::node_facts::NodeFacts;
@@ -43,6 +44,22 @@ use crate::notifications::watch::remove::RemoveWatchOperation;
 pub struct TimerMemory {
     pub attempts: u32,
     pub cursor: Option<Vec<u8>>,
+}
+
+/// Retry steps after which a timer's retry ladder stops doubling.
+const LADDER_STEPS: u32 = 7;
+
+impl TimerMemory {
+    /// The wait after a failed run: `base` for the first, then doubled per further attempt up to
+    /// `max`. The returned memory counts the attempt and keeps the cursor.
+    pub fn next_retry(&self, base: Duration, max: Duration) -> (Duration, TimerMemory) {
+        let after = capped_backoff(base, max, self.attempts.min(LADDER_STEPS), 0);
+        let memory = TimerMemory {
+            attempts: self.attempts.saturating_add(1),
+            cursor: self.cursor.clone(),
+        };
+        (after, memory)
+    }
 }
 
 /// When a timer runs again, `None` while it waits for work, and what it keeps until then.
