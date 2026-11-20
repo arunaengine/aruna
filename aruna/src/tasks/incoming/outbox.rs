@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_operations::node::outbox::finish::FinishBatchOperation;
-use aruna_operations::node::outbox::publish::PublishBatchesOperation;
+use aruna_operations::node::finish_batch::FinishBatchOperation;
+use aruna_operations::node::publish_batches::PublishBatchesOperation;
 
 /// The realm configuration the drain decides with: `None` on a node that has none yet, where the
 /// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
