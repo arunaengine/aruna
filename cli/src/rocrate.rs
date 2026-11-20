@@ -8,20 +8,23 @@ use std::io::Read;
 use std::path::Path;
 
 pub const METADATA_FILE: &str = "ro-crate-metadata.json";
+/// The node's default metadata bound for an RO-Crate import.
+const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Loads the crate's JSON-LD and checks it has a `@graph`.
 pub fn load_crate(path: &Path) -> Result<Value, CliError> {
     let bytes = if path.is_dir() {
-        std::fs::read(path.join(METADATA_FILE)).map_err(|error| {
+        let file = std::fs::File::open(path.join(METADATA_FILE)).map_err(|error| {
             CliError::usage(format!(
                 "{} has no {METADATA_FILE}: {error}",
                 path.display()
             ))
-        })?
+        })?;
+        read_bounded(file, MAX_METADATA_BYTES)?
     } else if is_archive(path)? {
         read_archive(path)?
     } else {
-        std::fs::read(path)?
+        read_bounded(std::fs::File::open(path)?, MAX_METADATA_BYTES)?
     };
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| CliError::usage(format!("{METADATA_FILE} is not JSON: {error}")))?;
@@ -59,11 +62,21 @@ fn read_archive(path: &Path) -> Result<Vec<u8>, CliError> {
         .ok_or_else(|| {
             CliError::usage(format!("{} contains no {METADATA_FILE}", path.display()))
         })?;
-    let mut entry = archive
+    let entry = archive
         .by_name(&name)
         .map_err(|error| CliError::usage(format!("{name}: {error}")))?;
+    read_bounded(entry, MAX_METADATA_BYTES)
+}
+
+/// At most `limit` bytes of `reader`, read as they arrive; a longer input is refused unparsed.
+fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>, CliError> {
     let mut bytes = Vec::new();
-    entry.read_to_end(&mut bytes)?;
+    reader.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(CliError::usage(format!(
+            "{METADATA_FILE} is larger than {limit} bytes, the metadata bound of an import"
+        )));
+    }
     Ok(bytes)
 }
 
@@ -206,6 +219,24 @@ mod tests {
         serde_json::to_writer(&mut writer, &sample()).unwrap();
         writer.finish().unwrap();
         assert_eq!(load_crate(&archive).unwrap(), sample());
+    }
+
+    #[test]
+    fn refuses_large_metadata() {
+        // Valid JSON past the bound is refused while it is unpacked, before it is parsed.
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("large.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        writer.start_file(METADATA_FILE, options).unwrap();
+        serde_json::to_writer(&mut writer, &sample()).unwrap();
+        let padding = vec![b' '; MAX_METADATA_BYTES as usize];
+        std::io::Write::write_all(&mut writer, &padding).unwrap();
+        writer.finish().unwrap();
+        let error = load_crate(&archive).unwrap_err().to_string();
+        assert!(error.contains("metadata bound"), "{error}");
+        assert_eq!(read_bounded(&b"{}"[..], 2).unwrap(), b"{}");
     }
 
     #[test]
