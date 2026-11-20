@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use byteview::ByteView;
 use thiserror::Error;
 
@@ -112,6 +112,11 @@ impl Operation for ListSecretsOperation {
     type Output = SecretPage;
     type Error = ListSecretsError;
 
+    /// A page's records and their state rows come from one snapshot, never two database states.
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+
     fn first(&mut self) -> Result<Next<Self::Output>, ListSecretsError> {
         self.phase = Phase::Page;
         Ok(Next::Call(IoCall::Page {
@@ -186,6 +191,23 @@ mod tests {
             operation.next(IoResult::Values(Vec::new())),
             Ok(Next::Done(empty))
         );
+    }
+
+    // The runner opens one read snapshot before the page, and the page reads in it.
+    #[test]
+    fn page_reads_snapshot() {
+        use aruna_core::calls::CallRun;
+        use aruna_core::effects::{Effect, StorageEffect};
+        use aruna_core::events::{Event, StorageEvent};
+        let mut run = CallRun::new(ListSecretsOperation::new(None));
+        let start = StorageEffect::StartTransaction { read: true };
+        assert_eq!(run.start().as_slice(), [Effect::Storage(start)]);
+        let txn_id = ulid::Ulid::from(5_u128);
+        let page = run.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert!(matches!(
+            page.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { txn_id: Some(read), .. })] if *read == txn_id
+        ));
     }
 
     // Each answer is taken only in the phase that asked for it.
