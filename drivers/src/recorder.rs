@@ -315,7 +315,7 @@ mod tests {
         );
     }
 
-    // A record larger than the whole budget is refused; the older records stay.
+    // A budget below one record refuses each record and keeps none.
     #[test]
     fn oversized_record_refused() {
         let mut buffer = Buffer::new();
