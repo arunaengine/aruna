@@ -395,7 +395,7 @@ async fn device_skips_holders() {
     }
 
     OperationsTaskHandler::new(context, JobsRuntime::new())
-        .refresh_blob_holders()
+        .run_trigger(TaskKey::RefreshBlobHolders)
         .await;
 
     let timer = storage

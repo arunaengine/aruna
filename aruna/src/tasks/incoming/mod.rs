@@ -624,8 +624,6 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// The timer map. Each arm is boxed here, outside an async body, so only
-    /// the selected timer's future stays on the stack while its work runs.
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
     async fn run_trigger(&self, key: TaskKey) {
         let memory = self.kept_memory(&key);
@@ -640,8 +638,16 @@ impl OperationsTaskHandler {
             running: Some(self.jobs_runtime.running_jobs()),
             has_tasks: self.context.task_handle.is_some(),
             group_concurrency: materialization_group_concurrency(),
-            heartbeats: (cluster.then(|| self.context.fresh_heartbeats())).unwrap_or_default(),
-            limits: (cluster.then(|| self.context.compute_limits())).unwrap_or_default(),
+            heartbeats: if cluster {
+                self.context.fresh_heartbeats()
+            } else {
+                Default::default()
+            },
+            limits: if cluster {
+                self.context.compute_limits()
+            } else {
+                Default::default()
+            },
             rocrate_limits: self.rocrate_limits.clone(),
         };
         let Some(operation) = timer_operation(&key, &input) else {
