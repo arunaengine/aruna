@@ -1,6 +1,5 @@
-//! Drains one page of the open outbox rotation: reads it, prepares each record's topic and peers,
-//! pulls missing shard geneses, splits the records, relays those this node cannot publish and
-//! publishes the rest.
+//! Drains one page of the open outbox rotation: reads it, pulls missing shard geneses, splits
+//! the records, relays those this node cannot publish and publishes the rest.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
