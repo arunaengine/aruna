@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::inbound::settle_followups;
-use aruna_operations::node::summary_refresh::RefreshUsageOperation;
+use aruna_operations::node::outbox_finish::FinishBatchOperation;
 
 /// The realm configuration the drain decides with: `None` on a node that has none yet, where the
 /// bootstrap rules apply, and an error when it cannot be read or decoded, which postpones the drain
@@ -795,85 +794,33 @@ pub async fn drive_sync_drain(context: Arc<DriverContext>) {
 }
 
 impl OperationsTaskHandler {
+    /// Finishes one synced sub-batch through its operation, and forgets the records it deleted.
     pub(super) async fn finish_sync_batch(
         &self,
         retry_key: &TaskKey,
         record_keys: Vec<Vec<u8>>,
         requested_targets: Vec<DocumentTarget>,
         event: Event,
-        mut outcome: DrainSyncOutcome,
+        outcome: DrainSyncOutcome,
     ) -> DrainSyncOutcome {
-        match event {
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled {
-                targets,
-                ..
-            })) => {
-                let mut refresh_targets = targets.clone();
-                refresh_targets.extend(requested_targets);
-                if let Some(net_handle) = self.context.net_handle.as_ref() {
-                    let (node_id, realm_id) = (net_handle.node_id(), Some(*net_handle.realm_id()));
-                    let generation = ulid::Ulid::generate();
-                    let refresh =
-                        RefreshUsageOperation::new(node_id, realm_id, &refresh_targets, generation);
-                    if let Err(error) = drive(refresh, self.context.as_ref()).await {
-                        warn!(%error, "Realm usage refresh stopped after an outbox drain");
-                    }
-                }
-                if let Some(net) = self.context.net_handle.as_ref() {
-                    let refresh = RefreshInterestOperation::new(&refresh_targets, *net.realm_id());
-                    if let Err(error) = drive(refresh, self.context.as_ref()).await {
-                        warn!(%error, "Watch interest refresh stopped after an outbox drain");
-                    }
-                }
-                let refresh = RefreshMailOperation::applied(&targets);
-                if let Err(error) = drive(refresh, self.context.as_ref()).await {
-                    warn!(%error, "Mail settings refresh stopped after an outbox drain");
-                }
-                // Each apply stored its metadata follow-up with it, and the applied drain owns it;
-                // the records stay for a rerun while its leftover work has no armed timer.
-                let project_started = Instant::now();
-                let settled = settle_followups(self.context.as_ref()).await;
-                outcome.project_elapsed = project_started.elapsed();
-                if !settled {
-                    warn!(task_id = ?retry_key, "Metadata follow-ups of an outbox drain wait");
-                    outcome.retry_needed = true;
-                    return outcome;
-                }
-                let delete_started = Instant::now();
-                let delete_count = record_keys.len();
-                let delete = DeleteOutboxPlan {
-                    keys: record_keys.clone(),
-                };
-                let deleted = drive(PlanOperation::new(delete), self.context.as_ref()).await;
-                outcome.delete_elapsed = delete_started.elapsed();
-                if deleted.is_ok() {
-                    outcome.deleted += delete_count;
+        let (serving, generation) = (self.context.node_and_realm(), ulid::Ulid::generate());
+        let batch = (record_keys.clone(), requested_targets);
+        let finish = FinishBatchOperation::new(serving, generation, batch, event, outcome);
+        match drive(finish, self.context.as_ref()).await {
+            Ok(finished) => {
+                if finished.deleted {
                     self.forget_published(&record_keys);
                 }
-                if let Err(error) = deleted {
-                    warn!(task_id = ?retry_key, error = %error, "Failed to delete document sync outbox records");
-                    outcome.retry_needed = true;
-                } else if refresh_targets
-                    .iter()
-                    .any(DocumentTarget::changes_dashboard)
-                {
-                    self.context.notify_dashboard_change();
+                finished.outcome
+            }
+            Err(error) => {
+                warn!(task_id = ?retry_key, %error, "Finishing a document sync batch broke off");
+                DrainSyncOutcome {
+                    retry_needed: true,
+                    ..DrainSyncOutcome::default()
                 }
             }
-            Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
-                warn!(task_id = ?retry_key, error = %error, "Failed to sync document batch");
-                outcome.retry_needed = true;
-            }
-            Event::Net(NetEvent::Error(error)) => {
-                warn!(task_id = ?retry_key, error = ?error, "Failed to sync document batch");
-                outcome.retry_needed = true;
-            }
-            other => {
-                warn!(task_id = ?retry_key, event = ?other, "Unexpected document sync batch result");
-                outcome.retry_needed = true;
-            }
         }
-        outcome
     }
 }
 

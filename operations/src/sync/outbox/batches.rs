@@ -178,7 +178,7 @@ pub fn resolve_publish_placement(
 
 /// What publishing and syncing sub-batches left: the time spent, the records deleted and the
 /// ordering domains to block for the rest of the rotation.
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct DrainSyncOutcome {
     pub sync_elapsed: Duration,
     pub project_elapsed: Duration,
