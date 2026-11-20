@@ -244,7 +244,6 @@ pub(crate) struct OperationsTaskHandler {
     // Where the replication drain's bootstrap work goes on. Loss on restart is fine: the
     // next drain starts at the first set and range.
     catch_up: std::sync::Mutex<CatchUpCursors>,
-    wake_cursor: std::sync::Mutex<Option<Key>>,
     // Rotation state of the bounded outbox drain. Loss on restart is fine: the
     // next rotation opens at the head.
     rotation: std::sync::Mutex<OutboxRotation>,
@@ -364,7 +363,6 @@ impl OperationsTaskHandler {
             retry_backoff: std::sync::Mutex::new(HashMap::new()),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
             catch_up: std::sync::Mutex::default(),
-            wake_cursor: std::sync::Mutex::new(None),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             published_records: std::sync::Mutex::new(BTreeSet::new()),
             drain_guard: tokio::sync::Mutex::new(()),
@@ -884,27 +882,7 @@ impl OperationsTaskHandler {
                     self.keep_retrying(key, AUDIT_RETRY).await;
                 }
             }),
-            TaskKey::DeliverKeyWakes => Box::pin(async move {
-                let start = (self.wake_cursor.lock())
-                    .expect("wake cursor mutex poisoned")
-                    .clone();
-                let serving = self.context.node_and_realm();
-                let deliver =
-                    aruna_operations::jobs::remote_key::DeliverWakesOperation::new(start, serving);
-                let delivery = drive(deliver, self.context.as_ref())
-                    .await
-                    .unwrap_or_else(|_| aruna_operations::jobs::remote_key::Delivery::unread());
-                *(self.wake_cursor.lock()).expect("wake cursor mutex poisoned") =
-                    delivery.next.clone();
-                if delivery.owed {
-                    // A further page follows at once; a finished round waits before retrying.
-                    let after = match delivery.next {
-                        Some(_) => Duration::ZERO,
-                        None => aruna_operations::jobs::remote_key::WAKE_RETRY,
-                    };
-                    self.reschedule_timer(TaskKey::DeliverKeyWakes, after).await;
-                }
-            }),
+            TaskKey::DeliverKeyWakes => Box::pin(self.run_trigger(key)),
             TaskKey::PublishRegistration => Box::pin(async move {
                 self.publish_registration().await;
             }),

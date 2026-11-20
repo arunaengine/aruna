@@ -24,6 +24,7 @@ use thiserror::Error;
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
 use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
+use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
@@ -148,6 +149,7 @@ pub enum TimerOperation {
     MigrateCompression(ProcessMigrationsOperation),
     SweepHiddenBlobs(ProcessHiddenOperation),
     PruneConnectorReferences(PruneReferencesOperation),
+    DeliverKeyWakes(DeliverWakesOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -186,6 +188,11 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::PruneConnectorReferences => Some(TimerOperation::PruneConnectorReferences(
             PruneReferencesOperation::new(),
         )),
+        TaskKey::DeliverKeyWakes => {
+            let start = input.memory.cursor.clone().map(Key::from);
+            let deliver = DeliverWakesOperation::new(start, input.facts.serving);
+            Some(TimerOperation::DeliverKeyWakes(deliver))
+        }
         _ => None,
     }
 }
@@ -204,6 +211,7 @@ macro_rules! each_timer {
             TimerOperation::MigrateCompression($operation) => $body,
             TimerOperation::SweepHiddenBlobs($operation) => $body,
             TimerOperation::PruneConnectorReferences($operation) => $body,
+            TimerOperation::DeliverKeyWakes($operation) => $body,
         }
     };
 }
@@ -378,6 +386,24 @@ impl TimerRun for PruneReferencesOperation {
             reason: error.to_string(),
         })?;
         Ok(TimerPlan::from(remaining.then_some(Duration::ZERO)))
+    }
+}
+
+impl TimerRun for DeliverWakesOperation {
+    /// Owed wakes go on at once with a further page and retry after a finished round; an
+    /// unreadable pass starts over later. The kept cursor is where the next pass starts.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let delivery = result.unwrap_or_else(|_| Delivery::unread());
+        let after = match (delivery.owed, &delivery.next) {
+            (false, _) => None,
+            (true, Some(_)) => Some(Duration::ZERO),
+            (true, None) => Some(WAKE_RETRY),
+        };
+        let memory = TimerMemory {
+            attempts: 0,
+            cursor: delivery.next.map(|key| key.to_vec()),
+        };
+        Ok(TimerPlan { after, memory })
     }
 }
 
@@ -711,6 +737,23 @@ mod tests {
         let error = PruneError::Schedule("boom".to_string());
         let failed = PruneReferencesOperation::rearm(Err(error));
         assert_eq!(failed.unwrap_err().retry_after, PRUNE_RETRY);
+    }
+
+    #[test]
+    fn wake_delivery_plans() {
+        // A further page follows at once, a finished round retries later, nothing owed waits.
+        let page = Delivery {
+            owed: true,
+            next: Some(Key::from(b"wake".to_vec())),
+            ..Delivery::default()
+        };
+        let plan = DeliverWakesOperation::rearm(Ok(page)).unwrap();
+        assert_eq!(plan.after, Some(Duration::ZERO));
+        assert_eq!(plan.memory.cursor.as_deref(), Some(&b"wake"[..]));
+        let unread = DeliverWakesOperation::rearm(Err(IoError::Codec("broken".to_string())));
+        assert_eq!(unread, Ok(TimerPlan::from(Some(WAKE_RETRY))));
+        let idle = DeliverWakesOperation::rearm(Ok(Delivery::default()));
+        assert_eq!(idle, Ok(TimerPlan::default()));
     }
 
     #[test]

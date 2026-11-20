@@ -539,7 +539,7 @@ impl Delivery {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DeliverStep {
     Owed,
     Sent(Box<OwedWake>),
@@ -547,7 +547,7 @@ enum DeliverStep {
 }
 
 /// Key node: sends one page of owed wakes after `start_after` and drops each acknowledged one.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeliverWakesOperation {
     start_after: Option<Key>,
     serving: ServingNode,
