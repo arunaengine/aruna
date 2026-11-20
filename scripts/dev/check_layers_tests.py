@@ -32,8 +32,11 @@ def write_tree(root, files):
 
 # The dispatch shells the trigger guard expects, each with one arm that only drives.
 TRIGGER_SITES = {
-    rel: f"fn serve(on: Kind) {{\n    match on {{\n        {prefix}One => {{}}\n    }}\n}}\n"
-    for rel, prefix in check_layers.TRIGGER_MATCHES
+    **{
+        rel: f"fn serve(on: Kind) {{\n    match on {{\n        {prefix}One => {{}}\n    }}\n}}\n"
+        for rel, prefix in check_layers.TRIGGER_MATCHES
+    },
+    "aruna/src/plugin_host/broker.rs": "impl Broker for RunBroker {}\n",
 }
 
 
@@ -225,8 +228,29 @@ class TriggerTest(unittest.TestCase):
 
     def test_trigger_missing(self):
         found = self.trigger_findings({})
+        missing = [f"{rel}: no {prefix} dispatch" for rel, prefix in check_layers.TRIGGER_MATCHES]
+        broker = "aruna/src/plugin_host/broker.rs: no Broker impl source"
+        self.assertEqual(found, missing + [broker])
+
+    def test_trigger_helpers(self):
+        # An arm may return only the table helper's future, and that helper must look the
+        # operation up once and drive it; a bespoke helper or a helper without a drive counts.
+        (timers, _), _ = check_layers.TRIGGER_MATCHES
+        timer_text = (
+            "fn work(key: TaskKey) {\n    match key {\n"
+            "        TaskKey::One => Box::pin(self.run_trigger(key)),\n"
+            "        TaskKey::Two => Box::pin(self.drain_two()),\n"
+            "    }\n}\n"
+            "async fn run_trigger(&self, key: TaskKey) {\n"
+            "    let operation = timer_operation(&key, &input);\n    self.later().await;\n}\n"
+        )
+        found = self.trigger_findings({**TRIGGER_SITES, timers: timer_text})
         self.assertEqual(
-            found, [f"{rel}: no {prefix} dispatch" for rel, prefix in check_layers.TRIGGER_MATCHES]
+            found,
+            [
+                f"{timers}: TaskKey::Two hands off to drain_two",
+                f"{timers}: run_trigger does not drive one timer_operation operation",
+            ],
         )
 
     def test_trigger_shapes(self):
@@ -238,7 +262,7 @@ class TriggerTest(unittest.TestCase):
             "    }\n}\n"
         )
         peer_text = "fn serve(alpn: Alpn) {\n    match alpn {\n        Alpn::Bao => {}\n    }\n}\n"
-        found = self.trigger_findings({timers: timer_text, peers: peer_text})
+        found = self.trigger_findings({**TRIGGER_SITES, timers: timer_text, peers: peer_text})
         self.assertEqual(found, [f"{timers}: {timer_prefix}Two"])
         self.assertTrue(peer_prefix.startswith("Alpn"))
 
