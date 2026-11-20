@@ -1,4 +1,5 @@
-//! Tests sync summary handling, buffered publish after restart and fan-out failure reports.
+//! Tests sync summary handling, buffered publish after restart, repeated publishes and fan-out
+//! failure reports.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -147,6 +148,88 @@ async fn buffered_publish_survives() {
             change: revision_change(),
         }
     );
+
+    service.shutdown().await;
+}
+
+fn restart_upsert() -> DocumentSyncPublish {
+    DocumentSyncPublish::Upsert {
+        event_id: restart_event_id(),
+        target: restart_target(),
+        bytes: restart_payload(),
+        change: revision_change(),
+        allow_genesis: true,
+    }
+}
+
+fn restart_key() -> Vec<u8> {
+    let event = DocumentEvent::Upsert {
+        event_id: restart_event_id(),
+        target: restart_target(),
+        bytes: restart_payload(),
+        change: revision_change(),
+    };
+    event_key(restart_topic(), &event).expect("event key encodes")
+}
+
+/// The sequence of this node's last op on the restart topic.
+fn own_tip(service: &DocumentSyncService) -> Option<u64> {
+    let topic_id = restart_topic();
+    let actor_id = ::irokle::actor_id_for(topic_id, service.node().peer_id());
+    let tip = ::irokle::Storage::actor_tip(service.node().storage(), &topic_id, &actor_id);
+    tip.expect("own tip reads").map(|(seq, _)| seq)
+}
+
+async fn publish_again(service: &DocumentSyncService) {
+    let published = DocumentNetEvent::DocumentsPublished {
+        targets: vec![restart_target()],
+    };
+    let event = service
+        .publish_documents(vec![restart_upsert()], Vec::new())
+        .await;
+    assert_eq!(event, published);
+}
+
+// The child stops after the oplog flush, before any outbox delete. The publish the restarted node
+// repeats finds the op, also when the process stopped before recording it.
+#[tokio::test]
+async fn restart_appends_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    run_restart_child(dir.path());
+    let service = open_restart_service(dir.path(), "parent-storage").await;
+    let tip = own_tip(&service);
+    assert!(tip.is_some(), "the child appended the event");
+
+    publish_again(&service).await;
+    assert_eq!(own_tip(&service), tip);
+
+    let (key, mark) = (restart_key(), restart_topic());
+    for key in [key.as_slice(), mark.as_bytes().as_slice()] {
+        service.published.remove(key).expect("record removed");
+    }
+    publish_again(&service).await;
+    assert_eq!(own_tip(&service), tip);
+
+    service.shutdown().await;
+}
+
+// A recorded op a genesis tie-break removed is gone with its lineage, so the event goes out again.
+#[tokio::test]
+async fn lost_lineage_republishes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let service = open_restart_service(dir.path(), "storage").await;
+    service
+        .ensure_sync_topics(&[restart_topic()], Vec::new())
+        .expect("shard topic genesis");
+    publish_again(&service).await;
+    let tip = own_tip(&service).expect("the event was appended");
+
+    let removed = ::irokle::OpId::hash(b"removed with its lineage");
+    service
+        .store_row(&restart_key(), removed.as_bytes())
+        .expect("record points at it");
+    publish_again(&service).await;
+    assert_eq!(own_tip(&service), Some(tip + 1));
 
     service.shutdown().await;
 }
