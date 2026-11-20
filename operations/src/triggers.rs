@@ -33,6 +33,7 @@ use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::info_timer::InfoTimerOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
@@ -181,6 +182,7 @@ pub enum TimerOperation {
     DrainMirrorRepair(DrainRepairsOperation),
     PublishUsageSnapshots(PublishUsageOperation),
     PublishNodeInfo(InfoTimerOperation),
+    DrainProjectionQueue(ProjectionRunOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -292,6 +294,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(Some(INFO_PUBLISH_INTERVAL))),
         }),
+        TaskKey::DrainProjectionQueue => Some(TimerOperation::DrainProjectionQueue(
+            ProjectionRunOperation::new(input.local_node),
+        )),
         _ => None,
     }
 }
@@ -319,6 +324,7 @@ macro_rules! each_timer {
             TimerOperation::DrainMirrorRepair($operation) => $body,
             TimerOperation::PublishUsageSnapshots($operation) => $body,
             TimerOperation::PublishNodeInfo($operation) => $body,
+            TimerOperation::DrainProjectionQueue($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -612,6 +618,17 @@ impl TimerRun for PublishUsageOperation {
 impl TimerRun for InfoTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for ProjectionRunOperation {
+    /// The run plans its own next start; a run that broke off retries after the projection delay.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: PROJECTION_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
     }
 }
 
@@ -1065,6 +1082,15 @@ mod tests {
         let mut idle = timer_operation(&TaskKey::PublishNodeInfo, &input()).unwrap();
         let next = TimerPlan::from(Some(INFO_PUBLISH_INTERVAL));
         assert_eq!(idle.first(), Ok(Next::Done(next)));
+    }
+
+    #[test]
+    fn projection_run_plans() {
+        // The run's own delay is kept; a run that broke off retries after the projection delay.
+        let more = ProjectionRunOperation::rearm(Ok(Some(Duration::ZERO)));
+        assert_eq!(more, Ok(TimerPlan::from(Some(Duration::ZERO))));
+        let failed = ProjectionRunOperation::rearm(Err(IoError::Unfinished));
+        assert_eq!(failed.unwrap_err().retry_after, PROJECTION_RETRY_AFTER);
     }
 
     #[test]

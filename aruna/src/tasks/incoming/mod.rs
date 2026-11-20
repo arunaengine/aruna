@@ -79,33 +79,13 @@ use aruna_operations::metadata::materialization_queue::{
     MaterializationBatchOperation, MetadataDrainResult, NEXT_BATCH_AFTER, NextTimerOperation,
     RequeueParkedOperation, materialization_group_concurrency,
 };
-use aruna_operations::metadata::projection::{
-    DrainProjectionOperation, PROJECTION_RETRY_AFTER, ProjectionTimerOperation, ReplayPageOperation,
-};
-use aruna_operations::replication::catch_up::CatchUpCursors;
-use aruna_operations::transfer::sharding::MaintainCursors;
-
-/// Replays the whole event log into the registry projection, one page at a time.
-async fn replay_event_log(
-    context: &aruna_drivers::driver::DriverContext,
-) -> Result<usize, aruna_operations::metadata::projection::MetadataProjectionError> {
-    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
-    let mut after = None;
-    let mut projected = 0usize;
-    loop {
-        let page = ReplayPageOperation::new(after, local_node);
-        let (count, next) = aruna_drivers::driver::drive(page, context).await?;
-        projected = projected.saturating_add(count);
-        match next {
-            Some(next) => after = Some(next),
-            None => return Ok(projected),
-        }
-    }
-}
+use aruna_operations::metadata::projection::ProjectionTimerOperation;
 use aruna_operations::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, PruneBatchOperation,
     PruneTimerOperation as GraphPruneTimerOperation, jobs_queued,
 };
+use aruna_operations::replication::catch_up::CatchUpCursors;
+use aruna_operations::transfer::sharding::MaintainCursors;
 
 /// Arms the graph prune drain for its next due job at start.
 async fn restore_graph_prune(
@@ -779,9 +759,7 @@ impl OperationsTaskHandler {
             }),
             TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
             TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainProjectionQueue => Box::pin(async move {
-                self.drain_projection_queue().await;
-            }),
+            TaskKey::DrainProjectionQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainMaterializationQueue => Box::pin(async move {
                 self.drain_materialization_queue().await;
             }),

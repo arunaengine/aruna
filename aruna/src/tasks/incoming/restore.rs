@@ -570,30 +570,6 @@ impl OperationsTaskHandler {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn drain_projection_queue(&self) {
-        let local_node = self.context.net_handle.as_ref().map(|net| net.node_id());
-        let drain = DrainProjectionOperation::new(local_node);
-        match drive(drain, &self.context).await {
-            Ok(result) if result.has_more => {
-                self.reschedule_timer(TaskKey::DrainProjectionQueue, std::time::Duration::ZERO)
-                    .await;
-            }
-            Ok(result) if result.markers_examined == 0 => {
-                if let Err(error) = replay_event_log(&self.context).await {
-                    warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to replay metadata event log fallback");
-                    self.reschedule_timer(TaskKey::DrainProjectionQueue, PROJECTION_RETRY_AFTER)
-                        .await;
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to drain metadata projection queue");
-                self.reschedule_timer(TaskKey::DrainProjectionQueue, PROJECTION_RETRY_AFTER)
-                    .await;
-            }
-        }
-    }
-
     pub(super) async fn drain_replication_queue(&self) {
         // A failed drain leaves the cursors where they were.
         let cursors = (self.catch_up.lock())
