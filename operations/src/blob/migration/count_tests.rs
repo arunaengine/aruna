@@ -187,3 +187,16 @@ fn stale_store_skipped() {
     let newer = value(Some(CoverageCount::new(8).to_bytes().unwrap()));
     assert_eq!(store.next(newer), Ok(Next::Done(())));
 }
+
+// A run started in the same millisecond replaced the record; the old worker leaves it alone.
+#[test]
+fn same_millisecond_skipped() {
+    let count = |id| CoverageCount {
+        run: Some(Ulid::from_parts(7, id)),
+        ..CoverageCount::new(7)
+    };
+    let mut store = StoreCountOperation::new("photos", count(1));
+    store.first().unwrap();
+    let newer = value(Some(count(2).to_bytes().unwrap()));
+    assert_eq!(store.next(newer), Ok(Next::Done(())));
+}

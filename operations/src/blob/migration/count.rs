@@ -410,8 +410,8 @@ impl Operation for StoreCountOperation {
         match self.step {
             StoreStep::Current => {
                 let stored = decode_count(result.value()?)?;
-                let started = self.record.started_at_ms;
-                if stored.is_none_or(|stored| stored.started_at_ms != started) {
+                let current = (self.record.started_at_ms, self.record.run);
+                if stored.is_none_or(|stored| (stored.started_at_ms, stored.run) != current) {
                     return Ok(Next::Done(()));
                 }
                 self.step = StoreStep::Written;
