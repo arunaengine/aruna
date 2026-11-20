@@ -460,9 +460,9 @@ async fn read_value(
     value
 }
 
+/// A delete of `target_version_id` up to its head read, which comes before any version scan.
 fn delete_until_lookup(
     target_version_id: Ulid,
-    all_version_ids: Vec<Ulid>,
     user_id: aruna_core::user::id::UserId,
 ) -> DeleteObjectOperation {
     let mut op = DeleteObjectOperation::new(DeleteObjectInput {
@@ -478,15 +478,28 @@ fn delete_until_lookup(
     // An ordinary bucket goes on to the version.
     assert_eq!(space(&op.next(read(None))), BLOB_VERSIONS_KEYSPACE);
     let turn = op.next(read(Some(deleted_version_value(user_id))));
-    assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
-    assert_eq!(space(&turn), BLOB_VERSIONS_KEYSPACE);
-    let rows = all_version_ids
-        .into_iter()
-        .map(|version_id| deleted_version_entry("bucket", "key", version_id, user_id))
-        .collect();
-    let turn = op.next(IoResult::Page { rows, next: None });
     assert_eq!(space(&turn), BLOB_HEAD_KEYSPACE);
     op
+}
+
+/// A head pointer naming `version_id`, as the head read answers it.
+fn head_answer(version_id: Ulid) -> IoResult {
+    let pointer = CurrentVersionPointer::new_with_generation(version_id, 20);
+    read(Some(pointer.to_bytes().unwrap().into()))
+}
+
+/// One page of versions of the key, then the version key to continue after.
+fn versions_page(
+    version_ids: &[Ulid],
+    next: Option<Ulid>,
+    user_id: aruna_core::user::id::UserId,
+) -> IoResult {
+    let rows = (version_ids.iter())
+        .map(|version_id| deleted_version_entry("bucket", "key", *version_id, user_id))
+        .collect();
+    let next = next.map(|version_id| VersionKey::new("bucket", "key", version_id));
+    let next = next.map(|key| key.to_bytes().unwrap().into());
+    IoResult::Page { rows, next }
 }
 
 #[test]
@@ -494,15 +507,10 @@ fn preserves_noncurrent_pointer() {
     let user_id = test_user_id();
     let current_version_id = Ulid::from_bytes([1u8; 16]);
     let target_version_id = Ulid::from_bytes([2u8; 16]);
-    let newer_version_id = Ulid::from_bytes([9u8; 16]);
-    let mut op = delete_until_lookup(
-        target_version_id,
-        vec![current_version_id, target_version_id, newer_version_id],
-        user_id,
-    );
-    let current_pointer = CurrentVersionPointer::new_with_generation(current_version_id, 20);
+    let mut op = delete_until_lookup(target_version_id, user_id);
 
-    let turn = op.next(read(Some(current_pointer.to_bytes().unwrap().into())));
+    // A version that is not the head is deleted without reading the other versions.
+    let turn = op.next(head_answer(current_version_id));
 
     assert_eq!(op.state, DeleteObjectState::DeleteTargetVersion);
     assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
@@ -514,14 +522,21 @@ fn rewrites_current_pointer() {
     let user_id = test_user_id();
     let target_version_id = Ulid::from_bytes([1u8; 16]);
     let fallback_version_id = Ulid::from_bytes([9u8; 16]);
-    let mut op = delete_until_lookup(
-        target_version_id,
-        vec![target_version_id, fallback_version_id],
-        user_id,
-    );
-    let current_pointer = CurrentVersionPointer::new_with_generation(target_version_id, 20);
+    let mut op = delete_until_lookup(target_version_id, user_id);
+    let scan = op.next(head_answer(target_version_id));
+    assert!(matches!(scan, Ok(Next::Call(IoCall::Page { limit: VERSION_PAGE, .. }))));
 
-    let written = call(op.next(read(Some(current_pointer.to_bytes().unwrap().into()))));
+    // The newest version on an earlier page wins over the versions of the last page.
+    let first = versions_page(&[fallback_version_id], Some(fallback_version_id), user_id);
+    let next = op.next(first);
+    let after = VersionKey::new("bucket", "key", fallback_version_id);
+    let after = Some(after.to_bytes().unwrap().into());
+    let Ok(Next::Call(IoCall::Page { after: page_after, .. })) = &next else {
+        panic!("expected the next version page, got {next:?}");
+    };
+    assert_eq!(*page_after, after);
+    let older = Ulid::from_bytes([5u8; 16]);
+    let written = call(op.next(versions_page(&[older, target_version_id], None, user_id)));
 
     let IoCall::Write(rows) = &written else {
         panic!("expected blob head write, got {written:?}");
@@ -553,6 +568,7 @@ fn unreadable_version_stops() {
     op.first().unwrap();
     op.next(read(None)).unwrap();
     op.next(read(Some(deleted_version_value(user_id)))).unwrap();
+    op.next(head_answer(target_version_id)).unwrap();
     let newer = VersionKey::new("bucket", "key", Ulid::from_bytes([9u8; 16]));
     let rows = vec![
         deleted_version_entry("bucket", "key", target_version_id, user_id),
@@ -569,10 +585,10 @@ fn unreadable_version_stops() {
 fn removes_final_pointer() {
     let user_id = test_user_id();
     let target_version_id = Ulid::from_bytes([1u8; 16]);
-    let mut op = delete_until_lookup(target_version_id, vec![target_version_id], user_id);
-    let current_pointer = CurrentVersionPointer::new_with_generation(target_version_id, 20);
+    let mut op = delete_until_lookup(target_version_id, user_id);
+    op.next(head_answer(target_version_id)).unwrap();
 
-    let turn = op.next(read(Some(current_pointer.to_bytes().unwrap().into())));
+    let turn = op.next(versions_page(&[target_version_id], None, user_id));
 
     assert_eq!(op.state, DeleteObjectState::WriteHead);
     assert!(matches!(&turn, Ok(Next::Call(IoCall::Delete(rows))) if rows.len() == 1));
