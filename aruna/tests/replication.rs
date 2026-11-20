@@ -59,7 +59,6 @@ use shared::{
     shutdown_pair, spawn_complete_joiner, spawn_complete_seed, wait_group_member, wait_realm_nodes,
     wait_until,
 };
-use std::time::Duration;
 use ulid::Ulid;
 
 fn error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
@@ -454,30 +453,35 @@ impl ReplicationHarness {
         .await
     }
 
-    async fn assert_object_absent(
-        &self,
-        bucket: &str,
-        key: &str,
-        polls: usize,
-        interval: Duration,
-    ) -> TestResult<()> {
-        for _ in 0..polls {
-            let head_result = self
-                .joiner_client
-                .head_object()
-                .bucket(bucket)
-                .key(key)
-                .send()
-                .await;
-            assert_eq!(
-                error_status(&head_result),
-                Some(404),
-                "the object must be absent on the joiner, not merely forbidden"
-            );
-            // Real time: the object must stay absent over the whole window, not at one look.
-            tokio::time::sleep(interval).await;
-        }
+    /// Checks once that the object is absent on the joiner. Call it after
+    /// [`Self::wait_replication_drained`] past a known boundary, so no copy can still come.
+    async fn assert_object_absent(&self, bucket: &str, key: &str) -> TestResult<()> {
+        let head_result = self
+            .joiner_client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_eq!(
+            error_status(&head_result),
+            Some(404),
+            "the object must be absent on the joiner, not merely forbidden"
+        );
         Ok(())
+    }
+
+    /// Waits until both nodes hold no replication obligation or job, so every source change
+    /// made before a replicated boundary object has been processed.
+    async fn wait_replication_drained(&self) -> TestResult<()> {
+        let (seed, joiner) = (self.seed.context.as_ref(), self.joiner.context.as_ref());
+        wait_until("replication queue drain", shared::WAIT_CAP, || async {
+            keyspace_empty(seed, REPLICATION_OBLIGATION_KEYSPACE).await
+                && keyspace_empty(joiner, REPLICATION_OBLIGATION_KEYSPACE).await
+                && keyspace_empty(seed, REPLICATION_JOB_KEYSPACE).await
+                && keyspace_empty(joiner, REPLICATION_JOB_KEYSPACE).await
+        })
+        .await
     }
 
     async fn shutdown(self) {
@@ -600,25 +604,28 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
             .body(ByteStream::from_static(b"must stay on source"))
             .send()
             .await?;
+        // A selected write after the excluded one: once it is copied and the queues are empty,
+        // the excluded write has been processed too.
+        harness
+            .seed_client
+            .put_object()
+            .bucket(source_bucket)
+            .key("selected/boundary.txt")
+            .body(ByteStream::from_static(b"boundary"))
+            .send()
+            .await?;
 
         harness.wait_for_object(target_bucket, target_key).await?;
         harness
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
         harness
-            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
+            .wait_for_object(target_bucket, "replica/boundary.txt")
             .await?;
-        harness
-            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
-            .await?;
-        harness
-            .assert_object_absent(
-                target_bucket,
-                excluded_target,
-                10,
-                Duration::from_millis(200),
-            )
-            .await?;
+        harness.wait_replication_drained().await?;
+        for key in [source_key, excluded_key, excluded_target] {
+            harness.assert_object_absent(target_bucket, key).await?;
+        }
 
         let delete_output = harness
             .seed_client
@@ -739,20 +746,11 @@ async fn once_syncs_prefix() -> TestResult<()> {
         harness
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
-        harness
-            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
-            .await?;
-        harness
-            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
-            .await?;
-        harness
-            .assert_object_absent(
-                target_bucket,
-                excluded_target,
-                10,
-                Duration::from_millis(200),
-            )
-            .await?;
+        // The once sync has copied everything it selects once its job is gone.
+        harness.wait_replication_drained().await?;
+        for key in [source_key, excluded_key, excluded_target] {
+            harness.assert_object_absent(target_bucket, key).await?;
+        }
         Ok(())
     }
     .await;
@@ -1884,9 +1882,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
         )
         .await?;
 
-        harness
-            .assert_object_absent(bucket, scoped_key, 5, Duration::from_millis(200))
-            .await?;
+        harness.assert_object_absent(bucket, scoped_key).await?;
         Ok(())
     }
     .await;
@@ -1942,10 +1938,9 @@ async fn scoped_replication_paths() -> TestResult<()> {
         harness
             .assert_object_matches(bucket, control_key, &control_body)
             .await?;
-
-        harness
-            .assert_object_absent(bucket, scoped_key, 10, Duration::from_millis(200))
-            .await?;
+        // The control write followed the scoped one, so with the queues empty both were handled.
+        harness.wait_replication_drained().await?;
+        harness.assert_object_absent(bucket, scoped_key).await?;
 
         let scoped_destination_get = harness
             .joiner_client

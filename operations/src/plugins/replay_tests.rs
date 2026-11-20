@@ -385,7 +385,11 @@ fn replays_take_turns() {
     assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
     let more = || child_result(Ok::<_, StoreError>((10usize, false)));
     replays.next(more()).unwrap();
-    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]), "then the other one");
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r2"[..]),
+        "then the other one"
+    );
     let ended = child_result(Ok::<_, StoreError>((2usize, true)));
     replays.next(ended).unwrap();
     assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));

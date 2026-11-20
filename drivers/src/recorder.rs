@@ -33,9 +33,12 @@ pub struct Record {
 /// as inputs, events and results can carry private data in any field or nested payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
+    /// The run header. `entropy` is the id-mint input, which every minted id shows anyway; with
+    /// the records' `at_ms` it gives the run's ids again. Secret seeds never come from it.
     Started {
         operation: &'static str,
         input_bytes: usize,
+        entropy: u128,
     },
     Event {
         label: &'static str,
@@ -82,13 +85,18 @@ pub fn take() -> Recorded {
         .unwrap_or_default()
 }
 
-/// Opens a run record when recording is on and returns the run's number.
-pub(crate) fn begin(operation: &'static str, at_ms: u64, input: &dyn Debug) -> Option<u64> {
+/// Opens a run record with the run's entropy when recording is on and returns the run's number.
+pub(crate) fn begin(
+    operation: &'static str,
+    at_ms: u64,
+    input: &dyn Debug,
+    entropy: u128,
+) -> Option<u64> {
     if !ENABLED.load(Ordering::Relaxed) {
         return None;
     }
     let run = RUNS.fetch_add(1, Ordering::Relaxed);
-    push(run, at_ms, started(operation, input, entry_cap()));
+    push(run, at_ms, started(operation, input, entropy, entry_cap()));
     Some(run)
 }
 
@@ -111,11 +119,12 @@ fn push(run: u64, at_ms: u64, entry: Entry) {
     }
 }
 
-fn started(operation: &'static str, input: &dyn Debug, cap: usize) -> Entry {
+fn started(operation: &'static str, input: &dyn Debug, entropy: u128, cap: usize) -> Entry {
     let input_bytes = debug_bytes(input, cap);
     Entry::Started {
         operation,
         input_bytes,
+        entropy,
     }
 }
 
@@ -243,7 +252,7 @@ mod tests {
         });
         let result: Result<Vec<u8>, ()> = Ok(private.as_bytes().to_vec());
         let entries = [
-            started("PeerOperation", &private, 4096),
+            started("PeerOperation", &private, 0, 4096),
             delivered(&grouped, 4096),
             ended("Ok", &result, 4096),
         ];

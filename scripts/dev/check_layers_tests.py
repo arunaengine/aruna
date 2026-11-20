@@ -30,8 +30,16 @@ def write_tree(root, files):
             handle.write(text)
 
 
+# The dispatch shells the trigger guard expects, each with one arm that only drives.
+TRIGGER_SITES = {
+    rel: f"fn serve(on: Kind) {{\n    match on {{\n        {prefix}One => {{}}\n    }}\n}}\n"
+    for rel, prefix in check_layers.TRIGGER_MATCHES
+}
+
+
 def base_tree(extra=None):
     files = {
+        **TRIGGER_SITES,
         "Cargo.toml": WORKSPACE,
         "operations/Cargo.toml": MANIFEST,
         "operations/src/lib.rs": "pub mod abe;\npub mod jobs;\n",
@@ -209,6 +217,31 @@ class TriggerTest(unittest.TestCase):
             [("TaskKey::Drain { id, .. }", True), ("TaskKey::Plain", False), ("TaskKey::Block if ready()", True), ("_", False)],
         )
 
+    def trigger_findings(self, files):
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            sources = {rel: check_layers.load_source(root, rel) for rel in files}
+        return check_layers.trigger_arms(sources)
+
+    def test_trigger_missing(self):
+        found = self.trigger_findings({})
+        self.assertEqual(
+            found, [f"{rel}: no {prefix} dispatch" for rel, prefix in check_layers.TRIGGER_MATCHES]
+        )
+
+    def test_trigger_shapes(self):
+        (timers, timer_prefix), (peers, peer_prefix) = check_layers.TRIGGER_MATCHES
+        timer_text = (
+            "fn work(key: TaskKey) {\n    match key {\n"
+            "        TaskKey::One => Box::pin(async move { drive(One::new(), c).await; }),\n"
+            "        TaskKey::Two => Box::pin(async move { drive(A, c).await; b().await; }),\n"
+            "    }\n}\n"
+        )
+        peer_text = "fn serve(alpn: Alpn) {\n    match alpn {\n        Alpn::Bao => {}\n    }\n}\n"
+        found = self.trigger_findings({timers: timer_text, peers: peer_text})
+        self.assertEqual(found, [f"{timers}: {timer_prefix}Two"])
+        self.assertTrue(peer_prefix.startswith("Alpn"))
+
     def test_broker_impl(self):
         rel = "aruna/src/plugin_host/broker.rs"
         text = (
@@ -216,10 +249,8 @@ class TriggerTest(unittest.TestCase):
             "    async fn one(&self) { Ok(drive(op, c).await?) }\n    fn sync(&self) {}\n}\n"
             "async fn free() { x.await; y.await }\n"
         )
-        with tempfile.TemporaryDirectory() as root:
-            write_tree(root, {rel: text})
-            source = check_layers.load_source(root, rel)
-        self.assertEqual(check_layers.trigger_arms({rel: source}), [f"{rel}: Broker::get"])
+        found = self.trigger_findings({**TRIGGER_SITES, rel: text})
+        self.assertEqual(found, [f"{rel}: Broker::get"])
 
 
 class ClocksTest(unittest.TestCase):

@@ -226,6 +226,45 @@ impl Operation for HolderChoiceOperation {
     }
 }
 
+/// Chooses one holder of `holders` with the entropy the runner gives this run, so replaying the
+/// run's events chooses the same one: of two random fresh candidates, the one with more free
+/// download slots, then more bandwidth. `None` when no holder is a fresh candidate.
+#[derive(Debug, PartialEq)]
+pub struct PickHolderOperation {
+    holders: Vec<NodeId>,
+    now_ms: u64,
+    entropy: u128,
+}
+
+impl PickHolderOperation {
+    pub fn new(holders: &[NodeId], now_ms: u64) -> Self {
+        Self {
+            holders: holders.to_vec(),
+            now_ms,
+            entropy: 0,
+        }
+    }
+}
+
+impl Operation for PickHolderOperation {
+    type Output = Option<HolderCandidate>;
+    type Error = HolderChoiceError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy;
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, HolderChoiceError> {
+        let choice = HolderChoiceOperation::new(&self.holders, self.now_ms);
+        Ok(Next::Call(IoCall::child(choice)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, HolderChoiceError> {
+        let candidates = result.child::<Vec<HolderCandidate>, HolderChoiceError>()??;
+        Ok(Next::Done(pick(candidates, self.entropy)))
+    }
+}
+
 #[cfg(test)]
 #[path = "holder_choice_tests.rs"]
 mod tests;

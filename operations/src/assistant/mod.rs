@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoError};
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
-use aruna_core::structs::assistant_chat::AssistantChatHead;
+use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TOTAL_KEYSPACE, CHAT_TURN_KEYSPACE};
+use aruna_core::structs::assistant_chat::{AssistantChatHead, AssistantChatTotals};
 use aruna_core::types::{Key, Value};
 use aruna_core::user::id::UserId;
 use byteview::ByteView;
@@ -21,6 +21,9 @@ pub mod turns;
 pub const CHAT_CAP: &str = "a user may keep at most 20 chats";
 pub const TURN_CAP: &str = "a turn payload may hold at most 256 KiB";
 pub const BUDGET_CAP: &str = "the chats of a user may hold at most 8 MiB together";
+
+/// Heads one page of a totals rebuild reads at most.
+const TOTALS_PAGE: usize = 64;
 
 fn head_prefix(user_id: UserId) -> Vec<u8> {
     let mut key = user_id.to_storage_key();
@@ -86,6 +89,83 @@ fn live_head(value: Option<Value>) -> Result<AssistantChatHead, ChatStoreError> 
         Ok(head)
     } else {
         Err(ChatStoreError::Deleted)
+    }
+}
+
+/// The row of one user's chat totals, written in the transaction of each change it counts.
+fn totals_entry(
+    user_id: UserId,
+    totals: AssistantChatTotals,
+) -> Result<(String, Key, Value), ChatStoreError> {
+    let key = ByteView::from(user_id.to_storage_key());
+    Ok((
+        CHAT_TOTAL_KEYSPACE.to_string(),
+        key,
+        totals.to_bytes()?.into(),
+    ))
+}
+
+/// What reading a user's chat totals needs next.
+#[derive(Debug, PartialEq)]
+enum TotalsStep {
+    Call(IoCall),
+    Done(AssistantChatTotals),
+}
+
+/// Reads one user's chat totals; a missing row is summed from the live heads in bounded pages,
+/// and the change that read it writes the row, so later changes read it directly.
+#[derive(Debug, PartialEq)]
+struct TotalsRead {
+    user_id: UserId,
+    paging: bool,
+    after: Option<Key>,
+    summed: AssistantChatTotals,
+}
+
+impl TotalsRead {
+    fn new(user_id: UserId) -> Self {
+        Self {
+            user_id,
+            paging: false,
+            after: None,
+            summed: AssistantChatTotals::default(),
+        }
+    }
+
+    fn call(&self) -> IoCall {
+        let key = ByteView::from(self.user_id.to_storage_key());
+        IoCall::Read(vec![(CHAT_TOTAL_KEYSPACE.to_string(), key)])
+    }
+
+    fn page(&self) -> IoCall {
+        IoCall::Page {
+            space: CHAT_HEAD_KEYSPACE.to_string(),
+            prefix: ByteView::from(head_prefix(self.user_id)),
+            after: self.after.clone(),
+            limit: TOTALS_PAGE,
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<TotalsStep, ChatStoreError> {
+        if !self.paging {
+            if let Some(value) = result.value()? {
+                return Ok(TotalsStep::Done(AssistantChatTotals::from_bytes(&value)?));
+            }
+            self.paging = true;
+            return Ok(TotalsStep::Call(self.page()));
+        }
+        let (rows, next) = result.page()?;
+        for head in decode_heads(rows)?.iter().filter(|head| head.is_live()) {
+            self.summed.chats = self.summed.chats.saturating_add(1);
+            self.summed.bytes = self.summed.bytes.saturating_add(head.bytes);
+        }
+        match next {
+            Some(after) => {
+                self.after = Some(after);
+                Ok(TotalsStep::Call(self.page()))
+            }
+            None => Ok(TotalsStep::Done(self.summed)),
+        }
     }
 }
 

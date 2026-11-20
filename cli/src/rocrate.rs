@@ -71,7 +71,9 @@ fn read_archive(path: &Path) -> Result<Vec<u8>, CliError> {
 /// At most `limit` bytes of `reader`, read as they arrive; a longer input is refused unparsed.
 fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>, CliError> {
     let mut bytes = Vec::new();
-    reader.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(CliError::usage(format!(
             "{METADATA_FILE} is larger than {limit} bytes, the metadata bound of an import"

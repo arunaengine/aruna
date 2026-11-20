@@ -17,7 +17,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::holder_choice::{HolderCandidate, HolderChoiceOperation, pick};
+use aruna_core::holder_choice::{HolderCandidate, PickHolderOperation};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::api::IdentifierMatch;
@@ -916,10 +916,10 @@ async fn choose_holder(
     let record = drive(DocumentRecordOperation::new(document_id), context)
         .await
         .ok()??;
-    let choice = HolderChoiceOperation::new(&record.holder_node_ids, now_ms);
-    let candidates = drive(choice, context).await.unwrap_or_default();
-    pick(candidates, Ulid::generate().random())
-        .filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
+    let choice = PickHolderOperation::new(&record.holder_node_ids, now_ms);
+    // Unlike DRS, a PID never serves from a holder without a published API.
+    let chosen = drive(choice, context).await.ok().flatten();
+    chosen.filter(|chosen| chosen.node_id != local_node_id && chosen.urls.api.is_some())
 }
 
 #[cfg(test)]

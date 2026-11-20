@@ -736,6 +736,65 @@ fn calls_after_commit() {
     assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
 }
 
+/// Collects the formatted logs of a test.
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut logs = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn refused_wake_logged() {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Captured(sink.clone()))
+        .with_ansi(false)
+        .finish();
+    let _logged = tracing::subscriber::set_default(subscriber);
+    let wake = TaskEffect::ShortenTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::ZERO,
+    };
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::Effect(Box::new(Effect::Task(wake)))];
+    let mut operation = run(procedure, false);
+    assert_eq!(operation.start().len(), 1, "the wake is sent");
+    let refused = TaskEvent::Error {
+        key: Some(TaskKey::DrainAppliedSync),
+        message: "queue full".to_string(),
+    };
+    assert!(operation.step(Event::Task(refused)).is_empty());
+    assert_eq!(operation.finalize(), Ok(Vec::new()), "the outcome stays");
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("A call after the commit failed"), "{logs}");
+    assert!(logs.contains("queue full"), "{logs}");
+}
+
+#[test]
+fn early_finalize_unfinished() {
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::Delay(Duration::from_secs(1))];
+    let mut operation = run(procedure, false);
+    assert_eq!(
+        operation.start().as_slice(),
+        &[Effect::Delay(Duration::from_secs(1))]
+    );
+    assert!(!operation.is_complete());
+    assert_eq!(operation.finalize(), Err(IoError::Unfinished));
+}
+
 #[test]
 fn reads_expected_answers() {
     let value: crate::types::Value = b"v".to_vec().into();

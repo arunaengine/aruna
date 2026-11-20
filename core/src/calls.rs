@@ -657,8 +657,13 @@ impl<P: Operation> CallRun<P> {
                 calls,
                 wait,
             } => {
-                if let Err(error) = answer(wait, event) {
-                    warn!(%error, "A call after the commit failed");
+                match answer(wait, event) {
+                    Err(error) => warn!(%error, "A call after the commit failed"),
+                    // An adapter refusal is a valid answer of its family, yet the call failed.
+                    Ok(IoResult::Event(event)) if event.label().ends_with("::Error") => {
+                        warn!(event = ?event, "A call after the commit failed");
+                    }
+                    Ok(_) => {}
                 }
                 self.after(output, calls)
             }
@@ -674,11 +679,11 @@ impl<P: Operation> CallRun<P> {
         matches!(self.state, State::Finished(_))
     }
 
-    /// The outcome; a run that did not finish reports `IoError::Unfinished`.
+    /// The outcome; a run that did not finish, even one whose calls after the commit still
+    /// run, reports `IoError::Unfinished`. `abort` settles a committed run first.
     pub fn finalize(self) -> Result<P::Output, P::Error> {
         match self.state {
             State::Finished(result) => result,
-            State::After { output, .. } => Ok(output),
             _ => Err(IoError::Unfinished.into()),
         }
     }

@@ -491,13 +491,18 @@ fn keep_id(record: &mut std::fs::File, upload_id: &str) -> std::io::Result<()> {
 /// A part's ETag is the MD5 of the bytes the node stored; another MD5 than the hashed one means
 /// the file changed while it was sent, so the hashed digest would not describe the upload.
 fn check_part(md5s: &[String], (number, etag): (i32, &str), path: &Path) -> Result<(), CliError> {
-    let expected = (number as usize).checked_sub(1).and_then(|index| md5s.get(index));
+    let expected = (number as usize)
+        .checked_sub(1)
+        .and_then(|index| md5s.get(index));
     let etag = etag.trim_matches('"');
     match expected {
         Some(expected) if expected.eq_ignore_ascii_case(etag) => Ok(()),
         expected => Err(CliError::Checksum {
             path: path.display().to_string(),
-            expected: format!("part {number} with MD5 {}", expected.map_or("", String::as_str)),
+            expected: format!(
+                "part {number} with MD5 {}",
+                expected.map_or("", String::as_str)
+            ),
             actual: etag.to_string(),
         }),
     }

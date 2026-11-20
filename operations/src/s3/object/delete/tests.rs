@@ -524,14 +524,23 @@ fn rewrites_current_pointer() {
     let fallback_version_id = Ulid::from_bytes([9u8; 16]);
     let mut op = delete_until_lookup(target_version_id, user_id);
     let scan = op.next(head_answer(target_version_id));
-    assert!(matches!(scan, Ok(Next::Call(IoCall::Page { limit: VERSION_PAGE, .. }))));
+    assert!(matches!(
+        scan,
+        Ok(Next::Call(IoCall::Page {
+            limit: VERSION_PAGE,
+            ..
+        }))
+    ));
 
     // The newest version on an earlier page wins over the versions of the last page.
     let first = versions_page(&[fallback_version_id], Some(fallback_version_id), user_id);
     let next = op.next(first);
     let after = VersionKey::new("bucket", "key", fallback_version_id);
     let after = Some(after.to_bytes().unwrap().into());
-    let Ok(Next::Call(IoCall::Page { after: page_after, .. })) = &next else {
+    let Ok(Next::Call(IoCall::Page {
+        after: page_after, ..
+    })) = &next
+    else {
         panic!("expected the next version page, got {next:?}");
     };
     assert_eq!(*page_after, after);
