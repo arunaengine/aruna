@@ -92,14 +92,43 @@ fn start_joins_run() {
     assert_eq!((restarted.observed, restarted.run), (0, Some(run)));
 }
 
-// A coordinator a start missed still holds its previous run; that count leaves the answer.
+// A coordinator a start missed holds its previous run or no count; either leaves the answer.
 #[test]
 fn other_runs_dropped() {
     let (old, new) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
     let runs = [Some(new), Some(old), None, Some(new)];
-    assert_eq!(other_runs(None, &runs), [1]);
-    assert_eq!(other_runs(Some(old), &runs), [0, 3]);
+    assert_eq!(current_run(None, &runs), Some(new));
+    assert_eq!(other_runs(Some(new), &runs), [1, 2]);
+    // A caller polls the run its start answered with, even when a newer one exists.
+    assert_eq!(current_run(Some(old), &runs), Some(old));
+    assert_eq!(other_runs(Some(old), &runs), [0, 2, 3]);
+    assert_eq!(current_run(None, &[None, None]), None);
     assert!(other_runs(None, &[None, None]).is_empty());
+}
+
+// One run for every coordinator of a distributed start, minted before the first one starts.
+#[test]
+fn mints_one_run() {
+    let mut mint = MintRunOperation::default();
+    mint.seed(5);
+    mint.stamp(7);
+    assert_eq!(mint.first(), Ok(Next::Done(Ulid::from_parts(7, 5))));
+}
+
+// A read for a run the node does not hold finds no count of it.
+#[test]
+fn read_filters_run() {
+    let saved = CoverageCount {
+        run: Some(Ulid::from_parts(7, 1)),
+        ..CoverageCount::new(7)
+    };
+    let other = Some(Ulid::from_parts(7, 2));
+    for (run, found) in [(None, true), (saved.run, true), (other, false)] {
+        let mut read = ReadCountOperation::new("photos", run);
+        read.first().unwrap();
+        let answer = read.next(value(Some(saved.to_bytes().unwrap())));
+        assert_eq!(answer, Ok(Next::Done(found.then(|| saved.clone()))));
+    }
 }
 
 #[test]
