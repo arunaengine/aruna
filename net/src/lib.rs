@@ -1164,6 +1164,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::CursorSign(_)) => "cursor_sign",
         Effect::Net(NetEffect::FederationSign(_)) => "federation_sign",
         Effect::Net(NetEffect::OpenCredential(_)) => "open_credential",
+        Effect::Net(NetEffect::AdminSign { .. }) => "admin_sign",
         Effect::Net(NetEffect::SealPosition(_)) => "seal_position",
         Effect::Net(NetEffect::OpenPosition(_)) => "open_position",
         Effect::Net(NetEffect::DrawSecret(_)) => "draw_secret",
