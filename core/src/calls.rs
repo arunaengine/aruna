@@ -647,8 +647,13 @@ impl<P: Operation> CallRun<P> {
                 calls,
                 wait,
             } => {
-                if let Err(error) = answer(wait, event) {
-                    warn!(%error, "A call after the commit failed");
+                match answer(wait, event) {
+                    Err(error) => warn!(%error, "A call after the commit failed"),
+                    // An adapter refusal is a valid answer of its family, yet the call failed.
+                    Ok(IoResult::Event(event)) if event.label().ends_with("::Error") => {
+                        warn!(event = ?event, "A call after the commit failed");
+                    }
+                    Ok(_) => {}
                 }
                 self.after(output, calls)
             }
