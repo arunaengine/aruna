@@ -377,18 +377,21 @@ async fn empty_ranges_resume() {
     assert_eq!(names, ["z.txt"]);
 }
 
-// A member that stops among entries its policy hides hands on a sealed cursor without a path.
+// The serving member's own policy hides a run longer than its scan budget: the page stops among
+// the hidden entries with a sealed cursor that names none of them. A holder's sealed cursor is
+// followed by the serving member's own scan, so only this member's rules end a page there.
 #[tokio::test]
 async fn hidden_run_resumes() {
     use aruna_operations::s3::object::pages::{Resume, decode_resume};
     use aruna_operations::s3::object::visible::SCAN_BUDGET;
     let shared = shared().await;
+    // Member 0 coordinates the keys below "m"; the visible key sorts after the hidden run.
     for n in 0..=SCAN_BUDGET {
-        put(&shared, 1, &format!("secret{n:04}.txt"), "closed").await;
+        put(&shared, 0, &format!("hidden{n:04}.txt"), "closed").await;
     }
-    put(&shared, 1, "t.txt", "open").await;
-    let expression = "request.session.kind == 'share' && path.contains('/secret')";
-    shared.members.deny_on(1, expression).await;
+    put(&shared, 0, "i.txt", "open").await;
+    let expression = "request.session.kind == 'share' && path.contains('/hidden')";
+    shared.members.deny_on(0, expression).await;
     let (_, visit) = visit(&shared, ShareModeBody::Read).await;
     let listed = page(&shared, &visit, ("", None, Some(10))).await.unwrap();
     assert!(listed.files.is_empty());
@@ -397,14 +400,14 @@ async fn hidden_run_resumes() {
     assert!(matches!(resume, Resume::Hidden { .. }), "{resume:?}");
     let fields = visible_fields(&resume);
     assert!(
-        fields.iter().all(|field| !field.contains("secret")),
+        fields.iter().all(|field| !field.contains("hidden")),
         "{resume:?}"
     );
     let rest = page(&shared, &visit, ("", Some(next), Some(10)))
         .await
         .unwrap();
     let names: Vec<_> = rest.files.into_iter().map(|file| file.name).collect();
-    assert_eq!(names, ["t.txt"]);
+    assert_eq!(names, ["i.txt"]);
 }
 
 #[test]
