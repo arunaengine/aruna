@@ -5,6 +5,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::compute::{BackendError, FenceContext, TombstoneEvidence};
 use serde::{Deserialize, Serialize};
@@ -66,12 +67,24 @@ impl DaemonLock {
     }
 
     pub fn verify(&self) -> Result<(), BackendError> {
-        let path = self.root.join("health.tmp");
-        let mut file = File::create(&path).map_err(api_error)?;
+        let path = self.probe_path();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(api_error)?;
         file.write_all(b"ok").map_err(api_error)?;
         file.sync_all().map_err(api_error)?;
         std::fs::remove_file(path).map_err(api_error)?;
         sync_dir(&self.root)
+    }
+
+    /// A probe file of its own, so overlapping probes never remove each other's file.
+    fn probe_path(&self) -> PathBuf {
+        static PROBES: AtomicU64 = AtomicU64::new(0);
+        let probe = PROBES.fetch_add(1, Ordering::Relaxed);
+        let name = format!("health.{}.{probe}.tmp", std::process::id());
+        self.root.join(name)
     }
 }
 
@@ -202,6 +215,19 @@ mod tests {
         control.mark_start().unwrap();
         drop(control);
         assert!(daemon.control(&fence(2)).unwrap().started());
+    }
+
+    #[test]
+    fn probes_stay_apart() {
+        // Each probe has a file of its own and removes it again.
+        let directory = tempdir().unwrap();
+        let daemon = DaemonLock::acquire(directory.path()).unwrap();
+        assert_ne!(daemon.probe_path(), daemon.probe_path());
+        daemon.verify().unwrap();
+        daemon.verify().unwrap();
+        let left = std::fs::read_dir(&daemon.root).unwrap();
+        let names: Vec<_> = left.map(|entry| entry.unwrap().file_name()).collect();
+        assert!(names.iter().all(|name| !name.to_string_lossy().starts_with("health")));
     }
 
     #[test]
