@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,7 +46,7 @@ pub struct RotationRunOperation {
     serving: Option<(NodeId, RealmId)>,
     limits: OutboxLimits,
     rotation: OutboxRotation,
-    published: BTreeSet<Vec<u8>>,
+    published: BTreeMap<Vec<u8>, [u8; 32]>,
     config: Option<Arc<RealmConfigDocument>>,
     invocation: Option<DrainInvocation>,
     before: Option<DrainInvocation>,

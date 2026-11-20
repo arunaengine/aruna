@@ -53,6 +53,14 @@ impl Default for OutboxLimits {
     }
 }
 
+/// What a record's publication is bound to: its topic's lineage and the digest of the row the
+/// drain read, each `None` where it could not be learned.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RowStamp {
+    pub lineage: Option<[u8; 32]>,
+    pub digest: Option<[u8; 32]>,
+}
+
 /// Records sent to the same peers together: the documents to publish, empty for records this
 /// process already published, and per record its topic, admin origin, target and key.
 #[derive(Debug, PartialEq)]
@@ -65,6 +73,8 @@ pub struct DrainSubBatch {
     pub origins: Vec<Option<NodeId>>,
     pub targets: Vec<DocumentTarget>,
     pub record_keys: Vec<Vec<u8>>,
+    /// What each record's publication is bound to; a missing stamp binds nothing.
+    pub stamps: Vec<RowStamp>,
 }
 
 impl DrainSubBatch {
@@ -74,11 +84,13 @@ impl DrainSubBatch {
         let mut origins = Vec::with_capacity(indices.len());
         let mut targets = Vec::with_capacity(indices.len());
         let mut record_keys = Vec::with_capacity(indices.len());
+        let mut stamps = Vec::with_capacity(indices.len());
         for &index in indices {
             topics.push(*self.topics.get(index)?);
             origins.push(*self.origins.get(index)?);
             targets.push(self.targets.get(index)?.clone());
             record_keys.push(self.record_keys.get(index)?.clone());
+            stamps.push(self.stamp(index));
         }
         Some(Self {
             peers: self.peers.clone(),
@@ -87,7 +99,13 @@ impl DrainSubBatch {
             origins,
             targets,
             record_keys,
+            stamps,
         })
+    }
+
+    /// What the publication of the record at `index` is bound to.
+    pub fn stamp(&self, index: usize) -> RowStamp {
+        self.stamps.get(index).copied().unwrap_or_default()
     }
 
     /// The entries at `indices` with their documents, to publish; `None` for an index outside.
@@ -153,6 +171,7 @@ pub fn build_drain_batches(
                     origins: Vec::new(),
                     targets: Vec::new(),
                     record_keys: Vec::new(),
+                    stamps: Vec::new(),
                 });
                 let index = subbatches.len() - 1;
                 open.insert(group, index);

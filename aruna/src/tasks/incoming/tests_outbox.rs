@@ -56,6 +56,7 @@ fn partial_publish_records() {
             duplicate_target.clone(),
         ],
         record_keys: vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()],
+        stamps: Vec::new(),
     };
 
     let selected = subbatch
