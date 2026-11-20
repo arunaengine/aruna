@@ -864,16 +864,13 @@ impl GitNode {
     }
 }
 
-/// A materialized graph waiting for its Git snapshot, stored under its job's document and event.
-/// A document's marks are captured in the order their jobs materialized them.
+/// A materialized graph waiting for its Git snapshot, stored under its document and the capture
+/// sequence its finish gave it, so a document's marks are captured in finish order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureMark {
-    pub materialized_at_ms: u64,
     /// The event whose graph the snapshot shows, and that graph as JSON-LD.
     pub event_id: Ulid,
     pub jsonld: String,
-    /// Set by the finish that stored the job's rows; until then the mark waits.
-    pub ready: bool,
 }
 
 impl CaptureMark {

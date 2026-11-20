@@ -1,4 +1,4 @@
-//! Snapshots the graph each ready capture mark holds, per document in materialization order,
+//! Snapshots the graph each queued capture mark holds, per document in capture sequence order,
 //! and deletes the mark only after the snapshot, so a crash never loses one.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -37,9 +37,9 @@ enum CaptureStep {
     Delete,
 }
 
-/// One drain run over every capture mark, per document in materialization order, so Git never
-/// gets an older graph after a newer one: the first mark not ready, or whose snapshot failed,
-/// stops its document. Answers when to run again after a failed snapshot.
+/// One drain run over every queued capture mark, per document in the sequence order its finishes
+/// gave, so Git gets the graphs in finish order: a failed snapshot stops its document. Answers
+/// when to run again after a failed snapshot.
 #[derive(Debug, PartialEq)]
 pub struct CaptureDrainOperation {
     node: GitNode,
@@ -49,7 +49,7 @@ pub struct CaptureDrainOperation {
     /// The document whose marks are gathered or taken.
     document: Option<Ulid>,
     gathered: Vec<(Key, CaptureMark)>,
-    /// The document's ready marks before its first open one, in materialization order.
+    /// The document's queued marks, in sequence order.
     taking: VecDeque<(Key, CaptureMark)>,
     record: Option<MetadataRegistryRecord>,
     current: Option<Key>,
@@ -57,10 +57,15 @@ pub struct CaptureDrainOperation {
     step: CaptureStep,
 }
 
-/// The document of a capture mark key, which ends with its job's event.
+/// The document of a queued capture mark, keyed by the document and its sequence.
 fn mark_document(key: &[u8]) -> Option<Ulid> {
     let document = <[u8; 16]>::try_from(key.get(..16)?).ok()?;
-    (key.len() == 32).then(|| Ulid::from_bytes(document))
+    (key.len() == 24).then(|| Ulid::from_bytes(document))
+}
+
+/// Whether a row is a job's hold, keyed by its document and event, which waits for its finish.
+fn is_hold(key: &[u8]) -> bool {
+    key.len() == 32
 }
 
 impl CaptureDrainOperation {
@@ -84,40 +89,34 @@ impl CaptureDrainOperation {
     }
 
     fn next_mark(&mut self) -> Turn {
-        loop {
-            if let Some((key, mark)) = self.taking.pop_front() {
-                let record = self.record.as_ref().ok_or(IoError::Unfinished)?;
-                let snapshot = capture(&self.node, record, Some((mark.event_id, mark.jsonld)));
-                self.current = Some(key);
-                self.step = CaptureStep::Capture;
-                return Ok(Next::Call(IoCall::child(snapshot)));
-            }
-            if let Some(turn) = self.gather() {
-                return turn;
-            }
-            if self.gathered.is_empty() {
-                return Ok(Next::Done(self.failed.then_some(CAPTURE_RETRY_AFTER)));
-            }
-            let mut gathered = std::mem::take(&mut self.gathered);
-            gathered.sort_by_key(|(_, mark)| (mark.materialized_at_ms, mark.event_id));
-            let open = gathered.iter().position(|(_, mark)| !mark.ready);
-            gathered.truncate(open.unwrap_or(gathered.len()));
-            if gathered.is_empty() {
-                continue;
-            }
-            self.taking = gathered.into();
-            let document_id = self.document.ok_or(IoError::Unfinished)?;
-            self.step = CaptureStep::Record;
-            return Ok(Next::Call(IoCall::child(DocumentRecordOperation::new(
-                document_id,
-            ))));
+        if let Some((key, mark)) = self.taking.pop_front() {
+            let record = self.record.as_ref().ok_or(IoError::Unfinished)?;
+            let snapshot = capture(&self.node, record, Some((mark.event_id, mark.jsonld)));
+            self.current = Some(key);
+            self.step = CaptureStep::Capture;
+            return Ok(Next::Call(IoCall::child(snapshot)));
         }
+        if let Some(turn) = self.gather() {
+            return turn;
+        }
+        if self.gathered.is_empty() {
+            return Ok(Next::Done(self.failed.then_some(CAPTURE_RETRY_AFTER)));
+        }
+        self.taking = std::mem::take(&mut self.gathered).into();
+        let document_id = self.document.ok_or(IoError::Unfinished)?;
+        self.step = CaptureStep::Record;
+        Ok(Next::Call(IoCall::child(DocumentRecordOperation::new(
+            document_id,
+        ))))
     }
 
     /// Gathers the marks of one document, reading on across pages; answers a call while it
     /// needs one, and nothing once the document's marks are all gathered.
     fn gather(&mut self) -> Option<Turn> {
         while let Some((key, value)) = self.marks.pop_front() {
+            if is_hold(&key) {
+                continue;
+            }
             let Some(document_id) = mark_document(&key) else {
                 return Some(self.delete(vec![key]));
             };
@@ -207,29 +206,23 @@ impl Operation for CaptureDrainOperation {
 mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::storage_entries::document_job_key;
+    use aruna_core::storage_entries::{capture_key, document_job_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
 
     const DOCUMENT: Ulid = Ulid::from_parts(1, 1);
     const EVENT: Ulid = Ulid::from_parts(2, 2);
 
-    fn mark(jsonld: &str, ready: bool) -> CaptureMark {
-        CaptureMark {
-            materialized_at_ms: 10,
+    fn queued(sequence: u64, jsonld: &str) -> (Key, Value) {
+        let mark = CaptureMark {
             event_id: EVENT,
             jsonld: jsonld.to_string(),
-            ready,
-        }
-    }
-
-    fn mark_row(job_event: Ulid, mark: &CaptureMark) -> (Key, Value) {
+        };
         let value = Value::from(mark.to_bytes().unwrap());
-        (document_job_key(DOCUMENT, job_event), value)
+        (capture_key(DOCUMENT, sequence), value)
     }
 
-    fn marks(mark: &CaptureMark) -> IoResult {
-        let rows = vec![mark_row(EVENT, mark)];
+    fn page(rows: Vec<(Key, Value)>) -> IoResult {
         IoResult::Page { rows, next: None }
     }
 
@@ -266,36 +259,41 @@ mod tests {
         IoResult::Child(ChildOutcome::new(outcome))
     }
 
-    fn delete_mark() -> Turn {
+    fn found() -> IoResult {
+        child(Ok::<_, StorageReadError>(Some(record())))
+    }
+
+    fn snapshot_of(jsonld: &str) -> Turn {
+        let graph = Some((EVENT, jsonld.to_string()));
+        let snapshot = capture(&GitNode::default(), &record(), graph);
+        Ok(Next::Call(IoCall::child(snapshot)))
+    }
+
+    fn deleted(sequence: u64) -> Turn {
         let row = (
             MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
-            document_job_key(DOCUMENT, EVENT),
+            capture_key(DOCUMENT, sequence),
         );
         Ok(Next::Call(IoCall::Delete(vec![row])))
     }
 
-    /// Runs a drain up to the snapshot of one ready mark. The drain asks for no status: a newer
+    /// Runs a drain up to the snapshot of one queued mark. The drain asks for no status: a newer
     /// event's failure never decides about this mark.
     fn snapshotting() -> CaptureDrainOperation {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
         let record_read = IoCall::child(DocumentRecordOperation::new(DOCUMENT));
-        assert_eq!(
-            drain.next(marks(&mark("first", true))),
-            Ok(Next::Call(record_read))
-        );
-        let found = child(Ok::<_, StorageReadError>(Some(record())));
-        let graph = Some((EVENT, "first".to_string()));
-        let snapshot = IoCall::child(capture(&GitNode::default(), &record(), graph));
-        assert_eq!(drain.next(found), Ok(Next::Call(snapshot)));
+        let rows = vec![queued(0, "first")];
+        assert_eq!(drain.next(page(rows)), Ok(Next::Call(record_read)));
+        assert_eq!(drain.next(found()), snapshot_of("first"));
         drain
     }
 
-    // A ready mark gets the snapshot of the graph it holds, and goes only after it.
+    // A queued mark gets the snapshot of the graph it holds, and goes only after it.
     #[test]
     fn snapshot_then_delete() {
         let mut drain = snapshotting();
-        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), delete_mark());
+        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted(0));
         assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(None)));
     }
 
@@ -309,84 +307,43 @@ mod tests {
             Ok(Next::Done(Some(CAPTURE_RETRY_AFTER)))
         );
         let mut rerun = snapshotting();
-        assert_eq!(rerun.next(child(Ok::<(), GitError>(()))), delete_mark());
+        assert_eq!(rerun.next(child(Ok::<(), GitError>(()))), deleted(0));
     }
 
-    // A mark whose finish has not stored its graph stays, without a snapshot.
+    // A job's hold waits for its finish without a snapshot, and stops no queued mark.
     #[test]
-    fn unready_mark_kept() {
+    fn hold_passed_over() {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
-        assert_eq!(
-            drain.next(marks(&mark("first", false))),
-            Ok(Next::Done(None))
-        );
-    }
-
-    fn ordered(event: Ulid, materialized_at_ms: u64, ready: bool) -> (Key, Value) {
-        let mark = CaptureMark {
-            materialized_at_ms,
-            event_id: event,
-            jsonld: event.to_string(),
-            ready,
-        };
-        mark_row(event, &mark)
-    }
-
-    fn snapshot_of(event: Ulid) -> Turn {
-        let graph = Some((event, event.to_string()));
-        let snapshot = capture(&GitNode::default(), &record(), graph);
-        Ok(Next::Call(IoCall::child(snapshot)))
-    }
-
-    fn deleted(event: Ulid) -> Turn {
-        let row = (
-            MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
-            document_job_key(DOCUMENT, event),
-        );
-        Ok(Next::Call(IoCall::Delete(vec![row])))
-    }
-
-    fn found() -> IoResult {
-        child(Ok::<_, StorageReadError>(Some(record())))
-    }
-
-    const LATER: Ulid = Ulid::from_parts(3, 3);
-
-    // A document's marks go in the order their jobs materialized them, not by event: a late
-    // older event that materialized last is snapshotted last, so its graph stays on top.
-    #[test]
-    fn ordered_by_materialization() {
+        let hold = (document_job_key(DOCUMENT, EVENT), Value::from(Vec::new()));
+        assert_eq!(drain.next(page(vec![hold.clone()])), Ok(Next::Done(None)));
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
-        let rows = vec![ordered(EVENT, 20, true), ordered(LATER, 10, true)];
-        drain.next(IoResult::Page { rows, next: None }).unwrap();
-        assert_eq!(drain.next(found()), snapshot_of(LATER));
-        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted(LATER));
-        assert_eq!(drain.next(IoResult::Done), snapshot_of(EVENT));
-        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted(EVENT));
+        drain.next(page(vec![hold, queued(0, "first")])).unwrap();
+        assert_eq!(drain.next(found()), snapshot_of("first"));
+    }
+
+    // Graphs of one winning event go in their capture sequence, the order their finishes ran.
+    #[test]
+    fn sequence_orders_marks() {
+        let mut drain = CaptureDrainOperation::new(GitNode::default());
+        drain.first().unwrap();
+        drain.next(page(vec![queued(1, "first"), queued(2, "second")])).unwrap();
+        assert_eq!(drain.next(found()), snapshot_of("first"));
+        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted(1));
+        assert_eq!(drain.next(IoResult::Done), snapshot_of("second"));
+        assert_eq!(drain.next(child(Ok::<(), GitError>(()))), deleted(2));
         assert_eq!(drain.next(IoResult::Done), Ok(Next::Done(None)));
     }
 
-    // The first mark not ready stops its document: a later ready graph waits behind it.
-    #[test]
-    fn open_mark_stops() {
-        let mut drain = CaptureDrainOperation::new(GitNode::default());
-        drain.first().unwrap();
-        let rows = vec![ordered(EVENT, 10, false), ordered(LATER, 20, true)];
-        let page = IoResult::Page { rows, next: None };
-        assert_eq!(drain.next(page), Ok(Next::Done(None)));
-    }
-
-    // A failed snapshot stops its document too, so the next run retries it before any later
-    // graph of that document.
+    // A failed snapshot stops its document, so the next run retries it before any later graph
+    // of that document.
     #[test]
     fn failed_snapshot_stops() {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
-        let rows = vec![ordered(EVENT, 10, true), ordered(LATER, 20, true)];
-        drain.next(IoResult::Page { rows, next: None }).unwrap();
-        assert_eq!(drain.next(found()), snapshot_of(EVENT));
+        drain.next(page(vec![queued(0, "first"), queued(1, "second")])).unwrap();
+        assert_eq!(drain.next(found()), snapshot_of("first"));
         let failed = child(Err::<(), _>(GitError::Unavailable));
         assert_eq!(
             drain.next(failed),
@@ -399,21 +356,15 @@ mod tests {
     fn pages_join_document() {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
-        let first = vec![ordered(EVENT, 20, true)];
-        let after = Some(document_job_key(DOCUMENT, EVENT));
-        let page = drain.next(IoResult::Page {
+        let first = vec![queued(0, "first")];
+        let after = Some(capture_key(DOCUMENT, 0));
+        let paged = drain.next(IoResult::Page {
             rows: first,
             next: after,
         });
-        assert!(matches!(page, Ok(Next::Call(IoCall::Page { .. }))));
-        let rest = vec![ordered(LATER, 10, true)];
-        drain
-            .next(IoResult::Page {
-                rows: rest,
-                next: None,
-            })
-            .unwrap();
-        assert_eq!(drain.next(found()), snapshot_of(LATER));
+        assert!(matches!(paged, Ok(Next::Call(IoCall::Page { .. }))));
+        drain.next(page(vec![queued(1, "second")])).unwrap();
+        assert_eq!(drain.next(found()), snapshot_of("first"));
     }
 
     // A mark that does not decode goes without a snapshot.
@@ -421,10 +372,7 @@ mod tests {
     fn unreadable_mark_deleted() {
         let mut drain = CaptureDrainOperation::new(GitNode::default());
         drain.first().unwrap();
-        let rows = vec![(document_job_key(DOCUMENT, EVENT), Value::from(vec![0xff]))];
-        assert_eq!(
-            drain.next(IoResult::Page { rows, next: None }),
-            delete_mark()
-        );
+        let rows = vec![(capture_key(DOCUMENT, 0), Value::from(vec![0xff]))];
+        assert_eq!(drain.next(page(rows)), deleted(0));
     }
 }

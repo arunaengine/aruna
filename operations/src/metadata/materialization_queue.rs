@@ -12,9 +12,8 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, GroupEvent, GroupResult};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
-    MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
-    MATERIALIZATION_STATUS_KEYSPACE,
+    CAPTURE_SEQUENCE_KEYSPACE, DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
+    MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
     ApplyRoCrateRequest, DeadLetterRecord, MaterializationState, MaterializationStatusRecord,
@@ -26,8 +25,8 @@ use aruna_core::operation::{Operation, TransactionMode, boxed_retry, boxed_subop
 use aruna_core::repository::link::{link_change_entry, schedule_drain};
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{
-    dead_letter_entry, dead_letter_key, document_job_entry, document_job_key, document_job_prefix,
-    event_log_key, materialization_job_entry, materialization_job_key,
+    capture_key, dead_letter_entry, dead_letter_key, document_job_entry, document_job_key,
+    document_job_prefix, event_log_key, materialization_job_entry, materialization_job_key,
     materialization_status_entry, materialization_status_key, profile_validation_entry,
 };
 use aruna_core::task::TaskEvent;
@@ -605,7 +604,7 @@ fn plan_rows(
     finished: Vec<FinishedMaterializationJob>,
     snapshot: &HashMap<Ulid, Status>,
     parked: &HashMap<(Ulid, Ulid), DeadLetterRecord>,
-    now_ms: u64,
+    (now_ms, mut sequences): (u64, HashMap<Ulid, u64>),
 ) -> Result<(FinishPlan, Vec<Ulid>), MetadataMaterializationError> {
     let mut plan = FinishPlan {
         deletes: Vec::with_capacity(finished.len().saturating_mul(2)),
@@ -613,19 +612,22 @@ fn plan_rows(
     };
     let mut planned: HashMap<Ulid, MaterializationStatusRecord> = HashMap::new();
     let mut superseding: HashMap<Ulid, Ulid> = HashMap::new();
+    let mut counted: BTreeMap<Ulid, u64> = BTreeMap::new();
     for finished in finished {
         match finished {
             FinishedMaterializationJob::Completed(job) => {
-                let mut ready = false;
+                // The document, once the finish keeps the job's graph and so queues its capture.
+                let mut ready = None;
                 if let Some(status) = job.status {
                     let current = guard_status(snapshot, &planned, status.document_id);
                     // A newer event not materialized yet leaves this graph the newest one made.
-                    ready = current.is_some_and(|current| {
+                    let newer = current.is_some_and(|current| {
                         current.event_id > status.event_id
                             && current.state != MaterializationState::Materialized
                     });
+                    ready = newer.then_some(status.document_id);
                     if should_write_final(current, &status) {
-                        ready = true;
+                        ready = Some(status.document_id);
                         superseding.insert(status.document_id, status.event_id);
                         plan.writes.extend(job.iri_index_writes);
                         plan.deletes.extend(job.link_deletes);
@@ -642,7 +644,7 @@ fn plan_rows(
                         && let Some(raw_state_write) = job.raw_state_write
                     {
                         // A late merge keeps the newer status but stores the graph it published.
-                        ready = true;
+                        ready = Some(status.document_id);
                         plan.writes.push(raw_state_write);
                     }
                 }
@@ -651,17 +653,17 @@ fn plan_rows(
                     ByteView::from(job.job_key),
                 ));
                 if let Some(document_job_key) = job.document_job_key {
-                    let mark = ByteView::from(document_job_key.clone());
                     let space = MATERIALIZATION_CAPTURE_KEYSPACE.to_string();
-                    // The finish that stores the graph, or keeps it the newest made, marks its
-                    // capture ready; the mark stays until the drain took the snapshot.
-                    match job.capture.filter(|_| ready) {
-                        Some(mut capture) => {
-                            capture.ready = true;
-                            let value = ByteView::from(capture.to_bytes()?);
-                            plan.writes.push((space, mark, value));
-                        }
-                        None => plan.deletes.push((space, mark)),
+                    let hold = ByteView::from(document_job_key.clone());
+                    plan.deletes.push((space.clone(), hold));
+                    // The finish that stores the graph, or keeps it the newest made, queues its
+                    // capture under the document's next sequence, so the drain takes finish order.
+                    if let (Some(capture), Some(document_id)) = (job.capture, ready) {
+                        let sequence = sequences.entry(document_id).or_default();
+                        let key = capture_key(document_id, *sequence);
+                        *sequence = sequence.saturating_add(1);
+                        plan.writes.push((space, key, ByteView::from(capture.to_bytes()?)));
+                        counted.insert(document_id, *sequence);
                     }
                     plan.deletes.push((
                         DOCUMENT_JOB_KEYSPACE.to_string(),
@@ -760,6 +762,11 @@ fn plan_rows(
             }
         }
     }
+    for (document_id, next) in counted {
+        let key = ByteView::from(document_id.to_bytes().to_vec());
+        let value = ByteView::from(next.to_be_bytes().to_vec());
+        plan.writes.push((CAPTURE_SEQUENCE_KEYSPACE.to_string(), key, value));
+    }
     Ok((plan, superseding.keys().copied().collect()))
 }
 
@@ -771,13 +778,15 @@ enum CommitStage {
 }
 
 /// Settles one finish chunk in one write transaction: reads the statuses and dead letters it
-/// guards against, then writes and deletes its rows. A status written meanwhile makes the
-/// commit lose its conflict, and the rerun judges the chunk against that status.
+/// guards against and the capture sequences it counts on, then writes and deletes its rows. A
+/// status written meanwhile makes the commit lose its conflict, and the rerun judges it again.
 #[derive(Debug, PartialEq)]
 struct CommitFinishOperation {
     finished: Vec<FinishedMaterializationJob>,
     documents: BTreeSet<Ulid>,
     parked: BTreeSet<(Ulid, Ulid)>,
+    /// The documents of jobs that hold a capture.
+    captures: BTreeSet<Ulid>,
     now_ms: u64,
     plan: FinishPlan,
     stage: CommitStage,
@@ -794,10 +803,19 @@ impl CommitFinishOperation {
                 _ => None,
             })
             .collect();
+        let captures = (finished.iter())
+            .filter_map(|finished| match finished {
+                FinishedMaterializationJob::Completed(job) if job.capture.is_some() => {
+                    Some(finished_document_id(finished))
+                }
+                _ => None,
+            })
+            .collect();
         Self {
             finished,
             documents,
             parked,
+            captures,
             now_ms: 0,
             plan: FinishPlan::default(),
             stage: CommitStage::Read,
@@ -813,13 +831,20 @@ impl CommitFinishOperation {
             }
         }
         let mut parked = HashMap::new();
-        for (target, value) in self.parked.iter().zip(values) {
+        for (target, value) in self.parked.iter().zip(values.by_ref()) {
             if let Some(record) = value.and_then(|value| postcard::from_bytes(&value).ok()) {
                 parked.insert(*target, record);
             }
         }
+        let mut sequences = HashMap::new();
+        for (document_id, value) in self.captures.iter().zip(values) {
+            let next = value.map(|value| <[u8; 8]>::try_from(&value[..]));
+            let next = next.transpose().map_err(ConversionError::from)?;
+            sequences.insert(*document_id, next.map_or(0, u64::from_be_bytes));
+        }
         let finished = std::mem::take(&mut self.finished);
-        let (mut plan, superseding) = plan_rows(finished, &snapshot, &parked, self.now_ms)?;
+        let counted = (self.now_ms, sequences);
+        let (mut plan, superseding) = plan_rows(finished, &snapshot, &parked, counted)?;
         // Linked repositories learn of the change in the same commit as the new status.
         let changes = superseding
             .into_iter()
@@ -865,7 +890,11 @@ impl Operation for CommitFinishOperation {
             let key = dead_letter_key(*document_id, *event_id);
             (DEAD_LETTER_KEYSPACE.to_string(), key)
         });
-        let reads: Vec<_> = statuses.chain(dead_letters).collect();
+        let sequences = (self.captures.iter()).map(|document_id| {
+            let key = ByteView::from(document_id.to_bytes().to_vec());
+            (CAPTURE_SEQUENCE_KEYSPACE.to_string(), key)
+        });
+        let reads: Vec<_> = statuses.chain(dead_letters).chain(sequences).collect();
         if reads.is_empty() {
             return self.plan(Vec::new());
         }
@@ -2119,20 +2148,15 @@ impl MaterializationJobOperation {
         materialized: MaterializedCreateEvent,
         (event_id, jsonld): (Ulid, String),
     ) -> MaterializationTurn<ProcessedMaterializationJob> {
-        let mark = CaptureMark {
-            materialized_at_ms: self.now_ms,
-            event_id,
-            jsonld,
-            ready: false,
-        };
-        let row = (
+        // The hold keeps refreshes off the raw view; the finish queues the mark itself.
+        let hold = (
             MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
             document_job_key(self.job.document_id, self.job.event_id),
-            ByteView::from(mark.to_bytes()?),
+            ByteView::from(Vec::new()),
         );
-        self.capture = Some(mark);
+        self.capture = Some(CaptureMark { event_id, jsonld });
         self.stage = JobStage::Mark(Box::new(materialized));
-        Ok(Next::Call(IoCall::Write(vec![row])))
+        Ok(Next::Call(IoCall::Write(vec![hold])))
     }
 
     fn projected(
