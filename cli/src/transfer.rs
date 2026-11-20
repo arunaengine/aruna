@@ -441,6 +441,26 @@ pub async fn upload(
     })
 }
 
+/// The folder of upload records below the config folder.
+pub(crate) const UPLOAD_RECORDS: &str = "uploads";
+
+/// Records `upload_id` as the provider upload of copying `path` to `bucket` and `key` at
+/// `endpoint` in parts of `part_size` bytes, as an interrupted run leaves it.
+pub(crate) fn keep_upload(
+    config_dir: &Path,
+    (endpoint, bucket, key): (&str, &str, &str),
+    (path, part_size): (&Path, u64),
+    upload_id: &str,
+) -> Result<(), CliError> {
+    let parts = split_parts(std::fs::metadata(path)?.len(), part_size);
+    let (blake3, _) = digest_file(path, &parts)?;
+    let records = config_dir.join(UPLOAD_RECORDS);
+    std::fs::create_dir_all(&records)?;
+    let record = upload_record(&records, (endpoint, bucket, key, &blake3), &parts);
+    std::fs::write(record, upload_id)?;
+    Ok(())
+}
+
 /// The record file of one transfer: its endpoint, bucket, key, content and part layout name it.
 fn upload_record(records: &Path, named: (&str, &str, &str, &str), parts: &[Part]) -> PathBuf {
     let (endpoint, bucket, key, blake3) = named;

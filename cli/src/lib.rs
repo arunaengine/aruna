@@ -32,3 +32,15 @@ where
     let cli = Cli::try_parse_from(args).map_err(|error| CliError::usage(error.to_string()))?;
     run(cli, out).await
 }
+
+/// Records `upload_id` in `config_dir` as the multipart upload a `cp` of `path` to `bucket` and
+/// `key` at `endpoint` started and did not finish, so the next such `cp` continues it. Tests use
+/// it to stand in for an interrupted first run.
+pub fn keep_upload(
+    config_dir: &std::path::Path,
+    target: (&str, &str, &str),
+    (path, part_size): (&std::path::Path, u64),
+    upload_id: &str,
+) -> Result<(), CliError> {
+    transfer::keep_upload(config_dir, target, (path, part_size), upload_id)
+}
