@@ -173,8 +173,16 @@ fn restore_into(
     if git_root.exists() {
         sync_dirs(&git_root)?;
     }
-    sync_dir(target)?;
+    for dir in store_dirs(target) {
+        sync_dir(&dir)?;
+    }
     Ok(())
+}
+
+/// The folders whose entries name the restored stores, innermost first: `craqle`, which names
+/// the metadata store, then the staging root, which names every store and the Git tree.
+fn store_dirs(target: &Path) -> [PathBuf; 2] {
+    [target.join("craqle"), target.to_path_buf()]
 }
 
 /// Queues a storage check of every bucket, as a backup holds no blob contents: the node then
@@ -529,6 +537,14 @@ mod tests {
         let restored = restore_backup(&file, &dir.path().join("restored"));
         assert!(restored.is_err());
         assert!(!staging_left(dir.path()));
+    }
+
+    // The metadata store's parent is synced before the root that names it.
+    #[test]
+    fn craqle_synced_first() {
+        let target = Path::new("restored");
+        let dirs = super::store_dirs(target);
+        assert_eq!(dirs, [target.join("craqle"), target.to_path_buf()]);
     }
 
     #[test]
