@@ -29,9 +29,9 @@ use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
-use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
+use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
@@ -47,8 +47,8 @@ use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
 use crate::plugins::work::PruneKeepingWork;
-use crate::replication::mirror_repair::drain::DrainRepairsOperation;
 use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
+use crate::replication::mirror_repair::drain::DrainRepairsOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
@@ -861,15 +861,15 @@ impl Operation for PeerOperation {
 mod tests {
     use super::*;
     use crate::blob::hidden::HiddenSweepOutcome;
-    use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
-    use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
-    use crate::jobs::prune::JobPruneOutcome;
-    use crate::jobs::lifecycle::LifecycleError;
-    use crate::s3::object::metadata::ReferenceRefreshError;
-    use crate::s3::object::metadata_drain::ReferenceDrainResult;
     use crate::blob::migration::drain::MigrationRun;
     use crate::blob::migration::shared::MigrationError;
     use crate::connectors::reference_prune::PruneError;
+    use crate::jobs::lifecycle::LifecycleError;
+    use crate::jobs::prune::JobPruneOutcome;
+    use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
+    use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
+    use crate::s3::object::metadata::ReferenceRefreshError;
+    use crate::s3::object::metadata_drain::ReferenceDrainResult;
 
     fn input() -> TimerInput {
         TimerInput::new(1_000, None)
