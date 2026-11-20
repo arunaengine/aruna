@@ -23,6 +23,7 @@ use thiserror::Error;
 
 use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
 use crate::blob::migration::drain::ProcessMigrationsOperation;
+use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
@@ -146,6 +147,7 @@ pub enum TimerOperation {
     RealmPresence(PresenceTimerOperation),
     MigrateCompression(ProcessMigrationsOperation),
     SweepHiddenBlobs(ProcessHiddenOperation),
+    PruneConnectorReferences(PruneReferencesOperation),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -181,6 +183,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::SweepHiddenBlobs => Some(TimerOperation::SweepHiddenBlobs(
             ProcessHiddenOperation::new(input.now_ms),
         )),
+        TaskKey::PruneConnectorReferences => Some(TimerOperation::PruneConnectorReferences(
+            PruneReferencesOperation::new(),
+        )),
         _ => None,
     }
 }
@@ -198,6 +203,7 @@ macro_rules! each_timer {
             TimerOperation::RealmPresence($operation) => $body,
             TimerOperation::MigrateCompression($operation) => $body,
             TimerOperation::SweepHiddenBlobs($operation) => $body,
+            TimerOperation::PruneConnectorReferences($operation) => $body,
         }
     };
 }
@@ -360,6 +366,18 @@ impl TimerRun for ProcessHiddenOperation {
             false => HIDDEN_SWEEP_AFTER,
         };
         Ok(TimerPlan::from(Some(after)))
+    }
+}
+
+impl TimerRun for PruneReferencesOperation {
+    /// Queued work runs again at once and a failed run after a short wait; an empty queue waits
+    /// for the next queued connector.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let remaining = result.map_err(|error| TimerFailure {
+            retry_after: PRUNE_RETRY,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(remaining.then_some(Duration::ZERO)))
     }
 }
 
@@ -635,6 +653,7 @@ mod tests {
     use crate::blob::hidden::HiddenSweepOutcome;
     use crate::blob::migration::drain::MigrationRun;
     use crate::blob::migration::shared::MigrationError;
+    use crate::connectors::reference_prune::PruneError;
 
     fn input() -> TimerInput {
         TimerInput::new(1_000, None)
@@ -680,6 +699,18 @@ mod tests {
         assert_eq!(clean.after, Some(HIDDEN_SWEEP_AFTER));
         let failed = ProcessHiddenOperation::rearm(Err(MigrationError::failed("boom")));
         assert_eq!(failed.unwrap_err().retry_after, HIDDEN_SWEEP_RETRY);
+    }
+
+    #[test]
+    fn reference_prune_plans() {
+        // Queued work runs again at once; a failure retries after a short wait.
+        let more = PruneReferencesOperation::rearm(Ok(true)).unwrap();
+        assert_eq!(more.after, Some(Duration::ZERO));
+        let idle = PruneReferencesOperation::rearm(Ok(false));
+        assert_eq!(idle, Ok(TimerPlan::default()));
+        let error = PruneError::Schedule("boom".to_string());
+        let failed = PruneReferencesOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, PRUNE_RETRY);
     }
 
     #[test]

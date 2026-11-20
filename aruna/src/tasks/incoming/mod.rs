@@ -199,8 +199,6 @@ const OUTBOX_CONTINUATION_STREAK: u32 = 8;
 const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
 const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
 const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
-/// Delay before a failed connector reference pruning run is tried again.
-const PRUNE_RETRY: Duration = Duration::from_secs(5);
 
 /// How long a device keeps its copy of the realm documents before asking for
 /// them again. A revocation reaches it within this window at the latest.
@@ -910,22 +908,7 @@ impl OperationsTaskHandler {
             TaskKey::PublishRegistration => Box::pin(async move {
                 self.publish_registration().await;
             }),
-            TaskKey::PruneConnectorReferences => Box::pin(async move {
-                let prune =
-                    aruna_operations::connectors::reference_prune::PruneReferencesOperation::new();
-                match drive(prune, &self.context).await {
-                    Ok(true) => {
-                        self.reschedule_timer(TaskKey::PruneConnectorReferences, Duration::ZERO)
-                            .await;
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        warn!(%error, "Failed to prune connector reference rows");
-                        self.reschedule_timer(TaskKey::PruneConnectorReferences, PRUNE_RETRY)
-                            .await;
-                    }
-                }
-            }),
+            TaskKey::PruneConnectorReferences => Box::pin(self.run_trigger(key)),
             TaskKey::MaintainRanges => Box::pin(async move {
                 use aruna_operations::transfer::sharding::{maintain_ranges, maintain_retry};
                 let context = &self.context;
