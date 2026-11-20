@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use aruna_core::compute::backend::{self as compute_backend, DestinationInputs};
 use aruna_core::federation::valid_federation_url;
 use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts, cors_allows};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
@@ -438,16 +437,6 @@ fn reject_token_clashes(
     Ok(())
 }
 
-/// A Kubernetes destination named by its kubeconfig and context. The settings check never reads
-/// the kubeconfig; the compute tables it checks are refused before any backend runs.
-fn configured_server(entry: &compute_backend::KubernetesEntry) -> Result<String, String> {
-    let kubeconfig = entry.kubeconfig.as_deref().unwrap_or("in-cluster");
-    Ok(format!(
-        "{kubeconfig}#{}",
-        entry.context.as_deref().unwrap_or_default()
-    ))
-}
-
 /// Reads the operator's backends file, or synthesises the implicit single
 /// filesystem backend so a zero-config node keeps working.
 fn load_backends_config(
@@ -466,21 +455,16 @@ fn load_backends_config(
     reject_token_clashes(file.compute.keys().cloned(), |token| {
         format!("the environment token {token}")
     })?;
-    let config = file.resolve(&|name| backend_credentials(env, name), timeouts)?;
-    let docker_host = env.var("DOCKER_HOST");
-    let inputs = DestinationInputs {
-        docker_host: docker_host.as_deref(),
-        kube_server: &configured_server,
-    };
-    // Dormant until the fencing, site and tenant checks exist: checked, never run.
-    if !compute_backend::resolve(&file, &inputs)?.is_empty() {
+    // Dormant until the fencing, site and tenant checks exist; refused before any destination
+    // is resolved, since only the node can reach a runtime.
+    if !file.compute.is_empty() {
         return Err(invalid_config_value(
             "BLOB_BACKENDS_PATH",
             path,
             "configured compute backends are not enabled yet; remove the [compute] tables",
         ));
     }
-    Ok(config)
+    Ok(file.resolve(&|name| backend_credentials(env, name), timeouts)?)
 }
 
 pub(crate) fn normalize_env_value(value: &str) -> String {
@@ -1877,8 +1861,14 @@ mod tests {
         assert!(error.to_string().contains("not enabled yet"), "{error}");
         let clash = with_backends(&format!("{storage}{}{}", slurm("hpc-a"), slurm("hpc_a")));
         assert!(clash.unwrap_err().to_string().contains("token HPC_A"));
-        let invalid = with_backends(&format!("{storage}{}", slurm("default")));
-        assert!(invalid.unwrap_err().to_string().contains("reserved"));
+        // Refused before any destination resolves: the node alone reaches a runtime.
+        let reserved = with_backends(&format!("{storage}{}", slurm("default")));
+        assert!(
+            reserved
+                .unwrap_err()
+                .to_string()
+                .contains("not enabled yet")
+        );
     }
 
     #[test]
