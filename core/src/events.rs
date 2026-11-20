@@ -428,8 +428,11 @@ pub enum StorageEvent {
     TransactionStarted {
         txn_id: TxnId,
     },
+    /// `sequence` orders this store's commits: a write commit takes the next number, and a
+    /// read-only one answers the number of the last write commit before it.
     TransactionCommitted {
         txn_id: TxnId,
+        sequence: u64,
     },
     TransactionAborted {
         txn_id: TxnId,

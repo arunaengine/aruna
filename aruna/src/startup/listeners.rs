@@ -23,8 +23,8 @@ use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
-use crate::config::{Config, PortalConfig, StartupMode};
 use crate::portal;
+use aruna_config::{Config, PortalConfig, StartupMode};
 
 pub(crate) struct ServerBindings {
     pub(crate) rest_handle: tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>,
@@ -90,7 +90,7 @@ fn wipe_plan(config: &Config) -> (Vec<std::path::PathBuf>, Vec<String>) {
         config.sync_storage_path.clone(),
         std::path::PathBuf::from(&config.blob_root),
     ]);
-    (crate::config::outermost_roots(&roots), unsupported)
+    (aruna_config::outermost_roots(&roots), unsupported)
 }
 
 /// The owner's replica cache budget from `ARUNA_DEVICE_CACHE_BYTES`, or the default.
@@ -292,7 +292,7 @@ async fn bind_all(
         true => {
             let (roots, unsupported) = wipe_plan(config);
             // Reject unsafe wipe roots before startup and erase only their normalized paths.
-            let roots = crate::config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
+            let roots = aruna_config::validate_wipe_roots(&roots, dirs::home_dir().as_deref())?;
             Some(Arc::new(DeviceWipe::new(roots, unsupported)))
         }
         false => None,
@@ -675,8 +675,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (config, storage) = crate::config::resolve_settings(
-            crate::settings::read_settings_from(&map).expect("settings parse"),
+        let (config, storage) = aruna_config::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await
         .expect("settings resolve");
@@ -740,7 +740,7 @@ mod tests {
         redirect: std::net::SocketAddr,
         files: &[String; 2],
     ) -> (
-        crate::config::Config,
+        aruna_config::Config,
         aruna_storage::storage::handle::StorageHandle,
     ) {
         let map: std::collections::BTreeMap<String, String> = [
@@ -762,8 +762,8 @@ mod tests {
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
-        crate::config::resolve_settings(
-            crate::settings::read_settings_from(&map).expect("settings parse"),
+        aruna_config::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await
         .expect("settings resolve")
@@ -775,7 +775,7 @@ mod tests {
     }
 
     async fn bind_error(
-        config: &crate::config::Config,
+        config: &aruna_config::Config,
         storage: aruna_storage::storage::handle::StorageHandle,
     ) -> String {
         let driver_ctx = std::sync::Arc::new(aruna_drivers::driver::DriverContext {

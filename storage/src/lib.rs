@@ -6,6 +6,7 @@
 mod compaction;
 pub mod errors;
 pub mod key_index;
+pub mod limits;
 pub mod scan;
 pub mod snapshot;
 pub mod storage;

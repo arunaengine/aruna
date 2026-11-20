@@ -7,7 +7,7 @@ use tracing::info;
 
 use super::settings::compute_s3_endpoint;
 use super::{ComputeBuildError, ComputeSettings, SlurmSettings};
-use crate::config::Config;
+use aruna_config::Config;
 
 pub(super) async fn build(
     settings: &ComputeSettings,

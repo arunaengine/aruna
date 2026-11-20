@@ -243,7 +243,7 @@ impl FjallStorage {
                     entry.kind,
                     CleanupKind::CommitQueued
                         | CleanupKind::CommitUnknown
-                        | CleanupKind::Committed
+                        | CleanupKind::Committed(_)
                         | CleanupKind::Aborted
                 )
             })
@@ -297,8 +297,8 @@ impl FjallStorage {
                     entry.kind = CleanupKind::CommitQueued;
                 }
             }
-            Some(CleanupKind::Committed) => {
-                return StorageEvent::TransactionCommitted { txn_id };
+            Some(CleanupKind::Committed(sequence)) => {
+                return StorageEvent::TransactionCommitted { txn_id, sequence };
             }
             None => {}
         }
@@ -307,7 +307,10 @@ impl FjallStorage {
         self.usage_views.remove(&txn_id);
         let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
-            Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
+            Some(Txn::Read(_)) => StorageEvent::TransactionCommitted {
+                txn_id,
+                sequence: self.commits,
+            },
             Some(Txn::Write(txn)) => {
                 // A commit never waits for a read still running in the transaction.
                 let Ok(mut txn) = Arc::try_unwrap(txn) else {
@@ -331,7 +334,13 @@ impl FjallStorage {
                     self.note_config_change();
                 }
                 match committed {
-                    Ok(Ok(())) => StorageEvent::TransactionCommitted { txn_id },
+                    Ok(Ok(())) => {
+                        self.commits += 1;
+                        StorageEvent::TransactionCommitted {
+                            txn_id,
+                            sequence: self.commits,
+                        }
+                    }
                     Ok(Err(_)) => StorageEvent::Error {
                         error: StorageError::TransactionConflict,
                     },

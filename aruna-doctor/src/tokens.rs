@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use aruna::config::load;
 use aruna_clock::unix_timestamp_millis;
+use aruna_config::load;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::calls::Next;
 use aruna_core::onboarding::{

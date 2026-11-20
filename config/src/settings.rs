@@ -25,7 +25,7 @@ use aruna_storage::storage::lifecycle::CACHE_BYTES;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
 use irokle::net::IrohRuntimeConfig;
 
-use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
+use crate::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
 
 const OPS_SOCKET_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3002);
 const BOOTSTRAP_TIMEOUT_SECS: u64 = 120;

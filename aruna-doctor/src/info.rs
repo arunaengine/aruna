@@ -285,11 +285,11 @@ fn env_key(id: &str) -> String {
 mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
     use crate::tests::fixtures::env_lock;
-    use aruna::config::load;
     use aruna::inbound::initialize_net_holder;
     use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
+    use aruna_config::load;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
@@ -485,7 +485,7 @@ mod tests {
         let _unset = EnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
-        let settings = aruna::settings::read_settings().unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
 
         assert_eq!(view.blob_bucket_size, Some(100_000));
         assert_eq!(
@@ -517,7 +517,7 @@ mod tests {
         let _unset = EnvGuard::remove(&["CONTENT_DIR"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
-        let settings = aruna::settings::read_settings().unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
 
         assert_eq!(view.blob_root, "/tmp/aruna-doctor-content/blobstore");
         assert_eq!(view.blob_root, settings.blob_root);

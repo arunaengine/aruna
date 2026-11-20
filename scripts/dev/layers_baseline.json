@@ -1,7 +1,6 @@
 {
   "crate_allow": {
     "aruna-doctor": [
-      "aruna",
       "aruna-net",
       "aruna-tasks",
       "aruna-wire"
