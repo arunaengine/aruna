@@ -15,7 +15,9 @@ use super::super::prune::PruneTimerOperation;
 use super::super::records::pages::ServingNode;
 use super::super::route::JobRouteError;
 use super::super::store::RunDelete;
-use super::super::store::job_calls::{CancelRequestOutcome, delete_finished_run, set_cancel_requested};
+use super::super::store::job_calls::{
+    CancelRequestOutcome, delete_finished_run, set_cancel_requested,
+};
 use super::super::store::mutation_error::JobMutationError;
 use super::super::store::row_calls::read_job_record;
 

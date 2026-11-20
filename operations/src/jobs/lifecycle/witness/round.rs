@@ -29,7 +29,9 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::super::LifecycleError;
-use super::super::launch_admit::{AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided};
+use super::super::launch_admit::{
+    AdmitLaunchOperation, LaunchDecision, LaunchNode, LaunchUndecided,
+};
 use super::super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::super::plan::{BuildPlanOperation, PlanBuildError, PlanRound};
 use super::arm::WitnessExplain;

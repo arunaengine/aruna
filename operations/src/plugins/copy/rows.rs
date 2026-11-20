@@ -16,7 +16,9 @@ use bytes::Bytes;
 
 use super::super::artifacts::ArtifactError;
 use super::super::copies::{Assembled, reserve_call, reserved};
-use super::super::rows::{Row, Rows, Scan, StoreError, delete_call, done, read_call, row, values, writes};
+use super::super::rows::{
+    Row, Rows, Scan, StoreError, delete_call, done, read_call, row, values, writes,
+};
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
 pub const CHUNK: usize = 8 << 20;

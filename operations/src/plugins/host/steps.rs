@@ -35,7 +35,9 @@ use super::super::dataset::{
 };
 use super::super::grants::{install_scope, parse_grants, patterns_for, restricted_account};
 use super::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
-use super::super::install::{InstallError, config_answer, config_call, pick_version, read_manifest};
+use super::super::install::{
+    InstallError, config_answer, config_call, pick_version, read_manifest,
+};
 use super::super::intents::{Begun, begin, written};
 use super::super::job_work::StartWork;
 use super::super::objects::LocalObject;

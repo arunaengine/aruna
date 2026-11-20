@@ -43,7 +43,11 @@ pub(in crate::jobs::lifecycle) struct GroupWriteOperation {
 }
 
 impl GroupWriteOperation {
-    pub(in crate::jobs::lifecycle) fn new(auth: &AuthContext, group_id: GroupId, local: NodeId) -> Self {
+    pub(in crate::jobs::lifecycle) fn new(
+        auth: &AuthContext,
+        group_id: GroupId,
+        local: NodeId,
+    ) -> Self {
         let check = CheckPermissionsConfig {
             auth_context: auth.clone(),
             path: group_permission_path(auth.realm_id, group_id, local),

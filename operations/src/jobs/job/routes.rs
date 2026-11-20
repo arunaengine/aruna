@@ -183,7 +183,11 @@ impl Operation for RecordRouteOperation {
     }
 }
 
-pub(in crate::jobs) fn routed_job_matches(job: &JobStatusView, user_id: UserId, job_id: JobId) -> bool {
+pub(in crate::jobs) fn routed_job_matches(
+    job: &JobStatusView,
+    user_id: UserId,
+    job_id: JobId,
+) -> bool {
     job.job_id == job_id && job.created_by == user_id && !job.kind.is_internal()
 }
 
