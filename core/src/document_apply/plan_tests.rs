@@ -14,7 +14,7 @@ use super::fixtures::{
     actor, check_plan, config_target, config_topic, node, realm, signature, single_event,
     snapshot_event,
 };
-use super::followups::{FollowUpNode, QueuedApply, followup_row};
+use super::followups::{FollowUpNode, QueuedApply, followup_id, followup_row};
 use super::links::LinkPlan;
 use super::quarantine::CursorEvidencePlan;
 use super::reads::{dependency_available, relay_allowed};
@@ -28,12 +28,14 @@ use crate::config_authority::AdminEventValidation;
 use crate::deferred_topics::DocumentSyncDependency;
 use crate::document::{
     AppliedStep, AppliedSync, DocumentChange, DocumentChangeKind, DocumentEvent,
-    DocumentReconcileResult, DocumentSyncRevision, DocumentTarget,
+    DocumentReconcileResult, DocumentSyncRevision, DocumentTarget, order_counter_key,
+    order_entry_key,
 };
 use crate::effects::{Effect, StorageEffect};
 use crate::events::{Event, StorageEvent};
 use crate::keyspaces::{
-    APPLIED_SYNC_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, SYNC_REVISION_KEYSPACE,
+    APPLIED_ORDER_KEYSPACE, APPLIED_SYNC_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
+    SYNC_REVISION_KEYSPACE,
 };
 use crate::metadata::{
     GraphLifecycleRecord, MetadataDeleteRecord, MetadataEventPayload, MetadataEventRecord,
@@ -753,17 +755,7 @@ fn batch_keeps_order() {
     let actor_seq = (2..64)
         .find(|seq| sorts_first(*seq))
         .expect("an identity whose own row sorts first");
-    let mut update = create.clone();
-    update.identity.actor_seq = actor_seq;
-    update.record.event_id = Ulid::from_parts(8, 8);
-    update.record.record.last_event_id = update.record.event_id;
-    update.record.payload = MetadataEventPayload::UpsertContextualEntity {
-        jsonld: r##"{"@id":"#person","@type":"Person"}"##.to_string(),
-    };
-    update.target = DocumentTarget::MetadataCreateEvent {
-        document_id: update.record.record.document_id,
-        event_id: update.record.event_id,
-    };
+    let update = accepted_update(&create, actor_seq);
     let order = [create.clone(), update.clone()];
     let plan = CreateBatchPlan::new(order.to_vec(), Vec::new(), Vec::new()).unwrap();
     let ran = run(plan.queuing(Some(followup_node())), &stored);
@@ -778,6 +770,54 @@ fn batch_keeps_order() {
         .filter(|(space, ..)| space == APPLIED_SYNC_KEYSPACE)
         .collect();
     assert_eq!(queued, vec![&row]);
+}
+
+/// An update of the document `create` makes, sent under the actor's `actor_seq`.
+fn accepted_update(create: &PendingCreateApply, actor_seq: u64) -> PendingCreateApply {
+    let mut update = create.clone();
+    update.identity.actor_seq = actor_seq;
+    update.record.event_id = Ulid::from_parts(8, 8);
+    update.record.record.last_event_id = update.record.event_id;
+    update.record.payload = MetadataEventPayload::UpsertContextualEntity {
+        jsonld: r##"{"@id":"#person","@type":"Person"}"##.to_string(),
+    };
+    update.target = DocumentTarget::MetadataCreateEvent {
+        document_id: update.record.record.document_id,
+        event_id: update.record.event_id,
+    };
+    update
+}
+
+// Batches of one document that separate transactions accept are queued in that order under
+// their own ids, so the drain projects the update after its create whatever the ids sort as.
+#[test]
+fn transactions_keep_order() {
+    let (create, mut stored) = accepted_create();
+    let document_id = create.record.record.document_id;
+    let first = CreateBatchPlan::new(vec![create.clone()], Vec::new(), Vec::new()).unwrap();
+    let ran = run(first.queuing(Some(followup_node())), &stored);
+    let entry = |sequence: u64, identity: SyncQuarantineIdentity| {
+        let id = Value::from(followup_id(&[identity]).to_bytes().to_vec());
+        let key = order_entry_key(document_id, sequence);
+        (APPLIED_ORDER_KEYSPACE.to_string(), key, id)
+    };
+    let counter = |next: u64| {
+        let key = order_counter_key(document_id);
+        let next = Value::from(next.to_be_bytes().to_vec());
+        (APPLIED_ORDER_KEYSPACE.to_string(), key, next)
+    };
+    assert!(ran.writes.contains(&entry(0, create.identity)));
+    assert!(ran.writes.contains(&counter(1)));
+    let written: Stored = (ran.writes.into_iter())
+        .map(|(space, key, value)| ((space, key), value))
+        .collect();
+    stored.extend(written);
+
+    let update = accepted_update(&create, 2);
+    let second = CreateBatchPlan::new(vec![update.clone()], Vec::new(), Vec::new()).unwrap();
+    let ran = run(second.queuing(Some(followup_node())), &stored);
+    assert!(ran.writes.contains(&entry(1, update.identity)));
+    assert!(ran.writes.contains(&counter(2)));
 }
 
 #[test]

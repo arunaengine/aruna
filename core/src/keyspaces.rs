@@ -106,6 +106,9 @@ pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
 /// Applied document reconciles whose follow-ups the node drain still runs, by reconcile id.
 pub const APPLIED_SYNC_KEYSPACE: &str = "document_applied_sync";
+/// The order queued follow-ups accepted a document's events in: a counter per document, and
+/// the id of each queued batch under the document and its sequence.
+pub const APPLIED_ORDER_KEYSPACE: &str = "document_applied_order";
 pub const OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
 pub const SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
@@ -657,6 +660,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,
     APPLIED_SYNC_KEYSPACE,
+    APPLIED_ORDER_KEYSPACE,
     OUTBOX_INDEX_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
     SYNC_CONFLICT_KEYSPACE,

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use byteview::ByteView;
 use ulid::Ulid;
 
-use super::followups::{FollowUpNode, followup_row};
+use super::followups::{FollowUpNode, followup_id, followup_row, order_rows};
 use super::quarantine::quarantine_entries;
 use super::registry::{
     Row, accepted_create, create_fence, event_logged, lifecycle_stale, placement_fence,
@@ -348,6 +348,14 @@ impl RowPlan for CreateBatchPlan {
         if let Some((node, queued)) = queued
             && !identities.is_empty()
         {
+            let mut documents = Vec::new();
+            for event in &queued.metadata_create_events {
+                let document_id = event.record.document_id;
+                if !documents.contains(&document_id) {
+                    documents.push(document_id);
+                }
+            }
+            writes.extend(order_rows(rows, &documents, followup_id(&identities))?);
             writes.push(followup_row(&node, &identities, queued)?);
         }
         match quarantine_entries(rows, &rejections)? {

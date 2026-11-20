@@ -465,6 +465,18 @@ pub fn applied_sync_entry(
     Ok((APPLIED_SYNC_KEYSPACE.to_string(), key, value))
 }
 
+/// The counter row of the order `document_id`'s queued follow-ups were accepted in.
+pub fn order_counter_key(document_id: Ulid) -> Key {
+    Key::from(document_id.to_bytes().to_vec())
+}
+
+/// The entry of the follow-up batch queued `sequence`-th for `document_id`; it holds the id.
+pub fn order_entry_key(document_id: Ulid, sequence: u64) -> Key {
+    let mut key = document_id.to_bytes().to_vec();
+    key.extend_from_slice(&sequence.to_be_bytes());
+    Key::from(key)
+}
+
 /// Arms the node drain of applied reconciles to run now.
 pub fn schedule_applied_drain() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {

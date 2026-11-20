@@ -34,10 +34,12 @@ enum SyncStage {
     Prune,
 }
 
-/// Why the metadata work after a sync must run again. A failed projection is not one: the
-/// projection drain takes it over, as its pending markers stay stored.
+/// Why the metadata work after a sync must run again.
 #[derive(Debug, Error, PartialEq)]
 pub enum AfterSyncError {
+    /// The create events were not projected; the next batches of their documents wait for them.
+    #[error("create events were not projected: {0:?}")]
+    Project(MetadataProjectionError),
     #[error("the projection retry was not scheduled: {0:?}")]
     Wake(MetadataProjectionError),
     #[error("deleted metadata graphs were not queued for pruning: {0:?}")]
@@ -46,9 +48,9 @@ pub enum AfterSyncError {
     Io(#[from] IoError),
 }
 
-/// Projects the create events a reconcile applied, then queues prunes for deleted graphs. A
-/// failed projection arms the projection drain; a failed handover or prune is an error for a
-/// caller that retries, the handover only after the prunes ran. Timings use the runner clock.
+/// Projects the create events a reconcile applied, then queues prunes for deleted graphs. A failed
+/// projection also arms the projection drain; it, a failed handover and a failed prune are errors
+/// for a caller that retries, reported after the prunes. Timings use the runner clock.
 #[derive(Debug, PartialEq)]
 pub struct AfterSyncOperation {
     node_id: Option<NodeId>,
@@ -62,7 +64,9 @@ pub struct AfterSyncOperation {
     pruning_ms: u64,
     now_ms: u64,
     timings: MetadataTimings,
-    /// A projection retry that was not scheduled, reported once the prunes ran.
+    /// A projection that failed, and its retry that was not scheduled, reported once the
+    /// prunes ran.
+    unprojected: Option<MetadataProjectionError>,
     unscheduled: Option<MetadataProjectionError>,
 }
 
@@ -84,6 +88,7 @@ impl AfterSyncOperation {
             pruning_ms: 0,
             now_ms: 0,
             timings: MetadataTimings::default(),
+            unprojected: None,
             unscheduled: None,
         }
     }
@@ -161,6 +166,7 @@ impl Operation for AfterSyncOperation {
                     return Ok(self.prune());
                 };
                 error!(error = ?projection, "Create events not projected; handed to the drain");
+                self.unprojected = Some(projection);
                 self.stage = SyncStage::Wake;
                 let wake = ProjectionWakeOperation::new(PROJECTION_RETRY_AFTER);
                 Ok(Next::Call(IoCall::child(wake)))
@@ -175,6 +181,9 @@ impl Operation for AfterSyncOperation {
                 pruned.map_err(AfterSyncError::Prune)?;
                 if let Some(error) = self.unscheduled.take() {
                     return Err(AfterSyncError::Wake(error));
+                }
+                if let Some(error) = self.unprojected.take() {
+                    return Err(AfterSyncError::Project(error));
                 }
                 self.timings.prune = elapsed(self.pruning_ms, self.now_ms);
                 Ok(Next::Done(self.timings))
@@ -240,9 +249,9 @@ mod tests {
             metadata_graph_tombstones: Vec::new(),
         };
 
-        aruna_drivers::driver::drive(AfterSyncOperation::new(None, result), &context)
-            .await
-            .unwrap();
+        let after = AfterSyncOperation::new(None, result);
+        let failed = aruna_drivers::driver::drive(after, &context).await;
+        assert!(matches!(failed, Err(AfterSyncError::Project(_))));
         let timer = read_timer(&storage, &TaskKey::DrainProjectionQueue)
             .await
             .expect("projection retry timer persisted");
@@ -284,8 +293,15 @@ mod tests {
         );
     }
 
-    // A failed projection is handed to the projection drain; a failed handover or prune ends
-    // in an error, so the applied drain runs the follow-up again instead of dropping it.
+    fn unprojected() -> IoResult {
+        child(Err::<LoggedProjection, _>(
+            MetadataProjectionError::PlacementFenced,
+        ))
+    }
+
+    // A failed projection is handed to the projection drain and still ends in an error, as do a
+    // failed handover and prune, so the applied drain keeps the follow-up and its document's
+    // later batches wait for it instead of projecting first.
     #[test]
     fn failed_projection_retries() {
         let mut result = empty();
@@ -293,12 +309,19 @@ mod tests {
             document_id: ulid::Ulid::from_parts(1, 1),
             event_id: ulid::Ulid::from_parts(2, 2),
         }];
-        let failed = child(Err::<LoggedProjection, _>(
-            MetadataProjectionError::PlacementFenced,
+        let mut handed = AfterSyncOperation::new(None, result.clone());
+        handed.first().unwrap();
+        handed.next(unprojected()).unwrap();
+        handed.next(child(Ok::<(), MetadataProjectionError>(()))).unwrap();
+        let pruned = child(Ok::<_, MetadataGraphError>(
+            TombstoneProcessingResult::default(),
         ));
+        let unprojected = AfterSyncError::Project(MetadataProjectionError::PlacementFenced);
+        assert_eq!(handed.next(pruned), Err(unprojected));
+
         let mut after = AfterSyncOperation::new(None, result);
         after.first().unwrap();
-        after.next(failed).unwrap();
+        after.next(unprojected()).unwrap();
         assert_eq!(after.stage, SyncStage::Wake);
         let unscheduled = child(Err::<(), _>(MetadataProjectionError::PlacementFenced));
         assert!(matches!(

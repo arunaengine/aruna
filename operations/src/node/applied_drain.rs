@@ -7,14 +7,15 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::document::{AppliedStep, AppliedSync, applied_sync_entry};
+use aruna_core::document::{AppliedStep, AppliedSync, applied_sync_entry, order_counter_key};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::keyspaces::APPLIED_SYNC_KEYSPACE;
+use aruna_core::keyspaces::{APPLIED_ORDER_KEYSPACE, APPLIED_SYNC_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
-use tracing::warn;
+use tracing::{debug, warn};
+use ulid::Ulid;
 
 use crate::metadata::after_sync::{AfterSyncError, AfterSyncOperation, MetadataTimings};
 use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
@@ -31,14 +32,20 @@ type Turn = Result<Next<Option<Duration>>, IoError>;
 #[derive(Clone, Debug, PartialEq)]
 enum DrainStep {
     Page,
+    /// The first queued entry of the document the order check is at.
+    Order,
+    /// Whether the batch that entry names is still queued.
+    Owner(Key),
+    /// The entry of a batch that is gone, deleted.
+    Stale,
     Run(AppliedStep),
     Progress,
     Delete,
 }
 
-/// One drain run over every queued reconcile, page by page. Each follow-up that succeeded is
-/// stored in its row and the last one deletes it; a failed one keeps the row for a rerun, and
-/// an unreadable row is deleted.
+/// One drain run over every queued reconcile, page by page. A follow-up that succeeded is stored
+/// in its row and the last deletes it; a failed one keeps it, an unreadable row is deleted, and a
+/// metadata follow-up waits while an earlier queued batch of one of its documents is unsettled.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AppliedDrainOperation {
     step: DrainStep,
@@ -47,6 +54,10 @@ pub struct AppliedDrainOperation {
     applied: Option<AppliedSync>,
     after: Option<Key>,
     failed: bool,
+    /// The current row's documents whose order is still to check, once the check started.
+    ordering: Option<VecDeque<Ulid>>,
+    /// The current row's own order entries, deleted with it.
+    entries: Vec<Key>,
 }
 
 impl Default for AppliedDrainOperation {
@@ -64,6 +75,8 @@ impl AppliedDrainOperation {
             applied: None,
             after: None,
             failed: false,
+            ordering: None,
+            entries: Vec::new(),
         }
     }
 
@@ -85,6 +98,8 @@ impl AppliedDrainOperation {
             };
         };
         self.current = Some(key);
+        self.ordering = None;
+        self.entries.clear();
         let Some(applied) = applied else {
             return self.delete();
         };
@@ -98,6 +113,7 @@ impl AppliedDrainOperation {
     }
 
     fn run(&mut self, step: AppliedStep) -> Turn {
+        let unordered = self.ordering.is_none();
         let applied = self.applied()?;
         let targets = &applied.result.targets;
         let call = match step {
@@ -112,6 +128,16 @@ impl AppliedDrainOperation {
                 None => return self.run(AppliedStep::Mail),
             },
             AppliedStep::Mail => IoCall::child(RefreshMailOperation::applied(targets)),
+            AppliedStep::Metadata if unordered => {
+                let mut documents = VecDeque::new();
+                for event in &applied.result.metadata_create_events {
+                    if !documents.contains(&event.record.document_id) {
+                        documents.push_back(event.record.document_id);
+                    }
+                }
+                self.ordering = Some(documents);
+                return self.check_order();
+            }
             AppliedStep::Metadata => {
                 let result = std::mem::take(&mut applied.result);
                 IoCall::child(AfterSyncOperation::new(Some(applied.node_id), result))
@@ -119,6 +145,58 @@ impl AppliedDrainOperation {
         };
         self.step = DrainStep::Run(step);
         Ok(Next::Call(call))
+    }
+
+    /// Reads the first queued entry of the next document to check, or runs the metadata
+    /// follow-up once every document's first entry is this row's own.
+    fn check_order(&mut self) -> Turn {
+        let ordering = self.ordering.as_ref().ok_or(IoError::Unfinished)?;
+        let Some(document_id) = ordering.front().copied() else {
+            return self.run(AppliedStep::Metadata);
+        };
+        self.step = DrainStep::Order;
+        let counter = order_counter_key(document_id);
+        Ok(Next::Call(IoCall::Page {
+            space: APPLIED_ORDER_KEYSPACE.to_string(),
+            prefix: counter.clone(),
+            after: Some(counter),
+            limit: 1,
+        }))
+    }
+
+    /// A document without a queued entry, or whose first one is this row's, is in order; an
+    /// earlier entry asks whether its batch is still queued.
+    fn ordered(&mut self, result: IoResult) -> Turn {
+        let (rows, _) = result.page()?;
+        let id = self.applied()?.id;
+        if let Some((entry, owner)) = rows.into_iter().next() {
+            if owner.as_ref() != id.to_bytes().as_slice() {
+                self.step = DrainStep::Owner(entry);
+                let row = (APPLIED_SYNC_KEYSPACE.to_string(), Key::from(owner.to_vec()));
+                return Ok(Next::Call(IoCall::Read(vec![row])));
+            }
+            self.entries.push(entry);
+        }
+        if let Some(ordering) = self.ordering.as_mut() {
+            ordering.pop_front();
+        }
+        self.check_order()
+    }
+
+    /// An earlier batch still queued keeps this row waiting for a later run; the entry of one
+    /// that is gone is deleted and the document checked again.
+    fn owned(&mut self, entry: Key, result: IoResult) -> Turn {
+        let owner = result.values()?.into_iter().next().flatten();
+        if owner.is_none() {
+            self.step = DrainStep::Stale;
+            let row = (APPLIED_ORDER_KEYSPACE.to_string(), entry);
+            return Ok(Next::Call(IoCall::Delete(vec![row])));
+        }
+        debug!("A queued follow-up waits for an earlier batch of its document");
+        self.failed = true;
+        self.applied = None;
+        self.current = None;
+        self.next_row()
     }
 
     /// Stores that `step` ran, so a rerun goes on with the next one; the last one ends the row.
@@ -134,12 +212,15 @@ impl AppliedDrainOperation {
         Ok(Next::Call(IoCall::Write(vec![entry])))
     }
 
+    /// Deletes the current row with its own order entries, so its document's next batch goes.
     fn delete(&mut self) -> Turn {
         let key = self.current.take().ok_or(IoError::Unfinished)?;
         self.applied = None;
         self.step = DrainStep::Delete;
-        let row = (APPLIED_SYNC_KEYSPACE.to_string(), key);
-        Ok(Next::Call(IoCall::Delete(vec![row])))
+        let mut rows = vec![(APPLIED_SYNC_KEYSPACE.to_string(), key)];
+        let entries = std::mem::take(&mut self.entries).into_iter();
+        rows.extend(entries.map(|entry| (APPLIED_ORDER_KEYSPACE.to_string(), entry)));
+        Ok(Next::Call(IoCall::Delete(rows)))
     }
 }
 
@@ -168,6 +249,12 @@ impl Operation for AppliedDrainOperation {
                     self.pending.push_back((key, applied));
                 }
                 self.next_row()
+            }
+            DrainStep::Order => self.ordered(result),
+            DrainStep::Owner(entry) => self.owned(entry, result),
+            DrainStep::Stale => {
+                result.done()?;
+                self.check_order()
             }
             DrainStep::Run(step) => {
                 let failure = match step {
@@ -257,7 +344,7 @@ impl Operation for SettleAppliedOperation {
 mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::document::{DocumentReconcileResult, DocumentTarget};
+    use aruna_core::document::{DocumentReconcileResult, DocumentTarget, order_entry_key};
     use aruna_core::id::NodeId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::types::Value;
@@ -444,5 +531,96 @@ mod tests {
         finished.first().unwrap();
         let none = child::<Option<Duration>, IoError>(Ok(None));
         assert_eq!(finished.next(none), Ok(Next::Done(true)));
+    }
+
+    /// A queued batch of the one document `test_event` names, accepting `event`.
+    fn batch(id: Ulid, event: Ulid) -> AppliedSync {
+        let mut row = applied(Some(realm()), AppliedStep::Metadata);
+        row.id = id;
+        let created = crate::metadata::raw_revision::tests::test_event(event, 1);
+        row.result.metadata_create_events = vec![created];
+        row
+    }
+
+    fn rows(batches: &[&AppliedSync]) -> IoResult {
+        let rows = batches.iter().map(|batch| {
+            let (_, key, value) = applied_sync_entry(batch).unwrap();
+            (key, value)
+        });
+        IoResult::Page {
+            rows: rows.collect(),
+            next: None,
+        }
+    }
+
+    /// The order entry `sequence` of the document, naming `batch`.
+    fn entry(sequence: u64, batch: &AppliedSync) -> (Key, Value) {
+        let document_id = batch.result.metadata_create_events[0].record.document_id;
+        let key = order_entry_key(document_id, sequence);
+        (key, Value::from(batch.id.to_bytes().to_vec()))
+    }
+
+    fn first_entry(entry: (Key, Value)) -> IoResult {
+        IoResult::Page {
+            rows: vec![entry],
+            next: None,
+        }
+    }
+
+    fn order_read(batch: &AppliedSync) -> Turn {
+        let document_id = batch.result.metadata_create_events[0].record.document_id;
+        let counter = order_counter_key(document_id);
+        Ok(Next::Call(IoCall::Page {
+            space: APPLIED_ORDER_KEYSPACE.to_string(),
+            prefix: counter.clone(),
+            after: Some(counter),
+            limit: 1,
+        }))
+    }
+
+    fn after_project(batch: &AppliedSync) -> Turn {
+        let result = batch.result.clone();
+        let after = AfterSyncOperation::new(Some(node()), result);
+        Ok(Next::Call(IoCall::child(after)))
+    }
+
+    // Two transactions queue batches of one document whose ids sort against the order they
+    // were accepted in. The later one waits while the first is unsettled, also after the first
+    // projection failed once, and goes only once the first one and its entry are gone.
+    #[test]
+    fn batches_project_ordered() {
+        let first = batch(Ulid::from_parts(2_000, 1), Ulid::from_parts(10, 1));
+        let later = batch(Ulid::from_parts(1_000, 1), Ulid::from_parts(11, 1));
+        let owner = |batch: &AppliedSync| {
+            let (_, _, value) = applied_sync_entry(batch).unwrap();
+            IoResult::Values(vec![Some(value)])
+        };
+        for failing in [true, false] {
+            let mut drain = AppliedDrainOperation::new();
+            drain.first().unwrap();
+            assert_eq!(drain.next(rows(&[&later, &first])), order_read(&later));
+            let read = drain.next(first_entry(entry(0, &first)));
+            assert!(matches!(read, Ok(Next::Call(IoCall::Read(_)))));
+            assert_eq!(drain.next(owner(&first)), order_read(&first));
+            let projecting = drain.next(first_entry(entry(0, &first)));
+            assert_eq!(projecting, after_project(&first));
+            if failing {
+                let unprojected = AfterSyncError::Io(IoError::Aborted);
+                let turn = drain.next(child::<MetadataTimings, _>(Err(unprojected)));
+                assert_eq!(turn, Ok(Next::Done(Some(APPLIED_RETRY_AFTER))));
+                continue;
+            }
+            let settled = drain.next(child::<_, AfterSyncError>(Ok(MetadataTimings::default())));
+            let Ok(Next::Call(IoCall::Delete(deleted))) = settled else {
+                panic!("the settled batch goes, got {settled:?}");
+            };
+            let (key, _) = entry(0, &first);
+            assert!(deleted.contains(&(APPLIED_ORDER_KEYSPACE.to_string(), key)));
+        }
+        let mut drain = AppliedDrainOperation::new();
+        drain.first().unwrap();
+        assert_eq!(drain.next(rows(&[&later])), order_read(&later));
+        let projecting = drain.next(first_entry(entry(1, &later)));
+        assert_eq!(projecting, after_project(&later));
     }
 }

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use byteview::ByteView;
 use ulid::Ulid;
 
 use super::admin::{AdminFollowUp, AdminOperationPlan, ConfigRunPlan};
@@ -12,8 +13,10 @@ use super::registry::Row;
 use super::{ApplyError, Step, invalid};
 use crate::document::{
     AppliedStep, AppliedSync, DocumentReconcileResult, DocumentTarget, applied_sync_entry,
+    order_counter_key, order_entry_key,
 };
 use crate::id::NodeId;
+use crate::keyspaces::APPLIED_ORDER_KEYSPACE;
 use crate::operation::TransactionMode;
 use crate::row_plan::{PlanRows, Planned, RowPlan};
 use crate::structs::identity::realm::RealmId;
@@ -39,13 +42,9 @@ impl FollowUpNode {
     }
 }
 
-/// The applied sync row of the events one transaction applied. Its id comes from their sync
+/// The id of the applied sync row of the events one transaction applied: a hash of their sync
 /// identities in apply order, so a replay that applies them again writes the same row.
-pub fn followup_row(
-    node: &FollowUpNode,
-    identities: &[SyncQuarantineIdentity],
-    result: DocumentReconcileResult,
-) -> Result<Row, ApplyError> {
+pub fn followup_id(identities: &[SyncQuarantineIdentity]) -> Ulid {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"aruna-applied-sync-v1\0");
     for identity in identities {
@@ -53,14 +52,47 @@ pub fn followup_row(
     }
     let mut id = [0u8; 16];
     id.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    Ulid::from_bytes(id)
+}
+
+/// The applied sync row of the events one transaction applied, under [`followup_id`].
+pub fn followup_row(
+    node: &FollowUpNode,
+    identities: &[SyncQuarantineIdentity],
+    result: DocumentReconcileResult,
+) -> Result<Row, ApplyError> {
     let applied = AppliedSync {
-        id: Ulid::from_bytes(id),
+        id: followup_id(identities),
         node_id: node.node_id,
         realm_id: Some(node.realm_id),
         result,
         next: node.from,
     };
     applied_sync_entry(&applied).map_err(invalid)
+}
+
+/// The rows that queue batch `id` after every earlier queued batch of each of `documents`, in
+/// the transaction that accepts them: its entry under the document's next sequence, and the
+/// advanced counter. The drain projects a document's batches in this order.
+pub(super) fn order_rows(rows: &mut PlanRows, documents: &[Ulid], id: Ulid) -> Step<Vec<Row>> {
+    for document_id in documents {
+        rows.want(APPLIED_ORDER_KEYSPACE, order_counter_key(*document_id));
+    }
+    let mut writes = Vec::with_capacity(documents.len().saturating_mul(2));
+    for document_id in documents {
+        let counter = rows.read(APPLIED_ORDER_KEYSPACE, order_counter_key(*document_id))?;
+        let next = match counter {
+            Some(value) => u64::from_be_bytes(<[u8; 8]>::try_from(&value[..]).map_err(invalid)?),
+            None => 0,
+        };
+        let entry = order_entry_key(*document_id, next);
+        let id = ByteView::from(id.to_bytes().to_vec());
+        writes.push((APPLIED_ORDER_KEYSPACE.to_string(), entry, id));
+        let counted = ByteView::from(next.saturating_add(1).to_be_bytes().to_vec());
+        let counter = order_counter_key(*document_id);
+        writes.push((APPLIED_ORDER_KEYSPACE.to_string(), counter, counted));
+    }
+    Ok(writes)
 }
 
 /// An apply plan that also writes its follow-up row for `node` when it changed rows, keyed by
