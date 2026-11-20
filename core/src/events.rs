@@ -533,6 +533,8 @@ pub enum NetEvent {
     FederationSigned(Result<crate::federation::FederationSignature, String>),
     /// The opened token, why it does not open, or `None` when this node holds no credential key.
     CredentialOpened(Option<Result<crate::compute::Secret, String>>),
+    /// The relay signature of an admin event, or why this node does not sign it.
+    AdminSigned(Result<iroh::Signature, String>),
     /// The sealed position, or `None` when it could not be sealed.
     PositionSealed(Option<Vec<u8>>),
     /// The opened position, or `None` when this process did not seal it.
@@ -1106,6 +1108,7 @@ impl Event {
                     CursorSigned,
                     FederationSigned,
                     CredentialOpened,
+                    AdminSigned,
                     PositionSealed,
                     PositionOpened,
                     SecretDrawn,

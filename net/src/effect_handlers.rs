@@ -7,6 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
@@ -17,6 +18,7 @@ use aruna_core::id::{DhtKeyId, hex_prefix};
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::family::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
 use aruna_core::structs::storage::distribution::snapshot::{SignedSnapshot, SnapshotClaim};
 use aruna_core::structs::storage::distribution::statement::{SignedStatement, StatementClaim};
@@ -274,6 +276,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::OpenCredential(_) => {
             NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
         }
+        NetEffect::AdminSign { event, placement } => {
+            NetEvent::AdminSigned(sign_admin(&ctx.secret_key, &event, &placement))
+        }
         NetEffect::CursorSign(bytes) => {
             let signer = ctx.secret_key.public();
             let signed = aruna_core::cursor::names_signer(&bytes, signer.as_bytes());
@@ -405,6 +410,19 @@ pub(crate) fn sign_execution(key: &iroh::SecretKey, claim: ExecutionClaim) -> Ex
         Ok(envelope) => ExecutionSignEvent::Signed(Box::new(envelope)),
         Err(error) => ExecutionSignEvent::Unavailable(error.to_string()),
     }
+}
+
+/// Signs an admin event for relay with this node's key, only when this node originated it.
+fn sign_admin(
+    key: &iroh::SecretKey,
+    event: &AdminDocumentEvent,
+    placement: &PlacementRef,
+) -> Result<iroh::Signature, String> {
+    if event.origin_node_id != key.public() {
+        return Err("the admin event names another origin".to_string());
+    }
+    let bytes = event.signing_bytes(placement).map_err(|error| error.to_string())?;
+    Ok(key.sign(&bytes))
 }
 
 #[tracing::instrument(
@@ -677,6 +695,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::CursorSign(_) => "cursor_sign",
         NetEffect::FederationSign(_) => "federation_sign",
         NetEffect::OpenCredential(_) => "open_credential",
+        NetEffect::AdminSign { .. } => "admin_sign",
         NetEffect::SealPosition(_) => "seal_position",
         NetEffect::OpenPosition(_) => "open_position",
         NetEffect::DrawSecret(_) => "draw_secret",

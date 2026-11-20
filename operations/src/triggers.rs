@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -68,6 +68,7 @@ use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::catch_up::{CATCH_UP_REFRESH, CatchUpOperation, next_pass};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
+use crate::node::outbox::rotation_run::RotationRunOperation;
 use crate::node::peer_metadata::{MetadataNode, MetadataPeerOperation};
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
@@ -94,6 +95,8 @@ use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 use crate::staging::native_source::{NativeAnswer, NativeAnswerOperation};
+use crate::sync::outbox::batches::OutboxLimits;
+use crate::sync::outbox::rotation::OutboxRotation;
 use crate::transfer::sharding::{MaintainCursors, maintain_retry};
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
@@ -109,6 +112,10 @@ pub struct TimerMemory {
     pub catch_up: CatchUpCursors,
     /// Where range maintenance goes on.
     pub ranges: MaintainCursors,
+    /// The open document sync outbox rotation.
+    pub rotation: OutboxRotation,
+    /// Outbox records whose op this process already created, so a retry only syncs them.
+    pub published: BTreeSet<Vec<u8>>,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -171,6 +178,8 @@ pub struct TimerInput {
     pub limits: BackendLimits,
     /// This node's ROCrate limits, such as the artifact retention and the holder refresh.
     pub rocrate_limits: RoCrateLimits,
+    /// The bounds of one document sync outbox invocation.
+    pub outbox: OutboxLimits,
 }
 
 /// Which costly inputs a timer reads; the shell builds only these, since most runs never look
@@ -231,6 +240,7 @@ impl TimerInput {
             heartbeats: BTreeMap::new(),
             limits: BTreeMap::new(),
             rocrate_limits: RoCrateLimits::default(),
+            outbox: OutboxLimits::default(),
         }
     }
 }
@@ -298,6 +308,7 @@ pub enum TimerOperation {
     PublishRegistration(RenewalTimerOperation),
     DrainLinkQueue(LinkRunOperation),
     RecordAudit(AuditTimerOperation),
+    DrainSyncOutbox(RotationRunOperation),
     RefreshBlobHolders(HoldersTimerOperation),
     DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
@@ -474,6 +485,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             let drain = LinkRunOperation::new(scope);
             Some(TimerOperation::DrainLinkQueue(drain))
         }
+        TaskKey::DrainSyncOutbox => Some(TimerOperation::DrainSyncOutbox(
+            RotationRunOperation::new(input),
+        )),
         TaskKey::RecordAudit { .. } => {
             let store = AuditTimerOperation::new(key.clone());
             Some(TimerOperation::RecordAudit(store))
@@ -548,6 +562,7 @@ macro_rules! each_timer {
             TimerOperation::PublishRegistration($operation) => $body,
             TimerOperation::DrainLinkQueue($operation) => $body,
             TimerOperation::RecordAudit($operation) => $body,
+            TimerOperation::DrainSyncOutbox($operation) => $body,
             TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
@@ -936,6 +951,12 @@ impl TimerRun for RenewalTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         let after = result.unwrap_or(Some(PUBLISH_INTERVAL));
         Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for RotationRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
     }
 }
 
@@ -1448,7 +1469,6 @@ mod tests {
     #[test]
     fn unconverted_keys_absent() {
         assert!(timer_operation(&TaskKey::DrainJobQueue, &input()).is_none());
-        assert!(timer_operation(&TaskKey::DrainSyncOutbox, &input()).is_none());
     }
 
     #[test]

@@ -323,155 +323,6 @@ fn rotation_holds_boundary() {
     assert!(rotation.admits(b"appended"));
 }
 
-#[tokio::test(start_paused = true)]
-async fn close_routes_defer() {
-    let _clock = freeze_clock();
-    let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainSyncOutbox;
-    let rotation = OutboxRotation {
-        totals: RotationTotals {
-            deferred: 2,
-            deleted: 1,
-            invocations: 2,
-            ..RotationTotals::default()
-        },
-        retry_attempts: 3,
-        ..OutboxRotation::default()
-    };
-
-    handler.close_rotation(key.clone(), rotation).await;
-
-    assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    let attempts = handler
-        .rotation
-        .lock()
-        .expect("rotation lock")
-        .retry_attempts;
-    assert_eq!(
-        attempts, 0,
-        "progress in the clean suffix resets failure backoff"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn close_keeps_retry() {
-    let _clock = freeze_clock();
-    let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainSyncOutbox;
-    let rotation = OutboxRotation {
-        totals: RotationTotals {
-            retry_invocations: 1,
-            invocations: 2,
-            ..RotationTotals::default()
-        },
-        retry_attempts: 3,
-        ..OutboxRotation::default()
-    };
-
-    handler.close_rotation(key.clone(), rotation).await;
-
-    assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
-    let attempts = handler
-        .rotation
-        .lock()
-        .expect("rotation lock")
-        .retry_attempts;
-    assert_eq!(attempts, 4);
-}
-
-#[tokio::test(start_paused = true)]
-async fn close_resets_progress() {
-    let _clock = freeze_clock();
-    let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainSyncOutbox;
-    let rotation = OutboxRotation {
-        totals: RotationTotals {
-            // A retry on an early page followed by a clean suffix made
-            // progress, so the next retry returns to the base interval.
-            deleted: 1,
-            retry_invocations: 1,
-            invocations: 2,
-            ..RotationTotals::default()
-        },
-        retry_attempts: 3,
-        ..OutboxRotation::default()
-    };
-
-    handler.close_rotation(key.clone(), rotation).await;
-
-    assert_eq!(
-        scheduled_after(&task_handle).await,
-        Duration::from_millis(250)
-    );
-    let attempts = handler
-        .rotation
-        .lock()
-        .expect("rotation lock")
-        .retry_attempts;
-    assert_eq!(attempts, 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn retry_suffix_closes() {
-    let _clock = freeze_clock();
-    let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainSyncOutbox;
-    // The first page retried; a clean suffix made progress before the
-    // rotation reached its observed high-water boundary.
-    let rotation = OutboxRotation {
-        boundary: Some(b"last".to_vec()),
-        cursor: Some(b"first".to_vec()),
-        totals: RotationTotals {
-            deleted: 1,
-            retry_invocations: 1,
-            invocations: 2,
-            ..RotationTotals::default()
-        },
-        ..OutboxRotation::default()
-    };
-
-    handler.finish_retry(key.clone(), rotation, true).await;
-
-    assert_eq!(
-        scheduled_after(&task_handle).await,
-        Duration::from_millis(250)
-    );
-    let rotation = handler.rotation.lock().expect("rotation lock");
-    assert!(rotation.boundary.is_none());
-    assert!(rotation.cursor.is_none());
-    assert_eq!(rotation.retry_attempts, 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn midpoint_retry_keeps() {
-    let _clock = freeze_clock();
-    let (_dir, handler, task_handle) = outbox_handler();
-    let key = TaskKey::DrainSyncOutbox;
-    let topic = irokle::TopicId::hash(b"midpoint-retry-topic");
-    let mut rotation = OutboxRotation {
-        boundary: Some(b"last".to_vec()),
-        cursor: Some(b"middle".to_vec()),
-        totals: RotationTotals {
-            retry_invocations: 1,
-            invocations: 1,
-            ..RotationTotals::default()
-        },
-        retry_attempts: 3,
-        ..OutboxRotation::default()
-    };
-    rotation.blocked_topics.insert(topic);
-
-    handler.finish_retry(key.clone(), rotation, false).await;
-
-    {
-        let rotation = handler.rotation.lock().expect("rotation lock");
-        assert_eq!(rotation.cursor.as_deref(), Some(b"middle".as_slice()));
-        assert!(rotation.blocked_topics.contains(&topic));
-        assert_eq!(rotation.totals.retry_invocations, 1);
-    }
-    assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
-}
-
 #[tokio::test]
 async fn config_reloads_between() {
     let ConfigHarness {
@@ -486,7 +337,7 @@ async fn config_reloads_between() {
     } = config_setup().await;
     handler.drain_sync_outbox().await;
     {
-        let rotation = handler.rotation.lock().expect("rotation lock");
+        let rotation = handler.kept_rotation();
         assert!(rotation.cursor.is_some());
         assert_eq!(rotation.totals.deleted, 1);
     }
@@ -521,24 +372,13 @@ fn outbox_bound_finite() {
     assert_ne!(OUTBOX_INVOCATION_RECORDS, 0);
 }
 
-#[tokio::test(start_paused = true)]
-async fn empty_resets_backoff() {
-    let _clock = freeze_clock();
-    let (_dir, handler, _task_handle) = outbox_handler();
-    let key = TaskKey::DrainSyncOutbox;
-    handler.store_rotation(OutboxRotation {
-        retry_attempts: 3,
-        ..OutboxRotation::default()
-    });
-    let rotation = std::mem::take(&mut *handler.rotation.lock().expect("rotation lock"));
-
-    assert!(handler.open_rotation(&key, rotation).await.is_none());
-    let attempts = handler
-        .rotation
-        .lock()
-        .expect("rotation lock")
-        .retry_attempts;
-    assert_eq!(attempts, 0, "an empty outbox drops the retry ladder");
+/// Keeps `rotation` as the drain's open rotation, as an earlier invocation would have left it.
+fn seed_rotation(handler: &OperationsTaskHandler, rotation: OutboxRotation) {
+    let memory = TimerMemory {
+        rotation,
+        ..TimerMemory::default()
+    };
+    handler.keep_memory(&TaskKey::DrainSyncOutbox, memory);
 }
 
 #[tokio::test]
@@ -562,10 +402,11 @@ async fn blocked_keeps_backoff() {
     });
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
-    handler.store_rotation(OutboxRotation {
+    let rotation = OutboxRotation {
         retry_attempts: 3,
         ..OutboxRotation::default()
-    });
+    };
+    seed_rotation(&handler, rotation);
     let mut blocked_change = change();
     blocked_change.placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: Ulid::from_bytes([48; 16]),
@@ -588,11 +429,7 @@ async fn blocked_keeps_backoff() {
     handler.drain_sync_outbox().await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    let attempts = handler
-        .rotation
-        .lock()
-        .expect("rotation lock")
-        .retry_attempts;
+    let attempts = handler.kept_rotation().retry_attempts;
     assert_eq!(attempts, 3);
     shutdown_net(&net).await;
 }
@@ -810,11 +647,7 @@ async fn rotation_streak() {
     for expected in 1..=OUTBOX_CONTINUATION_STREAK {
         handler.drain_sync_outbox().await;
         assert_eq!(
-            handler
-                .rotation
-                .lock()
-                .expect("rotation lock")
-                .continuations,
+            handler.kept_rotation().continuations,
             expected
         );
         assert_eq!(
@@ -824,11 +657,7 @@ async fn rotation_streak() {
     }
     handler.drain_sync_outbox().await;
     assert_eq!(
-        handler
-            .rotation
-            .lock()
-            .expect("rotation lock")
-            .continuations,
+        handler.kept_rotation().continuations,
         0
     );
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
@@ -1430,7 +1259,7 @@ impl BoundaryHarness {
     }
 
     fn assert_rotation(&self, examined: usize, cursor: bool, continuations: u32) {
-        let rotation = self.handler.rotation.lock().expect("rotation lock");
+        let rotation = self.handler.kept_rotation();
         assert_eq!(
             (rotation.totals.examined, rotation.cursor.is_some()),
             (examined, cursor)
@@ -1469,41 +1298,3 @@ impl BoundaryHarness {
     }
 }
 
-// A realm config that cannot be decoded postpones the drain instead of reading as absent, where
-// the bootstrap rules would let a record publish without verified membership.
-#[tokio::test]
-async fn unreadable_config_waits() {
-    let temp_dir = tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let context = Arc::new(DriverContext {
-        storage_handle: storage.clone(),
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    });
-    let realm_id = RealmId::from_bytes([66u8; 32]);
-    let load = || crate::tasks::incoming::outbox::load_drain_config(&context, realm_id);
-    assert!(matches!(load().await, Ok(None)));
-
-    let written = storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            value: ByteView::from(vec![0xff]),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        written,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
-    assert!(load().await.is_err());
-
-    let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-    write_realm_config(&storage, realm_id, &config, node(1)).await;
-    assert!(matches!(load().await, Ok(Some(_))));
-}

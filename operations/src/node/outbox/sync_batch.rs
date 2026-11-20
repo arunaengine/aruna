@@ -15,7 +15,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use irokle::TopicId;
 use ulid::Ulid;
 
-use crate::node::finish_batch::{FinishBatchOperation, FinishedBatch};
+use crate::node::outbox::finish_batch::{FinishBatchOperation, FinishedBatch};
 use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
 use crate::sync::reconcile::SyncTopicsOperation;
 
@@ -81,7 +81,8 @@ impl Operation for SyncBatchOperation {
             return Err(IoError::Unfinished);
         };
         let synced = result.child::<DocumentReconcileResult, ApplyError>()?;
-        let event = Event::Net(NetEvent::DocumentSync(DocumentNetEvent::reconciled(synced)));
+        let synced = DocumentNetEvent::reconciled(synced);
+        let event = Event::Net(NetEvent::DocumentSync(synced));
         let elapsed = self.now_ms.saturating_sub(self.started_ms);
         let outcome = DrainSyncOutcome {
             sync_elapsed: Duration::from_millis(elapsed),

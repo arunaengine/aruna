@@ -11,15 +11,47 @@ use aruna_core::id::NodeId;
 use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::telemetry::duration_ms;
 use irokle::TopicId;
+use tracing::info;
 use ulid::Ulid;
 
 use super::defer::{DrainDeferState, DrainRecord, admin_origin};
+use super::record::OUTBOX_DRAIN_SIZE;
 use super::rotation::OutboxRotation;
-use crate::sync::shard_placement::sort_node_ids;
+use crate::sync::shard_placement::{DEFER_RETRY_AFTER, sort_node_ids};
 
 /// Records one publish or sync sub-batch holds at most.
 pub const DRAIN_SUBBATCH_RECORDS: usize = 512;
+/// Pages one drain invocation may examine, so a large or blocked queue cannot
+/// monopolise a task invocation.
+pub const OUTBOX_INVOCATION_PAGES: usize = 2;
+pub const OUTBOX_INVOCATION_RECORDS: usize = OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_SIZE;
+/// Consecutive continuations before a rotation yields through the timer, so an
+/// append-heavy or wholly blocked queue cannot keep the task continuously hot.
+pub const OUTBOX_CONTINUATION_STREAK: u32 = 8;
+const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
+/// When a rotation with records left goes on after an invocation.
+pub const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
+
+/// The pages and records one invocation may examine, and the continuations before a rotation
+/// yields through the timer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutboxLimits {
+    pub pages: usize,
+    pub records: usize,
+    pub continuation_streak: u32,
+}
+
+impl Default for OutboxLimits {
+    fn default() -> Self {
+        Self {
+            pages: OUTBOX_INVOCATION_PAGES,
+            records: OUTBOX_INVOCATION_RECORDS,
+            continuation_streak: OUTBOX_CONTINUATION_STREAK,
+        }
+    }
+}
 
 /// Records sent to the same peers together: the documents to publish, empty for records this
 /// process already published, and per record its topic, admin origin, target and key.
@@ -179,7 +211,7 @@ pub fn resolve_publish_placement(
 
 /// What publishing and syncing sub-batches left: the time spent, the records deleted and the
 /// ordering domains to block for the rest of the rotation.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct DrainSyncOutcome {
     pub sync_elapsed: Duration,
     pub project_elapsed: Duration,
@@ -208,6 +240,7 @@ pub type StuckRecord = (u64, DocumentTarget, TopicId, PlacementRef);
 
 /// One bounded invocation of an open rotation: where it reads, what it blocks and what it
 /// counted.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainInvocation {
     pub outcome: DrainSyncOutcome,
     pub defer: DrainDeferState,
@@ -260,5 +293,82 @@ impl DrainInvocation {
     /// Whether records past this invocation's cursor wait for a later one.
     pub fn has_unvisited(&self) -> bool {
         !self.reached_end && !self.read_failed
+    }
+
+    /// Takes this finished invocation into `rotation`, logs its summary and answers when the
+    /// drain runs again: on the retry ladder, as a continuation, after the defer delay once the
+    /// streak is spent, or as the closed rotation plans. `elapsed` is the invocation's time.
+    pub fn finish(
+        mut self,
+        rotation: &mut OutboxRotation,
+        limits: &OutboxLimits,
+        (now_ms, elapsed): (u64, Duration),
+    ) -> Option<Duration> {
+        let outcome = &self.outcome;
+        let defer = &mut self.defer;
+        defer.deferred_topics.extend(outcome.blocked_topics.iter().copied());
+        defer.blocked_origins.extend(outcome.blocked_origins.iter().copied());
+        let unvisited = self.has_unvisited();
+        let retry = self.outcome.retry_needed || self.read_failed;
+        rotation.cursor = match self.reached_end {
+            true => None,
+            false => self.cursor.take(),
+        };
+        rotation.blocked_topics = std::mem::take(&mut self.defer.deferred_topics);
+        rotation.blocked_origins = std::mem::take(&mut self.defer.blocked_origins);
+        rotation.undeliverable_topics = std::mem::take(&mut self.defer.undeliverable_topics);
+        let totals = &mut rotation.totals;
+        totals.examined += self.records;
+        totals.deleted += self.outcome.deleted;
+        totals.deferred += self.deferred;
+        totals.undeliverable += self.undeliverable;
+        totals.retry_invocations += usize::from(retry);
+        totals.invocations = totals.invocations.saturating_add(1);
+        if self.records > 0 {
+            self.summary(rotation.continuations, (unvisited, retry), (now_ms, elapsed));
+        }
+        if retry {
+            return rotation.finish_retry(self.reached_end);
+        }
+        if !unvisited {
+            return rotation.close_logged();
+        }
+        if rotation.continuations < limits.continuation_streak {
+            rotation.continuations = rotation.continuations.saturating_add(1);
+            return Some(OUTBOX_CONTINUATION_AFTER);
+        }
+        rotation.continuations = 0;
+        Some(DEFER_RETRY_AFTER)
+    }
+
+    fn summary(&self, continuation: u32, (unvisited, retry): (bool, bool), at: (u64, Duration)) {
+        let (now_ms, elapsed) = at;
+        let oldest_age_ms = (self.oldest_record_ms)
+            .map(|record_ms| now_ms.saturating_sub(record_ms))
+            .unwrap_or(0);
+        info!(
+            event = "pipeline.drain.summary",
+            records = self.records,
+            examined = self.records,
+            deleted = self.outcome.deleted,
+            deferred = self.deferred,
+            undeliverable = self.undeliverable,
+            retry_scheduled = retry,
+            has_unvisited = unvisited,
+            continuation = continuation,
+            rotation_complete = self.reached_end,
+            groups = self.groups,
+            subbatches = self.subbatches,
+            pages = self.pages,
+            scan_ms = duration_ms(self.scan_elapsed),
+            publish_ms = duration_ms(self.publish_elapsed),
+            sync_ms = duration_ms(self.outcome.sync_elapsed),
+            project_ms = duration_ms(self.outcome.project_elapsed),
+            delete_ms = duration_ms(self.outcome.delete_elapsed),
+            total_ms = duration_ms(elapsed),
+            oldest_age_ms,
+            retry = retry,
+            "Document sync outbox drain summary"
+        );
     }
 }

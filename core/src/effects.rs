@@ -878,6 +878,12 @@ pub enum NetEffect {
     /// Opens a sealed repository token with this node's credential key, which only the adapter
     /// holds. Answers `NetEvent::CredentialOpened`.
     OpenCredential(Box<crate::repository::credential::CredentialOpen>),
+    /// Signs an admin event this node originated over its placement-bound bytes, so a holder can
+    /// take it in relay; answers `NetEvent::AdminSigned`.
+    AdminSign {
+        event: Box<crate::admin_documents::AdminDocumentEvent>,
+        placement: PlacementRef,
+    },
     /// Seals a search or listing position with this process's key, so it names no key;
     /// answers `NetEvent::PositionSealed`.
     SealPosition(Vec<u8>),

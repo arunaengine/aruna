@@ -2,24 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::document::{
-    DocumentNetEvent, DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget,
-};
 use aruna_core::effects::Effect;
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::identity::JobExecutionClass;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Key;
 use aruna_tasks::shutdown::Shutdown;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
@@ -52,7 +47,6 @@ use aruna_operations::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
 };
 use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
-use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
 use aruna_operations::jobs::prune::PruneTimerOperation;
@@ -93,7 +87,6 @@ async fn restore_graph_prune(
     }
 }
 use crate::tasks::task_persistence::restore_task_timers;
-use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 use aruna_drivers::driver::node_facts;
 use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
@@ -104,20 +97,9 @@ use aruna_operations::queue_backoff::retry_delay_ms;
 use aruna_operations::replication::drain::RestoreDrainOperation;
 use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
-use aruna_operations::sync::document_outbox::{
-    DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
-};
-use aruna_operations::sync::outbox::batches::{
-    DrainInvocation, DrainSubBatch, DrainSyncOutcome, build_drain_batches,
-    resolve_publish_placement,
-};
-use aruna_operations::sync::outbox::defer::{
-    DrainRecord, classify_deferred_record, partition_drain_records,
-};
-use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
+use aruna_operations::sync::document_outbox::OutboxTimerOperation;
+use aruna_operations::sync::outbox::batches::OutboxLimits;
 use aruna_operations::sync::outbox::rotation::OutboxRotation;
-use aruna_operations::sync::reconcile::SyncTopicsOperation;
-use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
     TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
 };
@@ -130,24 +112,6 @@ pub mod git_drain;
 pub mod outbox;
 pub mod restore;
 
-/// Process-wide tally of document sync outbox records ever classified
-/// undeliverable. The drain already error-logs each one; this exposes the count
-/// so a test can assert the draining-flush path never black-holes a record.
-pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// Outbox records remembered as published; past it they are forgotten and published once
-/// more, which only costs log space.
-const MAX_PUBLISHED_RECORDS: usize = 65_536;
-/// Pages one drain invocation may examine, so a large or blocked queue cannot
-/// monopolise a task invocation.
-const OUTBOX_INVOCATION_PAGES: usize = 2;
-const OUTBOX_INVOCATION_RECORDS: usize = OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_SIZE;
-/// Consecutive continuations before a rotation yields through the timer, so an
-/// append-heavy or wholly blocked queue cannot keep the task continuously hot.
-const OUTBOX_CONTINUATION_STREAK: u32 = 8;
-const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
-const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
 const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 
 /// How long a device keeps its copy of the realm documents before asking for
@@ -159,26 +123,6 @@ const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
 const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_TICKS: usize = 12;
-/// How long a record may wait for its shard topic's genesis before the drain
-/// stops treating the wait as normal and says so at error level.
-const OUTBOX_STUCK_AFTER: Duration = Duration::from_secs(300);
-
-#[derive(Clone, Copy)]
-struct OutboxLimits {
-    pages: usize,
-    records: usize,
-    continuation_streak: u32,
-}
-
-impl Default for OutboxLimits {
-    fn default() -> Self {
-        Self {
-            pages: OUTBOX_INVOCATION_PAGES,
-            records: OUTBOX_INVOCATION_RECORDS,
-            continuation_streak: OUTBOX_CONTINUATION_STREAK,
-        }
-    }
-}
 
 /// One drained outbox record with its resolved publish topic.
 pub(crate) struct OperationsTaskHandler {
@@ -188,28 +132,11 @@ pub(crate) struct OperationsTaskHandler {
     // What each converted timer keeps between runs; the operations decide on it. Loss on
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
-    // Rotation state of the bounded outbox drain. Loss on restart is fine: the
-    // next rotation opens at the head.
-    rotation: std::sync::Mutex<OutboxRotation>,
-    // Outbox records whose op this process already created, so a retry only syncs them.
-    // Loss on restart is fine: such a record is published once more.
-    published_records: std::sync::Mutex<BTreeSet<Vec<u8>>>,
-    drain_guard: tokio::sync::Mutex<()>,
     outbox_limits: OutboxLimits,
     // When a device may next fetch the realm documents, and how many attempts
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
     // Signs registry publications; `None` where no node identity was supplied.
-}
-
-enum DrainPage {
-    Records {
-        records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
-        has_more: bool,
-        boundary_reached: bool,
-    },
-    Skip,
-    Stop,
 }
 
 impl OperationsTaskHandler {
@@ -219,9 +146,6 @@ impl OperationsTaskHandler {
             jobs_runtime,
             rocrate_limits: RoCrateLimits::default(),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
-            rotation: std::sync::Mutex::new(OutboxRotation::default()),
-            published_records: std::sync::Mutex::new(BTreeSet::new()),
-            drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
         }
@@ -246,144 +170,6 @@ impl OperationsTaskHandler {
             continuation_streak,
         };
         self
-    }
-
-    /// Handles records this node cannot publish itself: admin records are relayed under
-    /// this node's origin signature and deleted once a holder takes custody, while
-    /// unsigned upserts/deletes stay in the outbox. Returns keys whose custody moved.
-    async fn relay_undeliverable_records(
-        &self,
-        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-        undeliverable: &[DrainRecord],
-    ) -> Vec<Vec<u8>> {
-        let mut relayed = Vec::new();
-        let device = self.is_device(config);
-        for (record_key, record, topic) in undeliverable {
-            if let Some(config) = config
-                && self.relay_admin_record(config, record).await
-            {
-                relayed.push(record_key.clone());
-                continue;
-            }
-            // A device can never become a holder, so an unrelayable row of its
-            // own would only be error-logged on every drain: drop it instead.
-            if device && !matches!(record.event, DocumentOutboxEvent::AdminOperation { .. }) {
-                warn!(
-                    event = "pipeline.drain.dropped",
-                    target = ?record.target,
-                    "Dropping a document sync outbox record no device can publish"
-                );
-                relayed.push(record_key.clone());
-                continue;
-            }
-            error!(
-                event = "pipeline.drain.undeliverable",
-                target = ?record.target,
-                %topic,
-                strategy = %record.placement.strategy_id,
-                shard = record.placement.shard,
-                age_ms = unix_timestamp_millis().saturating_sub(record.outbox_id.timestamp_ms()),
-                "Cannot publish a document sync outbox record from this node and it is not relayable; leaving it in the outbox"
-            );
-        }
-        // A relayed record left this node, so it never counts as undeliverable.
-        UNDELIVERABLE_RECORD_COUNT.fetch_add(
-            undeliverable.len().saturating_sub(relayed.len()) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        relayed
-    }
-
-    /// Whether this node is a device: configured with a kind that holds no
-    /// sync topic. Unknown kinds count as infrastructure.
-    fn is_device(
-        &self,
-        config: Option<&aruna_core::structs::identity::realm::RealmConfigDocument>,
-    ) -> bool {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            return false;
-        };
-        config
-            .and_then(|config| {
-                aruna_operations::realm::mutate_placement::node_kind(config, net_handle.node_id())
-            })
-            .is_some_and(|kind| !kind.is_sync_eligible())
-    }
-
-    /// Signs one locally originated administrative envelope and hands it to a
-    /// holder. Returns whether a holder took custody.
-    async fn relay_admin_record(
-        &self,
-        config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-        record: &DocumentOutboxRecord,
-    ) -> bool {
-        let DocumentOutboxEvent::AdminOperation {
-            event,
-            origin_signature,
-        } = &record.event
-        else {
-            return false;
-        };
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            return false;
-        };
-        let origin_signature = match origin_signature {
-            Some(signature) => *signature,
-            None if event.origin_node_id == net_handle.node_id() => {
-                match event.signing_bytes(&record.placement) {
-                    Ok(bytes) => net_handle.sign(&bytes),
-                    Err(error) => {
-                        warn!(%error, "Cannot sign an admin event for relay");
-                        return false;
-                    }
-                }
-            }
-            None => return false,
-        };
-        let holders = aruna_core::placement::resolve_shard_holders(config, &record.placement);
-        if holders.is_empty() {
-            return false;
-        }
-        match drive(
-            RelayAdminOperation::new(
-                self.context.node_and_realm().map(|(node_id, _)| node_id),
-                &holders,
-                record.target.clone(),
-                event.clone(),
-                record.placement,
-                origin_signature,
-            ),
-            &self.context,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(
-                    event = "pipeline.drain.relayed",
-                    target = ?record.target,
-                    origin = %event.origin_node_id,
-                    "Relayed an admin outbox record to a holder"
-                );
-                true
-            }
-            Err(error) => {
-                warn!(
-                    event = "pipeline.drain.relay_failed",
-                    target = ?record.target,
-                    %error,
-                    "No holder accepted a relayed admin outbox record"
-                );
-                false
-            }
-        }
-    }
-
-    /// Re-arms the outbox drain on the rotation's retry ladder, which counts the attempt. The
-    /// drain re-arm is the only retry path for an accepted write after a transient sync failure.
-    async fn retry_drain(&self, key: TaskKey, mut rotation: OutboxRotation) {
-        let after = rotation.retry_after();
-        self.store_rotation(rotation);
-        self.reschedule_timer(key, after).await;
     }
 
     async fn reschedule_timer(&self, key: TaskKey, after: std::time::Duration) -> bool {
@@ -428,24 +214,6 @@ impl OperationsTaskHandler {
     pub(super) async fn arm_backend_imports(&self) {
         self.keep_retrying(TaskKey::RunBackendImports, Duration::ZERO)
             .await;
-    }
-
-    // Kicks the placement reconciler immediately (not persisted; it is re-derived
-    // from the realm config at startup by `RestoreTopicsOperation`).
-    async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::id::NodeId) {
-        let task_id = TaskKey::SyncPlacements { realm_id, node_id };
-        let Some(task_handle) = self.context.task_handle.as_ref() else {
-            warn!(task_id = ?task_id, "Cannot schedule shard placement sync without task handle");
-            return;
-        };
-        let effect = Effect::Task(TaskEffect::ResetTimer {
-            key: task_id.clone(),
-            after: Duration::ZERO,
-        });
-        if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(effect).await
-        {
-            warn!(task_id = ?task_id, message = %message, "Failed to schedule shard placement sync after local realm config change");
-        }
     }
 
     /// Fetches the realm documents on a device, at most once per backoff
@@ -543,6 +311,7 @@ impl OperationsTaskHandler {
                 Default::default()
             },
             rocrate_limits: self.rocrate_limits.clone(),
+            outbox: self.outbox_limits,
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -616,9 +385,7 @@ impl OperationsTaskHandler {
         match key {
             TaskKey::RealmPresence { .. } => Box::pin(self.run_trigger(key)),
             TaskKey::SyncPlacements { .. } => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainSyncOutbox => Box::pin(async move {
-                self.drain_sync_outbox().await;
-            }),
+            TaskKey::DrainSyncOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
             TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
             TaskKey::DrainProjectionQueue => Box::pin(self.run_trigger(key)),
@@ -736,6 +503,13 @@ impl InboundTaskHandler for OperationsTaskHandler {
     }
 
     async fn handle_firing(&self, key: TaskKey, stamp: Option<u64>) {
+        // A test pins the first outbox drain of a launch until it releases the barrier.
+        #[cfg(debug_assertions)]
+        if matches!(key, TaskKey::DrainSyncOutbox)
+            && let Some(barrier) = OutboxBarrier::new()
+        {
+            barrier.wait_start().await;
+        }
         // An audit record retry keeps its row until the record is stored, in one transaction.
         if !matches!(key, TaskKey::RecordAudit { .. }) {
             delete_persisted_timer(&self.context.storage_handle, &key, stamp).await;

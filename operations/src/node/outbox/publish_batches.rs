@@ -18,8 +18,8 @@ use aruna_core::task::TaskKey;
 use irokle::TopicId;
 use tracing::warn;
 
-use crate::node::finish_batch::FinishedBatch;
-use crate::node::sync_batch::SyncBatchOperation;
+use crate::node::outbox::finish_batch::FinishedBatch;
+use crate::node::outbox::sync_batch::SyncBatchOperation;
 use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
 
 /// What publishing the sub-batches left: the sync outcome, the time the publishes took, the
