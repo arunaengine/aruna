@@ -320,7 +320,6 @@ pub async fn upload(
     records: &Path,
 ) -> Result<Uploaded, CliError> {
     let size = tokio::fs::metadata(path).await?.len();
-    let client = access.client().await?;
     if size <= part_size {
         // One read is hashed and sent, so the reported digest and size are of the sent bytes.
         let bytes = tokio::fs::read(path).await?;
@@ -332,7 +331,9 @@ pub async fn upload(
         .map_err(|error| CliError::Io(std::io::Error::other(error)))?;
         let size = bytes.len() as u64;
         let body = ByteStream::from(bytes);
-        client
+        access
+            .client()
+            .await?
             .put_object()
             .bucket(bucket)
             .key(key)
@@ -355,6 +356,8 @@ pub async fn upload(
     };
     let named = (access.endpoint.as_str(), bucket, key, blake3.as_str());
     let (mut record, kept) = claim_record(upload_record(records, named, &parts)).await?;
+    // Hashing and the wait for the record can outlast the session, so it refreshes only now.
+    let client = access.client().await?;
     let resumed = match kept {
         Some(upload_id) => (stored_parts(&client, bucket, key, &upload_id).await?)
             .map(|stored| (upload_id, stored)),
