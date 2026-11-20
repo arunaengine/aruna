@@ -24,7 +24,7 @@ use ulid::Ulid;
 use super::check::{CallError, RunScope};
 use super::grants::short_path;
 use super::held::ReplyShown;
-use super::host_steps::AdmitCall;
+use super::host::steps::AdmitCall;
 use super::rows::{Rows, StoreError, decode, delete_rows, scan_rows};
 use super::submit::{PrepareWork, PreparedWork, WORK_ACTIVE, WorkRequest};
 use super::unavailable;

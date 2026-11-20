@@ -15,8 +15,8 @@ use ulid::Ulid;
 
 use super::check::{CallError, RunScope};
 use super::grants::object_path;
-use super::host_calls::{CallFailure, ObjectInfoCall, ObjectListCall, StateCall, StateChange};
-use super::host_steps::{AdmitCall, NativeCall};
+use super::host::calls::{CallFailure, ObjectInfoCall, ObjectListCall, StateCall, StateChange};
+use super::host::steps::{AdmitCall, NativeCall};
 use super::job_work::CancelWork;
 use super::state::{ReadState, read_state};
 use super::submit::WorkRequest;

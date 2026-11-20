@@ -16,13 +16,13 @@ use aruna_plugin_types::calls::{ErrorKind, HostError, Intent, ObjectInfo, Object
 use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
-use super::check::{Authorize, CallError, matching};
-use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row};
-use super::marks::is_marked;
-use super::objects::LocalObject;
-use super::rows::{StoreError, delete_rows, mapped_child, write_rows};
-use super::state::{PutError, put_state, remove_state};
-use super::unavailable;
+use super::super::check::{Authorize, CallError, matching};
+use super::super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row};
+use super::super::marks::is_marked;
+use super::super::objects::LocalObject;
+use super::super::rows::{StoreError, delete_rows, mapped_child, write_rows};
+use super::super::state::{PutError, put_state, remove_state};
+use super::super::unavailable;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
 
@@ -609,5 +609,5 @@ impl Operation for ObjectListCall {
 }
 
 #[cfg(test)]
-#[path = "host_calls_tests.rs"]
+#[path = "calls_tests.rs"]
 mod tests;

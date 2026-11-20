@@ -20,8 +20,8 @@ use aruna_operations::plugins::creates::{CreatePlan, stored_created};
 use aruna_operations::plugins::dataset::file_entity;
 use aruna_operations::plugins::grants::object_path;
 use aruna_operations::plugins::held::SecretValue;
-use aruna_operations::plugins::host_calls::{CallFailure, StateChange, call_intent, version_id};
-use aruna_operations::plugins::host_steps::{
+use aruna_operations::plugins::host::calls::{CallFailure, StateChange, call_intent, version_id};
+use aruna_operations::plugins::host::steps::{
     AdmitCall, ChangeInput, ChangeMutation, ChangePlan, Checked, ConnectionAsk, ListDatasets,
     PrepareChange, PrepareCreate, ReadDataset, ReadFiles, ReadPlace,
 };

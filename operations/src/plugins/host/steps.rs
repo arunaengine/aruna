@@ -27,24 +27,24 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use ulid::Ulid;
 
-use super::check::{Authorize, CallError, CheckCall, RunScope, matching};
-use super::creates::write_outcome;
-use super::dataset::{
+use super::super::check::{Authorize, CallError, CheckCall, RunScope, matching};
+use super::super::creates::write_outcome;
+use super::super::dataset::{
     content_urls, dataset_change, dataset_crate, dataset_of, file_entities, parse_document,
     same_revision,
 };
-use super::grants::{install_scope, parse_grants, patterns_for, restricted_account};
-use super::host_calls::{CallEnd, CallFailure, RecordCall, begun_reply};
-use super::install::{InstallError, config_answer, config_call, pick_version, read_manifest};
-use super::intents::{Begun, begin, written};
-use super::job_work::StartWork;
-use super::objects::LocalObject;
-use super::outgoing::{outgoing, request_context};
-use super::rate::{take_call, taken};
-use super::rows::StoreError;
-use super::submit::WorkRequest;
-use super::unavailable;
-use super::work::RequestContext;
+use super::super::grants::{install_scope, parse_grants, patterns_for, restricted_account};
+use super::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
+use super::super::install::{InstallError, config_answer, config_call, pick_version, read_manifest};
+use super::super::intents::{Begun, begin, written};
+use super::super::job_work::StartWork;
+use super::super::objects::LocalObject;
+use super::super::outgoing::{outgoing, request_context};
+use super::super::rate::{take_call, taken};
+use super::super::rows::StoreError;
+use super::super::submit::WorkRequest;
+use super::super::unavailable;
+use super::super::work::RequestContext;
 use crate::jobs::records::pages::ServingNode;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::export_types::ExportMetadataRequest;
@@ -1495,5 +1495,5 @@ impl Operation for NativeCall {
 }
 
 #[cfg(test)]
-#[path = "host_steps_tests.rs"]
+#[path = "steps_tests.rs"]
 mod tests;
