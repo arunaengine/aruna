@@ -108,7 +108,7 @@ mod tests {
 
     // A batch hands its cursors to the next run; a failed one keeps the cursors it started from.
     #[test]
-    fn catch_up_cursors_kept() {
+    fn drain_cursors_kept() {
         let more = run(b"kept", Ok(drained(true, b"left")));
         assert_eq!(more.after, Some(Duration::ZERO));
         assert_eq!(more.memory.catch_up.set_after.as_deref(), Some(&b"left"[..]));
