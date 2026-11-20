@@ -225,7 +225,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::SettleJobTerminals => Some(TimerOperation::SettleJobTerminals(
             SettleTerminalsOperation::new(input.facts.serving, input.now_ms),
         )),
-        TaskKey::PruneJobs => Some(TimerOperation::PruneJobs(PruneKeepingWork::new(JOB_PRUNE_PAGE))),
+        TaskKey::PruneJobs => Some(TimerOperation::PruneJobs(PruneKeepingWork::new(
+            JOB_PRUNE_PAGE,
+        ))),
         _ => None,
     }
 }
