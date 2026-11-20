@@ -837,8 +837,12 @@ impl OperationsTaskHandler {
                 Some(failure.retry_after)
             }
         };
-        if let Some(after) = after {
-            self.reschedule_timer(key, after).await;
+        let Some(after) = after else {
+            return;
+        };
+        if !self.reschedule_timer(key.clone(), after).await && key == TaskKey::DrainAppliedSync {
+            // Its persisted timer is gone and durable rows wait on it, so a live wake stays.
+            self.keep_retrying(key, after).await;
         }
     }
 
