@@ -6,10 +6,8 @@ use super::drained::remove_drained_backends;
 use super::*;
 use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use aruna_drivers::driver::node_routing;
-use aruna_operations::federation::registration::PublishRegistrationOperation;
 use std::time::SystemTime;
 
-const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// The first and the longest wait before an incomplete timer restoration resumes.
 const TIMER_RESUME_FIRST: Duration = Duration::from_secs(1);
 const TIMER_RESUME_MOST: Duration = Duration::from_secs(60);
@@ -213,14 +211,12 @@ pub async fn install_task_queues(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
-    node_capabilities: Option<NodeCapabilities>,
 ) -> TaskQueues {
     install_task_handler(
         context,
         task_handle,
         jobs_runtime,
         rocrate_limits,
-        node_capabilities,
         true,
     )
     .await
@@ -241,7 +237,6 @@ pub async fn start_task_queues(
         task_handle,
         jobs_runtime,
         RoCrateLimits::default(),
-        None,
     )
     .await
     .restore_and_start(shutdown)
@@ -253,14 +248,12 @@ async fn install_task_handler(
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
-    node_capabilities: Option<NodeCapabilities>,
     refresh_holders: bool,
 ) -> TaskQueues {
     let handler_context = context.clone();
     let handler = Arc::new(
         OperationsTaskHandler::new(handler_context, jobs_runtime.clone())
-            .with_rocrate_limits(rocrate_limits)
-            .with_node_capabilities(node_capabilities),
+            .with_rocrate_limits(rocrate_limits),
     );
     task_handle.set_inbound_handler(handler.clone()).await;
     // Prime the origin-side watch interest cache from any digests already in
@@ -450,47 +443,6 @@ impl TaskQueues {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn publish_registration(&self) {
-        let key = TaskKey::PublishRegistration;
-        match (self.context.net_handle.as_ref(), &self.node_capabilities) {
-            (Some(net_handle), Some(capabilities)) => {
-                let publish = PublishRegistrationOperation::new(
-                    *net_handle.realm_id(),
-                    net_handle.node_id(),
-                    capabilities.clone(),
-                );
-                if let Err(error) = drive(publish, &self.context).await {
-                    warn!(task_id = ?key, error = %error, "Failed to publish registry registration");
-                }
-            }
-            _ => warn!(task_id = ?key, "Cannot publish registration without net handle or keys"),
-        }
-        // The fired row is gone, so a refused rearm keeps a live renewal that stores it again.
-        self.keep_retrying(key, aruna_core::federation::PUBLISH_INTERVAL)
-            .await;
-    }
-}
-
-impl OperationsTaskHandler {
-    /// Starts the repository link pushes whose debounce elapsed and re-arms for the next one.
-    pub(super) async fn drain_link_queue(&self) {
-        let drain = aruna_operations::jobs::repository::link_queue::DrainLinksOperation::new(
-            self.context.node_scope(),
-        );
-        let after = match drive(drain, &self.context).await {
-            Ok(after) => after,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainLinkQueue, %error, "Failed to drain repository link queue");
-                Some(LINK_RETRY_AFTER)
-            }
-        };
-        if let Some(after) = after {
-            self.reschedule_timer(TaskKey::DrainLinkQueue, after).await;
-        }
-    }
-}
-
-impl OperationsTaskHandler {
     pub(super) async fn drain_job_queue(&self) {
         if !self.jobs_runtime.is_started() {
             return;
@@ -642,8 +594,10 @@ async fn restore_registration_timer(
         key: TaskKey::PublishRegistration,
         after: aruna_core::federation::PUBLISH_INTERVAL,
     };
+    // A stored renewal, which may be due earlier, wins: restoration arms it, also when it
+    // resumes after this runs.
     if let Event::Task(TaskEvent::Error { message, .. }) =
-        change_timer(storage, Some(task_handle), effect, true).await
+        arm_unless_stored(storage, task_handle, effect).await
     {
         warn!(message = %message, "Failed to arm registry publication timer");
     }
@@ -728,10 +682,91 @@ mod stop_tests {
             task_handle.clone(),
             JobsRuntime::new_paused(),
             RoCrateLimits::default(),
-            None,
         )
         .await;
         (temp_dir, task_handle, queues, Shutdown::new())
+    }
+
+    /// Probes the wake the scheduler holds for the registry renewal: its holding admission and
+    /// the time left, without moving it, since the probe asks for a later deadline.
+    async fn held_renewal(task_handle: &TaskHandle) -> (Option<u64>, Duration) {
+        let probe = aruna_core::federation::PUBLISH_INTERVAL * 2;
+        let key = TaskKey::PublishRegistration;
+        let (event, holder) = task_handle.shorten_owned(key, probe, 1).await;
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = event else {
+            panic!("the probe is answered");
+        };
+        (holder, after)
+    }
+
+    // A stored renewal that restoration has not armed yet keeps its due time: it is armed at once
+    // with the admission that owns its row, and only a node without one gets the default.
+    #[tokio::test]
+    async fn stored_renewal_wins() {
+        use aruna_core::federation::PUBLISH_INTERVAL;
+        use aruna_storage::task_timers::read_timer;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        let stored = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &stored)
+            .await
+            .expect("timer persists");
+        let before = read_timer(&storage, &key).await.expect("reads");
+
+        restore_registration_timer(&storage, &task_handle).await;
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
+        let (holder, after) = held_renewal(&task_handle).await;
+        assert_eq!(holder, before.map(|row| row.admission));
+        assert!(after <= Duration::from_secs(60), "the stored due time is armed");
+
+        let fresh_dir = tempdir().expect("temp dir");
+        let fresh = FjallStorage::open(fresh_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        restore_registration_timer(&fresh, &TaskHandle::new()).await;
+        let armed = read_timer(&fresh, &key).await.expect("reads").expect("row");
+        let limit = aruna_clock::unix_timestamp_millis() + PUBLISH_INTERVAL.as_millis() as u64;
+        assert!(armed.due_unix_millis <= limit);
+    }
+
+    // A renewal row that cannot be read stays for restoration while the default runs from memory,
+    // so the node still renews.
+    #[tokio::test]
+    async fn unread_renewal_live() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
+        use aruna_storage::task_timers::read_timer;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let key = TaskKey::PublishRegistration;
+        let stored = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &stored)
+            .await
+            .expect("timer persists");
+        let before = read_timer(&storage, &key).await.expect("reads");
+        let reads_timers = |effect: &StorageEffect| match effect {
+            StorageEffect::Read { key_space, .. } => key_space == TASK_TIMER_KEYSPACE,
+            _ => false,
+        };
+        let unreadable = aruna_test_support::metadata::refusing_when(storage.clone(), reads_timers);
+        let task_handle = TaskHandle::new();
+
+        restore_registration_timer(&unreadable, &task_handle).await;
+        let (holder, after) = held_renewal(&task_handle).await;
+        assert_ne!(holder, Some(1), "the default runs from memory");
+        assert!(after <= aruna_core::federation::PUBLISH_INTERVAL);
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
     }
 
     // A stop accepted before restoration admits no restore unit.

@@ -2,9 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::Operation;
-use aruna_core::repository::credential::RepositoryCredential;
+use aruna_core::repository::credential::{CredentialOpen, RepositoryCredential};
 use aruna_core::repository::remote::{InvenioAccess, JobStop, NodeScope};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -96,6 +98,7 @@ pub(crate) struct ConnectRequest {
 enum ConnectStep {
     Access,
     Connector,
+    Open(ConnectorView),
     Secret(ConnectorView),
 }
 
@@ -164,18 +167,17 @@ impl Operation for ConnectOperation {
                         "the repository connector is not of kind {kind}"
                     )));
                 }
-                if let Some(credential) = &self.request.credential {
-                    let key = self.request.scope.credential_key.as_ref().ok_or_else(|| {
-                        TransferError::Retryable("node credential key unavailable".into())
-                    })?;
-                    let token = credential.open(
-                        key,
-                        self.request.auth.user_id,
-                        self.request.group_id,
-                        self.request.connector_id,
-                        &view.connector.endpoint,
-                    )?;
-                    return Ok(Next::Done(self.opened(&view, Some(token))?));
+                if let Some(credential) = self.request.credential.take() {
+                    let open = CredentialOpen {
+                        credential,
+                        user: self.request.auth.user_id,
+                        group: self.request.group_id,
+                        connector: self.request.connector_id,
+                        endpoint: view.connector.endpoint.clone(),
+                    };
+                    self.step = ConnectStep::Open(view);
+                    let open = Effect::Net(NetEffect::OpenCredential(Box::new(open)));
+                    return Ok(Next::Call(open.into()));
                 }
                 if !view.has_secret_config {
                     return Ok(Next::Done(self.opened(&view, None)?));
@@ -184,6 +186,18 @@ impl Operation for ConnectOperation {
                 Ok(Next::Call(
                     read_secret_effect(self.request.connector_id, None).into(),
                 ))
+            }
+            ConnectStep::Open(view) => {
+                let Event::Net(NetEvent::CredentialOpened(opened)) = result.event()? else {
+                    let expected = "NetEvent::CredentialOpened";
+                    let got = "another event";
+                    return Err(IoError::Unexpected { expected, got }.into());
+                };
+                let token = opened.ok_or_else(|| {
+                    TransferError::Retryable("node credential key unavailable".into())
+                })?;
+                let token = token.map_err(TransferError::Permanent)?;
+                Ok(Next::Done(self.opened(&view, Some(token.expose().to_string()))?))
             }
             ConnectStep::Secret(view) => {
                 let secret = parse_secret_read(result.event()?).map_err(|_| {

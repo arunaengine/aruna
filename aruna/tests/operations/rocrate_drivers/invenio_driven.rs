@@ -126,7 +126,7 @@ pub(super) async fn seal_credential(
     let connector = ConnectorViewOperation::new(destination.group_id, destination.connector_id);
     let view = drive(connector, context).await?;
     seal_token(
-        &context.node_scope(),
+        context.credential_key(),
         auth.user_id,
         &view,
         None,
@@ -145,7 +145,7 @@ pub(super) async fn seal_link_token(
 ) -> Result<RepositoryCredential, TransferError> {
     let view = drive(ConnectorViewOperation::new(group_id, connector_id), context).await?;
     seal_token(
-        &context.node_scope(),
+        context.credential_key(),
         user,
         &view,
         Some(link_id),

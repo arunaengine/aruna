@@ -392,7 +392,7 @@ pub async fn rotate_token(
         .await
         .map_err(seal_error)?;
     let secret = seal_token(
-        &context.node_scope(),
+        context.credential_key(),
         link.created_by,
         &connector,
         Some(link.link_id),

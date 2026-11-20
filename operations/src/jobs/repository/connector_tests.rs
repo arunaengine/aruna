@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::jobs::repository::push::creator_auth;
-use crate::jobs::repository::test_support::{child, credential_key, link, local_scope, scope};
+use crate::jobs::repository::test_support::{child, credential_key, link, scope};
+use aruna_core::compute::Secret;
+use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::structs::execution::harvest::RepositoryConnector;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -137,32 +139,54 @@ fn credential_gives_token() {
     .unwrap();
     let mut operation = ConnectOperation::new(request(Some(credential)));
     past_access(&mut operation);
-    let Ok(Next::Done(session)) = operation.next(invenio()) else {
+    let Ok(Next::Done(session)) = open_with(&mut operation, Some(credential_key())) else {
         panic!("the connector opens with the credential");
     };
     assert_eq!(session.access().token(), Some("secret-token"));
 }
 
+/// Answers the connector's credential open as the net adapter does on a node holding `key`.
+fn open_with(
+    operation: &mut ConnectOperation,
+    key: Option<CredentialEncryptionKey>,
+) -> Result<Next<Session>, TransferError> {
+    let Ok(Next::Call(IoCall::Effect(effect))) = operation.next(invenio()) else {
+        panic!("the connector asks the net adapter to open the credential");
+    };
+    let Effect::Net(NetEffect::OpenCredential(open)) = *effect else {
+        panic!("expected the credential open effect");
+    };
+    let opened = key.map(|key| open.open(&key).map_err(|error| error.to_string()));
+    let opened = opened.map(|token| token.map(Secret::new));
+    let event = Event::Net(NetEvent::CredentialOpened(opened));
+    operation.next(IoResult::Event(Box::new(event)))
+}
+
+// A node without a credential key retries later; another node's key never opens the token.
 #[test]
 fn credential_needs_key() {
-    let mut connect = request(Some(
-        RepositoryCredential::seal_link(
-            (&credential_key(), [3; 24]),
-            link().created_by,
-            link().group_id,
-            link().connector_id,
-            None,
-            link().endpoint,
-            "token",
-        )
-        .unwrap(),
-    ));
-    connect.scope = local_scope();
-    let mut operation = ConnectOperation::new(connect);
+    let sealed = RepositoryCredential::seal_link(
+        (&credential_key(), [3; 24]),
+        link().created_by,
+        link().group_id,
+        link().connector_id,
+        None,
+        link().endpoint,
+        "token",
+    )
+    .unwrap();
+    let mut operation = ConnectOperation::new(request(Some(sealed.clone())));
     past_access(&mut operation);
     assert!(matches!(
-        operation.next(invenio()),
+        open_with(&mut operation, None),
         Err(TransferError::Retryable(_))
+    ));
+    let mut operation = ConnectOperation::new(request(Some(sealed)));
+    past_access(&mut operation);
+    let other = CredentialEncryptionKey::derive(&[2; 32]);
+    assert!(matches!(
+        open_with(&mut operation, Some(other)),
+        Err(TransferError::Permanent(_))
     ));
 }
 

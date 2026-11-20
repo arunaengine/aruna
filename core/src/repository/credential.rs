@@ -80,6 +80,25 @@ impl RepositoryCredential {
     }
 }
 
+/// A sealed token with the user, group, connector and endpoint it must open for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CredentialOpen {
+    pub credential: RepositoryCredential,
+    pub user: UserId,
+    pub group: Ulid,
+    pub connector: Ulid,
+    pub endpoint: String,
+}
+
+impl CredentialOpen {
+    /// Opens the token with the node's credential key.
+    pub fn open(&self, key: &CredentialEncryptionKey) -> Result<String, RepositoryError> {
+        let (user, group, connector) = (self.user, self.group, self.connector);
+        let credential = &self.credential;
+        credential.open(key, user, group, connector, &self.endpoint)
+    }
+}
+
 fn token_aad(
     user: UserId,
     group: Ulid,

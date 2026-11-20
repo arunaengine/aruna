@@ -250,6 +250,39 @@ impl Operation for StoreAuditOperation {
     }
 }
 
+/// One `RecordAudit` timer run: stores the record the timer keeps and answers when to try again
+/// while storage still refuses it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuditTimerOperation {
+    key: TaskKey,
+}
+
+impl AuditTimerOperation {
+    pub fn new(key: TaskKey) -> Self {
+        Self { key }
+    }
+}
+
+impl Operation for AuditTimerOperation {
+    type Output = Option<Duration>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<Duration>>, IoError> {
+        let store = StoreAuditOperation::new(self.key.clone());
+        Ok(Next::Call(IoCall::child(store)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Duration>>, IoError> {
+        match result.child::<(), AuditError>()? {
+            Ok(()) => Ok(Next::Done(None)),
+            Err(error) => {
+                warn!(error = %error, "Bucket key audit record still not stored");
+                Ok(Next::Done(Some(AUDIT_RETRY)))
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ResumeState {
     Scan,
@@ -558,6 +591,19 @@ mod tests {
     fn other_timers_refused() {
         let mut operation = StoreAuditOperation::new(TaskKey::DrainCleanupQueue);
         assert_eq!(operation.first(), Err(AuditError::NotAuditTimer));
+    }
+
+    // A record still not stored runs again after the retry wait; a stored one ends its timer.
+    #[test]
+    fn failed_store_retries() {
+        let mut run = AuditTimerOperation::new(retry_timer(&record()));
+        let store = IoCall::child(StoreAuditOperation::new(retry_timer(&record())));
+        assert_eq!(run.first(), Ok(Next::Call(store)));
+        let failed = Err::<(), _>(AuditError::Storage(StorageError::KeyNotFound));
+        let failed = IoResult::Child(ChildOutcome::new(failed));
+        assert_eq!(run.next(failed), Ok(Next::Done(Some(AUDIT_RETRY))));
+        let stored = IoResult::Child(ChildOutcome::new(Ok::<(), AuditError>(())));
+        assert_eq!(run.next(stored), Ok(Next::Done(None)));
     }
 
     #[test]

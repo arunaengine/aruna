@@ -266,6 +266,14 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::OpenPosition(_) => NetEvent::PositionOpened(None),
         // Secrets are drawn by the drivers adapter; this handler never answers one.
         NetEffect::DrawSecret(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
+        // Federation signatures are made by the drivers adapter; this handler never answers one.
+        NetEffect::FederationSign(_) => {
+            NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
+        }
+        // Credentials are opened by the drivers adapter; this handler never answers one.
+        NetEffect::OpenCredential(_) => {
+            NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
+        }
         NetEffect::CursorSign(bytes) => {
             let signer = ctx.secret_key.public();
             let signed = aruna_core::cursor::names_signer(&bytes, signer.as_bytes());
@@ -664,6 +672,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DelegationSign(_) => "delegation_sign",
         NetEffect::AvoidHolder { .. } => "avoid_holder",
         NetEffect::CursorSign(_) => "cursor_sign",
+        NetEffect::FederationSign(_) => "federation_sign",
+        NetEffect::OpenCredential(_) => "open_credential",
         NetEffect::SealPosition(_) => "seal_position",
         NetEffect::OpenPosition(_) => "open_position",
         NetEffect::DrawSecret(_) => "draw_secret",

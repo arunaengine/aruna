@@ -143,13 +143,18 @@ impl DriverContext {
     pub fn node_scope(&self) -> aruna_core::repository::remote::NodeScope {
         aruna_core::repository::remote::NodeScope {
             node: self.node_and_realm(),
-            credential_key: self
-                .net_handle
-                .as_ref()
-                .map(|net| net.credential_encryption_key()),
             has_blob: self.blob_handle.is_some(),
             has_tasks: self.task_handle.is_some(),
         }
+    }
+
+    /// The key this node seals repository tokens with, held by its net transport.
+    pub fn credential_key(
+        &self,
+    ) -> Option<aruna_core::credential_encryption::CredentialEncryptionKey> {
+        self.net_handle
+            .as_ref()
+            .map(|net| net.credential_encryption_key())
     }
 
     /// This context with its storage effects on the bulk lane, so

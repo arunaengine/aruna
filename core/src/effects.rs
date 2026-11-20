@@ -857,6 +857,12 @@ pub enum NetEffect {
     /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.
     /// Answers `NetEvent::CursorSigned`.
     CursorSign(Vec<u8>),
+    /// Signs the domain-tagged bytes of a federation payload with this node's realm or issuer
+    /// key, which only the adapter holds. Answers `NetEvent::FederationSigned`.
+    FederationSign(Vec<u8>),
+    /// Opens a sealed repository token with this node's credential key, which only the adapter
+    /// holds. Answers `NetEvent::CredentialOpened`.
+    OpenCredential(Box<crate::repository::credential::CredentialOpen>),
     /// Seals a search or listing position with this process's key, so it names no key;
     /// answers `NetEvent::PositionSealed`.
     SealPosition(Vec<u8>),

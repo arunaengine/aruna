@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{LINK_CHANGE_KEYSPACE, LINK_QUEUE_KEYSPACE};
@@ -51,6 +51,8 @@ use crate::queue_backoff::{due_after, min_due_at};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 const QUEUE_PAGE: usize = 256;
+/// When a failed link drain runs again.
+pub const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
 const ERROR_RETRY_MS: u64 = 60_000;
 
 type Turn<T> = Result<Next<T>, LinkError>;
@@ -401,6 +403,39 @@ impl Operation for DrainLinksOperation {
                 settled(result)?;
                 self.next_due = min_due_at(self.next_due, retry_at);
                 self.advance()
+            }
+        }
+    }
+}
+
+/// One link queue timer run: drains the due links and answers when the queue runs again, after
+/// [`LINK_RETRY_AFTER`] when the drain failed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinkRunOperation {
+    scope: NodeScope,
+}
+
+impl LinkRunOperation {
+    pub fn new(scope: NodeScope) -> Self {
+        Self { scope }
+    }
+}
+
+impl Operation for LinkRunOperation {
+    type Output = Option<Duration>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<Duration>>, IoError> {
+        let drain = DrainLinksOperation::new(self.scope.clone());
+        Ok(Next::Call(IoCall::child(drain)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<Duration>>, IoError> {
+        match result.child::<Option<Duration>, LinkError>()? {
+            Ok(after) => Ok(Next::Done(after)),
+            Err(error) => {
+                warn!(%error, "Failed to drain repository link queue");
+                Ok(Next::Done(Some(LINK_RETRY_AFTER)))
             }
         }
     }

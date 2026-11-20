@@ -12,6 +12,7 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::document::ShardTransportMessage;
+use aruna_core::federation::PUBLISH_INTERVAL;
 use aruna_core::git::GitNode;
 use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
@@ -21,6 +22,7 @@ use aruna_core::native_reference::{
 };
 use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
+use aruna_core::repository::remote::NodeScope;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
@@ -40,6 +42,7 @@ use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::device::publish_queue::DrainOutcome;
 use crate::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
+use crate::federation::registration::RenewalTimerOperation;
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::backend_import::schedule::RunDueOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
@@ -49,6 +52,7 @@ use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation
 use crate::jobs::node_inputs::witness_node;
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
+use crate::jobs::repository::link_queue::LinkRunOperation;
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::device::drain::{
     DrainPublishOperation, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, drain_publish_queue,
@@ -79,6 +83,7 @@ use crate::replication::catch_up::CatchUpCursors;
 use crate::replication::drain_timer::ReplicationTimerOperation;
 use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
 use crate::replication::mirror_repair::drain::DrainRepairsOperation;
+use crate::s3::bucket::audit_retry::AuditTimerOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
@@ -173,6 +178,12 @@ pub struct TimerNeeds {
     /// The fresh heartbeats and executor limits.
     pub cluster: bool,
     pub cores: bool,
+}
+
+/// Whether the timer of `key` rearms with a shorten after a run, so a wake armed while it ran,
+/// such as the prompt publication of a settings change, is never postponed.
+pub fn keeps_earlier(key: &TaskKey) -> bool {
+    matches!(key, TaskKey::PublishRegistration)
 }
 
 /// The costly inputs the timer of `key` reads.
@@ -277,6 +288,9 @@ pub enum TimerOperation {
     DrainWitnessQueue(WitnessDrainOperation),
     RunBackendImports(RunDueOperation),
     MaintainRanges(RangeTimerOperation),
+    PublishRegistration(RenewalTimerOperation),
+    DrainLinkQueue(LinkRunOperation),
+    RecordAudit(AuditTimerOperation),
     RefreshBlobHolders(HoldersTimerOperation),
     DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
@@ -426,6 +440,28 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
         }),
+        // The net adapter signs with the node's key, so no key enters this input.
+        TaskKey::PublishRegistration => Some(match input.serving {
+            Some((node_id, realm_id)) => {
+                let renewal = RenewalTimerOperation::new(realm_id, node_id);
+                TimerOperation::PublishRegistration(renewal)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(Some(PUBLISH_INTERVAL))),
+        }),
+        // The connector opens stored tokens through the net adapter, so no key enters this scope.
+        TaskKey::DrainLinkQueue => {
+            let scope = NodeScope {
+                node: input.serving,
+                has_blob: input.has_blob,
+                has_tasks: input.has_tasks,
+            };
+            let drain = LinkRunOperation::new(scope);
+            Some(TimerOperation::DrainLinkQueue(drain))
+        }
+        TaskKey::RecordAudit { .. } => {
+            let store = AuditTimerOperation::new(key.clone());
+            Some(TimerOperation::RecordAudit(store))
+        }
         TaskKey::MaintainRanges => Some(TimerOperation::MaintainRanges(RangeTimerOperation::new(
             input,
         ))),
@@ -491,6 +527,9 @@ macro_rules! each_timer {
             TimerOperation::DrainWitnessQueue($operation) => $body,
             TimerOperation::RunBackendImports($operation) => $body,
             TimerOperation::MaintainRanges($operation) => $body,
+            TimerOperation::PublishRegistration($operation) => $body,
+            TimerOperation::DrainLinkQueue($operation) => $body,
+            TimerOperation::RecordAudit($operation) => $body,
             TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
@@ -852,6 +891,26 @@ impl TimerRun for RunDueOperation {
     /// The run names when a schedule is due next; a failed run waits for the next rule change.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         Ok(TimerPlan::from(result.unwrap_or(None)))
+    }
+}
+
+impl TimerRun for RenewalTimerOperation {
+    /// A renewal runs again after the publication interval, also after a failed run.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.unwrap_or(Some(PUBLISH_INTERVAL));
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for AuditTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
+    }
+}
+
+impl TimerRun for LinkRunOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        Ok(TimerPlan::from(result.map_err(TimerFailure::from)?))
     }
 }
 
@@ -1578,6 +1637,15 @@ mod tests {
         assert!(materialize.routing && materialize.cores && !materialize.facts);
         assert_eq!(group_concurrency(7), 4);
         assert_eq!(group_concurrency(0), 1);
+    }
+
+    #[test]
+    fn renewal_without_network() {
+        // A node without a network keeps its renewal armed; a broken run also renews later.
+        let mut idle = timer_operation(&TaskKey::PublishRegistration, &input()).unwrap();
+        let next = TimerPlan::from(Some(PUBLISH_INTERVAL));
+        assert_eq!(idle.first(), Ok(Next::Done(next.clone())));
+        assert_eq!(RenewalTimerOperation::rearm(Err(IoError::Unfinished)), Ok(next));
     }
 
     #[test]
