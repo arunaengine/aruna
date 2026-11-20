@@ -238,7 +238,7 @@ mod tests {
     // A re-emitted row keeps the key of the evicted record but never its bytes: each carries a
     // fresh incarnation, so the finish of an older drain that read the first row keeps it.
     #[test]
-    fn reemit_differs_from_read() {
+    fn reemit_differs_read() {
         let document = evicted(1);
         let read = crate::sync::outbox::record::new_identified_record(
             document.event_id,
