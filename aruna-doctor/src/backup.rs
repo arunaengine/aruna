@@ -5,7 +5,7 @@
 
 use crate::error::CliError;
 use crate::storage::{
-    ImportKeyspaceState, ensure_target_path, keyspace_name, publish_dir, staging_dir,
+    ImportKeyspaceState, ensure_target_path, keyspace_name, publish_dir, staging_dir, sync_tree,
 };
 use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
 use aruna_core::structs::storage::broken::StorageCheck;
@@ -158,6 +158,10 @@ fn restore_into(
     queue_checks(&databases[0])?;
     for database in &databases {
         database.persist(PersistMode::SyncAll)?;
+    }
+    // The Git files were only written; they must be durable before the restore is published.
+    if git_root.exists() {
+        sync_tree(&git_root)?;
     }
     Ok(())
 }

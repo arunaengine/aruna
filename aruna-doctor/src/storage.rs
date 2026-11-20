@@ -238,12 +238,44 @@ pub(crate) fn publish_dir(staging: &Path, target: &Path) -> Result<(), SnapshotE
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     let moved = std::fs::rename(staging, target);
     match moved {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(SnapshotError::TargetPathExists(target.to_path_buf()))
+            return Err(SnapshotError::TargetPathExists(target.to_path_buf()));
         }
-        Err(error) => Err(error.into()),
+        Err(error) => return Err(error.into()),
     }
+    // The rename is durable only once the directory that now names the target is synced.
+    if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Syncs every file and directory below and including `root`, so restored files are durable
+/// before they are published; answers how many it synced.
+pub(crate) fn sync_tree(root: &Path) -> std::io::Result<usize> {
+    let mut synced = 0;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            synced += sync_tree(&entry.path())?;
+        } else if file_type.is_file() {
+            File::open(entry.path())?.sync_all()?;
+            synced += 1;
+        }
+    }
+    sync_dir(root)?;
+    Ok(synced + 1)
+}
+
+/// Syncs a directory's entries; Windows cannot open a directory to sync it, and needs no sync.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 pub(crate) fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
@@ -321,6 +353,16 @@ mod tests {
         }
         let staged = std::fs::read_dir(dir.path()).unwrap().count();
         assert_eq!(staged, 1, "only the snapshot file is left");
+    }
+
+    // Every restored file and directory is synced, each once.
+    #[test]
+    fn tree_synced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("one.git/objects")).unwrap();
+        std::fs::write(dir.path().join("one.git/HEAD"), b"ref").unwrap();
+        std::fs::write(dir.path().join("one.git/objects/pack"), b"data").unwrap();
+        assert_eq!(super::sync_tree(dir.path()).unwrap(), 5);
     }
 
     // Large values commit once their bytes reach the limit, long before the entry limit.
