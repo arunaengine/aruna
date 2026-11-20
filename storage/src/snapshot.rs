@@ -108,29 +108,55 @@ impl<W: Write> SnapshotWriter<W> {
                 "began a keyspace before closing the previous keyspace",
             ));
         }
-        let mut record = Vec::with_capacity(1 + 8 + name.len());
-        record.push(RECORD_BEGIN_KEYSPACE);
-        push_prefixed_bytes(&mut record, name.as_bytes())?;
-        self.write_record(&record)?;
+        self.write_hashed(&[RECORD_BEGIN_KEYSPACE])?;
+        self.write_prefixed(name.as_bytes())?;
         self.open_entries = Some(0);
         self.keyspace_count += 1;
         Ok(())
     }
 
     pub fn entry(&mut self, key: &[u8], value: &[u8]) -> Result<(), SnapshotError> {
+        self.open_entry(key)?;
+        self.write_prefixed(value)?;
+        self.count_entry();
+        Ok(())
+    }
+
+    /// Writes an entry whose `len` value bytes are copied from `value` piece by piece, so a
+    /// large value is never held whole. A source that ends early fails the entry.
+    pub fn entry_from(
+        &mut self,
+        key: &[u8],
+        len: u64,
+        value: impl Read,
+    ) -> Result<(), SnapshotError> {
+        self.open_entry(key)?;
+        self.write_hashed(&len.to_be_bytes())?;
+        let mut out = Hashed {
+            out: &mut self.out,
+            hasher: &mut self.hasher,
+        };
+        if std::io::copy(&mut value.take(len), &mut out)? != len {
+            let early = std::io::Error::new(ErrorKind::UnexpectedEof, "an entry value ended early");
+            return Err(early.into());
+        }
+        self.count_entry();
+        Ok(())
+    }
+
+    fn open_entry(&mut self, key: &[u8]) -> Result<(), SnapshotError> {
         if self.open_entries.is_none() {
             return Err(SnapshotError::InvalidStructure(
                 "wrote an entry outside a keyspace section",
             ));
         }
-        let mut record = Vec::with_capacity(1 + 16 + key.len() + value.len());
-        record.push(RECORD_ENTRY);
-        push_prefixed_bytes(&mut record, key)?;
-        push_prefixed_bytes(&mut record, value)?;
-        self.write_record(&record)?;
+        self.write_hashed(&[RECORD_ENTRY])?;
+        self.write_prefixed(key)
+    }
+
+    fn count_entry(&mut self) {
         self.open_entries = self.open_entries.map(|count| count + 1);
         self.entry_count += 1;
-        Ok(())
     }
 
     pub fn end_keyspace(&mut self) -> Result<(), SnapshotError> {
@@ -139,10 +165,8 @@ impl<W: Write> SnapshotWriter<W> {
                 "ended a keyspace outside a keyspace section",
             ));
         };
-        let mut record = Vec::with_capacity(9);
-        record.push(RECORD_END_KEYSPACE);
-        record.extend_from_slice(&entry_count.to_be_bytes());
-        self.write_record(&record)
+        self.write_hashed(&[RECORD_END_KEYSPACE])?;
+        self.write_hashed(&entry_count.to_be_bytes())
     }
 
     /// Writes every keyspace of `db` from one read snapshot, sorted by name and each name
@@ -193,10 +217,35 @@ impl<W: Write> SnapshotWriter<W> {
         Ok((self.out, stats))
     }
 
-    fn write_record(&mut self, record: &[u8]) -> Result<(), SnapshotError> {
-        self.out.write_all(record)?;
-        self.hasher.update(record);
+    fn write_hashed(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.out.write_all(bytes)?;
+        self.hasher.update(bytes);
         Ok(())
+    }
+
+    fn write_prefixed(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let len =
+            u64::try_from(bytes.len()).map_err(|_| SnapshotError::LengthOverflow(u64::MAX))?;
+        self.write_hashed(&len.to_be_bytes())?;
+        self.write_hashed(bytes)
+    }
+}
+
+/// Writes to the output and the checksum together.
+struct Hashed<'a, W> {
+    out: &'a mut W,
+    hasher: &'a mut Hasher,
+}
+
+impl<W: Write> Write for Hashed<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.out.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
     }
 }
 
@@ -382,13 +431,6 @@ impl<R: Read> SnapshotReader<R> {
     }
 }
 
-fn push_prefixed_bytes(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SnapshotError> {
-    let len = u64::try_from(bytes.len()).map_err(|_| SnapshotError::LengthOverflow(u64::MAX))?;
-    buffer.extend_from_slice(&len.to_be_bytes());
-    buffer.extend_from_slice(bytes);
-    Ok(())
-}
-
 fn read_array<const N: usize>(input: &mut impl Read) -> Result<[u8; N], std::io::Error> {
     let mut bytes = [0_u8; N];
     input.read_exact(&mut bytes)?;
@@ -419,6 +461,22 @@ mod tests {
             records.push(record);
         }
         Ok(records)
+    }
+
+    #[test]
+    fn streamed_entry_matches() {
+        let mut writer = SnapshotWriter::new(Vec::new(), 7).unwrap();
+        writer.begin_keyspace("a").unwrap();
+        writer.entry_from(b"k1", 2, &b"v1"[..]).unwrap();
+        writer.entry(b"k2", b"v2").unwrap();
+        writer.end_keyspace().unwrap();
+        assert_eq!(writer.finish().unwrap().0, sample_stream());
+        let mut writer = SnapshotWriter::new(Vec::new(), 7).unwrap();
+        writer.begin_keyspace("a").unwrap();
+        let Err(SnapshotError::Io(early)) = writer.entry_from(b"k1", 3, &b"v1"[..]) else {
+            panic!("a short source fails the entry");
+        };
+        assert_eq!(early.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
