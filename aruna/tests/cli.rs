@@ -110,10 +110,18 @@ async fn data_round_trip() -> TestResult<()> {
 
         // 11 MiB with 5 MiB parts takes the multipart path with three parts.
         let big = pattern(11 * 1024 * 1024, 7);
-        // An earlier attempt stored part 1 only; cp must continue that upload.
         let credentials = create_s3_credentials(&seed.base_url, &token, &group).await?;
         let endpoint = seed.s3.as_ref().ok_or("the node runs no S3 server")?;
         let client = s3_client(endpoint, &credentials);
+        // Another client's unfinished upload of the same key is never continued.
+        let foreign = client
+            .create_multipart_upload()
+            .bucket("cli-data")
+            .key("up/big.bin")
+            .send()
+            .await?;
+        let foreign_id = foreign.upload_id().unwrap_or_default().to_string();
+        // An earlier cp stored part 1 only and kept its upload; cp must continue that upload.
         let started = client
             .create_multipart_upload()
             .bucket("cli-data")
@@ -131,6 +139,9 @@ async fn data_round_trip() -> TestResult<()> {
             .await?;
         let local = dir.path().join("big.bin");
         std::fs::write(&local, &big)?;
+        let target = (s3.as_str(), "cli-data", "up/big.bin");
+        let upload_id = started.upload_id().unwrap_or_default();
+        aruna_cli::keep_upload(&config, target, (&local, 5 * 1024 * 1024), upload_id)?;
         let local_text = local.to_string_lossy().to_string();
         let up = cli_json(
             &config,
@@ -148,6 +159,16 @@ async fn data_round_trip() -> TestResult<()> {
         assert_eq!(up["key"], "up/big.bin");
         assert_eq!(up["verified"], true, "upload not checked by BLAKE3: {up}");
         assert_eq!(up["resumed"], 1, "the stored part was not reused: {up}");
+        let open = client
+            .list_multipart_uploads()
+            .bucket("cli-data")
+            .prefix("up/big.bin")
+            .send()
+            .await?;
+        let open: Vec<&str> = (open.uploads().iter())
+            .filter_map(|upload| upload.upload_id())
+            .collect();
+        assert_eq!(open, [foreign_id.as_str()], "only the other upload stays open");
 
         let listing = cli_json(&config, &["ls", "cli-data/up"]).await?;
         let keys: Vec<&str> = listing["objects"]

@@ -34,7 +34,7 @@ use aruna_operations::onboarding::finalize_bootstrap::{
 use aruna_operations::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
 };
-use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
+use aruna_operations::onboarding::list_secrets::{ListSecretsOperation, SecretPage};
 use aruna_operations::onboarding::reserve_secret::ReserveSecretError;
 use aruna_operations::realm::ensure_config::EnsureConfigError;
 use axum::extract::{Path, State};
@@ -240,28 +240,40 @@ async fn enforce_enrollment_policies(
     .map_err(|_| ServerError::Forbidden)
 }
 
+/// One page of onboarding secrets after the record key `after`.
+async fn secret_page(
+    state: &Arc<ServerState>,
+    after: Option<byteview::ByteView>,
+) -> ServerResult<SecretPage> {
+    drive(ListSecretsOperation::new(after), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.into()))
+}
+
 async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
     let now = now_timestamp();
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))?;
-
-    for secret in secrets {
-        if secret.record.expires_at < now
-            && !matches!(&secret.state, OnboardingSecretState::Finalizing { .. })
-        {
-            drive(
-                DeleteSecretOperation::new(DeleteSecretInput {
-                    enrollment_id: secret.record.enrollment_id,
-                }),
-                &state.get_ctx(),
-            )
-            .await
-            .map_err(map_delete_error)?;
+    let mut after = None;
+    loop {
+        let page = secret_page(state, after).await?;
+        for secret in page.entries {
+            if secret.record.expires_at < now
+                && !matches!(&secret.state, OnboardingSecretState::Finalizing { .. })
+            {
+                drive(
+                    DeleteSecretOperation::new(DeleteSecretInput {
+                        enrollment_id: secret.record.enrollment_id,
+                    }),
+                    &state.get_ctx(),
+                )
+                .await
+                .map_err(map_delete_error)?;
+            }
+        }
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(()),
         }
     }
-
-    Ok(())
 }
 
 #[utoipa::path(
@@ -496,17 +508,23 @@ pub async fn list_onboarding_secrets(
 ) -> ServerResult<(StatusCode, Json<ListSecretsResponse>)> {
     let _auth = authorize_onboarding_admin(&state, auth).await?;
     prune_stale_secrets(&state).await?;
-    let mut secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))?;
-    secrets.sort_by_key(|entry| entry.record.expires_at);
+    let (mut secrets, mut after) = (Vec::new(), None);
+    loop {
+        let page = secret_page(&state, after).await?;
+        secrets.extend(page.entries.into_iter().map(|entry| entry.record));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    secrets.sort_by_key(|record| record.expires_at);
 
     Ok((
         StatusCode::OK,
         Json(ListSecretsResponse {
             secrets: secrets
                 .into_iter()
-                .map(|entry| OnboardingSecretSummary::from(entry.record))
+                .map(OnboardingSecretSummary::from)
                 .collect(),
         }),
     ))
@@ -603,12 +621,17 @@ pub async fn get_secret_status(
 ) -> ServerResult<(StatusCode, Json<OnboardingSecretResponse>)> {
     let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::BadRequest)?;
     let caller = auth.clone().ok_or(ServerError::Unauthorized)?;
-    let entry = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))?
-        .into_iter()
-        .find(|entry| entry.record.enrollment_id == enrollment_id)
-        .ok_or(ServerError::NotFound)?;
+    let mut after = None;
+    let entry = loop {
+        let page = secret_page(&state, after).await?;
+        let mut entries = page.entries.into_iter();
+        let found = entries.find(|entry| entry.record.enrollment_id == enrollment_id);
+        match (found, page.next) {
+            (Some(entry), _) => break entry,
+            (None, Some(next)) => after = Some(next),
+            (None, None) => return Err(ServerError::NotFound),
+        }
+    };
 
     // The owner polls its own device; anybody else needs the admin path. A
     // refusal answers 404 so the route cannot confirm a foreign secret exists.

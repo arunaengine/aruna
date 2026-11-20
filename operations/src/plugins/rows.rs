@@ -140,6 +140,14 @@ impl Scan {
         )
     }
 
+    /// Takes one page and hands its rows over at once, keeping none; `true` while more follow.
+    pub fn page(&mut self, answer: IoResult) -> Result<(Rows, bool), StoreError> {
+        let (rows, next) = page_of(answer)?;
+        let more = next.is_some();
+        self.after = next;
+        Ok((rows, more))
+    }
+
     /// Takes one page; returns every row once the last page arrived.
     pub fn take(&mut self, answer: IoResult) -> Result<Option<Rows>, StoreError> {
         let (rows, next) = page_of(answer)?;

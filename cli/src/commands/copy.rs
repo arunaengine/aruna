@@ -45,7 +45,7 @@ impl Bucket {
             fallback: context.s3_endpoint.clone(),
             read_only,
             access: None,
-            records: context.config.dir.join("uploads"),
+            records: context.config.dir.join(transfer::UPLOAD_RECORDS),
         })
     }
 

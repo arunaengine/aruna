@@ -383,7 +383,8 @@ mod tests {
             replacement
         );
 
-        let entries = drive(ListSecretsOperation::new(), &context).await.unwrap();
+        let entries = drive(ListSecretsOperation::new(None), &context).await.unwrap();
+        let entries = entries.entries;
         assert!(entries.iter().all(|entry| {
             entry.record.enrollment_id != old_id && entry.record.enrollment_id != other_old_id
         }));

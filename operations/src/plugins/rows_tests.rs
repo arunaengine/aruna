@@ -45,6 +45,22 @@ fn scans_every_page() {
 }
 
 #[test]
+fn pages_handed_over() {
+    // Each page leaves the scan at once, so a long scan holds one page at a time.
+    let mut scan = Scan::new(SPACE, b"p".to_vec());
+    let first = vec![(b"p1".to_vec(), b"1".to_vec())];
+    let (rows, more) = scan.page(page_result(first.clone(), Some(b"p1".to_vec()))).unwrap();
+    assert_eq!((rows, more), (first, true));
+    assert!(scan.rows.is_empty());
+    let IoCall::Page { after, .. } = scan.ask() else {
+        panic!("a scan reads a page");
+    };
+    assert_eq!(after.map(|key| key.to_vec()), Some(b"p1".to_vec()));
+    let (rows, more) = scan.page(page_result(Vec::new(), None)).unwrap();
+    assert!(rows.is_empty() && !more);
+}
+
+#[test]
 fn single_requests() {
     let mut read = ReadRows(Some(read_call(vec![(SPACE, b"a".to_vec())])));
     assert!(matches!(read.first().unwrap(), Next::Call(IoCall::Read(_))));

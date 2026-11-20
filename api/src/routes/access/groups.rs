@@ -121,6 +121,9 @@ pub struct CreatedRoleResponse {
     /// Open scoped key request ids created for assigned users in encrypted buckets on this node.
     #[serde(default)]
     pub key_requests: Vec<String>,
+    /// False when a key request could not be opened; granting the role again retries it.
+    #[serde(default)]
+    pub key_requests_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -138,6 +141,9 @@ pub struct GroupRolesResponse {
     /// Open scoped key request ids created for the member in encrypted buckets on this node.
     #[serde(default)]
     pub key_requests: Vec<String>,
+    /// False when a key request could not be opened; adding the member again retries it.
+    #[serde(default)]
+    pub key_requests_complete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ToSchema)]
@@ -1548,7 +1554,8 @@ administrative path for the user being added, so authority can be granted per me
   is rejected when that role is missing or ambiguous.
 - Adding a user who already holds the roles is accepted and changes nothing.
 - `key_requests` lists open scoped key requests for the member in encrypted buckets on this node;
-  holders are notified when the caller holds no bucket key.
+  holders are notified when the caller holds no bucket key. `key_requests_complete` is false when
+  a request could not be opened; the member is added anyway, and adding again retries it.
 - The change commits here and reaches the rest of the realm through document sync."#,
     request_body(
         content = AddMemberRequest,
@@ -1578,7 +1585,8 @@ administrative path for the user being added, so authority can be granted per me
                         "public": false
                     }
                 ],
-                "key_requests": ["01JABCDEF0123456789ABCDEFG"]
+                "key_requests": ["01JABCDEF0123456789ABCDEFG"],
+                "key_requests_complete": true
             })
         ),
         (status = 400, description = "Malformed ids, a user id standing for everyone, or no default `user` role to fall back on", body = ErrorResponse),
@@ -1647,7 +1655,7 @@ pub async fn add_group_member(
     .await
     .map_err(map_member_error)?;
     let members = vec![user_id];
-    let key_requests =
+    let (key_requests, key_requests_complete) =
         crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
             .await;
 
@@ -1656,6 +1664,7 @@ pub async fn add_group_member(
         Json(GroupRolesResponse {
             roles: map_roles(auth_doc, state.get_realm_id()),
             key_requests,
+            key_requests_complete,
         }),
     ))
 }
@@ -1806,7 +1815,8 @@ administrative path.
   reported capitalised.
 - The role commits here and reaches the rest of the realm through document sync.
 - `key_requests` lists open scoped key requests for assigned users in encrypted buckets on this
-  node; holders are notified when the caller holds no bucket key.
+  node; holders are notified when the caller holds no bucket key. `key_requests_complete` is
+  false when a request could not be opened; the role is created anyway.
 
 **Limits**
 - The name is trimmed, must not be empty, and must not be `admin` or `user`, which are reserved for
@@ -1845,7 +1855,8 @@ administrative path.
                     "01JUSER02ABCDEFGHJKMNPQRST@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
                 ],
                 "public": false,
-                "key_requests": ["01JABCDEF0123456789ABCDEFG"]
+                "key_requests": ["01JABCDEF0123456789ABCDEFG"],
+                "key_requests_complete": true
             })
         ),
         (status = 400, description = "Reserved or empty name, an unknown grant value, a permission path outside the group, a malformed assigned user, or a public role asking for more than `READ`", body = ErrorResponse),
@@ -1945,10 +1956,14 @@ pub async fn create_group_role(
         crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
     }
     let members = assigned_users.into_iter().collect();
-    let key_requests =
+    let (key_requests, key_requests_complete) =
         crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
             .await;
-    let role = CreatedRoleResponse { role, key_requests };
+    let role = CreatedRoleResponse {
+        role,
+        key_requests,
+        key_requests_complete,
+    };
     Ok((StatusCode::CREATED, Json(role)))
 }
 

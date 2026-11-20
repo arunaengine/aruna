@@ -1549,7 +1549,8 @@ async fn abe_members() -> TestResult<()> {
         let (node_id, plain_id) = (seed.net.node_id(), Ulid::from_string(&plain.group_id)?);
         let now = aruna_clock::unix_timestamp_millis();
         let operation = MemberKeysOperation::new(auth, node_id, plain_id, vec![first], now);
-        assert_eq!(drive(operation, &seed.context).await, Ok(Vec::new()));
+        let keys = drive(operation, &seed.context).await.unwrap();
+        assert!(keys.opened.is_empty() && keys.failed.is_empty(), "{keys:?}");
 
         // An unindexed bucket joins the index when a change admits a new generation.
         let bucket = "abe-plain-b";
