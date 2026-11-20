@@ -687,8 +687,20 @@ mod stop_tests {
         (temp_dir, task_handle, queues, Shutdown::new())
     }
 
-    // A stored renewal that restoration has not armed yet keeps its due time: arming the default
-    // interval at start leaves it alone, and only a node without one gets the default.
+    /// Probes the wake the scheduler holds for the registry renewal: its holding admission and
+    /// the time left, without moving it, since the probe asks for a later deadline.
+    async fn held_renewal(task_handle: &TaskHandle) -> (Option<u64>, Duration) {
+        let probe = aruna_core::federation::PUBLISH_INTERVAL * 2;
+        let key = TaskKey::PublishRegistration;
+        let (event, holder) = task_handle.shorten_owned(key, probe, 1).await;
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = event else {
+            panic!("the probe is answered");
+        };
+        (holder, after)
+    }
+
+    // A stored renewal that restoration has not armed yet keeps its due time: it is armed at once
+    // with the admission that owns its row, and only a node without one gets the default.
     #[tokio::test]
     async fn stored_renewal_wins() {
         use aruna_core::federation::PUBLISH_INTERVAL;
@@ -710,14 +722,51 @@ mod stop_tests {
 
         restore_registration_timer(&storage, &task_handle).await;
         assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
+        let (holder, after) = held_renewal(&task_handle).await;
+        assert_eq!(holder, before.map(|row| row.admission));
+        assert!(after <= Duration::from_secs(60), "the stored due time is armed");
 
         let fresh_dir = tempdir().expect("temp dir");
         let fresh = FjallStorage::open(fresh_dir.path().to_str().expect("temp path"))
             .expect("storage opens");
-        restore_registration_timer(&fresh, &task_handle).await;
+        restore_registration_timer(&fresh, &TaskHandle::new()).await;
         let armed = read_timer(&fresh, &key).await.expect("reads").expect("row");
         let limit = aruna_clock::unix_timestamp_millis() + PUBLISH_INTERVAL.as_millis() as u64;
         assert!(armed.due_unix_millis <= limit);
+    }
+
+    // A renewal row that cannot be read stays for restoration while the default runs from memory,
+    // so the node still renews.
+    #[tokio::test]
+    async fn unread_renewal_live() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
+        use aruna_storage::task_timers::read_timer;
+
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let key = TaskKey::PublishRegistration;
+        let stored = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &stored)
+            .await
+            .expect("timer persists");
+        let before = read_timer(&storage, &key).await.expect("reads");
+        let reads_timers = |effect: &StorageEffect| match effect {
+            StorageEffect::Read { key_space, .. } => key_space == TASK_TIMER_KEYSPACE,
+            _ => false,
+        };
+        let unreadable = aruna_test_support::metadata::refusing_when(storage.clone(), reads_timers);
+        let task_handle = TaskHandle::new();
+
+        restore_registration_timer(&unreadable, &task_handle).await;
+        let (holder, after) = held_renewal(&task_handle).await;
+        assert_ne!(holder, Some(1), "the default runs from memory");
+        assert!(after <= aruna_core::federation::PUBLISH_INTERVAL);
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
     }
 
     // A stop accepted before restoration admits no restore unit.

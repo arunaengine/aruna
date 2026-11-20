@@ -38,27 +38,32 @@ pub async fn change_timer(
     apply_change(storage, task_handle, effect, keep_live).await
 }
 
-/// Arms a timer only while no row is stored for its key: a stored due time, which may be
-/// earlier, is left for restoration to arm, so this default never postpones it.
+/// Arms a timer's stored due time, which may be earlier, with the admission that owns its row,
+/// and the default `effect` only without a row. An unreadable row stays for restoration while
+/// the default runs from memory.
 pub async fn arm_unless_stored(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
     effect: TaskEffect,
 ) -> Event {
     let _held = hold_change(&effect).await;
-    if let Some(key) = task_effect_key(&effect) {
-        match read_timer(storage, &key).await {
+    if let TaskEffect::ShortenTimer { key, after } = &effect {
+        let admission = match read_timer(storage, key).await {
             Ok(Some(row)) => {
-                let now_ms = unix_timestamp_millis();
-                let left = row.due_unix_millis.saturating_sub(now_ms);
-                let after = Duration::from_millis(left);
-                return Event::Task(TaskEvent::TimerScheduled { key, after });
+                let left = row.due_unix_millis.saturating_sub(unix_timestamp_millis());
+                let (after, admission) = (Duration::from_millis(left), row.admission);
+                let (event, _) = task_handle.shorten_owned(row.key, after, admission).await;
+                return event;
             }
-            Ok(None) => {}
+            Ok(None) => None,
             Err(message) => {
-                let key = Some(key);
-                return Event::Task(TaskEvent::Error { key, message });
+                warn!(key = ?key, %message, "Timer kept in memory only");
+                Some(next_admission())
             }
+        };
+        if let Some(admission) = admission {
+            let (event, _) = task_handle.shorten_owned(key.clone(), *after, admission).await;
+            return event;
         }
     }
     apply_change(storage, Some(task_handle), effect, true).await
