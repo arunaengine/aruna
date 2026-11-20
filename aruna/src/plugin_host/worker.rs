@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::id::NodeId;
@@ -48,6 +48,8 @@ use aruna_operations::plugins::work::prune_work;
 
 /// How often the worker rechecks the events waiting for their install record or account.
 const RECHECK_MS: u64 = 10 * 1000;
+/// Journal pages all replays read together in one tick, before due runs are claimed.
+const REPLAY_PAGES: usize = 16;
 /// How often the worker prunes runs that ended before the retention period.
 const PRUNE_MS: u64 = 3600 * 1000;
 /// How often the worker keeps the summaries of finished plugin work.
@@ -63,6 +65,8 @@ pub struct Worker {
     backoff: tokio::sync::Mutex<Backoff>,
     /// When the waiting events were last rechecked.
     rechecked: AtomicU64,
+    /// A replay has more pages than the last tick read, so the next tick comes at once.
+    replaying: AtomicBool,
 }
 
 impl Worker {
@@ -90,6 +94,7 @@ impl Worker {
             supervisor,
             backoff: tokio::sync::Mutex::default(),
             rechecked: AtomicU64::new(0),
+            replaying: AtomicBool::new(false),
         }))
     }
 
@@ -115,9 +120,10 @@ impl Worker {
         if let Err(error) = drive(matched, &self.ctx).await {
             warn!(%error, "Could not match plugin events to installs");
         }
-        let replays = RunReplays::new(now_ms, (JOURNAL_PAGE, usize::MAX));
-        if let Err(error) = drive(replays, &self.ctx).await {
-            warn!(%error, "Could not replay plugin events");
+        let replays = RunReplays::new(now_ms, (JOURNAL_PAGE, REPLAY_PAGES));
+        match drive(replays, &self.ctx).await {
+            Ok((_, more)) => self.replaying.store(more, Ordering::Relaxed),
+            Err(error) => warn!(%error, "Could not replay plugin events"),
         }
         self.forward(&shared, now_ms).await;
         let rechecked = self.rechecked.load(Ordering::Relaxed);
@@ -394,7 +400,10 @@ pub fn spawn_worker(
             }
             tokio::select! {
                 _ = token.cancelled() => break,
-                _ = tokio::time::sleep(TICK) => {}
+                _ = tokio::time::sleep(match worker.replaying.load(Ordering::Relaxed) {
+                    true => std::time::Duration::ZERO,
+                    false => TICK,
+                }) => {}
             }
         }
         worker.stop().await;

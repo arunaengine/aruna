@@ -369,9 +369,27 @@ fn replays_pages_bounded() {
     let last = child_result(Ok::<_, StoreError>((1usize, false)));
     assert_eq!(
         replays.next(last),
-        Ok(Next::Done(5)),
-        "the page bound ends it"
+        Ok(Next::Done((5, true))),
+        "the page bound ends it, with more to read"
     );
+}
+
+#[test]
+fn replays_take_turns() {
+    // Each replay reads a page in turn, so a long replay cannot hold back the others.
+    let keys = [(b"r1".to_vec(), Vec::new()), (b"r2".to_vec(), Vec::new())];
+    let page = crate::plugins::rows::tests::page_result(keys.to_vec(), None);
+    let mut replays = RunReplays::new(9, (10, 3));
+    replays.first().unwrap();
+    replays.next(page).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
+    let more = || child_result(Ok::<_, StoreError>((10usize, false)));
+    replays.next(more()).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]), "then the other one");
+    let ended = child_result(Ok::<_, StoreError>((2usize, true)));
+    replays.next(ended).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
+    assert_eq!(replays.next(more()), Ok(Next::Done((22, true))));
 }
 
 mod replay_pass {
