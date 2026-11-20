@@ -220,11 +220,14 @@ impl KeyOperation {
             .max_by_key(|k| (k.created_at_ms, k.record_id))
     }
     fn settings_read(&mut self, value: Option<Value>) -> KeyTurn {
-        let settings = BucketEncryption::from_row(value.as_deref()).ok();
-        let Some(key) = settings.as_ref().and_then(|s| s.active_key()) else {
+        // Settings that do not decode or validate fail; only decoded ones without a key need none.
+        let Ok(settings) = BucketEncryption::from_row(value.as_deref()) else {
+            return self.fail(AbeError::Context);
+        };
+        let Some(key) = settings.active_key() else {
             return self.fail(KeyError::Missing);
         };
-        self.managed = settings.is_some_and(|s| s.mode == EncryptionMode::NodeManaged);
+        self.managed = settings.mode == EncryptionMode::NodeManaged;
         if let KeyAction::Publish(grant) = &self.action
             && grant.context.request.parameters.key != key
         {
@@ -464,8 +467,12 @@ impl Operation for KeyOperation {
         match self.state {
             State::Bucket => {
                 let [value] = values::<1>(result)?;
-                let Some(info) = value.as_ref().and_then(|v| BucketInfo::from_bytes(v).ok()) else {
+                // Only an absent bucket is `Missing`; one that does not decode fails.
+                let Some(value) = value else {
                     return self.fail(KeyError::Missing);
+                };
+                let Ok(info) = BucketInfo::from_bytes(&value) else {
+                    return self.fail(AbeError::Context);
                 };
                 self.info = Some(info);
                 self.state = State::Settings;
@@ -554,6 +561,31 @@ mod tests {
         let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
         assert_eq!(operation.transaction(), TransactionMode::Write);
         assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    }
+
+    #[test]
+    fn unreadable_rows_fail() {
+        // A stored bucket or settings row that does not decode is an error, never a skip.
+        let realm_id = RealmId([1; 32]);
+        let user_id = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let action = KeyAction::Member(user_id);
+        let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
+        operation.first().unwrap();
+        let garbage = || IoResult::Values(vec![Some(Value::from(vec![0xff; 3]))]);
+        assert_eq!(operation.next(garbage()), Err(KeyError::Abe(AbeError::Context)));
+        operation.state = State::Settings;
+        let unreadable = operation.settings_read(Some(Value::from(vec![0xff; 3])));
+        assert_eq!(unreadable, Err(KeyError::Abe(AbeError::Context)));
+        let absent = IoResult::Values(vec![None]);
+        operation.state = State::Bucket;
+        assert_eq!(operation.next(absent), Err(KeyError::Missing));
     }
 
     #[test]
