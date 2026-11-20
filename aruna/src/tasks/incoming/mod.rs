@@ -149,16 +149,12 @@ use crate::tasks::task_persistence::restore_task_timers;
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 use aruna_drivers::driver::node_facts;
-use aruna_operations::node::info::flows::ObservePlacementOperation;
 use aruna_operations::notifications::email::RefreshMailOperation;
 use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use aruna_operations::notifications::prune::RestorePruneOperation;
 use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::table::RebuildTableOperation;
-use aruna_operations::placement::process_placements::PlacementReconcileOutcome;
-use aruna_operations::placement::process_placements::PlacementReconcileStatus;
-use aruna_operations::placement::process_placements::ReconcilePlacementsOperation;
 use aruna_operations::queue_backoff::retry_delay_ms;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
@@ -178,9 +174,7 @@ use aruna_operations::sync::document_outbox::{
 };
 use aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
-use aruna_operations::sync::shard_placement::{
-    DEFER_RETRY_AFTER, PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
-};
+use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{TimerInput, TimerMemory, TimerPlan, timer_operation};
 use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_task_effect};
 use folder_pass::{restore_publish_timer, restore_sync_timers};
@@ -662,13 +656,6 @@ impl OperationsTaskHandler {
             .expect("reclaim cursor mutex poisoned") = cursor;
     }
 
-    /// Keeps the first missing-topic pull retry prompt, then doubles each subsequent
-    /// full placement scan up to the placement interval. New holders only need their
-    /// co-holders to apply the same config, so the ladder must not cliff to 30s.
-    fn placement_retry_after(&self, key: &TaskKey) -> Duration {
-        self.retry_ladder(key, PULL_RETRY_AFTER, PULL_RETRY_MAX)
-    }
-
     /// Keeps `base` for the first attempt, then doubles each further one up to
     /// `max`, counting attempts in the shared in-memory ladder.
     fn retry_ladder(&self, key: &TaskKey, base: Duration, max: Duration) -> Duration {
@@ -899,37 +886,7 @@ impl OperationsTaskHandler {
                     .await;
                 }
             }),
-            TaskKey::SyncPlacements { realm_id, node_id } => Box::pin(async move {
-                let key = TaskKey::SyncPlacements { realm_id, node_id };
-                // The same observation that reconciles shards reconciles this node's placement subject: a moved,
-                // draining or removed node stops admitting governed data and revalidates its inventory.
-                let observe = ObservePlacementOperation::new(
-                    realm_id,
-                    node_id,
-                    unix_timestamp_millis(),
-                    node_facts(&self.context),
-                );
-                if let Err(error) = drive(observe, &self.context).await {
-                    warn!(error = %error, "Placement subject reconcile failed");
-                }
-                let outcome = drive(
-                    ReconcilePlacementsOperation::new(realm_id, node_id, true),
-                    &self.context,
-                )
-                .await
-                .unwrap_or_else(|_| PlacementReconcileOutcome::storage_failure());
-                match outcome.status {
-                    PlacementReconcileStatus::Clean => self.reset_backoff(&key),
-                    PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
-                        let after = self.placement_retry_after(&key);
-                        self.reschedule_timer(key, after).await;
-                    }
-                    PlacementReconcileStatus::RetryScheduled => {}
-                    PlacementReconcileStatus::StorageFailure => {
-                        self.reschedule_timer(key, PLACEMENT_RETRY_AFTER).await;
-                    }
-                }
-            }),
+            TaskKey::SyncPlacements { .. } => Box::pin(self.run_trigger(key)),
             TaskKey::DrainSyncOutbox => Box::pin(async move {
                 self.drain_sync_outbox().await;
             }),
