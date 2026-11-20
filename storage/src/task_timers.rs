@@ -77,6 +77,8 @@ fn timer_is_ephemeral(effect: &TaskEffect) -> bool {
     matches!(key, TaskKey::LockBucket { .. })
 }
 
+/// Deletes the row of a timer that fired, best effort: a row that survives only fires the work
+/// once more after a restart.
 pub async fn delete_persisted_timer(storage: &StorageHandle, key: &TaskKey) {
     if let Err(error) = delete_timer(storage, key).await {
         warn!(error = %error, key = ?key, "Failed to delete persisted task timer");
@@ -159,13 +161,13 @@ async fn write_record(storage: &StorageHandle, record: &PersistedTaskTimer) -> R
 }
 
 async fn delete_timer(storage: &StorageHandle, key: &TaskKey) -> Result<(), String> {
-    delete_timer_key(storage, task_storage_key(key)?).await;
-    Ok(())
+    delete_timer_key(storage, task_storage_key(key)?).await
 }
 
-/// Deletes one timer row by its row key, such as a row that no longer decodes.
-pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
-    if let Event::Storage(StorageEvent::Error { error }) = storage
+/// Deletes one timer row by its row key, such as a row that no longer decodes; a failed delete is
+/// the caller's to report, as a surviving row re-arms its timer at the next restart.
+pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) -> Result<(), String> {
+    match storage
         .send_storage_effect(StorageEffect::Delete {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
             key,
@@ -173,7 +175,9 @@ pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
         })
         .await
     {
-        warn!(error = %error, "Failed to delete persisted task timer");
+        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected storage event: {other:?}")),
     }
 }
 

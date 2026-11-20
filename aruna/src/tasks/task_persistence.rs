@@ -50,7 +50,9 @@ pub async fn restore_task_timers(storage: &StorageHandle, task_handle: &TaskHand
                 Ok(record) => record,
                 Err(error) => {
                     warn!(error = %error, "Failed to decode persisted task timer");
-                    delete_timer_key(storage, key_bytes).await;
+                    if let Err(error) = delete_timer_key(storage, key_bytes).await {
+                        warn!(%error, "Failed to delete an undecodable persisted task timer");
+                    }
                     continue;
                 }
             };
@@ -134,6 +136,26 @@ mod tests {
             .expect("restored timer should fire");
 
         assert_eq!(*observed.lock().await, Some(key));
+    }
+
+    // A cancellation whose row could not be deleted fails, so no caller acknowledges it while the
+    // row would schedule the work again at the next restart.
+    #[tokio::test]
+    async fn failed_cancel_errs() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::RefreshBlobHolders;
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        persist_task_effect(&storage, &reset).await.expect("timer persists");
+        let refused = aruna_test_support::metadata::refusing(storage.clone(), TASK_TIMER_KEYSPACE);
+
+        let cancel = TaskEffect::CancelTimer { key: key.clone() };
+        assert!(persist_task_effect(&refused, &cancel).await.is_err());
+        assert!(read_timer(&storage, &key).await.expect("timer reads").is_some());
     }
 
     #[tokio::test]
