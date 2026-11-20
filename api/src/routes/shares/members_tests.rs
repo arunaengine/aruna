@@ -285,8 +285,9 @@ async fn holder_policy_hides() {
 // share policy on this member hides them, and no cursor names a hidden entry.
 #[tokio::test]
 async fn serving_policy_hides() {
-    use aruna_operations::s3::object::pages::{Resume, decode_resume};
+    use aruna_operations::s3::object::pages::decode_resume;
     let shared = shared().await;
+    put(&shared, 1, "a.txt", "first").await;
     put(&shared, 1, "private/secret.txt", "closed").await;
     put(&shared, 1, "public.txt", "open").await;
     let expression = "request.session.kind == 'share' && path.contains('/private/')";
@@ -298,13 +299,14 @@ async fn serving_policy_hides() {
     assert_eq!(code(error), "share_unavailable");
     assert_eq!(
         names(&shared, &visit, "", 100).await.unwrap(),
-        ["public.txt"]
+        ["a.txt", "public.txt"]
     );
     let listed = page(&shared, &visit, ("private/", None, None))
         .await
         .unwrap();
     assert!(listed.files.is_empty() && listed.folders.is_empty());
-    let (mut cursor, mut shown) = (None, Vec::new());
+    // One entry a page puts a cursor next to the hidden folder; every cursor must decode.
+    let (mut cursor, mut shown, mut cursors) = (None, Vec::new(), 0);
     loop {
         let listed = page(&shared, &visit, ("", cursor, Some(1))).await.unwrap();
         shown.extend(listed.files.into_iter().map(|file| file.name));
@@ -312,14 +314,56 @@ async fn serving_policy_hides() {
         let Some(next) = listed.next_cursor else {
             break;
         };
-        if let Ok(Resume::After { key, group }) = decode_resume(&next) {
-            assert!(
-                !key.contains("private") && group.is_none_or(|group| !group.contains("private"))
-            );
-        }
+        let resume = decode_resume(&next).expect("a visit cursor decodes");
+        let fields = visible_fields(&resume);
+        assert!(fields.iter().all(|field| !field.contains("private")), "{resume:?}");
+        cursors += 1;
         cursor = Some(next);
     }
-    assert_eq!(shown, ["public.txt"]);
+    assert!(cursors > 0, "the listing needs a cursor");
+    assert_eq!(shown, ["a.txt", "public.txt"]);
+}
+
+/// Every field of a cursor a visitor can read; each cursor shape is named, so a new one must
+/// be added here.
+fn visible_fields(resume: &aruna_operations::s3::object::pages::Resume) -> Vec<String> {
+    use aruna_operations::s3::object::pages::Resume;
+    match resume {
+        Resume::After { key, group } => [Some(key.clone()), group.clone()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        Resume::From(lower) => vec![lower.clone()],
+        Resume::Hidden {
+            lower,
+            cursor,
+            group,
+            ..
+        } => [Some(lower.clone()), Some(cursor.clone()), group.clone()]
+            .into_iter()
+            .flatten()
+            .collect(),
+    }
+}
+
+#[test]
+fn cursor_fields_named() {
+    // Each cursor shape shows the path parts it carries, so the check above sees them.
+    use aruna_operations::s3::object::pages::Resume;
+    let after = Resume::After {
+        key: "private/a".into(),
+        group: Some("private/".into()),
+    };
+    assert_eq!(visible_fields(&after), ["private/a", "private/"]);
+    assert_eq!(visible_fields(&Resume::From("private/b".into())), ["private/b"]);
+    let hidden = Resume::Hidden {
+        lower: "private/c".into(),
+        node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        copy: false,
+        cursor: "sealed".into(),
+        group: None,
+    };
+    assert_eq!(visible_fields(&hidden), ["private/c", "sealed"]);
 }
 
 // A range whose coordinator is down cannot be listed or written, and the visitor is told to
