@@ -132,7 +132,7 @@ async fn fetch_checks_copy() {
 
 mod operations {
     use super::*;
-    use crate::plugins::copy_rows::{chunk_count, chunk_of};
+    use crate::plugins::copy::rows::{chunk_count, chunk_of};
     use crate::plugins::fixtures::{
         config_result, is_child, is_effect, memory_answer, peer_says, peer_silent,
     };

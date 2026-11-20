@@ -17,7 +17,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::copies::{Assembled, reserve_call, reserved};
-use super::copy_rows::{
+use super::copy::rows::{
     CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies, chunk_count, chunk_fits,
     kept_digests,
 };
@@ -189,7 +189,7 @@ impl FetchArtifact {
         chunk: Chunk,
     ) -> Result<Next<FetchedArtifact>, ArtifactError> {
         let index = self.arriving.as_ref().map_or(0, |arriving| {
-            (arriving.bytes.len() as u64).div_ceil(super::copy_rows::CHUNK as u64) as u32
+            (arriving.bytes.len() as u64).div_ceil(super::copy::rows::CHUNK as u64) as u32
         });
         let placed = chunk.index == index && chunk.digest == self.plugin.digest;
         let same = (self.arriving.as_ref()).is_none_or(|arriving| arriving.total == chunk.total);

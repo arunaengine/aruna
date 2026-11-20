@@ -266,7 +266,7 @@ fn sent(node_id: NodeId, artifact: &[u8], index: u32) -> Effect {
 
 #[test]
 fn copies_in_window() {
-    use crate::plugins::copy_rows::CHUNK;
+    use crate::plugins::copy::rows::CHUNK;
     let artifact = vec![7u8; CHUNK + 1];
     let (first, second) = (node(1), node(2));
     let mut copy = copy_artifact(

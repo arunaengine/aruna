@@ -17,9 +17,9 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
-use super::check::{CallError, CopyGrants};
-use super::objects::{LocalObject, Unmarked};
-use super::transfer_steps::account;
+use super::super::check::{CallError, CopyGrants};
+use super::super::objects::{LocalObject, Unmarked};
+use super::super::transfer_steps::account;
 use crate::jobs::key_locks::{KeyCheckError, VersionWaitOperation};
 use crate::s3::object::get::GetObjectError;
 use crate::s3::object::head::{
@@ -229,5 +229,5 @@ impl Operation for LockedSource {
 }
 
 #[cfg(test)]
-#[path = "copy_steps_tests.rs"]
+#[path = "steps_tests.rs"]
 mod tests;

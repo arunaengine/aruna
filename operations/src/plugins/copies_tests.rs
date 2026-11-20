@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::plugins::artifacts::ArtifactError;
 use crate::plugins::calls::*;
-use crate::plugins::copy_rows::tests::stale_progress;
-use crate::plugins::copy_rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
+use crate::plugins::copy::rows::tests::stale_progress;
+use crate::plugins::copy::rows::{CHUNK, GRACE, MAX_UNSETTLED, chunk_count, chunk_of};
 use crate::plugins::rows::{Scan, scan_rows};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;

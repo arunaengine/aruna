@@ -27,7 +27,7 @@ use super::bound::{BindError, BindPlace, BindSlots, BoundSlots, CheckNodeBinding
 use super::check::RunScope;
 use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start};
 use super::copies::Assembled;
-use super::copy_rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
+use super::copy::rows::{CopyTotal, KeepChunk, ReadChunk, ReadLocal, StoreCopy, SweepCopies};
 use super::decide::DecideBatch;
 use super::dispatch::{EnqueueTimers, HookAuthorization, StartError, StartRun, VerifyHook};
 use super::finished::NotifyDue;

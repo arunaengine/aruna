@@ -14,9 +14,9 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_plugin_types::artifact::{ArtifactDigest, check_artifact};
 use bytes::Bytes;
 
-use super::artifacts::ArtifactError;
-use super::copies::{Assembled, reserve_call, reserved};
-use super::rows::{Row, Rows, Scan, StoreError, delete_call, done, read_call, row, values, writes};
+use super::super::artifacts::ArtifactError;
+use super::super::copies::{Assembled, reserve_call, reserved};
+use super::super::rows::{Row, Rows, Scan, StoreError, delete_call, done, read_call, row, values, writes};
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
 pub const CHUNK: usize = 8 << 20;
@@ -944,5 +944,5 @@ impl Operation for KeepChunk {
 }
 
 #[cfg(test)]
-#[path = "copy_rows_tests.rs"]
+#[path = "rows_tests.rs"]
 pub(crate) mod tests;
