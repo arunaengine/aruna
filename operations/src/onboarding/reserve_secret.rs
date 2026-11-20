@@ -34,9 +34,7 @@ pub struct ReserveSecretInput {
 #[derive(Clone, Debug, PartialEq)]
 enum Stage {
     Records,
-    Config {
-        owner: UserId,
-    },
+    Config { owner: UserId },
     Count(SlotCount),
     Write,
 }

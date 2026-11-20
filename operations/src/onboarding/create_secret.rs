@@ -517,7 +517,9 @@ mod tests {
             ..device_record(owner)
         };
         write_secret(&context, &expired).await;
-        mint(&context, owner).await.expect("an expired secret holds no slot");
+        mint(&context, owner)
+            .await
+            .expect("an expired secret holds no slot");
 
         let other = UserId::local(Ulid::generate(), realm());
         let finalizing = OnboardingSecretRecord {
