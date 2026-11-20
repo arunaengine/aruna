@@ -39,7 +39,9 @@ pub async fn hold_change(effect: &TaskEffect) -> Option<tokio::sync::MutexGuard<
     Some(hold_timer(key).await)
 }
 
-async fn hold_timer(key: &TaskKey) -> tokio::sync::MutexGuard<'static, ()> {
+/// Holds the change lock of `key` as a timer change does, so a caller can reread its row and hand
+/// it to the scheduler before any later change of the key.
+pub async fn hold_timer(key: &TaskKey) -> tokio::sync::MutexGuard<'static, ()> {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     let index = (hasher.finish() % TIMER_LOCK_COUNT as u64) as usize;
@@ -218,6 +220,32 @@ pub async fn delete_timer_key(storage: &StorageHandle, key: ByteView) -> Result<
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
+    }
+}
+
+/// Deletes a row whose value no longer decodes, under its key's change lock and only while it still
+/// does not decode, so a timer a later change wrote for the key stays.
+pub async fn delete_malformed(storage: &StorageHandle, key: ByteView) -> Result<(), String> {
+    let task_key = postcard::from_bytes::<TaskKey>(&key).ok();
+    let _held = match &task_key {
+        Some(task_key) => Some(hold_timer(task_key).await),
+        None => None,
+    };
+    let read = StorageEffect::Read {
+        key_space: TASK_TIMER_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id: None,
+    };
+    let value = match storage.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("unexpected storage event: {other:?}")),
+    };
+    match value {
+        Some(bytes) if postcard::from_bytes::<PersistedTaskTimer>(&bytes).is_err() => {
+            delete_timer_key(storage, key).await
+        }
+        _ => Ok(()),
     }
 }
 
