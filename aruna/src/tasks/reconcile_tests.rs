@@ -1,11 +1,11 @@
-//! Tests that the compute reconciler spares a lost attempt it cannot observe.
+//! Tests that reconciling a lost attempt spares one this node cannot observe.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_clock::unix_timestamp_millis;
 
 use super::workflow_fixtures::{execution_spec, node_id};
-use crate::tasks::runner::ComputeReconciler;
+use crate::tasks::runner::reconcile_lost_attempt;
 use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::input::JobPayload;
@@ -15,7 +15,6 @@ use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
-use aruna_drivers::jobs::context::ExternalReconciler;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::JOB_MAX_ATTEMPTS;
 use aruna_storage::storage::worker::FjallStorage;
@@ -85,13 +84,12 @@ async fn missing_backend_spares() {
     .unwrap();
 
     let runtime = JobsRuntime::new();
-    let reconciler = ComputeReconciler::new(context.clone(), Arc::downgrade(&runtime));
     for sweep in 0..(JOB_MAX_ATTEMPTS + 2) {
         let lost = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
-        reconciler.reconcile_lost_attempt(&context, lost).await;
+        reconcile_lost_attempt(&runtime, &context, lost).await;
         let after = read_job_record(&context, job_id, None)
             .await
             .unwrap()

@@ -17,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::executor::RangeTurns;
 use super::{EXTERNAL_CONCURRENCY_CAP, JOB_CONCURRENCY_CAP};
-use crate::jobs::context::ExternalReconciler;
 use aruna_core::jobs::ProgressReporter;
 
 struct RunningJob {
@@ -92,7 +91,6 @@ pub struct JobsRuntime {
     next_nonce: AtomicU64,
     internal_cap: usize,
     external_cap: usize,
-    reconciler: Mutex<Option<Arc<dyn ExternalReconciler>>>,
     claim_producer_barrier: RwLock<()>,
     /// Node shutdown. Deliberately not the per-job cancel token: that one means the
     /// user asked for a `Cancelled` job and runs cleanup handlers, while this one only
@@ -117,36 +115,20 @@ impl JobsRuntime {
     }
 
     pub fn new_paused() -> Arc<Self> {
-        Self::build(JOB_CONCURRENCY_CAP, EXTERNAL_CONCURRENCY_CAP, None, false)
+        Self::build(JOB_CONCURRENCY_CAP, EXTERNAL_CONCURRENCY_CAP, false)
     }
 
     pub fn with_capacity(cap: usize) -> Arc<Self> {
-        Self::build(cap, EXTERNAL_CONCURRENCY_CAP, None, true)
+        Self::build(cap, EXTERNAL_CONCURRENCY_CAP, true)
     }
 
-    /// Wire the reconcile hook that receives lost external attempts (Stage 2).
-    pub fn with_reconciler(reconciler: Arc<dyn ExternalReconciler>) -> Arc<Self> {
-        Self::build(
-            JOB_CONCURRENCY_CAP,
-            EXTERNAL_CONCURRENCY_CAP,
-            Some(reconciler),
-            true,
-        )
-    }
-
-    fn build(
-        internal_cap: usize,
-        external_cap: usize,
-        reconciler: Option<Arc<dyn ExternalReconciler>>,
-        started: bool,
-    ) -> Arc<Self> {
+    fn build(internal_cap: usize, external_cap: usize, started: bool) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(RuntimeState::default()),
             started: AtomicBool::new(started),
             next_nonce: AtomicU64::new(0),
             internal_cap,
             external_cap,
-            reconciler: Mutex::new(reconciler),
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
             range_turns: RangeTurns::default(),
@@ -155,17 +137,6 @@ impl JobsRuntime {
 
     fn state(&self) -> std::sync::MutexGuard<'_, RuntimeState> {
         self.state.lock().expect("runtime mutex poisoned")
-    }
-
-    pub fn reconciler(&self) -> Option<Arc<dyn ExternalReconciler>> {
-        self.reconciler
-            .lock()
-            .expect("reconciler mutex poisoned")
-            .clone()
-    }
-
-    pub fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
-        *self.reconciler.lock().expect("reconciler mutex poisoned") = Some(reconciler);
     }
 
     pub fn running_count(&self) -> usize {

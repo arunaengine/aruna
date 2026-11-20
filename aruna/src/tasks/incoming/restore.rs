@@ -4,7 +4,7 @@
 
 use super::drained::remove_drained_backends;
 use super::*;
-use crate::tasks::runner::{claim_producer, spawn_job};
+use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use aruna_drivers::driver::node_routing;
 use aruna_operations::federation::registration::PublishRegistrationOperation;
 use std::time::SystemTime;
@@ -267,12 +267,6 @@ async fn install_task_handler(
     refresh_holders: bool,
 ) -> TaskQueues {
     let handler_context = context.clone();
-    if context.compute_handle.is_some() {
-        jobs_runtime.set_reconciler(crate::tasks::runner::ComputeReconciler::new(
-            context.clone(),
-            Arc::downgrade(&jobs_runtime),
-        ));
-    }
     let handler = Arc::new(
         OperationsTaskHandler::new(handler_context, jobs_runtime.clone())
             .with_rocrate_limits(rocrate_limits)
@@ -879,13 +873,8 @@ impl OperationsTaskHandler {
             }
         };
 
-        // A node without a reconciler leaves the attempt alone: it cannot observe the container.
-        if let Some(reconciler) = self.jobs_runtime.reconciler() {
-            for record in std::mem::take(&mut result.lost_attempts) {
-                reconciler
-                    .reconcile_lost_attempt(self.context.as_ref(), record)
-                    .await;
-            }
+        for record in std::mem::take(&mut result.lost_attempts) {
+            reconcile_lost_attempt(&self.jobs_runtime, self.context.as_ref(), record).await;
         }
 
         for record in result.claimed {
