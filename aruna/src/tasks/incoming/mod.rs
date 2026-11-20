@@ -45,6 +45,7 @@ impl Drop for OutboxBarrier {
 }
 
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, node_routing};
+use aruna_drivers::effect_adapters::task::change_timer;
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
@@ -120,7 +121,7 @@ use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
     TimerInput, TimerMemory, TimerPlan, timer_needs, timer_operation,
 };
-use aruna_storage::task_timers::{delete_persisted_timer, hold_change, persist_stamped};
+use aruna_storage::task_timers::delete_persisted_timer;
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 pub(crate) mod drained;
@@ -448,19 +449,9 @@ impl OperationsTaskHandler {
             key: key.clone(),
             after,
         };
-        let _held = hold_change(&effect).await;
-        let stamp = match persist_stamped(&self.context.storage_handle, &effect).await {
-            Ok(stamp) => stamp,
-            Err(message) => {
-                warn!(task_id = ?key, message = %message, "Failed to persist timer re-arm");
-                return false;
-            }
-        };
-        let Some(task_handle) = self.context.task_handle.as_ref() else {
-            warn!(task_id = ?key, "Cannot re-arm failed timer without task handle");
-            return false;
-        };
-        match task_handle.send_stamped(effect, stamp).await {
+        let storage = &self.context.storage_handle;
+        let task_handle = self.context.task_handle.as_ref();
+        match change_timer(storage, task_handle, effect, false).await {
             Event::Task(TaskEvent::TimerScheduled { .. }) => true,
             Event::Task(TaskEvent::Error { message, .. }) => {
                 warn!(task_id = ?key, message = %message, "Failed to re-arm failed timer");
@@ -476,21 +467,21 @@ impl OperationsTaskHandler {
     /// Re-arms a timer in memory even when storage cannot persist it, so an outage does not end
     /// the retries; the persisted copy is best effort.
     async fn keep_retrying(&self, key: TaskKey, after: std::time::Duration) {
-        let effect = TaskEffect::ResetTimer {
-            key: key.clone(),
-            after,
-        };
-        let _held = hold_change(&effect).await;
-        let stamp = match persist_stamped(&self.context.storage_handle, &effect).await {
-            Ok(stamp) => stamp,
-            Err(message) => {
-                warn!(task_id = ?key, message = %message, "Retry timer kept in memory only");
-                None
-            }
-        };
-        if let Some(task_handle) = self.context.task_handle.as_ref() {
-            task_handle.send_stamped(effect, stamp).await;
+        let effect = TaskEffect::ResetTimer { key, after };
+        let storage = &self.context.storage_handle;
+        let task_handle = self.context.task_handle.as_ref();
+        if let Event::Task(TaskEvent::Error { key, message }) =
+            change_timer(storage, task_handle, effect, true).await
+        {
+            warn!(task_id = ?key, message = %message, "Failed to arm the retry timer");
         }
+    }
+
+    /// Arms the backend import pass at start, live even when its row cannot be stored, since
+    /// no restored wake runs the rules until a rule changes.
+    pub(super) async fn arm_backend_imports(&self) {
+        self.keep_retrying(TaskKey::RunBackendImports, Duration::ZERO)
+            .await;
     }
 
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
@@ -633,10 +624,8 @@ impl OperationsTaskHandler {
         let Some(after) = plan.after else {
             return;
         };
-        if !self.reschedule_timer(key.clone(), after).await {
-            // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
-            self.keep_retrying(key, after).await;
-        }
+        // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
+        self.keep_retrying(key, after).await;
     }
 
     /// What a timer kept from its last run, empty for its first run since the start.

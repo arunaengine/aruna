@@ -625,6 +625,7 @@ mod tests {
         let timer = PersistedTaskTimer {
             key: retry_timer(&record),
             due_unix_millis: 0,
+            admission: 0,
         };
         let value = Value::from(postcard::to_allocvec(&timer).unwrap());
         let mut resume = ResumeAuditOperation::default();

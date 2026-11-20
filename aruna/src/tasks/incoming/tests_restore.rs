@@ -506,6 +506,65 @@ async fn refused_rearm_kept() {
     assert!(after <= PRUNE_POLL_AFTER, "the rearm stays armed in memory");
 }
 
+/// A handler on storage that refuses timer rows, with its task handle.
+fn refusing_handler() -> (tempfile::TempDir, OperationsTaskHandler, TaskHandle) {
+    use aruna_test_support::metadata::refusing;
+
+    let temp_dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
+    let task_handle = TaskHandle::new();
+    let context = Arc::new(DriverContext {
+        storage_handle: refusing(storage, TASK_TIMER_KEYSPACE),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+        outbound_handle: None,
+    });
+    let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
+    (temp_dir, handler, task_handle)
+}
+
+/// The deadline the scheduler holds for `key`, read by asking it to shorten to `probe`.
+async fn armed_after(task_handle: &TaskHandle, key: TaskKey, probe: Duration) -> Duration {
+    let shorten = TaskEffect::ShortenTimer { key, after: probe };
+    let Event::Task(TaskEvent::TimerScheduled { after, .. }) =
+        task_handle.send_effect(Effect::Task(shorten)).await
+    else {
+        panic!("expected timer scheduled");
+    };
+    after
+}
+
+// A registry renewal whose row cannot be stored stays armed in memory, so the lease is renewed
+// once storage recovers instead of expiring.
+#[tokio::test]
+async fn renewal_rearm_kept() {
+    use aruna_core::federation::PUBLISH_INTERVAL;
+
+    let (_temp_dir, handler, task_handle) = refusing_handler();
+    handler.publish_registration().await;
+    let key = TaskKey::PublishRegistration;
+    let after = armed_after(&task_handle, key, PUBLISH_INTERVAL * 2).await;
+    assert!(after <= PUBLISH_INTERVAL, "the renewal stays armed in memory");
+}
+
+// The backend import pass armed at start stays armed in memory when its row cannot be stored,
+// so rules without a restored wake still run.
+#[tokio::test]
+async fn startup_imports_kept() {
+    let (_temp_dir, handler, task_handle) = refusing_handler();
+    let (seen_tx, mut seen_rx) = mpsc::channel(1);
+    task_handle
+        .set_inbound_handler(Arc::new(RecordingTaskHandler { seen: seen_tx }))
+        .await;
+    handler.arm_backend_imports().await;
+    let fired = tokio::time::timeout(Duration::from_secs(5), seen_rx.recv()).await;
+    assert_eq!(fired.ok().flatten(), Some(TaskKey::RunBackendImports));
+}
+
 // A timer change waits while another change of the same key holds it, so its row and the
 // scheduler take both changes in one order.
 #[tokio::test]

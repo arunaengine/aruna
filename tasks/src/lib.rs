@@ -62,7 +62,8 @@ enum TaskCommand {
         key: TaskKey,
         after: Duration,
         stamp: Option<u64>,
-        response: oneshot::Sender<TaskEvent>,
+        /// The event, and whether this change armed a new wake rather than keeping one.
+        response: oneshot::Sender<(TaskEvent, bool)>,
     },
     ScheduleIdleTimer {
         key: TaskKey,
@@ -393,33 +394,31 @@ impl SchedulerState {
         TaskEvent::TimerScheduled { key, after }
     }
 
+    /// Moves the wake of `key` earlier; answers whether it armed a new wake with `stamp`, rather
+    /// than keeping an earlier live one that owns its own row.
     fn shorten_timer(
         &mut self,
         (key, stamp): (TaskKey, Option<u64>),
         after: Duration,
         now: Instant,
-    ) -> TaskEvent {
+    ) -> (TaskEvent, bool) {
         let Some(requested_deadline) = now.checked_add(after) else {
-            return TaskEvent::Error {
-                key: Some(key),
-                message: "timer deadline overflow".to_string(),
-            };
+            let message = "timer deadline overflow".to_string();
+            let key = Some(key);
+            return (TaskEvent::Error { key, message }, false);
         };
 
         if let Some(existing) = self.timers_by_key.get(&key)
             && existing.deadline <= requested_deadline
         {
-            return TaskEvent::TimerScheduled {
-                key,
-                after: existing.deadline.saturating_duration_since(now),
-            };
+            let after = existing.deadline.saturating_duration_since(now);
+            return (TaskEvent::TimerScheduled { key, after }, false);
         }
 
         let Some(id) = self.allocate_timer_id(requested_deadline) else {
-            return TaskEvent::Error {
-                key: Some(key),
-                message: "timer id space exhausted".to_string(),
-            };
+            let message = "timer id space exhausted".to_string();
+            let key = Some(key);
+            return (TaskEvent::Error { key, message }, false);
         };
 
         self.remove_timer(&key);
@@ -432,7 +431,7 @@ impl SchedulerState {
             },
         );
 
-        TaskEvent::TimerScheduled { key, after }
+        (TaskEvent::TimerScheduled { key, after }, true)
     }
 
     fn schedule_idle_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
@@ -814,14 +813,31 @@ impl TaskHandle {
         .await
     }
 
-    async fn shorten_timer(&self, key: TaskKey, after: Duration, stamp: Option<u64>) -> TaskEvent {
-        self.dispatch_command(key, |key, response| TaskCommand::ShortenTimer {
+    async fn shorten_timer(
+        &self,
+        key: TaskKey,
+        after: Duration,
+        stamp: Option<u64>,
+    ) -> (TaskEvent, bool) {
+        let command_key = key.clone();
+        let (response, result) = oneshot::channel();
+        let command = TaskCommand::ShortenTimer {
             key,
             after,
             stamp,
             response,
-        })
-        .await
+        };
+        if self.command_tx.send(command).await.is_err() {
+            return (scheduler_unavailable(command_key), false);
+        }
+        (result.await).unwrap_or_else(|_| (scheduler_unavailable(command_key), false))
+    }
+
+    /// Moves the wake of `key` earlier as admission `stamp`; answers whether the scheduler armed
+    /// that admission, so the caller writes its row, or kept an earlier wake that owns its own.
+    pub async fn shorten_owned(&self, key: TaskKey, after: Duration, stamp: u64) -> (Event, bool) {
+        let (event, armed) = self.shorten_timer(key, after, Some(stamp)).await;
+        (Event::Task(event), armed)
     }
 
     /// Hands a timer change to the scheduler with the due time of the durable row it wrote, so
@@ -829,7 +845,9 @@ impl TaskHandle {
     pub async fn send_stamped(&self, effect: TaskEffect, stamp: Option<u64>) -> Event {
         let event = match effect {
             TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after, stamp).await,
-            TaskEffect::ShortenTimer { key, after } => self.shorten_timer(key, after, stamp).await,
+            TaskEffect::ShortenTimer { key, after } => {
+                self.shorten_timer(key, after, stamp).await.0
+            }
             other => return self.send_effect(Effect::Task(other)).await,
         };
         Event::Task(event)
@@ -1027,7 +1045,7 @@ impl Handle for TaskHandle {
                         self.reset_timer(key, after, None).await
                     }
                     TaskEffect::ShortenTimer { key, after } => {
-                        self.shorten_timer(key, after, None).await
+                        self.shorten_timer(key, after, None).await.0
                     }
                     TaskEffect::ScheduleIdleTimer { key, after } => {
                         self.schedule_idle_timer(key, after).await
