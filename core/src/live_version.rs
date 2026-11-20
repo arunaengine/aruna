@@ -186,6 +186,7 @@ impl Operation for LiveVersionOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
@@ -279,10 +280,30 @@ mod tests {
         assert_eq!(failed, Err(error));
     }
 
-    // An unset drain timer leaves the obligation queued and answers false; its warning is the
-    // only other effect.
+    /// Keeps what the test's subscriber writes, for the test to read afterwards.
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // An unset drain timer leaves the obligation queued, answers false and warns about it.
     #[test]
     fn unarmed_drain_false() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || Captured(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _logged = tracing::subscriber::set_default(subscriber);
         let mut operation = live_operation();
         operation.first().unwrap();
         operation.next(live_written(Ok(()))).unwrap();
@@ -291,5 +312,8 @@ mod tests {
             message: "full".to_string(),
         })));
         assert_eq!(operation.next(refused), Ok(Next::Done(false)));
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("drain timer was not set"), "{logs}");
     }
 }
