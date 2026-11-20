@@ -61,13 +61,21 @@ async fn device_fetches_revocation() -> TestResult<()> {
         realm.node(0).context.as_ref(),
     )
     .await?;
-    replicate_config(&realm.nodes, realm_id).await;
-    assert!(
-        read_realm_config(realm.node(0), realm_id)
-            .await?
-            .token_revoked(&token_hash, unix_timestamp_secs()),
-        "the realm must hold its own revocation"
-    );
+    // The device takes the first realm node's answer, in a shuffled order, so every realm node
+    // must hold the revocation before it asks; one replication pass may leave one behind.
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "the revocation did not reach every realm node",
+        || async {
+            replicate_config(&realm.nodes, realm_id).await;
+            let mut missing = 0;
+            for node in &realm.nodes {
+                let config = read_realm_config(node, realm_id).await?;
+                missing += usize::from(!config.token_revoked(&token_hash, unix_timestamp_secs()));
+            }
+            Ok(missing)
+        },
+    )
+    .await?;
 
     // The device joins afterwards, with the configuration as it was before the
     // revocation: exactly what a device that was closed comes back to.
