@@ -35,6 +35,8 @@ use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
+use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
+use crate::jobs::lifecycle::outbox::timers::FamilyTimerOperation;
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
 use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
@@ -208,6 +210,7 @@ pub enum TimerOperation {
     DrainReplicationQueue(ReplicationTimerOperation),
     DrainMaterializationQueue(MaterializationRunOperation),
     DrainPruneQueue(PruneRunOperation),
+    DrainFamilyOutbox(FamilyTimerOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -333,6 +336,12 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainPruneQueue => Some(TimerOperation::DrainPruneQueue(PruneRunOperation::new(
             input,
         ))),
+        TaskKey::DrainFamilyOutbox => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                TimerOperation::DrainFamilyOutbox(FamilyTimerOperation::new(realm_id, node_id))
+            }
+            None => TimerOperation::Wait(WaitOperation::after(None)),
+        }),
         _ => None,
     }
 }
@@ -374,6 +383,7 @@ macro_rules! each_timer {
             TimerOperation::DrainReplicationQueue($operation) => $body,
             TimerOperation::DrainMaterializationQueue($operation) => $body,
             TimerOperation::DrainPruneQueue($operation) => $body,
+            TimerOperation::DrainFamilyOutbox($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -701,6 +711,16 @@ impl TimerRun for PruneRunOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         let after = result.map_err(|error| TimerFailure {
             retry_after: GRAPH_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::from(after))
+    }
+}
+
+impl TimerRun for FamilyTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let after = result.map_err(|error| TimerFailure {
+            retry_after: OUTBOX_RETRY_AFTER,
             reason: error.to_string(),
         })?;
         Ok(TimerPlan::from(after))

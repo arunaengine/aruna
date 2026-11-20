@@ -66,8 +66,6 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::forward::realm::RelayAdminOperation;
 use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
-use aruna_operations::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
-use aruna_operations::jobs::lifecycle::outbox::drain::DrainOutboxOperation;
 use aruna_operations::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, WitnessDrainOperation};
 use aruna_operations::jobs::node_inputs::witness_node;
 use aruna_operations::jobs::prune::PruneTimerOperation;
@@ -898,9 +896,7 @@ impl OperationsTaskHandler {
                         .await;
                 }
             }),
-            TaskKey::DrainFamilyOutbox => Box::pin(async move {
-                self.drain_family_outbox().await;
-            }),
+            TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::DrainWitnessQueue => Box::pin(async move {
                 self.drain_witness_queue().await;
             }),
