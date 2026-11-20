@@ -669,11 +669,11 @@ impl<P: Operation> CallRun<P> {
         matches!(self.state, State::Finished(_))
     }
 
-    /// The outcome; a run that did not finish reports `IoError::Unfinished`.
+    /// The outcome; a run that did not finish, even one whose calls after the commit still
+    /// run, reports `IoError::Unfinished`. `abort` settles a committed run first.
     pub fn finalize(self) -> Result<P::Output, P::Error> {
         match self.state {
             State::Finished(result) => result,
-            State::After { output, .. } => Ok(output),
             _ => Err(IoError::Unfinished.into()),
         }
     }

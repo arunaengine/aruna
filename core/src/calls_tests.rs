@@ -773,6 +773,19 @@ fn refused_wake_logged() {
 }
 
 #[test]
+fn early_finalize_unfinished() {
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::Delay(Duration::from_secs(1))];
+    let mut operation = run(procedure, false);
+    assert_eq!(
+        operation.start().as_slice(),
+        &[Effect::Delay(Duration::from_secs(1))]
+    );
+    assert!(!operation.is_complete());
+    assert_eq!(operation.finalize(), Err(IoError::Unfinished));
+}
+
+#[test]
 fn reads_expected_answers() {
     let value: crate::types::Value = b"v".to_vec().into();
     let one = IoResult::Values(vec![Some(value.clone())]);
