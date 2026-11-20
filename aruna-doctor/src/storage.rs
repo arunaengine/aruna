@@ -215,10 +215,7 @@ impl ImportKeyspaceState {
 /// An empty directory beside `target` that only its owner may enter, uniquely named so a crashed
 /// run leaves nothing that blocks the next one.
 pub(crate) fn staging_dir(target: &Path) -> std::io::Result<tempfile::TempDir> {
-    let parent = match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    let parent = parent_dir(target);
     let mut builder = tempfile::Builder::new();
     builder.prefix(".restore-");
     #[cfg(unix)]
@@ -245,10 +242,16 @@ pub(crate) fn publish_dir(staging: &Path, target: &Path) -> Result<(), SnapshotE
         Err(error) => return Err(error.into()),
     }
     // The rename is durable only once the directory that now names the target is synced.
-    if let Some(parent) = target.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        sync_dir(parent)?;
-    }
+    sync_dir(parent_dir(target))?;
     Ok(())
+}
+
+/// The directory that holds `target`, the working directory for a bare name.
+fn parent_dir(target: &Path) -> &Path {
+    match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// Syncs every file and directory below and including `root`, so restored files are durable
@@ -270,7 +273,7 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<usize> {
 }
 
 /// Syncs a directory's entries; Windows cannot open a directory to sync it, and needs no sync.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]

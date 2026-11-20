@@ -5,7 +5,8 @@
 
 use crate::error::CliError;
 use crate::storage::{
-    ImportKeyspaceState, ensure_target_path, keyspace_name, publish_dir, staging_dir, sync_tree,
+    ImportKeyspaceState, ensure_target_path, keyspace_name, publish_dir, staging_dir, sync_dir,
+    sync_tree,
 };
 use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
 use aruna_core::structs::storage::broken::StorageCheck;
@@ -163,6 +164,7 @@ fn restore_into(
     if git_root.exists() {
         sync_tree(&git_root)?;
     }
+    sync_dir(target)?;
     Ok(())
 }
 
