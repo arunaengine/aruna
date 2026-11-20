@@ -112,7 +112,9 @@ impl DrainSubBatch {
     pub fn select(&self, indices: &[usize]) -> Option<Self> {
         let mut selected = self.sync_subset(indices)?;
         if self.documents.len() == self.record_keys.len() {
-            let documents = indices.iter().map(|&index| self.documents.get(index).cloned());
+            let documents = indices
+                .iter()
+                .map(|&index| self.documents.get(index).cloned());
             selected.documents = documents.collect::<Option<_>>()?;
         }
         Some(selected)
@@ -332,8 +334,12 @@ impl DrainInvocation {
     /// a later page cannot publish or relay past a record that has to wait.
     pub fn merge_outcome(&mut self, outcome: DrainSyncOutcome) {
         let defer = &mut self.defer;
-        defer.deferred_topics.extend(outcome.blocked_topics.iter().copied());
-        defer.blocked_origins.extend(outcome.blocked_origins.iter().copied());
+        defer
+            .deferred_topics
+            .extend(outcome.blocked_topics.iter().copied());
+        defer
+            .blocked_origins
+            .extend(outcome.blocked_origins.iter().copied());
         self.outcome.merge(outcome);
     }
 
@@ -481,7 +487,10 @@ mod tests {
         ];
         let (groups, batches) = build_drain_batches(records, &BTreeSet::new());
         assert_eq!(groups, 2);
-        let keys: Vec<_> = batches.iter().map(|batch| batch.record_keys.clone()).collect();
+        let keys: Vec<_> = batches
+            .iter()
+            .map(|batch| batch.record_keys.clone())
+            .collect();
         assert_eq!(keys, vec![vec![vec![1], vec![3]], vec![vec![2]]]);
     }
 

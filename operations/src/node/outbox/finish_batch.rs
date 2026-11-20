@@ -150,7 +150,11 @@ impl FinishBatchOperation {
         topics.sort();
         topics.dedup();
         let Some(call) = lineage_call(&topics) else {
-            let rows = self.record_keys.iter().map(|key| (key.clone(), None)).collect();
+            let rows = self
+                .record_keys
+                .iter()
+                .map(|key| (key.clone(), None))
+                .collect();
             return self.delete(rows);
         };
         self.topics = topics;
