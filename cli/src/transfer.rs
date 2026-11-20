@@ -143,6 +143,9 @@ pub struct S3Access {
     session: Option<S3Session>,
     client: aws_sdk_s3::Client,
     endpoint: String,
+    /// The group and endpoint fallback a lapsed session is taken again for.
+    group_id: String,
+    fallback: Option<String>,
 }
 
 impl S3Access {
@@ -172,15 +175,26 @@ impl S3Access {
             session,
             client,
             endpoint,
+            group_id: group_id.to_string(),
+            fallback: fallback.map(str::to_string),
         })
     }
 
-    /// The client, after refreshing a session that is about to expire.
+    /// The client, after refreshing a session that is about to expire, or taking a new one for
+    /// the same group from the same node once it expired, as after a long wait for a record.
     pub async fn client(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
         let Some(session) = &mut self.session else {
             return Ok(self.client.clone());
         };
         let now = chrono::Utc::now();
+        if expires_within(&session.token.expires_at, now, chrono::TimeDelta::zero()) {
+            // The node refuses to refresh an expired session; the caller's token gives the new
+            // one the same restrictions.
+            let fresh = request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
+            self.client = s3_client(&fresh);
+            *session = fresh;
+            return Ok(self.client.clone());
+        }
         if !expires_within(&session.token.expires_at, now, REFRESH_BEFORE) {
             return Ok(self.client.clone());
         }
@@ -885,9 +899,18 @@ mod tests {
             client: s3_client(&session),
             session: Some(session),
             endpoint: "http://127.0.0.1:1".into(),
+            group_id: "g".into(),
+            fallback: None,
         };
         let error = access.client().await.unwrap_err();
         assert!(error.to_string().contains("cannot refresh"), "{error}");
+        // An expired session is taken again, so the unreachable API is now asked.
+        let lapsed = chrono::Utc::now() - chrono::TimeDelta::minutes(1);
+        if let Some(session) = access.session.as_mut() {
+            session.token.expires_at = lapsed.to_rfc3339();
+        }
+        let error = access.client().await.unwrap_err();
+        assert!(error.to_string().contains("cannot reach the API"), "{error}");
     }
 
     #[test]
