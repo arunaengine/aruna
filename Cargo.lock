@@ -1030,6 +1030,7 @@ version = "3.0.0-alpha.207"
 dependencies = [
  "aruna-core",
  "async-trait",
+ "futures-util",
  "iroh",
  "tempfile",
  "tokio",

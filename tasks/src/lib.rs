@@ -15,10 +15,11 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{error, warn};
 
 const TASK_COMMAND_BUFFER: usize = 1024;
 const HANDLER_WARN_AFTER: Duration = Duration::from_secs(30);
@@ -627,11 +628,16 @@ fn spawn_timer_handler(
 
         // A cooperative stop drops the handler future at its next await, then
         // still reports completion so the scheduler releases the key and the
-        // drain only after the run really ended.
+        // drain only after the run really ended. A panic reports completion too.
+        let run = std::panic::AssertUnwindSafe(handler.handle_timer(task.key.clone()));
         tokio::select! {
             biased;
             _ = &mut cancel => {}
-            _ = handler.handle_timer(task.key.clone()) => {}
+            ran = run.catch_unwind() => {
+                if ran.is_err() {
+                    error!(key = ?task.key, "Timer handler panicked");
+                }
+            }
         }
 
         let elapsed = task.started_at.elapsed();
@@ -1007,6 +1013,21 @@ mod tests {
         }
     }
 
+    /// Panics on its first run and counts every run.
+    struct PanickingHandler {
+        runs: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for PanickingHandler {
+        async fn handle_timer(&self, _key: TaskKey) {
+            let run = self.runs.fetch_add(1, Ordering::SeqCst);
+            self.notify.notify_one();
+            assert!(run > 0, "the first run fails");
+        }
+    }
+
     #[derive(Clone)]
     struct SelfReschedulingHandler {
         handle: TaskHandle,
@@ -1209,6 +1230,33 @@ mod tests {
         })
         .await
         .expect("rescheduled timer should fire twice");
+    }
+
+    #[tokio::test]
+    async fn panic_releases_key() {
+        let handle = TaskHandle::new();
+        let runs = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+        let handler = PanickingHandler {
+            runs: runs.clone(),
+            notify: notify.clone(),
+        };
+        handle.set_inbound_handler(Arc::new(handler)).await;
+        for seen in 0..2 {
+            let _ = handle
+                .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                    key: test_key(),
+                    after: Duration::ZERO,
+                }))
+                .await;
+            tokio::time::timeout(Duration::from_secs(60), async {
+                while runs.load(Ordering::SeqCst) == seen {
+                    notify.notified().await;
+                }
+            })
+            .await
+            .expect("the timer runs after an earlier run panicked");
+        }
     }
 
     #[tokio::test]
