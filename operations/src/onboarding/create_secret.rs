@@ -517,6 +517,17 @@ mod tests {
             ..device_record(owner)
         };
         write_secret(&context, &expired).await;
+        let available = aruna_core::onboarding::OnboardingSecretState::Available;
+        let (key_space, key, value) =
+            crate::onboarding::secret_state::secret_state_entry(expired.enrollment_id, available)
+                .unwrap();
+        let state_row = StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        };
+        context.storage_handle.send_storage_effect(state_row).await;
         mint(&context, owner)
             .await
             .expect("an expired secret holds no slot");
