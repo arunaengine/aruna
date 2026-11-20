@@ -7,20 +7,20 @@
 
 use std::collections::BTreeMap;
 
-use crate::calls::{IoCall, IoError, IoResult, Next};
-use crate::document::DocumentTarget;
-use crate::effects::{Effect, NetEffect};
-use crate::events::{Event, NetEvent};
-use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
-use crate::id::NodeId;
-use crate::keyspaces::NODE_INFO_KEYSPACE;
-use crate::operation::Operation;
-use crate::structs::identity::realm::RealmConfigDocument;
-use crate::structs::placement::compute_config::RealmComputeConfig;
-use crate::structs::storage::node_info::{
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
+use aruna_core::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, HolderFacts};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::compute_config::RealmComputeConfig;
+use aruna_core::structs::storage::node_info::{
     LOCATION_LABEL_KEY, NodeInfoDocument, NodeUrls, node_info_key,
 };
-use crate::types::{Key, Value};
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 

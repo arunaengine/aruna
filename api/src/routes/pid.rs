@@ -17,7 +17,6 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::holder_choice::{HolderCandidate, PickHolderOperation};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::api::IdentifierMatch;
@@ -38,6 +37,7 @@ use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifie
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::holder_choice::{HolderCandidate, PickHolderOperation};
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::identifier_fanout::lookup_identifier_distributed;
 use aruna_operations::metadata::identifier_lookup::IdentifierQuery;

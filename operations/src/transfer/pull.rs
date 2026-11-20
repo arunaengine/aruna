@@ -14,7 +14,6 @@ use aruna_core::effects::{BlobEffect, Effect, NetEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::heartbeat::HeartbeatEffect;
-use aruna_core::holder_choice::{HolderCandidate, HolderChoiceError, HolderChoiceOperation, pick};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
@@ -41,6 +40,7 @@ use crate::distribution::held::{HeldElsewhere, PullRequest, admitted, held_answe
 use crate::distribution::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
+use crate::holder_choice::{HolderCandidate, HolderChoiceError, HolderChoiceOperation, pick};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::ManagedReadOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectResult};
