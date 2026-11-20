@@ -3567,7 +3567,7 @@ mod test {
     }
 
     /// Mints one id from the runner's stamp and entropy and ends with it.
-    #[derive(Debug, Default)]
+    #[derive(Debug, Default, PartialEq)]
     struct Minter {
         now_ms: u64,
         ids: aruna_core::id_mint::IdMint,

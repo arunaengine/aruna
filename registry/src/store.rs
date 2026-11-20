@@ -255,7 +255,7 @@ impl Store {
     /// The realm's stored entry, also after its lease ended.
     pub fn stored_entry(&self, realm_id: &RealmId) -> Result<Option<Entry>, StoreError> {
         let value = self.entries.get(realm_id.as_bytes())?;
-        Ok(value.map(|value| decode_entry(&value)).transpose()?)
+        value.map(|value| decode_entry(&value)).transpose()
     }
 
     /// Every realm with an entry, a name history or admin state, so withdrawn realms stay
