@@ -352,8 +352,9 @@ enum TombstoneStage {
 }
 
 /// Queues and runs the prunes for graphs a document sync deleted: each registry row leaves the
-/// cache, its prune job is queued and a kept local copy is removed; index rows go last. A graph
-/// that fails is logged and the others continue.
+/// cache, its prune job is queued and a kept local copy is removed; index rows go last. A failed
+/// immediate prune is logged, as its queued job retries it. A prune job that was not queued or
+/// index rows that stay fail the run once the other graphs ran, so the caller runs it again.
 #[derive(Debug, PartialEq)]
 pub struct TombstonesOperation {
     tombstones: VecDeque<GraphLifecycleRecord>,
@@ -361,6 +362,8 @@ pub struct TombstonesOperation {
     deleted_documents: BTreeSet<Ulid>,
     stage: TombstoneStage,
     result: TombstoneProcessingResult,
+    /// The first failure without a durable retry, reported when the run ends.
+    failure: Option<MetadataGraphError>,
 }
 
 impl TombstonesOperation {
@@ -376,6 +379,7 @@ impl TombstonesOperation {
             deleted_documents: BTreeSet::new(),
             stage: TombstoneStage::Uncache,
             result: TombstoneProcessingResult::default(),
+            failure: None,
         }
     }
 
@@ -430,6 +434,7 @@ impl Operation for TombstonesOperation {
             TombstoneStage::Enqueue => {
                 if let Err(error) = result.child::<(), MetadataGraphError>()? {
                     warn!(%graph_iri, error = ?error, "Failed to enqueue metadata graph prune job");
+                    self.failure.get_or_insert(error);
                     return self.next_tombstone();
                 }
                 self.result.enqueued = self.result.enqueued.saturating_add(1);
@@ -451,8 +456,12 @@ impl Operation for TombstonesOperation {
             TombstoneStage::Index => {
                 if let Err(error) = result.child::<(), MetadataError>()? {
                     warn!(error = ?error, "Failed to prune IRI index rows for deleted documents");
+                    self.failure.get_or_insert(error.into());
                 }
-                Ok(Next::Done(std::mem::take(&mut self.result)))
+                match self.failure.take() {
+                    Some(error) => Err(error),
+                    None => Ok(Next::Done(std::mem::take(&mut self.result))),
+                }
             }
         }
     }
@@ -766,7 +775,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    use crate::tests::metadata::storage_key_exists;
+    use crate::tests::metadata::{refusing, storage_key_exists};
     use aruna_drivers::testing::write_entries;
 
     fn lifecycle(graph_iri: &str) -> GraphLifecycleRecord {
@@ -1014,6 +1023,93 @@ mod tests {
         process_graph_tombstones(&context, vec![tombstone]).await;
 
         assert!(!index_row_exists(&storage, index_key).await);
+    }
+
+    /// A store with the IRI index rows of one document and the tombstone that deletes it, on a
+    /// node with a graph handle, as `prunes_index_rows` sets it up.
+    async fn indexed_tombstone(
+        storage: &StorageHandle,
+        metadata_dir: &std::path::Path,
+    ) -> (aruna_graph::GraphHandle, ByteView, GraphLifecycleRecord) {
+        let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let graph_handle = aruna_graph::GraphHandle::open(
+            metadata_dir,
+            node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        )
+        .expect("metadata handle opens");
+        storage.install_metadata_indexes(metadata_dir);
+        let record = registry_record(Ulid::from_parts(9, 2), "docs/refused");
+        let index_key = aruna_core::storage_entries::iri_reference_key(
+            "https://schema.org/conformsTo",
+            "https://example.test/profile",
+            record.document_id,
+        );
+        let document_row =
+            aruna_core::structs::storage::data::link::document_key(record.document_id, &index_key);
+        let index = aruna_core::keyspaces::IRI_INDEX_KEYSPACE.to_string();
+        let document = aruna_core::keyspaces::DOCUMENT_IRI_KEYSPACE.to_string();
+        let rows = vec![
+            (index, index_key.clone(), ByteView::from(vec![1u8])),
+            (document, ByteView::from(document_row), ByteView::from(Vec::new())),
+        ];
+        write_entries(storage, rows).await;
+        let tombstone = GraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        (graph_handle, index_key, tombstone)
+    }
+
+    fn graph_context(
+        storage: StorageHandle,
+        graph_handle: aruna_graph::GraphHandle,
+    ) -> DriverContext {
+        DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: Some(graph_handle),
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+            outbound_handle: None,
+        }
+    }
+
+    // A prune job that was not queued fails the run, after the index rows were still pruned, so
+    // a caller with a durable row runs it again.
+    #[tokio::test]
+    async fn failed_enqueue_errs() {
+        let (dir, metadata_dir) = (tempdir().expect("temp dir"), tempdir().expect("metadata dir"));
+        let storage = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("opens");
+        let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
+        let store = refusing(storage.clone(), PRUNE_JOB_KEYSPACE);
+
+        let run = drive(TombstonesOperation::new([tombstone]), &graph_context(store, graph));
+
+        assert!(matches!(run.await, Err(MetadataGraphError::Storage(_))));
+        assert!(read_jobs(&storage).await.is_empty());
+        assert!(!index_row_exists(&storage, index_key).await);
+    }
+
+    // Index rows that could not be deleted fail the run; the queued prune job is kept.
+    #[tokio::test]
+    async fn failed_index_errs() {
+        let (dir, metadata_dir) = (tempdir().expect("temp dir"), tempdir().expect("metadata dir"));
+        let storage = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("opens");
+        let (graph, index_key, tombstone) = indexed_tombstone(&storage, metadata_dir.path()).await;
+        let store = refusing(storage.clone(), aruna_core::keyspaces::IRI_INDEX_KEYSPACE);
+
+        let run = drive(TombstonesOperation::new([tombstone]), &graph_context(store, graph));
+
+        assert!(matches!(run.await, Err(MetadataGraphError::Metadata(_))));
+        assert_eq!(read_jobs(&storage).await.len(), 1);
+        assert!(index_row_exists(&storage, index_key).await);
     }
 
     #[tokio::test]
