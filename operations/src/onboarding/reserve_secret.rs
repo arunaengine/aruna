@@ -16,7 +16,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::onboarding::create_secret::{
-    enrolled_devices, pending_devices, secret_pages, secret_record_key,
+    Counted, SlotCount, enrolled_devices, secret_pages, secret_record_key,
 };
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry};
 
@@ -37,13 +37,7 @@ enum Stage {
     Config {
         owner: UserId,
     },
-    /// Counts the owner's outstanding secrets page by page against `cap`.
-    Count {
-        cap: u32,
-        enrolled: Vec<String>,
-        /// Secrets counted by the pages already read.
-        pending: u32,
-    },
+    Count(SlotCount),
     Write,
 }
 
@@ -241,39 +235,19 @@ impl ReserveSecretOperation {
         if enrolled.len() as u32 >= cap {
             return Err(ReserveSecretError::DeviceCapExceeded { limit: cap });
         }
-        self.stage = Stage::Count {
-            cap,
-            enrolled,
-            pending: 0,
-        };
+        let scope = (owner, self.input.enrollment_id, self.input.now);
+        self.stage = Stage::Count(SlotCount::new(cap, enrolled, scope));
         Ok(Next::Call(self.pages.call()))
     }
 
     fn handle_page(&mut self, result: IoResult) -> ReserveTurn {
-        let owner = self.record.as_ref().and_then(|record| record.mode.owner());
-        let Stage::Count {
-            cap,
-            enrolled,
-            pending,
-        } = &mut self.stage
-        else {
+        let Stage::Count(count) = &mut self.stage else {
             return Err(ReserveSecretError::NotFinished);
         };
-        let rows = self.pages.take(result)?;
-        *pending = pending.saturating_add(pending_devices(
-            &rows,
-            owner,
-            self.input.enrollment_id,
-            enrolled,
-        ));
-        if enrolled.len() as u32 + *pending >= *cap {
-            return Err(ReserveSecretError::DeviceCapExceeded { limit: *cap });
-        }
-        // The range is followed to its end, so a slot this owner holds
-        // cannot hide behind another owner's records.
-        match self.pages.done() {
-            true => self.reserve_write(),
-            false => Ok(Next::Call(self.pages.call())),
+        match count.step::<ReserveSecretError>(&mut self.pages, result)? {
+            Counted::Call(call) => Ok(Next::Call(call)),
+            Counted::Done => self.reserve_write(),
+            Counted::Exceeded(limit) => Err(ReserveSecretError::DeviceCapExceeded { limit }),
         }
     }
 }
@@ -302,7 +276,7 @@ impl Operation for ReserveSecretOperation {
                 let [value] = values::<1>(result)?;
                 self.handle_config(owner, value)
             }
-            Stage::Count { .. } => self.handle_page(result),
+            Stage::Count(_) => self.handle_page(result),
             Stage::Write => {
                 result.done()?;
                 self.record
