@@ -34,8 +34,6 @@ pub(crate) struct Walk<T> {
     recursive: bool,
     /// The directory to list next and the cursor names still to pass inside it.
     pending: Option<(String, Vec<String>)>,
-    /// Whether the pending listing refills the current directory's window.
-    refill: bool,
     frames: Vec<Frame<T>>,
 }
 
@@ -43,10 +41,6 @@ struct Frame<T> {
     path: String,
     children: VecDeque<Child<T>>,
     after: Vec<String>,
-    /// Whether the directory holds names past this window, listed once the window runs out.
-    more: bool,
-    /// The last name taken from the window.
-    last: Option<String>,
 }
 
 impl<T> Walk<T> {
@@ -55,7 +49,6 @@ impl<T> Walk<T> {
         Self {
             recursive,
             pending: Some((base.trim_matches('/').to_string(), after)),
-            refill: false,
             frames: Vec::new(),
         }
     }
@@ -75,17 +68,9 @@ impl<T> Walk<T> {
         }
         while let Some(frame) = self.frames.last_mut() {
             let Some(mut child) = frame.children.pop_front() else {
-                // A window that ran out lists its directory again after the last name it held.
-                if let (true, Some(last)) = (frame.more, frame.last.clone()) {
-                    frame.more = false;
-                    self.refill = true;
-                    self.pending = Some((frame.path.clone(), vec![last]));
-                    return Step::List(frame.path.clone());
-                }
                 self.frames.pop();
                 continue;
             };
-            frame.last = Some(child.name.clone());
             let path = join_path(&frame.path, &child.name);
             let order = (frame.after.first()).map(|first| child.name.as_str().cmp(first.as_str()));
             if order == Some(Ordering::Less) || !resolve(&path, &mut child) {
@@ -120,36 +105,15 @@ impl<T> Walk<T> {
     }
 
     /// Takes the children of the directory the last [`Step::List`] asked for.
-    pub(crate) fn listed(&mut self, children: Vec<Child<T>>) {
-        self.listed_window(children, false);
-    }
-
-    /// Takes a window of the directory's first children from [`Self::resume_name`] on; with
-    /// `more`, the walk lists the directory again from the window's last name once it ran out,
-    /// so a window must hold at least two names to move on.
-    pub(crate) fn listed_window(&mut self, mut children: Vec<Child<T>>, more: bool) {
+    pub(crate) fn listed(&mut self, mut children: Vec<Child<T>>) {
         let Some((path, after)) = self.pending.take() else {
             return;
         };
         children.sort_by(|left, right| left.name.cmp(&right.name));
-        if std::mem::take(&mut self.refill)
-            && let Some(frame) = self.frames.last_mut()
-        {
-            let last = frame.last.clone();
-            let fresh = |child: &Child<T>| {
-                last.as_deref()
-                    .is_none_or(|last| child.name.as_str() > last)
-            };
-            frame.children.extend(children.into_iter().filter(fresh));
-            frame.more = more;
-            return;
-        }
         self.frames.push(Frame {
             path,
             children: children.into(),
             after,
-            more,
-            last: None,
         });
     }
 }
@@ -198,7 +162,8 @@ pub(crate) fn walk_page(
     (entries, next)
 }
 
-fn join_path(directory: &str, name: &str) -> String {
+/// `name` below `directory`, or alone below the root.
+pub(crate) fn join_path(directory: &str, name: &str) -> String {
     match directory.is_empty() {
         true => name.to_string(),
         false => format!("{directory}/{name}"),
@@ -286,32 +251,6 @@ mod tests {
         };
         assert_eq!(path, "b.txt");
         assert_eq!(resolved, ["a-c", "b.txt"]);
-    }
-
-    // A window of the first names is refilled after its last name once the walk used it up.
-    #[test]
-    fn window_refills() {
-        let mut walk = Walk::new("", Vec::new(), false);
-        let mut paths = Vec::new();
-        loop {
-            match walk.step() {
-                Step::List(directory) => {
-                    let from = walk.resume_name().map(ToOwned::to_owned);
-                    let keep = |child: &Child<()>| {
-                        from.as_deref()
-                            .is_none_or(|from| child.name.as_str() >= from)
-                    };
-                    let mut names: Vec<_> = children(&directory).into_iter().filter(keep).collect();
-                    names.sort_by(|left, right| left.name.cmp(&right.name));
-                    let more = names.len() > 2;
-                    names.truncate(2);
-                    walk.listed_window(names, more);
-                }
-                Step::Entry { path, .. } => paths.push(path),
-                Step::Done => break,
-            }
-        }
-        assert_eq!(paths, ["a", "a-c", "b.txt", "c"]);
     }
 
     #[test]
