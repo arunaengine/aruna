@@ -13,8 +13,7 @@ use crate::driver::DriverContext;
 pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -> Event {
     // The row and the scheduler see changes of one key in the same order.
     let _held = hold_change(&effect).await;
-    // An audit record retry runs from memory when storage cannot persist it.
-    let kept = matches!(task_effect_key(&effect), Some(TaskKey::RecordAudit { .. }));
+    let kept = kept_in_memory(&effect);
     let stamp = match persist_stamped(&context.storage_handle, &effect).await {
         Ok(stamp) => stamp,
         Err(_) if kept => None,
@@ -35,6 +34,17 @@ pub(super) async fn dispatch_task(effect: TaskEffect, context: &DriverContext) -
     }
 }
 
+/// Whether a change arms an audit record retry, which runs from memory when storage cannot
+/// persist it; a failed cancellation of that retry is reported like any other.
+fn kept_in_memory(effect: &TaskEffect) -> bool {
+    match effect {
+        TaskEffect::ResetTimer { key, .. } | TaskEffect::ShortenTimer { key, .. } => {
+            matches!(key, TaskKey::RecordAudit { .. })
+        }
+        _ => false,
+    }
+}
+
 /// The timer key a control effect names, so a persistence failure still points
 /// at the affected timer.
 fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
@@ -50,9 +60,39 @@ fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::task_effect_key;
+    use super::{kept_in_memory, task_effect_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::task::TaskEffect;
+
+    // Only arming an audit retry runs from memory; its failed cancellation is reported.
+    #[test]
+    fn audit_arming_kept() {
+        use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+        let record = BucketAuditRecord {
+            event_id: ulid::Ulid::from_parts(5, 1),
+            bucket_id: ulid::Ulid::from_bytes([2; 16]),
+            at_ms: 5,
+            action: AuditAction::Lock,
+            actor: None,
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            generation: Some(1),
+            session_id: None,
+            intent_id: None,
+            sequence: None,
+            deadline_ms: None,
+            reason: None,
+            outcome: AuditOutcome::Intent,
+        };
+        let key = aruna_core::task::TaskKey::RecordAudit {
+            record: Box::new(record),
+        };
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: std::time::Duration::ZERO,
+        };
+        assert!(kept_in_memory(&reset));
+        assert!(!kept_in_memory(&TaskEffect::CancelTimer { key }));
+    }
 
     #[test]
     fn control_effects_key() {
