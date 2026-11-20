@@ -891,6 +891,12 @@ impl S3ServerHandle {
             .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
+    /// The accepted connections whose tasks still run, for tests that wait on admission.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
     /// Stops accepting and asks every connection to close; does not wait.
     pub fn abort(&self) {
         self.abort_connections.cancel();
