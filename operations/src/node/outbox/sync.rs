@@ -15,7 +15,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use irokle::TopicId;
 use ulid::Ulid;
 
-use crate::node::outbox_finish::{FinishBatchOperation, FinishedBatch};
+use crate::node::outbox::finish::{FinishBatchOperation, FinishedBatch};
 use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
 use crate::sync::reconcile::SyncTopicsOperation;
 
