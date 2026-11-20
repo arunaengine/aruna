@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use aruna_core::id::NodeId;
 use irokle::TopicId;
+use tracing::info;
 
 use crate::queue_backoff::retry_delay_ms;
 use crate::sync::shard_placement::DEFER_RETRY_AFTER;
@@ -103,6 +104,35 @@ impl OutboxRotation {
             _ => Some(self.retry_after()),
         };
         (closed, after)
+    }
+
+    /// Closes this rotation as [`Self::close_plan`] does and logs what it examined; answers when
+    /// the drain runs again.
+    pub fn close_logged(&mut self) -> Option<Duration> {
+        let (closed, after) = self.close_plan();
+        if closed.examined > 0 {
+            info!(
+                event = "pipeline.drain.rotation",
+                examined = closed.examined,
+                deleted = closed.deleted,
+                deferred = closed.deferred,
+                undeliverable = closed.undeliverable,
+                retry_invocations = closed.retry_invocations,
+                invocations = closed.invocations,
+                "Document sync outbox rotation complete"
+            );
+        }
+        after
+    }
+
+    /// After an invocation that must retry: a rotation that reached its end closes, any other
+    /// waits on the retry ladder. Either way the continuation streak starts again.
+    pub fn finish_retry(&mut self, reached_end: bool) -> Option<Duration> {
+        self.continuations = 0;
+        match reached_end {
+            true => self.close_logged(),
+            false => Some(self.retry_after()),
+        }
     }
 }
 

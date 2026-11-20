@@ -101,7 +101,7 @@ use aruna_operations::replication::drain::RestoreDrainOperation;
 use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
 use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
 use aruna_operations::sync::document_outbox::{OutboxTailsOperation, OutboxTimerOperation};
-use aruna_operations::sync::outbox::batches::DrainInvocation;
+use aruna_operations::sync::outbox::batches::{DrainInvocation, OutboxLimits};
 use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::outbox::rotation::OutboxRotation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
@@ -126,15 +126,6 @@ pub static UNDELIVERABLE_RECORD_COUNT: std::sync::atomic::AtomicU64 =
 /// Outbox records remembered as published; past it they are forgotten and published once
 /// more, which only costs log space.
 const MAX_PUBLISHED_RECORDS: usize = 65_536;
-/// Pages one drain invocation may examine, so a large or blocked queue cannot
-/// monopolise a task invocation.
-const OUTBOX_INVOCATION_PAGES: usize = 2;
-const OUTBOX_INVOCATION_RECORDS: usize = OUTBOX_INVOCATION_PAGES * OUTBOX_DRAIN_SIZE;
-/// Consecutive continuations before a rotation yields through the timer, so an
-/// append-heavy or wholly blocked queue cannot keep the task continuously hot.
-const OUTBOX_CONTINUATION_STREAK: u32 = 8;
-const _: () = assert!(OUTBOX_INVOCATION_PAGES > 0 && OUTBOX_CONTINUATION_STREAK > 0);
-const OUTBOX_CONTINUATION_AFTER: Duration = Duration::from_millis(50);
 const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 
 /// How long a device keeps its copy of the realm documents before asking for
@@ -146,23 +137,6 @@ const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
 const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_TICKS: usize = 12;
-
-#[derive(Clone, Copy)]
-struct OutboxLimits {
-    pages: usize,
-    records: usize,
-    continuation_streak: u32,
-}
-
-impl Default for OutboxLimits {
-    fn default() -> Self {
-        Self {
-            pages: OUTBOX_INVOCATION_PAGES,
-            records: OUTBOX_INVOCATION_RECORDS,
-            continuation_streak: OUTBOX_CONTINUATION_STREAK,
-        }
-    }
-}
 
 /// One drained outbox record with its resolved publish topic.
 pub(crate) struct OperationsTaskHandler {

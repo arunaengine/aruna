@@ -187,21 +187,8 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn close_rotation(&self, retry_key: TaskKey, mut rotation: OutboxRotation) {
-        let (closed, after) = rotation.close_plan();
+        let after = rotation.close_logged();
         self.store_rotation(rotation);
-        if closed.examined > 0 {
-            info!(
-                event = "pipeline.drain.rotation",
-                examined = closed.examined,
-                deleted = closed.deleted,
-                deferred = closed.deferred,
-                undeliverable = closed.undeliverable,
-                retry_invocations = closed.retry_invocations,
-                invocations = closed.invocations,
-                "Document sync outbox rotation complete"
-            );
-        }
-
         if let Some(after) = after {
             self.reschedule_timer(retry_key, after).await;
         }
@@ -263,11 +250,10 @@ impl OperationsTaskHandler {
         mut rotation: OutboxRotation,
         reached_end: bool,
     ) {
-        rotation.continuations = 0;
-        if reached_end {
-            self.close_rotation(retry_key, rotation).await;
-        } else {
-            self.retry_drain(retry_key, rotation).await;
+        let after = rotation.finish_retry(reached_end);
+        self.store_rotation(rotation);
+        if let Some(after) = after {
+            self.reschedule_timer(retry_key, after).await;
         }
     }
 }
@@ -279,17 +265,9 @@ impl OperationsTaskHandler {
         net_handle: &aruna_net::NetHandle,
         realm_id: RealmId,
         mut rotation: OutboxRotation,
-        mut invocation: DrainInvocation,
+        invocation: DrainInvocation,
         drain_started: Instant,
     ) {
-        invocation
-            .defer
-            .deferred_topics
-            .extend(invocation.outcome.blocked_topics.iter().copied());
-        invocation
-            .defer
-            .blocked_origins
-            .extend(invocation.outcome.blocked_origins.iter().copied());
         if let Some((oldest_ms, target, topic, placement)) = &invocation.oldest_stuck {
             error!(
                 event = "pipeline.drain.stuck",
@@ -307,70 +285,11 @@ impl OperationsTaskHandler {
                 .await;
         }
 
-        let unvisited = invocation.has_unvisited();
-        rotation.cursor = if invocation.reached_end {
-            None
-        } else {
-            invocation.cursor.clone()
-        };
-        rotation.blocked_topics = invocation.defer.deferred_topics;
-        rotation.blocked_origins = invocation.defer.blocked_origins;
-        rotation.undeliverable_topics = invocation.defer.undeliverable_topics;
-        rotation.totals.examined += invocation.records;
-        rotation.totals.deleted += invocation.outcome.deleted;
-        rotation.totals.deferred += invocation.deferred;
-        rotation.totals.undeliverable += invocation.undeliverable;
-        rotation.totals.retry_invocations +=
-            usize::from(invocation.outcome.retry_needed || invocation.read_failed);
-        rotation.totals.invocations = rotation.totals.invocations.saturating_add(1);
-
-        let oldest_age_ms = invocation
-            .oldest_record_ms
-            .map(|record_ms| unix_timestamp_millis().saturating_sub(record_ms))
-            .unwrap_or(0);
-        if invocation.records > 0 {
-            info!(
-                event = "pipeline.drain.summary",
-                records = invocation.records,
-                examined = invocation.records,
-                deleted = invocation.outcome.deleted,
-                deferred = invocation.deferred,
-                undeliverable = invocation.undeliverable,
-                retry_scheduled = invocation.outcome.retry_needed || invocation.read_failed,
-                has_unvisited = unvisited,
-                continuation = rotation.continuations,
-                rotation_complete = invocation.reached_end,
-                groups = invocation.groups,
-                subbatches = invocation.subbatches,
-                pages = invocation.pages,
-                scan_ms = duration_ms(invocation.scan_elapsed),
-                publish_ms = duration_ms(invocation.publish_elapsed),
-                sync_ms = duration_ms(invocation.outcome.sync_elapsed),
-                project_ms = duration_ms(invocation.outcome.project_elapsed),
-                delete_ms = duration_ms(invocation.outcome.delete_elapsed),
-                total_ms = duration_ms(drain_started.elapsed()),
-                oldest_age_ms,
-                retry = invocation.outcome.retry_needed || invocation.read_failed,
-                "Document sync outbox drain summary"
-            );
-        }
-
-        if invocation.outcome.retry_needed || invocation.read_failed {
-            self.finish_retry(retry_key, rotation, invocation.reached_end)
-                .await;
-        } else if unvisited {
-            if rotation.continuations < self.outbox_limits.continuation_streak {
-                rotation.continuations = rotation.continuations.saturating_add(1);
-                self.store_rotation(rotation);
-                self.reschedule_timer(retry_key, OUTBOX_CONTINUATION_AFTER)
-                    .await;
-            } else {
-                rotation.continuations = 0;
-                self.store_rotation(rotation);
-                self.reschedule_timer(retry_key, DEFER_RETRY_AFTER).await;
-            }
-        } else {
-            self.close_rotation(retry_key, rotation).await;
+        let at = (unix_timestamp_millis(), drain_started.elapsed());
+        let after = invocation.finish(&mut rotation, &self.outbox_limits, at);
+        self.store_rotation(rotation);
+        if let Some(after) = after {
+            self.reschedule_timer(retry_key, after).await;
         }
     }
 }
