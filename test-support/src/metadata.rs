@@ -86,31 +86,39 @@ pub async fn export_rocrate_jsonld(
 /// A storage that forwards every effect to `real`, except writes and deletes that touch
 /// `key_space`, which it refuses as a failed write.
 pub fn refusing(real: StorageHandle, key_space: &'static str) -> StorageHandle {
+    refusing_when(real, move |effect| match effect {
+        StorageEffect::Write {
+            key_space: space, ..
+        }
+        | StorageEffect::Delete {
+            key_space: space, ..
+        } => space == key_space,
+        StorageEffect::BatchWrite { writes, .. } => {
+            writes.iter().any(|(space, ..)| space == key_space)
+        }
+        StorageEffect::BatchDelete { deletes, .. } => {
+            deletes.iter().any(|(space, _)| space == key_space)
+        }
+        _ => false,
+    })
+}
+
+/// A storage that forwards every effect to `real`, except the ones `refuse` picks, which it
+/// answers as a failed write.
+pub fn refusing_when(
+    real: StorageHandle,
+    refuse: impl Fn(&StorageEffect) -> bool + Clone + Send + 'static,
+) -> StorageHandle {
     let (handle, receivers) = StorageHandle::new();
     for receiver in [receivers.foreground, receivers.bulk] {
-        let real = real.clone();
+        let (real, refuse) = (real.clone(), refuse.clone());
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("proxy runtime builds");
             while let Ok((effect, response, ..)) = receiver.recv() {
-                let touched = match &effect {
-                    StorageEffect::Write {
-                        key_space: space, ..
-                    }
-                    | StorageEffect::Delete {
-                        key_space: space, ..
-                    } => space == key_space,
-                    StorageEffect::BatchWrite { writes, .. } => {
-                        writes.iter().any(|(space, ..)| space == key_space)
-                    }
-                    StorageEffect::BatchDelete { deletes, .. } => {
-                        deletes.iter().any(|(space, _)| space == key_space)
-                    }
-                    _ => false,
-                };
-                if touched {
+                if refuse(&effect) {
                     let error = StorageError::WriteError("refused by the test".to_string());
                     response.send(StorageEvent::Error { error });
                     continue;

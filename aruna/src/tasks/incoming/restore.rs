@@ -10,6 +10,42 @@ use aruna_operations::federation::registration::PublishRegistrationOperation;
 use std::time::SystemTime;
 
 const LINK_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The first and the longest wait before an incomplete timer restoration resumes.
+const TIMER_RESUME_FIRST: Duration = Duration::from_secs(1);
+const TIMER_RESUME_MOST: Duration = Duration::from_secs(60);
+
+/// Resumes an incomplete timer restoration from where it stopped until every persisted timer is
+/// armed, so a durable retry on a later page does not stay dormant for the process lifetime.
+fn spawn_timer_resume(
+    context: &Arc<DriverContext>,
+    task_handle: &TaskHandle,
+    shutdown: &Shutdown,
+    mut resume_after: Option<byteview::ByteView>,
+) {
+    let (context, task_handle) = (Arc::downgrade(context), task_handle.clone());
+    let cancelled = shutdown.token();
+    shutdown.spawn(async move {
+        let mut wait = TIMER_RESUME_FIRST;
+        loop {
+            tokio::select! {
+                _ = cancelled.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+            let Some(context) = context.upgrade() else {
+                return;
+            };
+            let storage = &context.storage_handle;
+            match restore_task_timers(storage, &task_handle, resume_after.take()).await {
+                Ok(()) => return,
+                Err(stopped) => {
+                    error!(error = %stopped.error, "Persisted task timers are still not restored");
+                    resume_after = stopped.resume_after;
+                    wait = wait.saturating_mul(2).min(TIMER_RESUME_MOST);
+                }
+            }
+        }
+    });
+}
 
 fn spawn_queue_rearm(context: &Arc<DriverContext>, task_handle: &TaskHandle, shutdown: &Shutdown) {
     if tokio::runtime::Handle::try_current().is_err() {
@@ -287,7 +323,11 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_task_timers(&context.storage_handle, &task_handle).await;
+        let restored = restore_task_timers(&context.storage_handle, &task_handle, None).await;
+        if let Err(incomplete) = restored {
+            warn!(error = %incomplete.error, "Persisted task timers not fully restored; resuming");
+            spawn_timer_resume(&context, &task_handle, shutdown, incomplete.resume_after);
+        }
         if stopped() {
             return;
         }
