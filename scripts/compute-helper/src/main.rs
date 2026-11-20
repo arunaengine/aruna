@@ -216,15 +216,24 @@ fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Res
 /// Opens the folder `relative` below `root` one component at a time without following a link,
 /// so a folder swapped for a link meanwhile is never entered; `None` when one is missing or a link.
 fn open_beneath(root: &Path, relative: &Path) -> io::Result<Option<rustix::fd::OwnedFd>> {
-    use rustix::fs::{Mode, OFlags, open, openat};
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, statat};
     use rustix::io::Errno;
 
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut handle = open(root, flags, Mode::empty())?;
     for component in relative.components() {
-        match openat(&handle, component.as_os_str(), flags, Mode::empty()) {
+        let name = component.as_os_str();
+        match openat(&handle, name, flags, Mode::empty()) {
             Ok(next) => handle = next,
             Err(Errno::NOENT | Errno::LOOP) => return Ok(None),
+            // Linux answers a link opened as a folder without following with ENOTDIR.
+            Err(Errno::NOTDIR) => match statat(&handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
+                    return Ok(None);
+                }
+                Err(Errno::NOENT) => return Ok(None),
+                _ => return Err(Errno::NOTDIR.into()),
+            },
             Err(error) => return Err(error.into()),
         }
     }
