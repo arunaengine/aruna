@@ -8,6 +8,7 @@ pub mod contacts;
 pub mod counter_check;
 pub mod heartbeat;
 pub mod info;
+pub mod info_timer;
 pub mod placement_timer;
 pub mod presence_timer;
 mod rebuild_counts;

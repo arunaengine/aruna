@@ -10,6 +10,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::git::GitNode;
+use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::node_facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
@@ -33,6 +34,7 @@ use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperati
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::node::applied_drain::AppliedDrainOperation;
+use crate::node::info_timer::InfoTimerOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
 use crate::node::usage_publish::PublishUsageOperation;
@@ -60,6 +62,8 @@ use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 pub struct TimerMemory {
     pub attempts: u32,
     pub cursor: Option<Vec<u8>>,
+    /// A count the timer advances on every run, such as a heartbeat sequence.
+    pub sequence: u64,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -72,7 +76,7 @@ impl TimerMemory {
         let after = capped_backoff(base, max, self.attempts.min(LADDER_STEPS), 0);
         let memory = TimerMemory {
             attempts: self.attempts.saturating_add(1),
-            cursor: self.cursor.clone(),
+            ..self.clone()
         };
         (after, memory)
     }
@@ -108,6 +112,8 @@ pub struct TimerInput {
     pub routing: NodeRouting,
     /// Whether this node has blob storage.
     pub has_blob: bool,
+    /// The jobs running on this node, for its heartbeat.
+    pub running: Option<RunningJobs>,
 }
 
 impl TimerInput {
@@ -120,6 +126,7 @@ impl TimerInput {
             facts: NodeFacts::default(),
             routing: NodeRouting::default(),
             has_blob: false,
+            running: None,
         }
     }
 }
@@ -173,6 +180,7 @@ pub enum TimerOperation {
     PruneJobs(PruneKeepingWork),
     DrainMirrorRepair(DrainRepairsOperation),
     PublishUsageSnapshots(PublishUsageOperation),
+    PublishNodeInfo(InfoTimerOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -277,6 +285,13 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             }
             None => TimerOperation::Wait(WaitOperation::after(None)),
         }),
+        TaskKey::PublishNodeInfo => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                let heartbeat = InfoTimerOperation::new(node_id, realm_id, input);
+                TimerOperation::PublishNodeInfo(heartbeat)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(Some(INFO_PUBLISH_INTERVAL))),
+        }),
         _ => None,
     }
 }
@@ -303,6 +318,7 @@ macro_rules! each_timer {
             TimerOperation::PruneJobs($operation) => $body,
             TimerOperation::DrainMirrorRepair($operation) => $body,
             TimerOperation::PublishUsageSnapshots($operation) => $body,
+            TimerOperation::PublishNodeInfo($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -452,6 +468,7 @@ impl TimerRun for ProcessMigrationsOperation {
         let memory = TimerMemory {
             attempts: 0,
             cursor: run.cursor.map(|key| key.to_vec()),
+            ..TimerMemory::default()
         };
         Ok(TimerPlan {
             after: run.next,
@@ -500,6 +517,7 @@ impl TimerRun for DeliverWakesOperation {
         let memory = TimerMemory {
             attempts: 0,
             cursor: delivery.next.map(|key| key.to_vec()),
+            ..TimerMemory::default()
         };
         Ok(TimerPlan { after, memory })
     }
@@ -588,6 +606,12 @@ impl TimerRun for PublishUsageOperation {
             reason: error.to_string(),
         })?;
         Ok(TimerPlan::default())
+    }
+}
+
+impl TimerRun for InfoTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
     }
 }
 
@@ -1033,6 +1057,14 @@ mod tests {
         assert_eq!(failed.unwrap_err().retry_after, SNAPSHOT_PUBLISH_DEBOUNCE);
         let mut idle = timer_operation(&TaskKey::PublishUsageSnapshots, &input()).unwrap();
         assert_eq!(idle.first(), Ok(Next::Done(TimerPlan::default())));
+    }
+
+    #[test]
+    fn heartbeat_without_network() {
+        // A node without a network still keeps its heartbeat timer armed.
+        let mut idle = timer_operation(&TaskKey::PublishNodeInfo, &input()).unwrap();
+        let next = TimerPlan::from(Some(INFO_PUBLISH_INTERVAL));
+        assert_eq!(idle.first(), Ok(Next::Done(next)));
     }
 
     #[test]

@@ -243,8 +243,6 @@ pub(crate) struct OperationsTaskHandler {
     // When a device may next fetch the realm documents, and how many attempts
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
-    // Sequence of the last heartbeat this process sent; the startup revision orders restarts.
-    heartbeat_sequence: std::sync::atomic::AtomicU64,
     // Signs registry publications; `None` where no node identity was supplied.
     node_capabilities: Option<NodeCapabilities>,
 }
@@ -356,7 +354,6 @@ impl OperationsTaskHandler {
             drain_guard: tokio::sync::Mutex::new(()),
             outbox_limits: OutboxLimits::default(),
             realm_documents: std::sync::Mutex::new((0, 0)),
-            heartbeat_sequence: std::sync::atomic::AtomicU64::new(0),
             node_capabilities: None,
         }
     }
@@ -722,6 +719,7 @@ impl OperationsTaskHandler {
             facts: node_facts(&self.context),
             routing: aruna_drivers::driver::node_routing(&self.context),
             has_blob: self.context.blob_handle.is_some(),
+            running: Some(self.jobs_runtime.running_jobs()),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
@@ -780,9 +778,7 @@ impl OperationsTaskHandler {
                 self.drain_sync_outbox().await;
             }),
             TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishNodeInfo => Box::pin(async move {
-                self.publish_node_info().await;
-            }),
+            TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
             TaskKey::DrainProjectionQueue => Box::pin(async move {
                 self.drain_projection_queue().await;
             }),
