@@ -213,12 +213,13 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    fn make_context() -> DriverContext {
+    /// The context and its database folder; the context is declared after the folder, so it
+    /// drops first and the folder is removed with the test.
+    fn make_context() -> (tempfile::TempDir, DriverContext) {
         let temp_dir = tempdir().unwrap();
         let storage_handle =
             storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
-        std::mem::forget(temp_dir);
-        DriverContext {
+        let context = DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
@@ -226,7 +227,8 @@ mod tests {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
-        }
+        };
+        (temp_dir, context)
     }
 
     fn bucket_info(cors_configuration: Option<BucketCorsConfiguration>) -> BucketInfo {
@@ -304,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn configuration_roundtrips() {
-        let context = make_context();
+        let (_dir, context) = make_context();
         let bucket = "my-bucket";
         let original = bucket_info(None);
         write_bucket(&context, bucket, &original).await;
@@ -353,7 +355,7 @@ mod tests {
     async fn missing_config_rejected() {
         let bucket = "missing-bucket".to_string();
 
-        let context = make_context();
+        let (_dir, context) = make_context();
         let put_missing = drive(
             PutCorsOperation::new(bucket.clone(), sample_cors()),
             &context,
@@ -372,7 +374,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(delete_missing, DeleteCorsError::NotFound);
 
-        let context = make_context();
+        let (_dir, context) = make_context();
         write_bucket(&context, &bucket, &bucket_info(None)).await;
 
         let get_no_config = drive(GetCorsOperation::new(bucket.clone()), &context)
