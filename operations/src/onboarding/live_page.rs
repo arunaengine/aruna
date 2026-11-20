@@ -5,9 +5,10 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::events::Event;
 use aruna_core::onboarding::OnboardingSecretState;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_retry};
 use byteview::ByteView;
 
 use crate::onboarding::expiry_page::ExpiryPageOperation;
@@ -15,7 +16,8 @@ use crate::onboarding::list_secrets::{ListSecretsError, OnboardingSecretEntry, S
 use crate::onboarding::prune_secret::{PruneOutcome, PruneSecretOperation};
 
 /// Reads one expiry page after `after`, then prunes each expired entry of it that is not
-/// finalizing, one conditional delete at a time; an expired finalizing entry stays listed.
+/// finalizing, one conditional delete at a time that a lost conflict reruns; an expired
+/// finalizing entry stays listed.
 #[derive(Debug, PartialEq)]
 pub struct LivePageOperation {
     now: u64,
@@ -47,9 +49,13 @@ impl LivePageOperation {
     fn advance(&mut self) -> Next<SecretPage> {
         while let Some(entry) = self.pending.pop_front() {
             if self.stale(&entry) {
-                let prune = PruneSecretOperation::new(entry.record.enrollment_id, self.now);
+                let (id, now) = (entry.record.enrollment_id, self.now);
+                let build = move || PruneSecretOperation::new(id, now);
+                let prune = boxed_retry(build, &id.to_bytes(), |result| {
+                    Event::Child(ChildOutcome::new(result))
+                });
                 self.pruning = Some(entry);
-                return Next::Call(IoCall::child(prune));
+                return Next::Call(IoCall::Child(prune));
             }
             self.kept.push(entry);
         }
@@ -86,7 +92,9 @@ impl Operation for LivePageOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::Effect;
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::StorageEvent;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use ulid::Ulid;
 
@@ -136,5 +144,26 @@ mod tests {
             .collect();
         assert_eq!(ids, [2, 3]);
         assert_eq!(page.next, Some(ByteView::from(b"next".as_slice())));
+    }
+
+    #[test]
+    fn prune_reruns_conflict() {
+        // A pruner that loses to a concurrent one rereads its rows instead of failing the page.
+        let mut live = LivePageOperation::new(10, None, 1);
+        live.first().unwrap();
+        let page = SecretPage {
+            entries: vec![entry(1, 5, OnboardingSecretState::Available)],
+            next: None,
+        };
+        let Ok(Next::Call(IoCall::Child(mut prune))) = live.next(child(page)) else {
+            panic!("expected the prune");
+        };
+        assert_eq!(prune.start().len(), 1);
+        let conflict = StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        };
+        let effects = prune.step(Event::Storage(conflict));
+        assert!(matches!(effects.as_slice(), [Effect::Delay(_)]));
+        assert!(!prune.is_complete());
     }
 }
