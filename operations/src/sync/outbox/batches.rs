@@ -110,10 +110,9 @@ impl DrainSubBatch {
     }
 }
 
-/// Groups records by peers into sub-batches and answers how many groups they formed. A record
-/// already published by this process goes into a sub-batch without documents, which only syncs.
-/// Sub-batches publish in order, and no record joins a sub-batch before one that holds an earlier
-/// record of its topic or admin origin, so each of them keeps the scan order.
+/// Groups records by peers into sub-batches and answers how many groups formed; a record this
+/// process published already only syncs. No record joins a sub-batch before one that holds an
+/// earlier record of its topic or admin origin, so each of them keeps the scan order.
 pub fn build_drain_batches(
     records: Vec<DrainRecord>,
     published: &BTreeSet<Vec<u8>>,
