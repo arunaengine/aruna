@@ -470,7 +470,6 @@ pub(crate) mod tests {
     use futures::StreamExt;
     use std::collections::HashMap;
 
-    // Empty directories still cost traversal, so a page fails once its bounds are spent.
     // The bound stops the scan of a wide directory itself, and names a page already passed get
     // no metadata.
     #[test]
@@ -495,6 +494,7 @@ pub(crate) mod tests {
         assert_eq!(names, ["d", "e"]);
     }
 
+    // Empty directories still cost traversal, so a page fails once its bounds are spent.
     #[test]
     fn walk_bounds_fail() {
         let dir = tempfile::tempdir().unwrap();
