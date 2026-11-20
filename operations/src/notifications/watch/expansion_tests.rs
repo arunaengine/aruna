@@ -257,10 +257,22 @@ fn failed_children_retry() {
     assert!(matches!(broken, Err(ExpandError::Fatal(_))));
 }
 
-// A stored watch row that does not decode fails the same way on every delivery, so the
-// expansion refuses it instead of retrying it forever.
+/// A stored row whose value does not decode, and a healthy watch of the same realm.
+fn mixed_rows() -> (WatchSubscription, Vec<(Key, Value)>) {
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let mut healthy = WatchSubscription::new(Ulid::generate(), user(4, 3), "data/".into(), mask, 1);
+    healthy.watch_id = Ulid::from_bytes([7; 16]);
+    let broken = watch_subscription_key(user(4, 2), Ulid::from_bytes([6; 16]));
+    let kept = watch_subscription_key(healthy.owner, healthy.watch_id);
+    let value = Value::from(healthy.to_bytes().unwrap());
+    let rows = vec![(broken, Value::from(vec![0xff])), (kept, value)];
+    (healthy, rows)
+}
+
+// A holder's delivery scan skips one malformed row and keeps the healthy watch on its page, so
+// the expansion goes on with it instead of refusing the events.
 #[test]
-fn malformed_watch_final() {
+fn malformed_row_skipped() {
     let scope = WatchScope::Page {
         realm_id: REALM,
         start: None,
@@ -268,14 +280,18 @@ fn malformed_watch_final() {
     };
     let mut listing = ListWatchesOperation::new(scope);
     listing.first().unwrap();
-    let key = watch_subscription_key(user(4, 2), Ulid::from_bytes([6; 16]));
-    let rows = vec![(key, Value::from(vec![0xff]))];
-    let Err(error) = listing.next(IoResult::Page { rows, next: None }) else {
-        panic!("an undecodable watch row fails the listing");
+    let (healthy, rows) = mixed_rows();
+    let listed = listing.next(IoResult::Page { rows, next: None });
+    let page = WatchPage {
+        subscriptions: vec![healthy],
+        next: None,
     };
-    assert!(matches!(error, WatchSubscriptionError::Malformed(_)));
+    assert_eq!(listed, Ok(Next::Done(page)));
+    let Ok(Next::Done(page)) = listed else {
+        unreachable!("the page was just checked");
+    };
     let mut expansion = expanding(None);
     expansion.first().unwrap();
-    let failed = IoResult::Child(ChildOutcome::new(Err::<WatchPage, _>(error)));
-    assert!(matches!(expansion.next(failed), Err(ExpandError::Fatal(_))));
+    let listed = IoResult::Child(ChildOutcome::new(Ok::<_, WatchSubscriptionError>(page)));
+    assert!(expansion.next(listed).is_ok());
 }
