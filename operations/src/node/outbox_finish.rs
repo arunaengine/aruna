@@ -183,7 +183,7 @@ impl Operation for FinishBatchOperation {
             }
         };
         self.refresh = targets.clone();
-        self.refresh.extend(self.requested.drain(..));
+        self.refresh.append(&mut self.requested);
         self.applied = targets;
         match self.serving {
             Some((node_id, realm_id)) => {

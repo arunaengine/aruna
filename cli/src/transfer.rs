@@ -22,8 +22,8 @@ pub const S3_REGION: &str = "us-east-1";
 const MAX_PARTS: u64 = 10_000;
 const PART_UPLOADS: usize = 4;
 const PARTIAL_SUFFIX: &str = ".aruna-part";
-/// The message of the node's refusal to refresh an expired session.
-const SESSION_EXPIRED: &str = "session has expired";
+/// The message of the node's refusal to refresh a session before its refresh window.
+const REFRESH_TOO_EARLY: &str = "session refresh is not available yet";
 const REFRESH_BEFORE: chrono::TimeDelta =
     chrono::TimeDelta::seconds(CLIENT_REFRESH_WINDOW.as_secs() as i64);
 
@@ -62,6 +62,16 @@ async fn request_session(
 ) -> Result<S3Session, CliError> {
     let body = serde_json::json!({ "group_id": group_id });
     let token: SessionTokenResponse = api.send(Method::POST, "access/s3/sessions", &body).await?;
+    resolve_session(api, fallback, token).await
+}
+
+/// The session of `token` at the endpoint its issuer names, else the one `api`'s node
+/// publishes or `fallback`; without an endpoint the session is revoked.
+async fn resolve_session(
+    api: &Api,
+    fallback: Option<&str>,
+    token: SessionTokenResponse,
+) -> Result<S3Session, CliError> {
     let mut session = S3Session {
         token,
         endpoint: String::new(),
@@ -203,29 +213,32 @@ impl S3Access {
         let path = format!("access/s3/sessions/{}/refresh", token.access_key_id);
         let body = serde_json::json!({});
         match self.api.send(Method::POST, &path, &body).await {
-            Ok(fresh) => {
-                if let Some(session) = self.session.as_mut() {
-                    session.token = fresh;
-                    self.client = s3_client(session);
-                }
+            Ok(token) => {
+                let fresh = resolve_session(&self.api, self.fallback.as_deref(), token).await?;
+                return self.adopt(fresh).await;
             }
             Err(error) => {
-                // The issuer refused an expired session, or it lapsed during the call.
+                // Only a refresh the node finds too early keeps the old pair until its expiry; an
+                // expired, swept or evicted session is taken again.
                 let lapsed = expires_within(&token.expires_at, chrono::Utc::now(), zero);
-                if lapsed || refused_expired(&error) {
+                if lapsed || !too_early(&error) {
                     return self.reacquire().await;
                 }
-                // The node may see the refresh window later; the old pair works until expiry.
             }
         }
         Ok(self.client.clone())
     }
 
     /// Takes a new session for the same group from the same node; the node refuses to refresh
-    /// an expired one. One from another issuer or endpoint is revoked, as uploads lock records
-    /// of the held destination.
+    /// an expired one.
     async fn reacquire(&mut self) -> Result<aws_sdk_s3::Client, CliError> {
         let fresh = request_session(&self.api, &self.group_id, self.fallback.as_deref()).await?;
+        self.adopt(fresh).await
+    }
+
+    /// Holds a refreshed or new session of the held issuer and endpoint. One of another is
+    /// revoked, as uploads lock records of the held destination.
+    async fn adopt(&mut self, fresh: S3Session) -> Result<aws_sdk_s3::Client, CliError> {
         let issuer = (self.session.as_ref()).map(|held| &held.token.issuer_node.node_id);
         if fresh.endpoint != self.endpoint || issuer != Some(&fresh.token.issuer_node.node_id) {
             revoke_session(&self.api, &fresh).await;
@@ -247,12 +260,12 @@ impl S3Access {
     }
 }
 
-/// Whether the node refused a refresh because the session already expired.
-fn refused_expired(error: &CliError) -> bool {
+/// Whether the node refused a refresh only because the refresh window has not begun.
+fn too_early(error: &CliError) -> bool {
     let CliError::Api(error) = error else {
         return false;
     };
-    error.status == 409 && error.body.error == SESSION_EXPIRED
+    error.status == 409 && error.body.error == REFRESH_TOO_EARLY
 }
 
 fn cannot_refresh(expires_at: &str) -> CliError {
@@ -1034,29 +1047,73 @@ mod tests {
         text.lines().next().unwrap_or_default().to_string()
     }
 
-    /// A refresh refused as expired, and a new session of the same node at the same endpoint.
-    fn refused_refresh(line: &str) -> (u16, String) {
+    /// A refresh refused by `status` and `error`, else a new session of the same destination.
+    fn refusing(line: &str, status: u16, error: &str) -> (u16, String) {
         if line.contains("/refresh ") {
-            let refusal = serde_json::json!({ "error": SESSION_EXPIRED, "code": "Conflict" });
-            return (409, refusal.to_string());
+            return (status, serde_json::json!({ "error": error }).to_string());
         }
         let later = (chrono::Utc::now() + chrono::TimeDelta::hours(1)).to_rfc3339();
         let token = session_token("fresh", later, "node");
         (200, serde_json::to_string(&token).unwrap())
     }
 
+    /// A refresh refused as expired.
+    fn refused_refresh(line: &str) -> (u16, String) {
+        refusing(line, 409, "session has expired")
+    }
+
+    /// A refresh of a session the node swept or evicted.
+    fn missing_refresh(line: &str) -> (u16, String) {
+        refusing(line, 404, "Not found")
+    }
+
+    /// A refresh before the node's refresh window.
+    fn early_refresh(line: &str) -> (u16, String) {
+        refusing(line, 409, REFRESH_TOO_EARLY)
+    }
+
     #[tokio::test]
     async fn reacquires_refused_refresh() {
-        // The issuer refuses a refresh that reaches it after expiry; the old pair is not kept.
-        let (base, seen) = serve(refused_refresh).await;
+        // An expired or missing session is taken again; the old pair is not kept.
+        let replies: [fn(&str) -> (u16, String); 2] = [refused_refresh, missing_refresh];
+        for reply in replies {
+            let (base, seen) = serve(reply).await;
+            let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
+            let mut access = held_access(&base, soon);
+            access.client().await.unwrap();
+            let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
+            assert_eq!(held.map(String::as_str), Some("fresh"));
+            let lines = seen.lock().unwrap().clone();
+            assert!(lines[0].starts_with("POST ") && lines[0].contains("/held/refresh "));
+            assert!(lines[1].starts_with("POST ") && lines[1].contains("/access/s3/sessions "));
+        }
+    }
+
+    #[tokio::test]
+    async fn refuses_moved_refresh() {
+        // A refresh to another endpoint ends the transfer and revokes the rotated session.
+        let (base, seen) = serve(moved_session).await;
+        let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
+        let mut access = held_access(&base, soon);
+        let error = access.client().await.unwrap_err();
+        assert!(matches!(error, CliError::Routing(_)), "{error}");
+        let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
+        assert_eq!(held.map(String::as_str), Some("held"));
+        let lines = seen.lock().unwrap().clone();
+        assert!(lines[0].starts_with("POST ") && lines[0].contains("/held/refresh "));
+        assert!(lines[1].starts_with("DELETE ") && lines[1].contains("/moved "));
+    }
+
+    #[tokio::test]
+    async fn keeps_early_session() {
+        // A refresh the node finds too early keeps the held pair, which works until its expiry.
+        let (base, seen) = serve(early_refresh).await;
         let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
         let mut access = held_access(&base, soon);
         access.client().await.unwrap();
         let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
-        assert_eq!(held.map(String::as_str), Some("fresh"));
-        let lines = seen.lock().unwrap().clone();
-        assert!(lines[0].starts_with("POST ") && lines[0].contains("/held/refresh "));
-        assert!(lines[1].starts_with("POST ") && lines[1].contains("/access/s3/sessions "));
+        assert_eq!(held.map(String::as_str), Some("held"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 
     /// A new session at another endpoint; revokes answer empty.

@@ -223,7 +223,8 @@ impl Operation for MetadataPeerOperation {
                 result: result.child::<SubmissionAck, SubmissionRefusal>()?,
             },
             Asked::Inputs => Message::ResolvedJobInputs {
-                result: result.child::<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal>()?,
+                result: result
+                    .child::<Vec<(InputSelection, CapturedInput)>, SubmissionRefusal>()?,
             },
             Asked::Page => {
                 let page = result.child::<Option<Box<InputPage>>, PageReadError>()?;
