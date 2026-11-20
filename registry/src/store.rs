@@ -187,7 +187,9 @@ impl Store {
     /// not decode is an error, so it never passes for absent and drops the replay check.
     pub fn totals(&self, realm_id: &RealmId) -> Result<Option<RealmTotals>, StoreError> {
         let value = self.totals.get(realm_id.as_bytes())?;
-        Ok(value.map(|value| postcard::from_bytes(&value)).transpose()?)
+        Ok(value
+            .map(|value| postcard::from_bytes(&value))
+            .transpose()?)
     }
 
     /// The realm's entry while its lease runs.
@@ -364,7 +366,9 @@ impl Store {
             return Ok(0);
         };
         let (key, _) = last.into_inner()?;
-        let sequence = key.get(32..).and_then(|bytes| <[u8; 8]>::try_from(bytes).ok());
+        let sequence = key
+            .get(32..)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok());
         Ok(sequence.map_or(0, |sequence| u64::from_be_bytes(sequence).saturating_add(1)))
     }
 
@@ -531,10 +535,22 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let realm = realm_id();
-        store.entries.insert(realm.as_bytes(), vec![0xff, 0xff]).unwrap();
-        store.totals.insert(realm.as_bytes(), vec![0xff, 0xff]).unwrap();
-        assert!(matches!(store.entry(&realm, 1), Err(StoreError::Encoding(_))));
-        assert!(matches!(store.stored_entry(&realm), Err(StoreError::Encoding(_))));
+        store
+            .entries
+            .insert(realm.as_bytes(), vec![0xff, 0xff])
+            .unwrap();
+        store
+            .totals
+            .insert(realm.as_bytes(), vec![0xff, 0xff])
+            .unwrap();
+        assert!(matches!(
+            store.entry(&realm, 1),
+            Err(StoreError::Encoding(_))
+        ));
+        assert!(matches!(
+            store.stored_entry(&realm),
+            Err(StoreError::Encoding(_))
+        ));
         assert!(matches!(store.entries(1), Err(StoreError::Encoding(_))));
         assert!(matches!(store.totals(&realm), Err(StoreError::Encoding(_))));
     }
@@ -552,7 +568,9 @@ pub(crate) mod tests {
             ..AdminState::default()
         };
         for note in ["a", "b", "c"] {
-            store.update_admin(&realm, noted(note), "test", 101).unwrap();
+            store
+                .update_admin(&realm, noted(note), "test", 101)
+                .unwrap();
         }
         let mut first = realm.as_bytes().to_vec();
         first.extend_from_slice(&0u64.to_be_bytes());
@@ -576,7 +594,10 @@ pub(crate) mod tests {
         store.register(&realm, &entry(100, 100), 100).unwrap();
         let listed = store.listings(100).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!((listed[0].1.status, &listed[0].2), (RealmStatus::Listed, &None));
+        assert_eq!(
+            (listed[0].1.status, &listed[0].2),
+            (RealmStatus::Listed, &None)
+        );
         assert!(store.resolvable(100).unwrap().is_empty());
 
         let approved = AdminState {

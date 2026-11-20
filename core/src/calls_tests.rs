@@ -22,6 +22,7 @@ struct Script {
     mode: TransactionMode,
     then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
+    rolled_back: bool,
 }
 
 impl Script {
@@ -65,6 +66,10 @@ impl Operation for Script {
     fn abort(&mut self) -> Vec<IoCall> {
         std::mem::take(&mut self.cleanup)
     }
+
+    fn rolled_back(&mut self) {
+        self.rolled_back = true;
+    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -76,6 +81,7 @@ fn script(calls: Vec<IoCall>) -> Script {
         mode: TransactionMode::None,
         then: Vec::new(),
         cleanup: Vec::new(),
+        rolled_back: false,
     }
 }
 
@@ -524,6 +530,7 @@ fn conflict_marks_retry() {
         error: StorageError::TransactionConflict,
     };
     assert!(operation.step(Event::Storage(conflict)).is_empty());
+    assert!(operation.operation.rolled_back, "a refused commit is told");
     let Err(error) = operation.finalize() else {
         panic!("a lost commit fails");
     };
@@ -727,6 +734,65 @@ fn calls_after_commit() {
     // An abort now keeps the committed outcome.
     assert!(operation.abort().is_empty());
     assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
+}
+
+/// Collects the formatted logs of a test.
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut logs = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        logs.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn refused_wake_logged() {
+    let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Captured(sink.clone()))
+        .with_ansi(false)
+        .finish();
+    let _logged = tracing::subscriber::set_default(subscriber);
+    let wake = TaskEffect::ShortenTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::ZERO,
+    };
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::Effect(Box::new(Effect::Task(wake)))];
+    let mut operation = run(procedure, false);
+    assert_eq!(operation.start().len(), 1, "the wake is sent");
+    let refused = TaskEvent::Error {
+        key: Some(TaskKey::DrainAppliedSync),
+        message: "queue full".to_string(),
+    };
+    assert!(operation.step(Event::Task(refused)).is_empty());
+    assert_eq!(operation.finalize(), Ok(Vec::new()), "the outcome stays");
+    let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("A call after the commit failed"), "{logs}");
+    assert!(logs.contains("queue full"), "{logs}");
+}
+
+#[test]
+fn early_finalize_unfinished() {
+    let mut procedure = script(Vec::new());
+    procedure.then = vec![IoCall::Delay(Duration::from_secs(1))];
+    let mut operation = run(procedure, false);
+    assert_eq!(
+        operation.start().as_slice(),
+        &[Effect::Delay(Duration::from_secs(1))]
+    );
+    assert!(!operation.is_complete());
+    assert_eq!(operation.finalize(), Err(IoError::Unfinished));
 }
 
 #[test]

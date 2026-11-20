@@ -1335,7 +1335,9 @@ async fn resolve_global(
         .collect();
     // The routing operation chooses, asks and skips the holders; this only maps its answer.
     let request = location_request(state, auth, &object);
-    let left = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
+    let left = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis() as u64;
     let deadline_ms = unix_timestamp_millis().saturating_add(left);
     let routing = HolderResolveOperation::new(remote, request, version_id, deadline_ms);
     let outcome = match drive_until(routing, &context, deadline).await {

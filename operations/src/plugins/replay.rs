@@ -479,8 +479,8 @@ impl Operation for PlanReplay {
     }
 }
 
-/// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
-/// answers the rows read.
+/// Continues the replays in turn, one page of `page` rows each, a page per transaction, until
+/// `pages` pages were read in all; answers the rows read and whether a replay has more.
 #[derive(Debug, PartialEq)]
 pub struct RunReplays {
     now_ms: u64,
@@ -488,7 +488,7 @@ pub struct RunReplays {
     pages: usize,
     scan: Option<Scan>,
     keys: VecDeque<Vec<u8>>,
-    current: Option<(Vec<u8>, usize)>,
+    current: Option<Vec<u8>>,
     read: usize,
 }
 
@@ -509,28 +509,30 @@ impl RunReplays {
         IoCall::child(replay_page(key, self.now_ms, self.page))
     }
 
-    /// The next page of the next replay, or the end.
-    fn next_replay(&mut self) -> Next<usize> {
-        while let Some(key) = self.keys.pop_front() {
-            if self.pages > 0 {
-                self.current = Some((key.clone(), 1));
-                return Next::Call(self.page_of(key));
-            }
+    /// The next page of the next replay in turn, or the end once the pages are spent.
+    fn next_replay(&mut self) -> Next<(usize, bool)> {
+        if self.pages == 0 {
+            return Next::Done((self.read, !self.keys.is_empty()));
         }
-        Next::Done(self.read)
+        let Some(key) = self.keys.pop_front() else {
+            return Next::Done((self.read, false));
+        };
+        self.pages -= 1;
+        self.current = Some(key.clone());
+        Next::Call(self.page_of(key))
     }
 }
 
 impl Operation for RunReplays {
-    type Output = usize;
+    type Output = (usize, bool);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+    fn first(&mut self) -> Result<Next<(usize, bool)>, StoreError> {
         let scan = self.scan.as_ref().ok_or(IoError::Unfinished)?;
         Ok(Next::Call(scan.ask()))
     }
 
-    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<(usize, bool)>, StoreError> {
         if let Some(scan) = self.scan.as_mut() {
             let Some(rows) = scan.take(answer)? else {
                 return Ok(Next::Call(scan.ask()));
@@ -541,12 +543,11 @@ impl Operation for RunReplays {
         }
         let (rows, ended) = answer.child::<(usize, bool), StoreError>()??;
         self.read += rows;
-        let (key, done_pages) = self.current.take().ok_or(IoError::Unfinished)?;
-        if ended || done_pages >= self.pages {
-            return Ok(self.next_replay());
+        let key = self.current.take().ok_or(IoError::Unfinished)?;
+        if !ended {
+            self.keys.push_back(key);
         }
-        self.current = Some((key.clone(), done_pages + 1));
-        Ok(Next::Call(self.page_of(key)))
+        Ok(self.next_replay())
     }
 }
 

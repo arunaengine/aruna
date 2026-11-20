@@ -75,7 +75,8 @@ fn send(
     checked(host.elab(&request)?)
 }
 
-/// One page of tagged experiments.
+/// One page of tagged experiments. A page that is no list, or an entry without its paging
+/// fields, fails the call, so a pass stays at this page instead of skipping past it.
 pub fn list(host: &dyn Host, tag: &str, order: Order, offset: u64) -> Result<Vec<Listed>> {
     let (order, sort) = match order {
         Order::Changed => ("lastchange", "desc"),
@@ -92,8 +93,16 @@ pub fn list(host: &dyn Host, tag: &str, order: Order, offset: u64) -> Result<Vec
     .map(|(name, value)| (name.to_string(), value))
     .into();
     let entries = json(&checked(host.elab(&request)?)?)?;
-    let entries = entries.as_array().map(Vec::as_slice).unwrap_or_default();
-    Ok(entries.iter().filter_map(listed).collect())
+    let entries = (entries.as_array())
+        .ok_or_else(|| Fault::new(Kind::Invalid, "eLabFTW answered a listing that is no list"))?;
+    (entries.iter().enumerate())
+        .map(|(position, entry)| {
+            listed(entry).ok_or_else(|| {
+                let message = format!("eLabFTW listing entry {position} has no id or change time");
+                Fault::new(Kind::Invalid, message)
+            })
+        })
+        .collect()
 }
 
 fn listed(entry: &Value) -> Option<Listed> {

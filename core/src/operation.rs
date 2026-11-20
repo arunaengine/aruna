@@ -69,6 +69,10 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         Vec::new()
     }
 
+    /// The commit was refused for certain, so nothing the run wrote holds; the runner calls this
+    /// right before `abort`. An unknown commit outcome never calls it.
+    fn rolled_back(&mut self) {}
+
     /// The runner's clock in Unix milliseconds, given right before `first` and each `next`.
     /// An operation that needs the time keeps it here instead of reading a clock; tests forge it.
     fn stamp(&mut self, _now_ms: u64) {}

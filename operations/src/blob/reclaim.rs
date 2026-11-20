@@ -25,6 +25,9 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
 use crate::groups::backends::backend_key;
+
+/// Hash aliases read per page; the next page continues after the last one.
+const ALIAS_PAGE: usize = 256;
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::structs::storage::cleanup::schedule_cleanup_effect;
 
@@ -211,7 +214,7 @@ impl ReclaimBlobOperation {
             space: PATHS_INDEX_KEYSPACE.to_string(),
             prefix: HashIndex::hash_prefix(&self.key.blake3)?.into(),
             after: start,
-            limit: usize::MAX,
+            limit: ALIAS_PAGE,
         };
         self.call(ReclaimState::ScanAliases, page)
     }
@@ -673,6 +676,31 @@ mod tests {
                 .await
                 .is_some()
         );
+    }
+
+    #[test]
+    fn alias_scan_bounded() {
+        let mut reclaim = reclaim_op(candidate_key());
+        let Ok(Next::Call(IoCall::Page { limit, .. })) = reclaim.scan_aliases(None) else {
+            panic!("expected an alias page");
+        };
+        assert_eq!(limit, ALIAS_PAGE);
+    }
+
+    #[tokio::test]
+    async fn later_page_pins() {
+        // A live alias past the first page still keeps the copy.
+        let dir = tempdir().unwrap();
+        let context = path_context(dir.path().to_str().unwrap());
+        seed(&context, 10).await;
+        for n in 0..ALIAS_PAGE as u128 {
+            add_alias(&context, Ulid::from_parts(1, n), false).await;
+        }
+        add_alias(&context, Ulid::from_parts(2, 0), true).await;
+
+        let verdict = drive(reclaim_op(candidate_key()), &context).await.unwrap();
+
+        assert_eq!(verdict, ReclaimVerdict::Pinned);
     }
 
     #[tokio::test]

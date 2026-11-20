@@ -895,6 +895,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
+ "http",
  "iroh",
  "lettre",
  "reqwest 0.13.5",
@@ -1029,6 +1030,7 @@ version = "3.0.0-alpha.207"
 dependencies = [
  "aruna-core",
  "async-trait",
+ "futures-util",
  "iroh",
  "tempfile",
  "tokio",

@@ -267,13 +267,14 @@ pub fn reusable_parts(
     md5s: &[String],
     stored: &[StoredPart],
 ) -> Vec<Option<String>> {
+    let by_number: std::collections::HashMap<i32, &StoredPart> =
+        stored.iter().map(|held| (held.number, held)).collect();
     parts
         .iter()
         .zip(md5s)
         .map(|(part, md5)| {
-            stored
-                .iter()
-                .find(|held| held.number == part.number && held.size == part.length)
+            (by_number.get(&part.number))
+                .filter(|held| held.size == part.length)
                 .filter(|held| held.etag.trim_matches('"').eq_ignore_ascii_case(md5))
                 .map(|held| held.etag.clone())
         })
@@ -301,18 +302,6 @@ fn digest_file(path: &Path, parts: &[Part]) -> std::io::Result<(String, Vec<Stri
     Ok((whole.finalize().to_hex().to_string(), md5s))
 }
 
-pub async fn hash_file(path: &Path) -> Result<String, CliError> {
-    let path = path.to_path_buf();
-    let digest = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update_reader(std::fs::File::open(path)?)?;
-        Ok(hasher.finalize().to_hex().to_string())
-    })
-    .await
-    .map_err(|error| CliError::Io(std::io::Error::other(error)))??;
-    Ok(digest)
-}
-
 /// What an upload sent and how much of it an earlier attempt had already stored.
 #[derive(Clone, Debug, Serialize)]
 pub struct Uploaded {
@@ -333,10 +322,16 @@ pub async fn upload(
     let size = tokio::fs::metadata(path).await?.len();
     let client = access.client().await?;
     if size <= part_size {
-        let blake3 = hash_file(path).await?;
-        let body = ByteStream::from_path(path)
-            .await
-            .map_err(|error| CliError::S3(error.to_string()))?;
+        // One read is hashed and sent, so the reported digest and size are of the sent bytes.
+        let bytes = tokio::fs::read(path).await?;
+        let (bytes, blake3) = tokio::task::spawn_blocking(move || {
+            let blake3 = blake3::hash(&bytes).to_hex().to_string();
+            (bytes, blake3)
+        })
+        .await
+        .map_err(|error| CliError::Io(std::io::Error::other(error)))?;
+        let size = bytes.len() as u64;
+        let body = ByteStream::from(bytes);
         client
             .put_object()
             .bucket(bucket)
@@ -397,6 +392,7 @@ pub async fn upload(
             && let Some(done) = tasks.join_next().await
         {
             let (number, etag) = joined(done)?;
+            check_part(&md5s, (number, &etag), path)?;
             etags[number as usize - 1] = Some(etag);
         }
         let client = access.client().await?;
@@ -407,6 +403,7 @@ pub async fn upload(
     }
     while let Some(done) = tasks.join_next().await {
         let (number, etag) = joined(done)?;
+        check_part(&md5s, (number, &etag), path)?;
         etags[number as usize - 1] = Some(etag);
     }
     let completed: Vec<CompletedPart> = parts
@@ -489,6 +486,26 @@ fn keep_id(record: &mut std::fs::File, upload_id: &str) -> std::io::Result<()> {
     record.rewind()?;
     record.write_all(upload_id.as_bytes())?;
     record.sync_all()
+}
+
+/// A part's ETag is the MD5 of the bytes the node stored; another MD5 than the hashed one means
+/// the file changed while it was sent, so the hashed digest would not describe the upload.
+fn check_part(md5s: &[String], (number, etag): (i32, &str), path: &Path) -> Result<(), CliError> {
+    let expected = (number as usize)
+        .checked_sub(1)
+        .and_then(|index| md5s.get(index));
+    let etag = etag.trim_matches('"');
+    match expected {
+        Some(expected) if expected.eq_ignore_ascii_case(etag) => Ok(()),
+        expected => Err(CliError::Checksum {
+            path: path.display().to_string(),
+            expected: format!(
+                "part {number} with MD5 {}",
+                expected.map_or("", String::as_str)
+            ),
+            actual: etag.to_string(),
+        }),
+    }
 }
 
 fn joined(
@@ -677,6 +694,19 @@ mod tests {
             parts.iter().map(|part| part.length).sum::<u64>(),
             MAX_PARTS * 100 + 1
         );
+    }
+
+    #[test]
+    fn changed_part_refused() {
+        // A part whose stored MD5 differs from the hashed one fails the upload.
+        let md5s = vec!["aa".to_string(), "bb".to_string()];
+        let path = Path::new("data.bin");
+        assert!(check_part(&md5s, (2, "\"BB\""), path).is_ok());
+        assert!(matches!(
+            check_part(&md5s, (1, "\"cc\""), path),
+            Err(CliError::Checksum { .. })
+        ));
+        assert!(check_part(&md5s, (3, "\"aa\""), path).is_err());
     }
 
     #[test]

@@ -95,11 +95,13 @@ fn write_files(
             writer.entry(format!("{path}/").as_bytes(), &[])?;
             write_files(writer, &entry.path(), &format!("{path}/"), None)?;
         } else if file_type.is_file() {
-            match std::fs::read(entry.path()) {
-                Ok(bytes) => writer.entry(path.as_bytes(), &bytes)?,
+            let file = match std::fs::File::open(entry.path()) {
+                Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
-            }
+            };
+            let len = file.metadata()?.len();
+            writer.entry_from(path.as_bytes(), len, file)?;
         }
     }
     Ok(())

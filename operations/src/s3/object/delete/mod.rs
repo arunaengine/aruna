@@ -54,6 +54,9 @@ use ulid::Ulid;
 mod abe;
 pub mod bulk;
 
+/// Versions of a key read per page while a head delete looks for its replacement.
+const VERSION_PAGE: usize = 256;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteObjectState {
     CheckPurgeFence,
@@ -495,22 +498,26 @@ impl DeleteObjectOperation {
         self.read_all_versions()
     }
 
+    /// The head is read first: only a delete of the head needs the newest remaining version.
     fn read_all_versions(&mut self) -> Turn {
-        // A purge removes the whole key, so its head needs no older replacement.
-        if self.purge.is_some() {
-            return self.read_current_lookup(self.target_id()?);
-        }
+        self.read_current_lookup(self.target_id()?)
+    }
+
+    /// One page of the key's versions, after the version key `after`.
+    fn scan_versions(&mut self, after: Option<Key>) -> Turn {
         let prefix = VersionKey::object_prefix(&self.input.bucket, &self.input.key)?;
         let page = IoCall::Page {
             space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: prefix.into(),
-            after: None,
-            limit: usize::MAX,
+            after,
+            limit: VERSION_PAGE,
         };
         self.call(DeleteObjectState::ReadAllVersions, page)
     }
 
-    fn versions_read(&mut self, values: Vec<(Key, Value)>) -> Turn {
+    /// Keeps the newest version other than the target, page by page; the last page replaces
+    /// the head with it.
+    fn versions_read(&mut self, (values, next): (Vec<(Key, Value)>, Option<Key>)) -> Turn {
         let target_version_id = self.target_id()?;
         // An unreadable surviving version stops the delete, so no older head replaces it.
         let remaining = values
@@ -527,14 +534,14 @@ impl DeleteObjectOperation {
                 )))
             })
             .collect::<Result<Vec<_>, ConversionError>>()?;
-        let remaining = remaining.into_iter().flatten();
-        self.latest_remaining = remaining.max_by_key(|summary| summary.version_id);
-        let replacement_version_id = self
-            .latest_remaining
-            .as_ref()
-            .map(|metadata| metadata.version_id)
-            .unwrap_or(target_version_id);
-        self.read_current_lookup(replacement_version_id)
+        let newest = remaining.into_iter().flatten();
+        let kept = self.latest_remaining.take();
+        self.latest_remaining = newest.chain(kept).max_by_key(|summary| summary.version_id);
+        if next.is_some() {
+            return self.scan_versions(next);
+        }
+        let existing = self.existing_pointer.clone();
+        self.replace_head(existing.as_ref())
     }
 
     fn read_current_lookup(&mut self, version_id: Ulid) -> Turn {
@@ -593,6 +600,14 @@ impl DeleteObjectOperation {
         if existing.is_none_or(|pointer| pointer.version_id != target_version_id) {
             return self.delete_target_version();
         }
+        // A purge removes the whole key, so its head needs no older replacement.
+        if self.purge.is_some() {
+            return self.replace_head(existing);
+        }
+        self.scan_versions(None)
+    }
+
+    fn replace_head(&mut self, existing: Option<&CurrentVersionPointer>) -> Turn {
         match self
             .latest_remaining
             .as_ref()
@@ -1062,7 +1077,7 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::ReadVersionBucket => self.version_bucket_read(result.value()?),
             DeleteObjectState::ReadTargetVersion => self.target_version_read(result.value()?),
             DeleteObjectState::ReadTargetLocation => self.target_location_read(result.value()?),
-            DeleteObjectState::ReadAllVersions => self.versions_read(result.page()?.0),
+            DeleteObjectState::ReadAllVersions => self.versions_read(result.page()?),
             DeleteObjectState::ReadCurrentLookup => self.current_lookup_read(result.value()?),
             DeleteObjectState::ReadLivenessVersion => self.liveness_read(result.value()?),
             DeleteObjectState::WriteHead => {
