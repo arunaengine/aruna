@@ -85,16 +85,50 @@ impl StartCountOperation {
     }
 }
 
-/// The positions of node counts from another run than the one a distributed count reports: the
-/// run its start gave, else the newest any node holds. A node without a count is in every run.
-pub fn other_runs(started: Option<Ulid>, runs: &[Option<Ulid>]) -> Vec<usize> {
-    let Some(current) = started.or_else(|| runs.iter().flatten().max().copied()) else {
+/// The run a distributed count reports: the one asked for, else the newest any coordinator holds.
+/// Only nodes mint runs, so the newest id is the latest start.
+pub fn current_run(wanted: Option<Ulid>, runs: &[Option<Ulid>]) -> Option<Ulid> {
+    wanted.or_else(|| runs.iter().flatten().max().copied())
+}
+
+/// The positions of coordinator counts outside `current`; once a run is known, a coordinator
+/// without a count missed it.
+pub fn other_runs(current: Option<Ulid>, runs: &[Option<Ulid>]) -> Vec<usize> {
+    let Some(current) = current else {
         return Vec::new();
     };
     (runs.iter().enumerate())
-        .filter(|(_, run)| run.is_some_and(|run| run != current))
+        .filter(|(_, run)| **run != Some(current))
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Mints the run a distributed count starts on every coordinator, before the first one starts.
+#[derive(Debug, Default, PartialEq)]
+pub struct MintRunOperation {
+    ids: IdMint,
+    now_ms: u64,
+}
+
+impl Operation for MintRunOperation {
+    type Output = Ulid;
+    type Error = StartCountError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<Ulid>, StartCountError> {
+        Ok(Next::Done(self.ids.mint(self.now_ms)))
+    }
+
+    fn next(&mut self, _result: IoResult) -> Result<Next<Ulid>, StartCountError> {
+        Err(StartCountError::Io(IoError::Unfinished))
+    }
 }
 
 impl Operation for StartCountOperation {
@@ -151,16 +185,19 @@ impl Operation for StartCountOperation {
     }
 }
 
-/// Reads the saved count of `bucket` on this node.
+/// Reads the saved count of `bucket` on this node; when `run` is given, a count of another run
+/// reads as none.
 #[derive(Debug, PartialEq)]
 pub struct ReadCountOperation {
     bucket: String,
+    run: Option<Ulid>,
 }
 
 impl ReadCountOperation {
-    pub fn new(bucket: &str) -> Self {
+    pub fn new(bucket: &str, run: Option<Ulid>) -> Self {
         Self {
             bucket: bucket.to_string(),
+            run,
         }
     }
 }
@@ -175,7 +212,9 @@ impl Operation for ReadCountOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Option<CoverageCount>>, StartCountError> {
-        Ok(Next::Done(decode_count(result.value()?)?))
+        let count = decode_count(result.value()?)?;
+        let wanted = |count: &CoverageCount| self.run.is_none_or(|run| count.run == Some(run));
+        Ok(Next::Done(count.filter(wanted)))
     }
 }
 
@@ -410,8 +449,8 @@ impl Operation for StoreCountOperation {
         match self.step {
             StoreStep::Current => {
                 let stored = decode_count(result.value()?)?;
-                let started = self.record.started_at_ms;
-                if stored.is_none_or(|stored| stored.started_at_ms != started) {
+                let current = (self.record.started_at_ms, self.record.run);
+                if stored.is_none_or(|stored| (stored.started_at_ms, stored.run) != current) {
                     return Ok(Next::Done(()));
                 }
                 self.step = StoreStep::Written;
