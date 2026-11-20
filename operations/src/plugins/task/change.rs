@@ -13,6 +13,7 @@ use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use ulid::Ulid;
 
 use super::super::rows::{StoreError, decode, delete_call, encode, read_call, row, values};
+use super::send::{Sent, decide};
 use aruna_core::install_work::{
     FinalState, Found, SendBoundary, Summary, WorkLookup, WorkRow, WorkState, index_key,
 };
@@ -43,6 +44,9 @@ pub enum TaskChange {
     },
     /// What a send proved, applied to a reserved row.
     Record(SendOutcome),
+    /// The answer to send `attempt`, decided against the rows read here: a refusal fails the row
+    /// only while that first attempt is still the last one marked and no answer was lost.
+    Sent { attempt: u32, sent: Sent },
     /// A removed install's settled row goes with its keys.
     Drop,
     /// A reservation that was never sent goes, if it is still unsent.
@@ -175,7 +179,10 @@ impl ChangeTask {
                 self.put((key, &row), &task, Changed::settled(true))
             }
             TaskChange::Settle(_) => unchanged(true),
-            TaskChange::Mark { .. } | TaskChange::Record(_) | TaskChange::End { .. }
+            TaskChange::Mark { .. }
+            | TaskChange::Record(_)
+            | TaskChange::Sent { .. }
+            | TaskChange::End { .. }
                 if !reserved =>
             {
                 unchanged(false)
@@ -208,6 +215,13 @@ impl ChangeTask {
                     marked,
                 };
                 self.put((key, &row), &task, changed)
+            }
+            TaskChange::Sent { attempt, sent } => {
+                let current = row.boundary == Some(SendBoundary::Sending { attempt });
+                let outcome = decide(attempt, task.uncertain || !current, sent);
+                let settled = matches!(outcome, SendOutcome::Fail(_));
+                apply_outcome((&mut row, &mut task), outcome, self.now_ms);
+                self.put((key, &row), &task, Changed::settled(settled))
             }
             TaskChange::Record(outcome) => {
                 let settled = matches!(outcome, SendOutcome::Fail(_));

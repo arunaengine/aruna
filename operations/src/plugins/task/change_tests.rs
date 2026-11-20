@@ -134,6 +134,37 @@ fn end_keeps_claimed() {
     assert_eq!(edit.next(found), Ok(Next::Done(Changed::settled(false))));
 }
 
+// A refusal of the first send fails the row only while that send is still the last one marked
+// and no answer was lost; after a resend was marked, the late refusal proves nothing.
+#[test]
+fn late_refusal_kept() {
+    let recorded = |attempt_marked: u32, uncertain: bool| {
+        let mut row = reserved();
+        row.boundary = Some(SendBoundary::Sending {
+            attempt: attempt_marked,
+        });
+        let task = TaskRow {
+            uncertain,
+            ..TaskRow::default()
+        };
+        let refused = Sent::Refused("quota".to_string());
+        let change = TaskChange::Sent {
+            attempt: 1,
+            sent: refused,
+        };
+        let (_, next) = applied(change, &row, Some(task));
+        let Ok(Next::Call(IoCall::Write(rows))) = next else {
+            panic!("the answer is recorded");
+        };
+        let row: WorkRow = decode(&rows[0].2).unwrap();
+        let task: TaskRow = decode(&rows[1].2).unwrap();
+        (row.state, task.uncertain)
+    };
+    assert_eq!(recorded(1, false), (WorkState::Settled, false));
+    assert_eq!(recorded(2, false), (WorkState::Reserved, true));
+    assert_eq!(recorded(1, true), (WorkState::Reserved, true));
+}
+
 #[test]
 fn settle_keeps_report() {
     let mut dispatched = reserved();

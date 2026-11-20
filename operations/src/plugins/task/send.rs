@@ -99,7 +99,7 @@ enum SendPhase {
     ),
     Pages(Box<(RealmConfigDocument, TaskSubmission)>),
     Mark(Box<(RealmConfigDocument, TaskSubmission)>),
-    Send(JobFamilyId, (u32, bool)),
+    Send(JobFamilyId, u32),
     Record,
 }
 
@@ -261,7 +261,7 @@ impl SendTask {
         let token = AuthToken::Internal(auth);
         let send = send_task_job(&submission, (&config, &self.node), token, &mut self.mint);
         let send = send.map_err(prepare_error)?;
-        self.phase = SendPhase::Send(submission.identity.family(), marked);
+        self.phase = SendPhase::Send(submission.identity.family(), marked.0);
         Ok(Next::Call(send))
     }
 }
@@ -327,10 +327,12 @@ impl Operation for SendTask {
                     None => Ok(Next::Done(())),
                 }
             }
-            SendPhase::Send(family, (attempt, uncertain)) => {
+            // The recording transaction decides: a resend marked meanwhile makes a refusal of
+            // this attempt prove nothing.
+            SendPhase::Send(family, attempt) => {
                 let answer = result.child::<AcceptedSubmission, SubmitJobError>()?;
-                let outcome = decide(attempt, uncertain, classify(answer, family));
-                let record = TaskChange::Record(outcome);
+                let sent = classify(answer, family);
+                let record = TaskChange::Sent { attempt, sent };
                 let record = ChangeTask::new(self.ids(), record, self.node.now_ms);
                 Ok(Next::Call(IoCall::child(record)))
             }
