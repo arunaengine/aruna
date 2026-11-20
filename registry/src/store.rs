@@ -40,6 +40,9 @@ pub struct NameRecord {
     pub since: u64,
 }
 
+/// A listed realm's entry, admin state and latest totals.
+pub type Listed = (Entry, AdminState, Option<RealmTotals>);
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("issued_at is not newer than the last accepted one")]
@@ -200,6 +203,41 @@ impl Store {
         let mut entries = self.all_entries()?;
         entries.retain(|entry| leased(entry, now));
         Ok(entries)
+    }
+
+    /// Every realm the public listing shows, in realm id order: a leased entry whose admin state
+    /// is listed, with that state and the realm's totals, read in one pass over the entries.
+    pub fn listings(&self, now: u64) -> Result<Vec<Listed>, StoreError> {
+        let mut listed = Vec::new();
+        for item in self.entries.iter() {
+            let (_, value) = item.into_inner()?;
+            let entry = decode_entry(&value)?;
+            if !leased(&entry, now) {
+                continue;
+            }
+            let realm_id = entry.registration.payload.descriptor.payload.realm_id;
+            let admin = self.admin(&realm_id)?;
+            if admin.listed() {
+                let totals = self.totals(&realm_id)?;
+                listed.push((entry, admin, totals));
+            }
+        }
+        Ok(listed)
+    }
+
+    /// Every leased entry the resolver may send identifiers to, in realm id order, read in one
+    /// pass over the entries.
+    pub fn resolvable(&self, now: u64) -> Result<Vec<Entry>, StoreError> {
+        let mut resolvable = Vec::new();
+        for item in self.entries.iter() {
+            let (_, value) = item.into_inner()?;
+            let entry = decode_entry(&value)?;
+            let realm_id = entry.registration.payload.descriptor.payload.realm_id;
+            if leased(&entry, now) && self.may_resolve(&realm_id)? == ResolveGate::Allowed {
+                resolvable.push(entry);
+            }
+        }
+        Ok(resolvable)
     }
 
     /// Every stored entry, also those whose lease ended, in realm id order.
@@ -524,6 +562,39 @@ pub(crate) mod tests {
             .map(|record| record.after.note)
             .collect();
         assert_eq!(notes, ["b", "c", "d"]);
+    }
+
+    // The listing and the resolver read each entry once with its admin state and keep their
+    // gates: the listing shows listed realms with their totals, the resolver approved ones, and
+    // neither an entry whose lease ended.
+    #[test]
+    fn single_pass_gates() {
+        use crate::admin::RealmStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = realm_id();
+        store.register(&realm, &entry(100, 100), 100).unwrap();
+        let listed = store.listings(100).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].1.status, &listed[0].2), (RealmStatus::Listed, &None));
+        assert!(store.resolvable(100).unwrap().is_empty());
+
+        let approved = AdminState {
+            status: RealmStatus::Approved,
+            ..AdminState::default()
+        };
+        store.update_admin(&realm, approved, "test", 101).unwrap();
+        assert_eq!(store.resolvable(101).unwrap().len(), 1);
+        let expired = 100 + LEASE_SECS;
+        assert!(store.listings(expired).unwrap().is_empty());
+        assert!(store.resolvable(expired).unwrap().is_empty());
+
+        let hidden = AdminState {
+            status: RealmStatus::Hidden,
+            ..AdminState::default()
+        };
+        store.update_admin(&realm, hidden, "test", 102).unwrap();
+        assert!(store.listings(102).unwrap().is_empty());
     }
 
     #[test]

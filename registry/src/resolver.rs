@@ -478,13 +478,14 @@ impl Resolver {
         P: Fn(Url, Source) -> F,
         F: Future<Output = Holding>,
     {
-        let mut approved = Vec::new();
-        for entry in self.registry.store.entries(now)? {
-            let realm = entry.registration.payload.descriptor.payload.realm_id;
-            if self.registry.store.may_resolve(&realm)? == ResolveGate::Allowed {
-                approved.push((realm, entry));
-            }
-        }
+        // The store reads block, so they run on the blocking pool instead of a request worker.
+        let registry = Arc::clone(&self.registry);
+        let resolvable = tokio::task::spawn_blocking(move || registry.store.resolvable(now))
+            .await
+            .map_err(|_| StoreError::Poisoned)??;
+        let mut approved: Vec<_> = (resolvable.into_iter())
+            .map(|entry| (entry.registration.payload.descriptor.payload.realm_id, entry))
+            .collect();
         approved.sort_by_key(|(realm, _)| Some(*realm) != self.default_realm);
         let targets = futures::stream::iter(approved)
             .map(|(realm, entry)| async move {
