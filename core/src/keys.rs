@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#[cfg(any(test, feature = "test-hooks"))]
 use ed25519_dalek::SigningKey;
 
 use crate::id::{DhtKeyId, NodeId};

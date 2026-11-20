@@ -22,8 +22,8 @@ pub const S3_REGION: &str = "us-east-1";
 const MAX_PARTS: u64 = 10_000;
 const PART_UPLOADS: usize = 4;
 const PARTIAL_SUFFIX: &str = ".aruna-part";
-/// The message of the node's refusal to refresh a session before its refresh window.
-const REFRESH_TOO_EARLY: &str = "session refresh is not available yet";
+/// The message of the node's refusal to refresh an expired session.
+const SESSION_EXPIRED: &str = "session has expired";
 const REFRESH_BEFORE: chrono::TimeDelta =
     chrono::TimeDelta::seconds(CLIENT_REFRESH_WINDOW.as_secs() as i64);
 
@@ -218,10 +218,10 @@ impl S3Access {
                 return self.adopt(fresh).await;
             }
             Err(error) => {
-                // Only a refresh the node finds too early keeps the old pair until its expiry; an
-                // expired, swept or evicted session is taken again.
+                // A lapsed, expired, swept or evicted session is taken again. Any other failure
+                // keeps the old pair, as a new session can evict another transfer's at the limit.
                 let lapsed = expires_within(&token.expires_at, chrono::Utc::now(), zero);
-                if lapsed || !too_early(&error) {
+                if lapsed || session_gone(&error) {
                     return self.reacquire().await;
                 }
             }
@@ -260,12 +260,12 @@ impl S3Access {
     }
 }
 
-/// Whether the node refused a refresh only because the refresh window has not begun.
-fn too_early(error: &CliError) -> bool {
+/// Whether the node refused a refresh because it no longer holds the session or it expired.
+fn session_gone(error: &CliError) -> bool {
     let CliError::Api(error) = error else {
         return false;
     };
-    error.status == 409 && error.body.error == REFRESH_TOO_EARLY
+    error.status == 404 || (error.status == 409 && error.body.error == SESSION_EXPIRED)
 }
 
 fn cannot_refresh(expires_at: &str) -> CliError {
@@ -1059,7 +1059,7 @@ mod tests {
 
     /// A refresh refused as expired.
     fn refused_refresh(line: &str) -> (u16, String) {
-        refusing(line, 409, "session has expired")
+        refusing(line, 409, SESSION_EXPIRED)
     }
 
     /// A refresh of a session the node swept or evicted.
@@ -1072,7 +1072,12 @@ mod tests {
 
     /// A refresh before the node's refresh window.
     fn early_refresh(line: &str) -> (u16, String) {
-        refusing(line, 409, REFRESH_TOO_EARLY)
+        refusing(line, 409, "session refresh is not available yet")
+    }
+
+    /// A refresh that fails for a while on the node.
+    fn failed_refresh(line: &str) -> (u16, String) {
+        refusing(line, 503, "Service unavailable")
     }
 
     #[tokio::test]
@@ -1108,15 +1113,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_early_session() {
-        // A refresh the node finds too early keeps the held pair, which works until its expiry.
-        let (base, seen) = serve(early_refresh).await;
-        let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
-        let mut access = held_access(&base, soon);
-        access.client().await.unwrap();
-        let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
-        assert_eq!(held.map(String::as_str), Some("held"));
-        assert_eq!(seen.lock().unwrap().len(), 1);
+    async fn keeps_live_session() {
+        // An early or failed refresh keeps the held pair, which works until its expiry, and
+        // takes no new session that could evict another transfer's.
+        let replies: [Reply; 2] = [early_refresh, failed_refresh];
+        for reply in replies {
+            let (base, seen) = serve(reply).await;
+            let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
+            let mut access = held_access(&base, soon);
+            access.client().await.unwrap();
+            let held = (access.session.as_ref()).map(|session| &session.token.access_key_id);
+            assert_eq!(held.map(String::as_str), Some("held"));
+            assert_eq!(seen.lock().unwrap().len(), 1);
+        }
     }
 
     /// A new session at another endpoint; revokes answer empty.

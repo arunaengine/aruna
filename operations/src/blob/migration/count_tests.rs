@@ -51,8 +51,9 @@ fn value(bytes: Option<Vec<u8>>) -> IoResult {
 
 #[test]
 fn start_queues_count() {
-    let mut start = StartCountOperation::new("photos".to_string());
+    let mut start = StartCountOperation::new("photos".to_string(), None);
     start.stamp(7);
+    start.seed(5);
     assert_eq!(start.transaction(), TransactionMode::Write);
     assert!(matches!(start.first(), Ok(Next::Call(IoCall::Read(_)))));
     let Ok(Next::Call(IoCall::Write(rows))) = start.next(value(Some(b"bucket".to_vec()))) else {
@@ -61,17 +62,49 @@ fn start_queues_count() {
     let spaces: Vec<&str> = rows.iter().map(|(space, _, _)| space.as_str()).collect();
     assert_eq!(spaces, [COVERAGE_COUNT_KEYSPACE, COUNT_QUEUE_KEYSPACE]);
     let written = CoverageCount::from_bytes(rows[0].2.as_ref()).unwrap();
-    assert_eq!(written, CoverageCount::new(7));
+    let minted = CoverageCount {
+        run: Some(Ulid::from_parts(7, 5)),
+        ..CoverageCount::new(7)
+    };
+    assert_eq!(written, minted);
     // The migration task wakes only after the commit.
     let Ok(Next::Then { output, calls }) = start.next(IoResult::Done) else {
         panic!("the count answers with the wake");
     };
-    assert_eq!((output, calls.len()), (CoverageCount::new(7), 1));
+    assert_eq!((output, calls.len()), (minted, 1));
+}
+
+// Every coordinator a distributed start reaches saves the run it was given.
+#[test]
+fn start_joins_run() {
+    let run = Ulid::from_parts(3, 9);
+    let mut start = StartCountOperation::new("photos".to_string(), Some(run));
+    start.stamp(7);
+    start.seed(5);
+    start.first().unwrap();
+    let Ok(Next::Call(IoCall::Write(rows))) = start.next(value(Some(b"bucket".to_vec()))) else {
+        panic!("the record and the queue entry are written");
+    };
+    let written = CoverageCount::from_bytes(rows[0].2.as_ref()).unwrap();
+    assert_eq!(written.run, Some(run));
+    let first = add_page(written, &report(3, 10, 2, Some(b"k")), 20);
+    let restarted = add_page(first, &report(4, 10, 0, Some(b"m")), 20);
+    assert_eq!((restarted.observed, restarted.run), (0, Some(run)));
+}
+
+// A coordinator a start missed still holds its previous run; that count leaves the answer.
+#[test]
+fn other_runs_dropped() {
+    let (old, new) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+    let runs = [Some(new), Some(old), None, Some(new)];
+    assert_eq!(other_runs(None, &runs), [1]);
+    assert_eq!(other_runs(Some(old), &runs), [0, 3]);
+    assert!(other_runs(None, &[None, None]).is_empty());
 }
 
 #[test]
 fn missing_bucket_refused() {
-    let mut start = StartCountOperation::new("photos".to_string());
+    let mut start = StartCountOperation::new("photos".to_string(), None);
     start.first().unwrap();
     assert_eq!(start.next(value(None)), Err(StartCountError::NoSuchBucket));
 }

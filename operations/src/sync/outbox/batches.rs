@@ -23,6 +23,7 @@ pub const DRAIN_SUBBATCH_RECORDS: usize = 512;
 
 /// Records sent to the same peers together: the documents to publish, empty for records this
 /// process already published, and per record its topic, admin origin, target and key.
+#[derive(Debug, PartialEq)]
 pub struct DrainSubBatch {
     pub peers: Vec<NodeId>,
     pub documents: Vec<DocumentSyncPublish>,
