@@ -449,6 +449,8 @@ impl SchedulerState {
 
     fn cancel_timer(&mut self, key: TaskKey) -> TaskEvent {
         self.remove_timer(&key);
+        // A firing that waited for a running handler is cancelled too, so no run follows it.
+        self.refire_requested.remove(&key);
         TaskEvent::TimerCancelled { key }
     }
 
@@ -2302,6 +2304,21 @@ mod decision_tests {
             !state.timers_by_key.contains_key(&key),
             "a timer dispatches at its deadline"
         );
+    }
+
+    // A cancellation acknowledged while a handler runs also drops the firing that waited for it.
+    #[test]
+    fn cancel_drops_refire() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.in_flight_keys.insert(key.clone(), 1);
+        state.reset_timer((key.clone(), None), Duration::ZERO, start);
+        let (tx, _rx) = mpsc::channel(1);
+        state.dispatch_due_timers(start, &tx.downgrade());
+        assert!(state.refire_requested.contains_key(&key), "the firing waits");
+        state.cancel_timer(key.clone());
+        assert!(!state.refire_requested.contains_key(&key), "no run follows the cancel");
     }
 
     #[test]
