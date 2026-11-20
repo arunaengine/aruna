@@ -56,7 +56,10 @@ async fn refusal_text(mut response: Response) -> String {
     let mut body = Vec::new();
     while body.len() < MAX_REFUSAL_BYTES {
         match response.chunk().await {
-            Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+            Ok(Some(chunk)) => {
+                let room = MAX_REFUSAL_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            }
             Ok(None) | Err(_) => break,
         }
     }
@@ -227,6 +230,14 @@ mod tests {
 
     async fn send(request: MemberFetch) -> MemberAnswer {
         fetch_member(request, Arc::new(NoSeal)).await
+    }
+
+    #[tokio::test]
+    async fn refusal_text_bounded() {
+        let chunks = [vec![b'a'; 60_000], vec![b'b'; 10_000]];
+        let body = Body::wrap_stream(stream::iter(chunks.map(Ok::<_, io::Error>)));
+        let text = refusal_text(Response::from(http::Response::new(body))).await;
+        assert_eq!(text.len(), MAX_REFUSAL_BYTES);
     }
 
     #[tokio::test]

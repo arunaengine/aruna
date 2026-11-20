@@ -895,6 +895,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
+ "http",
  "iroh",
  "lettre",
  "reqwest 0.13.5",
