@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -114,6 +114,7 @@ use aruna_operations::sync::outbox::defer::{
     DrainDeferState, DrainRecord, admin_origin, classify_deferred_record, partition_drain_records,
 };
 use aruna_operations::sync::outbox::record::OUTBOX_DRAIN_SIZE;
+use aruna_operations::sync::outbox::rotation::OutboxRotation;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
 use aruna_operations::triggers::{
@@ -184,9 +185,6 @@ pub(crate) struct OperationsTaskHandler {
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
     rocrate_limits: RoCrateLimits,
-    // In-memory retry-attempt counters keyed by timer. Loss on restart is fine:
-    // a restarted node simply retries from the base interval.
-    retry_backoff: std::sync::Mutex<HashMap<TaskKey, u32>>,
     // What each converted timer keeps between runs; the operations decide on it. Loss on
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
@@ -203,39 +201,6 @@ pub(crate) struct OperationsTaskHandler {
     realm_documents: std::sync::Mutex<(u32, u64)>,
     // Signs registry publications; `None` where no node identity was supplied.
     node_capabilities: Option<NodeCapabilities>,
-}
-
-/// Outcome counts accumulated across the invocations of one rotation.
-#[derive(Clone, Copy, Debug, Default)]
-struct RotationTotals {
-    examined: usize,
-    deleted: usize,
-    deferred: usize,
-    undeliverable: usize,
-    retry_invocations: usize,
-    invocations: u32,
-}
-
-/// One rotation of the bounded document-sync drain: head to observed end across
-/// as many bounded invocations as it needs. Ordering blocks and outcome counts
-/// carry across them; holdership and publisher authority never do.
-#[derive(Default)]
-struct OutboxRotation {
-    /// Last key observed when this rotation opened.
-    boundary: Option<Vec<u8>>,
-    /// Last key observed in each independently ordered event-kind stream.
-    stream_boundaries: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Where the next invocation resumes; `None` is the head.
-    cursor: Option<Vec<u8>>,
-    /// Topics whose FIFO is blocked for the rest of this rotation.
-    blocked_topics: HashSet<irokle::TopicId>,
-    /// Admin origin streams blocked for the rest of this rotation.
-    blocked_origins: HashSet<aruna_core::id::NodeId>,
-    /// Topics this node can never publish onto, for the rest of this rotation.
-    undeliverable_topics: HashSet<irokle::TopicId>,
-    totals: RotationTotals,
-    /// Continuations already spent without yielding through the timer.
-    continuations: u32,
 }
 
 struct DrainSubBatch {
@@ -304,7 +269,6 @@ impl OperationsTaskHandler {
             context,
             jobs_runtime,
             rocrate_limits: RoCrateLimits::default(),
-            retry_backoff: std::sync::Mutex::new(HashMap::new()),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
             rotation: std::sync::Mutex::new(OutboxRotation::default()),
             published_records: std::sync::Mutex::new(BTreeSet::new()),
@@ -471,41 +435,12 @@ impl OperationsTaskHandler {
         }
     }
 
-    /// Backoff interval for the next re-arm of `key`, from the in-memory attempt count
-    /// without mutating it. The drain re-arm is the only retry path for an accepted
-    /// write after a transient sync failure, so it uses the queue scale, not a 30s base.
-    fn backoff_after(&self, key: &TaskKey) -> Duration {
-        let attempts = self
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(key)
-            .copied()
-            .unwrap_or(0);
-        Duration::from_millis(retry_delay_ms(attempts))
-    }
-
-    fn note_retry_backoff(&self, key: &TaskKey) {
-        let mut backoff = self
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned");
-        let attempts = backoff.entry(key.clone()).or_insert(0);
-        *attempts = attempts.saturating_add(1);
-    }
-
-    fn reset_backoff(&self, key: &TaskKey) {
-        self.retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .remove(key);
-    }
-
-    /// Re-arms `key` at its current backoff interval and records the attempt.
-    async fn reschedule_with_backoff(&self, key: TaskKey) -> bool {
-        let after = self.backoff_after(&key);
-        self.note_retry_backoff(&key);
-        self.reschedule_timer(key, after).await
+    /// Re-arms the outbox drain on the rotation's retry ladder, which counts the attempt. The
+    /// drain re-arm is the only retry path for an accepted write after a transient sync failure.
+    async fn retry_drain(&self, key: TaskKey, mut rotation: OutboxRotation) {
+        let after = rotation.retry_after();
+        self.store_rotation(rotation);
+        self.reschedule_timer(key, after).await;
     }
 
     async fn reschedule_timer(&self, key: TaskKey, after: std::time::Duration) -> bool {

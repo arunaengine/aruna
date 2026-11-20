@@ -168,35 +168,6 @@ impl DrainSubBatch {
     }
 }
 
-impl OutboxRotation {
-    pub(super) fn admits(&self, key: &[u8]) -> bool {
-        if !self.stream_boundaries.is_empty() {
-            return self
-                .stream_boundaries
-                .iter()
-                .find(|(prefix, _)| key.starts_with(prefix))
-                .is_some_and(|(_, boundary)| key <= boundary.as_slice());
-        }
-        self.boundary
-            .as_deref()
-            .is_none_or(|boundary| key <= boundary)
-    }
-
-    pub(super) fn at_end(&self, cursor: Option<&[u8]>) -> bool {
-        cursor.is_some_and(|cursor| {
-            self.boundary
-                .as_deref()
-                .is_some_and(|boundary| cursor >= boundary)
-        })
-    }
-
-    pub(super) fn close(&mut self) -> RotationTotals {
-        let totals = self.totals;
-        *self = Self::default();
-        totals
-    }
-}
-
 #[cfg(debug_assertions)]
 impl OutboxBarrier {
     pub(super) fn new() -> Option<Self> {
@@ -310,7 +281,7 @@ impl OperationsTaskHandler {
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(task_id = ?retry_key, "Cannot drain document sync outbox without net handle");
-            self.reschedule_with_backoff(retry_key).await;
+            self.retry_drain(retry_key, self.take_rotation()).await;
             return;
         };
 
@@ -320,7 +291,7 @@ impl OperationsTaskHandler {
             Err(error) => {
                 // No row is decided while membership is unknown, so all keep their order.
                 warn!(task_id = ?retry_key, %error, "Outbox drain waits for the realm config");
-                self.reschedule_with_backoff(retry_key).await;
+                self.retry_drain(retry_key, self.take_rotation()).await;
                 return;
             }
         };
@@ -393,7 +364,7 @@ impl OperationsTaskHandler {
 
 impl OperationsTaskHandler {
     pub(super) async fn close_rotation(&self, retry_key: TaskKey, mut rotation: OutboxRotation) {
-        let closed = rotation.close();
+        let (closed, after) = rotation.close_plan();
         self.store_rotation(rotation);
         if closed.examined > 0 {
             info!(
@@ -408,18 +379,8 @@ impl OperationsTaskHandler {
             );
         }
 
-        if closed.retry_invocations > 0 {
-            if closed.deleted > 0 {
-                self.reset_backoff(&retry_key);
-            }
-            self.reschedule_with_backoff(retry_key).await;
-        } else if closed.deferred > 0 {
-            if closed.deleted > 0 {
-                self.reset_backoff(&retry_key);
-            }
-            self.reschedule_timer(retry_key, DEFER_RETRY_AFTER).await;
-        } else {
-            self.reset_backoff(&retry_key);
+        if let Some(after) = after {
+            self.reschedule_timer(retry_key, after).await;
         }
     }
 }
@@ -432,18 +393,15 @@ impl OperationsTaskHandler {
     ) -> Option<OutboxRotation> {
         if rotation.boundary.is_none() {
             match drive(OutboxTailsOperation::new(), self.context.as_ref()).await {
-                Ok(boundaries) if boundaries.is_empty() => {
-                    self.reset_backoff(retry_key);
-                    return None;
-                }
+                // An empty outbox drops the rotation, and with it the retry ladder.
+                Ok(boundaries) if boundaries.is_empty() => return None,
                 Ok(boundaries) => {
                     rotation.boundary = boundaries.iter().map(|(_, key)| key).max().cloned();
                     rotation.stream_boundaries = boundaries;
                 }
                 Err(error) => {
                     warn!(task_id = ?retry_key, %error, "Failed to open document sync outbox rotation");
-                    self.store_rotation(rotation);
-                    self.reschedule_with_backoff(retry_key.clone()).await;
+                    self.retry_drain(retry_key.clone(), rotation).await;
                     return None;
                 }
             }
@@ -883,8 +841,7 @@ impl OperationsTaskHandler {
         if reached_end {
             self.close_rotation(retry_key, rotation).await;
         } else {
-            self.store_rotation(rotation);
-            self.reschedule_with_backoff(retry_key).await;
+            self.retry_drain(retry_key, rotation).await;
         }
     }
 }

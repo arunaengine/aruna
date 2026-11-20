@@ -7,6 +7,7 @@ use super::*;
 use crate::tasks::incoming::restore::start_task_queues;
 use aruna_clock::testing::poll_until;
 use aruna_drivers::testing::freeze_clock;
+use aruna_operations::sync::outbox::rotation::RotationTotals;
 
 #[test]
 fn outbox_upsert_revision() {
@@ -326,11 +327,6 @@ async fn close_routes_defer() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let rotation = OutboxRotation {
         totals: RotationTotals {
             deferred: 2,
@@ -338,20 +334,15 @@ async fn close_routes_defer() {
             invocations: 2,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
 
     handler.close_rotation(key.clone(), rotation).await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    assert!(
-        !handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .contains_key(&key),
-        "progress in the clean suffix resets failure backoff"
-    );
+    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    assert_eq!(attempts, 0, "progress in the clean suffix resets failure backoff");
 }
 
 #[tokio::test(start_paused = true)]
@@ -359,31 +350,21 @@ async fn close_keeps_retry() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let rotation = OutboxRotation {
         totals: RotationTotals {
             retry_invocations: 1,
             invocations: 2,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
 
     handler.close_rotation(key.clone(), rotation).await;
 
     assert_eq!(scheduled_after(&task_handle).await, Duration::from_secs(2));
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&4)
-    );
+    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    assert_eq!(attempts, 4);
 }
 
 #[tokio::test(start_paused = true)]
@@ -391,11 +372,6 @@ async fn close_resets_progress() {
     let _clock = freeze_clock();
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let rotation = OutboxRotation {
         totals: RotationTotals {
             // A retry on an early page followed by a clean suffix made
@@ -405,6 +381,7 @@ async fn close_resets_progress() {
             invocations: 2,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
 
@@ -414,14 +391,8 @@ async fn close_resets_progress() {
         scheduled_after(&task_handle).await,
         Duration::from_millis(250)
     );
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&1)
-    );
+    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    assert_eq!(attempts, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -452,14 +423,7 @@ async fn retry_suffix_closes() {
     let rotation = handler.rotation.lock().expect("rotation lock");
     assert!(rotation.boundary.is_none());
     assert!(rotation.cursor.is_none());
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&1)
-    );
+    assert_eq!(rotation.retry_attempts, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -468,11 +432,6 @@ async fn midpoint_retry_keeps() {
     let (_dir, handler, task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
     let topic = irokle::TopicId::hash(b"midpoint-retry-topic");
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
     let mut rotation = OutboxRotation {
         boundary: Some(b"last".to_vec()),
         cursor: Some(b"middle".to_vec()),
@@ -481,6 +440,7 @@ async fn midpoint_retry_keeps() {
             invocations: 1,
             ..RotationTotals::default()
         },
+        retry_attempts: 3,
         ..OutboxRotation::default()
     };
     rotation.blocked_topics.insert(topic);
@@ -550,25 +510,15 @@ async fn empty_resets_backoff() {
     let _clock = freeze_clock();
     let (_dir, handler, _task_handle) = outbox_handler();
     let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
+    handler.store_rotation(OutboxRotation {
+        retry_attempts: 3,
+        ..OutboxRotation::default()
+    });
+    let rotation = std::mem::take(&mut *handler.rotation.lock().expect("rotation lock"));
 
-    assert!(
-        handler
-            .open_rotation(&key, OutboxRotation::default())
-            .await
-            .is_none()
-    );
-    assert!(
-        !handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .contains_key(&key)
-    );
+    assert!(handler.open_rotation(&key, rotation).await.is_none());
+    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    assert_eq!(attempts, 0, "an empty outbox drops the retry ladder");
 }
 
 #[tokio::test]
@@ -592,12 +542,10 @@ async fn blocked_keeps_backoff() {
     });
     let handler =
         OperationsTaskHandler::new(context, JobsRuntime::new()).with_outbox_limits(1, 1, 1);
-    let key = TaskKey::DrainSyncOutbox;
-    handler
-        .retry_backoff
-        .lock()
-        .expect("retry backoff mutex poisoned")
-        .insert(key.clone(), 3);
+    handler.store_rotation(OutboxRotation {
+        retry_attempts: 3,
+        ..OutboxRotation::default()
+    });
     let mut blocked_change = change();
     blocked_change.placement = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: Ulid::from_bytes([48; 16]),
@@ -620,14 +568,8 @@ async fn blocked_keeps_backoff() {
     handler.drain_sync_outbox().await;
 
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
-    assert_eq!(
-        handler
-            .retry_backoff
-            .lock()
-            .expect("retry backoff mutex poisoned")
-            .get(&key),
-        Some(&3)
-    );
+    let attempts = handler.rotation.lock().expect("rotation lock").retry_attempts;
+    assert_eq!(attempts, 3);
     shutdown_net(&net).await;
 }
 
