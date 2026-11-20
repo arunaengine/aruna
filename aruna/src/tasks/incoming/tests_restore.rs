@@ -221,7 +221,7 @@ async fn finish_batch(
     synced: Event,
     outcome: DrainSyncOutcome,
 ) -> DrainSyncOutcome {
-    use aruna_operations::node::finish_batch::FinishBatchOperation;
+    use aruna_operations::node::outbox::finish_batch::FinishBatchOperation;
 
     let context = handler.context.as_ref();
     let (serving, generation) = (context.node_and_realm(), ulid::Ulid::generate());

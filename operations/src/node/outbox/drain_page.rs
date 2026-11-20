@@ -30,9 +30,9 @@ use irokle::TopicId;
 use tracing::warn;
 
 use crate::groups::deletion::coordinator::SyncDecisionOperation;
-use crate::node::finish_batch::{FinishBatchOperation, FinishedBatch};
-use crate::node::publish_batches::{PublishBatchesOperation, PublishedBatches};
-use crate::node::relay_records::{RelayRecordsOperation, RelayedRecords};
+use crate::node::outbox::finish_batch::{FinishBatchOperation, FinishedBatch};
+use crate::node::outbox::publish_batches::{PublishBatchesOperation, PublishedBatches};
+use crate::node::outbox::relay_records::{RelayRecordsOperation, RelayedRecords};
 use crate::sync::document_outbox::{OutboxPagePlan, OutboxReadBatch};
 use crate::sync::outbox::batches::{
     DrainInvocation, DrainSyncOutcome, build_drain_batches, resolve_publish_placement,

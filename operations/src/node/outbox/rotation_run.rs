@@ -17,7 +17,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEvent, TaskKey};
 use tracing::{error, warn};
 
-use crate::node::drain_page::{DrainPageOperation, DrainedPage, PageEnd};
+use crate::node::outbox::drain_page::{DrainPageOperation, DrainedPage, PageEnd};
 use crate::sync::document_outbox::OutboxTailsOperation;
 use crate::sync::outbox::batches::{DrainInvocation, OutboxLimits};
 use crate::sync::outbox::record::OUTBOX_DRAIN_SIZE;
