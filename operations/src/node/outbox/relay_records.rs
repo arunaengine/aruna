@@ -86,7 +86,9 @@ impl RelayRecordsOperation {
         }
         let keys = self.out.relayed.clone();
         self.step = RelayStep::Delete;
-        Ok(Next::Call(IoCall::child(PlanOperation::new(DeleteOutboxPlan { keys }))))
+        Ok(Next::Call(IoCall::child(PlanOperation::new(
+            DeleteOutboxPlan { keys },
+        ))))
     }
 
     /// The call that relays `record`, or `None` once it is decided without one.
