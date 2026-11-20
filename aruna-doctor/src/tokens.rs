@@ -893,7 +893,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_body_size: aruna_api::server::MAX_BODY_SIZE,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         )

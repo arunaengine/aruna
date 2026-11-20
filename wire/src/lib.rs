@@ -4,5 +4,6 @@
 
 pub mod address;
 pub mod info;
+pub mod portal;
 pub mod session;
 pub mod users;

@@ -8,8 +8,8 @@ use crate::error::ServerSetupError;
 use crate::routes::rest_router;
 pub mod state;
 use crate::forwarded::DirectOrigin;
+use crate::https::check_host;
 use crate::https::listener::CombinedListener;
-use crate::https::{HostRoute, check_host};
 use crate::server::state::{ServerState, swagger_ui};
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request};
 use axum::http::{Method, StatusCode};
@@ -22,8 +22,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-
-pub const MAX_BODY_SIZE: usize = 1024 * 1024;
 
 // Backstop for handler response creation; interactive operations use tighter deadlines.
 // Streaming bodies are unbounded, and handler-owned request bodies use exempt routes.
@@ -197,7 +195,8 @@ async fn redirect_swagger(request: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BODY_SIZE, Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt};
+    use super::{Server, ServerConfig, TIMEOUT_EXEMPT_ROUTES, is_exempt};
+    use aruna_core::listener::MAX_BODY_SIZE;
     use axum::Router;
     use axum::body::Body;
     use axum::extract::MatchedPath;

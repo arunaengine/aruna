@@ -978,8 +978,8 @@ mod tests {
 
     #[tokio::test]
     async fn index_size_bounded() {
-        let page = index_page("/", "<a href=\"a.txt\">a.txt</a>  19-Jul-2026 10:01  10\n");
-        let exact = format!("{page}{}", " ".repeat(MAX_INDEX_BYTES - page.len()));
+        let index = index_page("/", "<a href=\"a.txt\">a.txt</a>  19-Jul-2026 10:01  10\n");
+        let exact = format!("{index}{}", " ".repeat(MAX_INDEX_BYTES - index.len()));
         let over = format!("{exact} ");
         let (server, endpoint) = spawn_index_server(vec![
             ("/exact/", "text/html", exact),

@@ -4,7 +4,7 @@
 
 use crate::shared;
 
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna_clock::testing::poll_until;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
@@ -158,13 +158,14 @@ async fn rejoin_peer(
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     peer.add_peer_addr(seed.net.endpoint_addr()).await;
     seed.net.add_peer_addr(peer.endpoint_addr()).await;
     Ok(RejoinedPeer {
         net: peer,
         _directory: directory,
         _context: context,
+        _incoming: incoming,
     })
 }
 
@@ -172,6 +173,8 @@ struct RejoinedPeer {
     net: NetHandle,
     _directory: tempfile::TempDir,
     _context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 async fn announce_peer(peer: &NetHandle, realm_id: RealmId) -> TestResult<()> {

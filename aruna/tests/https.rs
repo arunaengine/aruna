@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use aruna::shutdown::NodeShutdown;
 use aruna_api::cors::CorsConfig;
+use aruna_api::https::HostCheck;
 use aruna_api::https::certificate::CertificateStore;
 use aruna_api::https::listener::{CombinedListener, HttpsHandle, RoutedListener};
-use aruna_api::https::{HostCheck, HostRoute, HostRoutes};
 use aruna_api::s3::server::{S3Server, S3ServerHandle};
+use aruna_core::listener::{HostRoute, HostRoutes};
 use aruna_tasks::shutdown::Shutdown;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -393,7 +394,7 @@ async fn rest_bearer_tls() -> TestResult<()> {
             state,
             aruna_api::server::ServerConfig {
                 http_addr: plain.local_addr()?,
-                max_body_size: aruna_api::server::MAX_BODY_SIZE,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
                 cors: CorsConfig::default(),
             },
         );

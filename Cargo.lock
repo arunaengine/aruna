@@ -608,7 +608,6 @@ dependencies = [
 name = "aruna-config"
 version = "3.0.0-alpha.207"
 dependencies = [
- "aruna-api",
  "aruna-clock",
  "aruna-core",
  "aruna-drivers",

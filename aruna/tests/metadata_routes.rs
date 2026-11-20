@@ -31,7 +31,7 @@ use axum::{Extension, Json};
 use std::sync::Arc;
 use ulid::Ulid;
 
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
@@ -724,6 +724,8 @@ struct DistributedMetadataNode {
     _node_dir: TempDir,
     net: NetHandle,
     state: Arc<ServerState>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 struct QueryNamesResult {
@@ -845,7 +847,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let state = Arc::new(
         ServerState::new(
             context,
@@ -863,6 +865,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         _node_dir: node_dir,
         net,
         state,
+        _incoming: incoming,
     }
 }
 

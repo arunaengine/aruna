@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::listener::CONNECTION_IDLE_TIMEOUT;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -9,9 +10,6 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tracing::warn;
 
-/// The idle bound a connection falls back to when no configured one was
-/// installed.
-pub(super) const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Body bytes between two progress units. Small frames must not hide a stream
 /// that never reaches a unit, so they accumulate until one is crossed.
 pub(super) const STREAM_PROGRESS_BYTES: usize = 1024;
@@ -311,7 +309,7 @@ pub(super) async fn run_connection<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::server::{INITIAL_REQUEST_TIMEOUT, STREAM_LIFETIME_TIMEOUT};
+    use aruna_core::listener::{INITIAL_REQUEST_TIMEOUT, STREAM_LIFETIME_TIMEOUT};
     use std::sync::atomic::Ordering;
 
     #[tokio::test(start_paused = true)]

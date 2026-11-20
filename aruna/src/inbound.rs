@@ -594,9 +594,20 @@ impl IncomingFixture {
     }
 }
 
+/// A fixture dropped without `stop` still deregisters its handler: the handler holds the context
+/// that holds the net handle, so a registered one keeps both and their sync folder alive.
+impl Drop for IncomingFixture {
+    fn drop(&mut self) {
+        if self.installed() {
+            self.net_handle.clear_inbound_handler();
+        }
+    }
+}
+
 /// Installs a handler under fixture-owned lifecycle owners; bind the fixture
 /// and call [`IncomingFixture::stop`] to deregister and drain before dropping
 /// test storage. Startup uses [`initialize_net_holder`] with the node owners.
+#[must_use = "dropping the fixture deregisters its handler"]
 pub fn initialize_incoming_fixture(context: Arc<DriverContext>) -> Option<IncomingFixture> {
     let net_handle = context.net_handle.clone()?;
     let shutdown = Shutdown::new();
@@ -1284,41 +1295,66 @@ mod tests {
         net_b.shutdown().await;
     }
 
+    /// A node context with storage, net and metadata below `dir`, and its net handle.
+    async fn fixture_context(
+        dir: &tempfile::TempDir,
+    ) -> (aruna_net::NetHandle, Arc<DriverContext>) {
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let net = aruna_net::NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                sync_storage_path: Some(dir.path().join("document-sync")),
+                ..NetConfig::default()
+            },
+            storage.clone(),
+        )
+        .await
+        .unwrap();
+        let graph_handle = aruna_graph::GraphHandle::open(
+            dir.path().join("metadata"),
+            net.node_id(),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
+            aruna_graph::GraphOptions::default(),
+        )
+        .unwrap();
+        storage.install_metadata_indexes(dir.path().join("metadata"));
+        let context = Arc::new(DriverContext {
+            storage_handle: storage,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            graph_handle: Some(graph_handle),
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        });
+        (net, context)
+    }
+
+    // The handler holds the context that holds the net handle, so only deregistering it lets
+    // the net, its sync service and that service's folder go.
+    #[tokio::test]
+    async fn dropped_fixture_deregisters() {
+        let dir = tempdir().unwrap();
+        let (net, context) = fixture_context(&dir).await;
+        let fixture = initialize_incoming_fixture(context.clone()).expect("net handle installs");
+        let handler = fixture.handler.clone();
+        drop(fixture);
+        assert_eq!(
+            handler.strong_count(),
+            0,
+            "the net handle let the handler go"
+        );
+        net.shutdown().await;
+    }
+
     #[tokio::test]
     async fn fixtures_stop_cleanly() {
         for _ in 0..2 {
             let dir = tempdir().unwrap();
-            let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-            let net = aruna_net::NetHandle::new(
-                NetConfig {
-                    bind_addr: "127.0.0.1:0".parse().unwrap(),
-                    discovery_method: DiscoveryMethod::None,
-                    relay_method: RelayMethod::None,
-                    sync_storage_path: Some(dir.path().join("document-sync")),
-                    ..NetConfig::default()
-                },
-                storage.clone(),
-            )
-            .await
-            .unwrap();
-            let graph_handle = aruna_graph::GraphHandle::open(
-                dir.path().join("metadata"),
-                net.node_id(),
-                Some(net.document_sync_node()),
-                Some(net.document_sync_database()),
-                aruna_graph::GraphOptions::default(),
-            )
-            .unwrap();
-            storage.install_metadata_indexes(dir.path().join("metadata"));
-            let context = Arc::new(DriverContext {
-                storage_handle: storage,
-                net_handle: Some(net.clone()),
-                blob_handle: None,
-                graph_handle: Some(graph_handle),
-                task_handle: None,
-                compute_handle: None,
-                outbound_handle: None,
-            });
+            let (net, context) = fixture_context(&dir).await;
 
             let fixture =
                 initialize_incoming_fixture(context.clone()).expect("net handle installs");

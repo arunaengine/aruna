@@ -8,10 +8,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use aruna_api::https::HostRoutes;
-use aruna_api::portal::{LegalDocument, LegalSource, PortalLogin};
-use aruna_api::s3::server::S3ServerTimeouts;
 use aruna_core::federation::valid_federation_url;
+use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts};
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::backends::{BackendsFile, NodeBackendsConfig};
@@ -23,6 +21,7 @@ use aruna_drivers::driver::HangLimits;
 use aruna_graph::MetadataSearchStorage;
 use aruna_storage::storage::lifecycle::CACHE_BYTES;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_wire::portal::{LegalDocument, LegalSource, PortalLogin};
 use irokle::net::IrohRuntimeConfig;
 
 use crate::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
@@ -266,7 +265,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         .var("MAX_HTTP_BODY_SIZE")
         .map(|value| value.parse::<usize>())
         .transpose()?
-        .unwrap_or(aruna_api::server::MAX_BODY_SIZE);
+        .unwrap_or(MAX_BODY_SIZE);
     let cors_allowed_origins = parse_list_env(env, "CORS_ALLOWED_ORIGINS");
     let desktop_cors = desktop_cors_env(env);
     let mcp_enabled = mcp_env(env)?;
@@ -1185,8 +1184,10 @@ fn https_env(
     check_hosts(&api, s3.as_ref(), portal.as_ref())?;
     if let Some(portal) = &portal {
         let origin = portal.origin().ascii_serialization();
-        let cors = aruna_api::cors::CorsConfig::new(settings.cors_allowed_origins.clone());
-        if !reqwest::header::HeaderValue::from_str(&origin).is_ok_and(|value| cors.allows(&value)) {
+        // The api's CORS rule: `*` allows every origin, and a listed origin may end in a slash.
+        let mut allowed = (settings.cors_allowed_origins.iter())
+            .map(|allowed| allowed.trim().trim_end_matches('/'));
+        if !allowed.any(|allowed| allowed == "*" || allowed == origin) {
             return Err(invalid_config_value(
                 "CORS_ALLOWED_ORIGINS",
                 settings.cors_allowed_origins.join(","),
@@ -1257,7 +1258,7 @@ fn check_hosts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_api::s3::server::S3ServerTimeouts;
+    use aruna_core::listener::S3ServerTimeouts;
 
     /// A minimal valid operator environment; each case overrides what it
     /// exercises. Parsing never reads the process environment.
@@ -1863,7 +1864,7 @@ mod tests {
         assert_eq!(https.key, PathBuf::from("/tls/privkey.pem"));
         assert_eq!(https.redirect, Some("127.0.0.1:8080".parse().unwrap()));
         assert_eq!(
-            https.routes.origin(aruna_api::https::HostRoute::Portal),
+            https.routes.origin(aruna_core::listener::HostRoute::Portal),
             Some("https://portal.test")
         );
         assert!(parse(&[]).unwrap().https.is_none());
@@ -1908,7 +1909,7 @@ mod tests {
                 .https
                 .unwrap()
                 .routes
-                .origin(aruna_api::https::HostRoute::Rest),
+                .origin(aruna_core::listener::HostRoute::Rest),
             Some("https://api.test:8443")
         );
     }

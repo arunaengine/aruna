@@ -142,12 +142,18 @@ mod tests {
         assert_eq!(second.after, Some(PULL_RETRY_AFTER * 2));
         assert_eq!(second.memory.attempts, 2);
         let capped = timer(40).plan(pending);
-        assert_eq!(capped.after, Some(PULL_RETRY_MAX.min(PULL_RETRY_AFTER * 128)));
+        assert_eq!(
+            capped.after,
+            Some(PULL_RETRY_MAX.min(PULL_RETRY_AFTER * 128))
+        );
 
         let clean = outcome(PlacementReconcileStatus::Clean, false);
         assert_eq!(timer(3).plan(clean), TimerPlan::default());
         let failed = timer(3).plan(PlacementReconcileOutcome::storage_failure());
-        assert_eq!((failed.after, failed.memory.attempts), (Some(PLACEMENT_RETRY_AFTER), 3));
+        assert_eq!(
+            (failed.after, failed.memory.attempts),
+            (Some(PLACEMENT_RETRY_AFTER), 3)
+        );
         let armed = timer(3).plan(outcome(PlacementReconcileStatus::RetryScheduled, false));
         assert_eq!((armed.after, armed.memory.attempts), (None, 3));
     }
@@ -159,7 +165,10 @@ mod tests {
         run.first().unwrap();
         let observed: Result<Option<SubjectScanResult>, SubjectScanError> = Ok(None);
         let observed = IoResult::Child(aruna_core::calls::ChildOutcome::new(observed));
-        assert!(matches!(run.next(observed), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            run.next(observed),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let failed: Result<PlacementReconcileOutcome, IoError> = Err(IoError::Unfinished);
         let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(failed));
         let plan = TimerPlan::from(Some(PLACEMENT_RETRY_AFTER));

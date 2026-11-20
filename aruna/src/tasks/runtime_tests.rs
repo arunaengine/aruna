@@ -918,7 +918,10 @@ async fn recover_reconciles_external() {
     assert_eq!(after.state, JobState::Running, "not requeued");
     assert_eq!(after.attempts, 0, "the restart spends no attempt");
     assert!(after.claim.is_some());
-    assert_eq!(after.attempt_intent, record.attempt_intent, "the attempt keeps its name");
+    assert_eq!(
+        after.attempt_intent, record.attempt_intent,
+        "the attempt keeps its name"
+    );
 }
 
 // An observed required-service failure lets the current recovery unit finish and admits no
@@ -941,7 +944,10 @@ async fn stop_between_units() {
     assert_eq!(recovered, Ok(1), "no next recovery unit after the failure");
     let mut claimed = 0;
     for job_id in [first, second] {
-        let record = read_job_record(&context, job_id, None).await.unwrap().unwrap();
+        let record = read_job_record(&context, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
         claimed += usize::from(record.state == JobState::Claimed);
     }
     assert_eq!(claimed, 1, "the unit after the failure stays as it was");
@@ -964,8 +970,15 @@ async fn cancel_before_recovery() {
             .unwrap(),
         0
     );
-    let untouched = read_job_record(&context, job_id, None).await.unwrap().unwrap();
-    assert_eq!(untouched.state, JobState::Claimed, "a recovered job would be requeued");
+    let untouched = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        untouched.state,
+        JobState::Claimed,
+        "a recovered job would be requeued"
+    );
 }
 
 // Rolling restarts must never exhaust JOB_MAX_ATTEMPTS on an external attempt whose
@@ -1019,7 +1032,10 @@ async fn recovery_spares_attempts() {
         let adopted = adopt_external_attempt(&context, job_id, record.owner_node_id, now_ms)
             .await
             .unwrap();
-        assert!(matches!(adopted, AdoptOutcome::Adopted(..)), "restart {restart}");
+        assert!(
+            matches!(adopted, AdoptOutcome::Adopted(..)),
+            "restart {restart}"
+        );
     }
 }
 

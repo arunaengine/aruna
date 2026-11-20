@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(KEEPALIVE_INTERVAL, Duration::from_secs(10));
         assert_ne!(
             KEEPALIVE_INTERVAL,
-            crate::s3::server::activity::CONNECTION_IDLE_TIMEOUT
+            aruna_core::listener::CONNECTION_IDLE_TIMEOUT
         );
         assert_eq!(KEEPALIVE_FILLER.len(), STREAM_PROGRESS_BYTES);
     }

@@ -125,7 +125,10 @@ mod tests {
             more: true,
             ..BlobCleanupOutcome::default()
         };
-        assert_eq!(plan(more), Ok(Next::Done(TimerPlan::from(Some(NEXT_PASS_AFTER)))));
+        assert_eq!(
+            plan(more),
+            Ok(Next::Done(TimerPlan::from(Some(NEXT_PASS_AFTER))))
+        );
         let clean = TimerPlan::from(Some(BLOB_CLEANUP_AFTER));
         assert_eq!(plan(BlobCleanupOutcome::default()), Ok(Next::Done(clean)));
     }

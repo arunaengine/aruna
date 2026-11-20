@@ -37,10 +37,7 @@ const RECLAIM_PAGE_SIZE: usize = 128;
 /// When the sweep runs again after `outcome`, `None` for a failed run, with the retries and queue
 /// key it keeps, and whether it reached the end of the queue. A failing candidate climbs the
 /// retry ladder, so it cannot hold a one-minute rescan of the whole queue forever.
-pub fn reclaim_plan(
-    outcome: Option<&ReclaimOutcome>,
-    memory: &TimerMemory,
-) -> (TimerPlan, bool) {
+pub fn reclaim_plan(outcome: Option<&ReclaimOutcome>, memory: &TimerMemory) -> (TimerPlan, bool) {
     let plan = |after, memory| TimerPlan {
         after: Some(after),
         memory,
