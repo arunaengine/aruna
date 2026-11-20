@@ -18,15 +18,26 @@ use crate::onboarding::secret_state::{resolve_secret_state, secret_state_key};
 /// states in one snapshot. `next` is the last index key of a page that may have more.
 #[derive(Debug, PartialEq)]
 pub struct ExpiryPageOperation {
+    phase: Phase,
     after: Option<ByteView>,
     limit: usize,
     ids: Vec<Ulid>,
     next: Option<ByteView>,
 }
 
+/// The answer the operation waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Created,
+    Index,
+    Values,
+    Done,
+}
+
 impl ExpiryPageOperation {
     pub fn new(after: Option<ByteView>, limit: usize) -> Self {
         Self {
+            phase: Phase::Created,
             after,
             limit,
             ids: Vec::new(),
@@ -65,6 +76,7 @@ impl Operation for ExpiryPageOperation {
     }
 
     fn first(&mut self) -> Result<Next<SecretPage>, ListSecretsError> {
+        self.phase = Phase::Index;
         Ok(Next::Call(IoCall::Page {
             space: ONBOARDING_KEYSPACE.to_string(),
             prefix: ByteView::from(SECRET_EXPIRY_PREFIX.as_bytes()),
@@ -74,11 +86,24 @@ impl Operation for ExpiryPageOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<SecretPage>, ListSecretsError> {
-        if let IoResult::Page { rows, next } = result {
-            self.next = next;
-            return Ok(Next::Call(self.reads(rows)?));
-        }
-        let values = result.values()?;
+        let values = match (self.phase, result) {
+            (Phase::Index, IoResult::Page { rows, next }) => {
+                self.phase = Phase::Values;
+                self.next = next;
+                return Ok(Next::Call(self.reads(rows)?));
+            }
+            (Phase::Values, IoResult::Values(values)) => {
+                self.phase = Phase::Done;
+                values
+            }
+            (phase, other) => {
+                return Err(ListSecretsError::UnexpectedEvent {
+                    state: format!("{phase:?}"),
+                    expected: "the index page, then the record and state batch",
+                    got: other.label(),
+                });
+            }
+        };
         if values.len() != self.ids.len() * 2 {
             return Err(ListSecretsError::UnexpectedEvent {
                 state: "ExpiryPage".to_string(),
@@ -106,6 +131,39 @@ impl Operation for ExpiryPageOperation {
 mod tests {
     use super::*;
     use crate::onboarding::create_secret::secret_expiry_key;
+
+    // Each answer is taken only in the phase that asked for it.
+    #[test]
+    fn wrong_order_refused() {
+        let page = || IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let mut early = ExpiryPageOperation::new(None, 2);
+        early.first().unwrap();
+        let refused = early.next(IoResult::Values(Vec::new()));
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
+        let mut twice = ExpiryPageOperation::new(None, 2);
+        twice.first().unwrap();
+        twice.next(page()).unwrap();
+        let refused = twice.next(page());
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
+        let mut done = ExpiryPageOperation::new(None, 2);
+        done.first().unwrap();
+        done.next(page()).unwrap();
+        done.next(IoResult::Values(Vec::new())).unwrap();
+        let refused = done.next(IoResult::Values(Vec::new()));
+        assert!(matches!(
+            refused,
+            Err(ListSecretsError::UnexpectedEvent { .. })
+        ));
+    }
 
     #[test]
     fn pages_by_expiry() {

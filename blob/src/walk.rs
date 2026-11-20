@@ -54,17 +54,29 @@ impl<T> Walk<T> {
     }
 
     pub(crate) fn step(&mut self) -> Step<T> {
+        self.step_with(|_, _| true)
+    }
+
+    /// Like [`Self::step`], but `resolve` completes each child right before the walk uses it,
+    /// given its path, and drops it by answering false; a child before the cursor never reaches it.
+    pub(crate) fn step_with(
+        &mut self,
+        mut resolve: impl FnMut(&str, &mut Child<T>) -> bool,
+    ) -> Step<T> {
         if let Some((path, _)) = &self.pending {
             return Step::List(path.clone());
         }
         while let Some(frame) = self.frames.last_mut() {
-            let Some(child) = frame.children.pop_front() else {
+            let Some(mut child) = frame.children.pop_front() else {
                 self.frames.pop();
                 continue;
             };
             let path = join_path(&frame.path, &child.name);
-            let enter = child.is_dir && self.recursive;
             let order = (frame.after.first()).map(|first| child.name.as_str().cmp(first.as_str()));
+            if order == Some(Ordering::Less) || !resolve(&path, &mut child) {
+                continue;
+            }
+            let enter = child.is_dir && self.recursive;
             match order {
                 Some(Ordering::Less) => {}
                 // An earlier page listed it; only its subtree may hold paths after the cursor.
@@ -219,6 +231,25 @@ mod tests {
         assert_eq!(listed, ["", "c"]);
         let (paths, _) = walked(&["a"], true);
         assert_eq!(paths, ["a/m", "a/m/x.txt", "a/z.txt", "a-c", "b.txt", "c"]);
+    }
+
+    // Children are completed one at a time as the walk reaches them, never before the cursor.
+    #[test]
+    fn resolves_when_visited() {
+        let mut walk = Walk::new("", vec!["a-c".to_string()], false);
+        let Step::List(directory) = walk.step() else {
+            panic!("the base is listed first");
+        };
+        walk.listed(children(&directory));
+        let mut resolved = Vec::new();
+        let Step::Entry { path, .. } = walk.step_with(|path, _| {
+            resolved.push(path.to_string());
+            true
+        }) else {
+            panic!("an entry follows the cursor");
+        };
+        assert_eq!(path, "b.txt");
+        assert_eq!(resolved, ["a-c", "b.txt"]);
     }
 
     #[test]

@@ -481,6 +481,8 @@ pub struct Replayed {
     pub read: usize,
     pub more: bool,
     pub after: Option<Vec<u8>>,
+    /// Replays whose page failed; each keeps its row and comes again after the others.
+    pub failed: usize,
 }
 
 /// Continues the replays in key order after `after`, one journal page of `page` rows each, a
@@ -502,6 +504,7 @@ pub struct RunReplays {
     last: Option<Vec<u8>>,
     read: usize,
     pending: bool,
+    failed: usize,
 }
 
 impl RunReplays {
@@ -519,6 +522,7 @@ impl RunReplays {
             last: None,
             read: 0,
             pending: false,
+            failed: 0,
         }
     }
 
@@ -526,12 +530,20 @@ impl RunReplays {
         IoCall::child(replay_page(key, self.now_ms, self.page))
     }
 
+    /// The end of the pass; a failure keeps the position past the failed replay and asks for
+    /// the ordinary delay instead of the next tick at once.
     fn done(&mut self, more: bool) -> Next<Replayed> {
-        let after = if more { self.last.take() } else { None };
+        let failed = self.failed;
+        let after = if more || failed > 0 {
+            self.last.take()
+        } else {
+            None
+        };
         Next::Done(Replayed {
             read: self.read,
-            more,
+            more: more && failed == 0,
             after,
+            failed,
         })
     }
 
@@ -567,7 +579,7 @@ impl RunReplays {
                 self.scan = Some(None);
                 continue;
             }
-            if self.pending && self.pages > 0 {
+            if self.pending && self.failed == 0 && self.pages > 0 {
                 (self.pending, self.start, self.wrapped) = (false, None, false);
                 self.scan = Some(None);
                 continue;
@@ -594,10 +606,16 @@ impl Operation for RunReplays {
             self.scan = next.map(Some);
             return Ok(self.advance());
         }
-        let (rows, ended) = answer.child::<(usize, bool), StoreError>()??;
-        self.read += rows;
-        self.last = Some(self.current.take().ok_or(IoError::Unfinished)?);
-        self.pending |= !ended;
+        let key = self.current.take().ok_or(IoError::Unfinished)?;
+        match answer.child::<(usize, bool), StoreError>()? {
+            Ok((rows, ended)) => {
+                self.read += rows;
+                self.pending |= !ended;
+            }
+            // The failed replay keeps its row; the pass goes on with the next install.
+            Err(_) => self.failed += 1,
+        }
+        self.last = Some(key);
         Ok(self.advance())
     }
 }

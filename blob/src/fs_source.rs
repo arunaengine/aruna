@@ -124,14 +124,14 @@ pub(crate) async fn list_local(
 /// Entries one local listing page may examine, skipped ones included.
 const MAX_LOCAL_EXAMINED: usize = 250_000;
 
-/// A listed local entry: where it resolves inside the root and its metadata there.
-type LocalChild = Child<cap_std::fs::Metadata>;
+/// A listed local entry: its name at first, and its metadata once the walk visits it.
+type LocalChild = Child<Option<cap_std::fs::Metadata>>;
 
 /// One page of a local walk; examining more than `examined` entries fails the page instead of
 /// walking on.
 fn walk_entries(
     root: &str,
-    mut walk: Walk<cap_std::fs::Metadata>,
+    mut walk: Walk<Option<cap_std::fs::Metadata>>,
     (limit, files_only): (usize, bool),
     examined: usize,
 ) -> Result<(Vec<SourceEntry>, bool), StagingSourceError> {
@@ -142,7 +142,7 @@ fn walk_entries(
     let mut seen = 0usize;
     let mut entries = Vec::new();
     loop {
-        let (path, child) = match walk.step() {
+        let (path, child) = match walk.step_with(|path, child| visit_child(&root, path, child)) {
             Step::List(directory) => {
                 let resolved = root.resolve(&directory)?;
                 let looped = ancestors(&directory).any(|up| listed.get(up) == Some(&resolved));
@@ -151,7 +151,7 @@ fn walk_entries(
                     true => Vec::new(),
                     false => {
                         let scan = (from.as_deref(), &mut seen, examined);
-                        local_children(&root, (&directory, &resolved), scan)?
+                        local_children(&root, &resolved, scan)?
                     }
                 };
                 listed.insert(directory, resolved);
@@ -171,7 +171,9 @@ fn walk_entries(
             true => SourceEntryKind::Directory,
             false => SourceEntryKind::File,
         };
-        let metadata = child.value;
+        let Some(metadata) = child.value else {
+            continue;
+        };
         entries.push(SourceEntry {
             name: child.name,
             path,
@@ -186,25 +188,41 @@ fn walk_entries(
     }
 }
 
+/// Reads the metadata of a child the walk is about to visit. A link out of the offered folder,
+/// a vanished entry and one that is neither file nor directory are skipped, not errors.
+fn visit_child(root: &OfferedRoot, path: &str, child: &mut LocalChild) -> bool {
+    let Ok(resolved) = root.resolve(path) else {
+        return false;
+    };
+    let Ok(metadata) = root.directory.metadata(&resolved) else {
+        return false;
+    };
+    if !(metadata.is_dir() || metadata.is_file()) {
+        return false;
+    }
+    child.is_dir = metadata.is_dir();
+    child.value = Some(metadata);
+    true
+}
+
 /// The paths that contain `path`, nearest first, down to the root of the offered folder.
 fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     let parents = path.rmatch_indices('/').map(|(at, _)| &path[..at]);
     parents.chain((!path.is_empty()).then_some(""))
 }
 
-/// The files and directories of the local `directory`, which resolves to `resolved`, from the
-/// name `from` on. The page fails as soon as it examined more than `examined` entries, before
-/// any metadata of this directory is read.
+/// The names in the local directory `resolved` from the name `from` on; their metadata waits
+/// until the walk visits them. The page fails once it examined more than `examined` entries.
 fn local_children(
     root: &OfferedRoot,
-    (directory, resolved): (&str, &Path),
+    resolved: &Path,
     (from, seen, examined): (Option<&str>, &mut usize, usize),
 ) -> Result<Vec<LocalChild>, StagingSourceError> {
     let reader = root
         .directory
         .read_dir(resolved)
         .map_err(|error| StagingSourceError::ListError(error.to_string()))?;
-    let mut names = Vec::new();
+    let mut children = Vec::new();
     for entry in reader {
         let entry = entry.map_err(|error| StagingSourceError::ListError(error.to_string()))?;
         *seen += 1;
@@ -225,26 +243,11 @@ fn local_children(
         if from.is_some_and(|from| name.as_str() < from) {
             continue;
         }
-        names.push(name);
-    }
-    let mut children = Vec::new();
-    for name in names {
-        // A link out of the offered directory is skipped, not an error: one
-        // stray link must not make the whole listing unusable.
-        let Ok(resolved) = root.resolve(&join_relative(directory, &name)) else {
-            continue;
-        };
-        let Ok(metadata) = root.directory.metadata(&resolved) else {
-            continue;
-        };
-        if metadata.is_dir() || metadata.is_file() {
-            let is_dir = metadata.is_dir();
-            children.push(Child {
-                name,
-                is_dir,
-                value: metadata,
-            });
-        }
+        children.push(Child {
+            name,
+            is_dir: false,
+            value: None,
+        });
     }
     Ok(children)
 }
@@ -441,13 +444,6 @@ pub(crate) async fn jailed_file(root: &str, relative: &str) -> Result<PathBuf, S
     Ok(resolved)
 }
 
-fn join_relative(prefix: &str, name: &str) -> String {
-    match prefix.is_empty() {
-        true => name.to_string(),
-        false => format!("{prefix}/{name}"),
-    }
-}
-
 fn file_metadata(metadata: &std::fs::Metadata) -> SourceMetadata {
     let modified: Option<SystemTime> = metadata.modified().ok();
     SourceMetadata {
@@ -474,7 +470,6 @@ pub(crate) mod tests {
     use futures::StreamExt;
     use std::collections::HashMap;
 
-    // Empty directories still cost traversal, so a page fails once its bounds are spent.
     // The bound stops the scan of a wide directory itself, and names a page already passed get
     // no metadata.
     #[test]
@@ -486,19 +481,20 @@ pub(crate) mod tests {
         let root = OfferedRoot::open(dir.path().to_str().unwrap()).unwrap();
         let resolved = root.resolve("").unwrap();
         let mut seen = 0;
-        let wide = local_children(&root, ("", &resolved), (None, &mut seen, 3));
+        let wide = local_children(&root, &resolved, (None, &mut seen, 3));
         assert!(matches!(wide, Err(StagingSourceError::InvalidListing(_))));
         assert_eq!(
             seen, 4,
             "the scan stopped at the first entry over the bound"
         );
         let mut seen = 0;
-        let rest = local_children(&root, ("", &resolved), (Some("d"), &mut seen, 10)).unwrap();
+        let rest = local_children(&root, &resolved, (Some("d"), &mut seen, 10)).unwrap();
         let mut names: Vec<String> = rest.into_iter().map(|child| child.name).collect();
         names.sort();
         assert_eq!(names, ["d", "e"]);
     }
 
+    // Empty directories still cost traversal, so a page fails once its bounds are spent.
     #[test]
     fn walk_bounds_fail() {
         let dir = tempfile::tempdir().unwrap();

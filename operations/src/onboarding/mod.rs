@@ -10,6 +10,8 @@ pub mod finalize_bootstrap;
 pub mod inspect_secret;
 pub mod issue_ticket;
 pub mod list_secrets;
+pub mod live_page;
+pub mod prune_secret;
 pub mod read_secret;
 pub mod recover_admin;
 pub mod reserve_secret;

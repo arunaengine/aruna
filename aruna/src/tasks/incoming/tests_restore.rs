@@ -548,7 +548,10 @@ async fn renewal_rearm_kept() {
     handler.publish_registration().await;
     let key = TaskKey::PublishRegistration;
     let after = armed_after(&task_handle, key, PUBLISH_INTERVAL * 2).await;
-    assert!(after <= PUBLISH_INTERVAL, "the renewal stays armed in memory");
+    assert!(
+        after <= PUBLISH_INTERVAL,
+        "the renewal stays armed in memory"
+    );
 }
 
 // The backend import pass armed at start stays armed in memory when its row cannot be stored,
