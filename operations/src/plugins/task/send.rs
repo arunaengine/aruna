@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id_mint::IdMint;
@@ -13,7 +14,7 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::execution::job::family::JobFamilyId;
 use aruna_core::structs::execution::job::identity::RETENTION_MS;
 use aruna_core::structs::execution::job::input::{ExecutionSpec, InputSource};
-use aruna_core::structs::execution::job::pages::PageManifest;
+use aruna_core::structs::execution::job::pages::{InputPage, PageManifest, spec_entries};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_plugin_types::calls::{ErrorKind, HostError};
@@ -26,14 +27,15 @@ use super::super::unavailable;
 use super::change::{ChangeTask, Changed, SendOutcome, TaskChange};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::admit::here::AcceptedSubmission;
+use crate::jobs::lifecycle::screen::{ScreenError, ScreenTask};
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::lifecycle::task_job::{
     PrepareTaskJob, TaskSubmission, send_task_job, task_targets,
 };
-use crate::jobs::records::pages::{PageReadError, StoreEntriesOperation};
+use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntriesOperation};
 use aruna_core::install_work::{ADMIT_WINDOW_MS, TaskRow, task_place};
 use aruna_core::job_request::SubmitJobError;
-use aruna_core::job_request::{self, RequestIdentity};
+use aruna_core::job_request::{self, RequestIdentity, SubmissionRequest};
 
 /// What one send proved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +77,20 @@ pub fn decide(attempt: u32, uncertain: bool, sent: Sent) -> SendOutcome {
     }
 }
 
+/// The stored spec with the inputs of its pages back in place of the paged ones.
+fn expanded(request: &SubmissionRequest, pages: Vec<InputPage>) -> SendSpec {
+    let entries = spec_entries(pages).map_err(|error| unavailable(error.to_string()));
+    let mut spec = request.spec.clone();
+    spec.inputs.retain(|input| input.source.is_inline());
+    spec.inputs.extend(
+        entries
+            .map_err(CallError)?
+            .into_iter()
+            .map(|(input, _)| input),
+    );
+    Ok(spec)
+}
+
 /// Errors before any send: nothing reached a holder, so the call may be made again.
 fn prepare_error(error: SubmitJobError) -> CallError {
     CallError(match error {
@@ -98,6 +114,10 @@ enum SendPhase {
         VecDeque<(String, String, Ulid)>,
     ),
     Pages(Box<(RealmConfigDocument, TaskSubmission)>),
+    /// A resend's saved input pages, read back for its task check.
+    Load(Box<(RealmConfigDocument, TaskSubmission)>),
+    /// A resend's task check on every input of its stored request.
+    Screen(Box<(RealmConfigDocument, TaskSubmission)>),
     Mark(Box<(RealmConfigDocument, TaskSubmission)>),
     Send(JobFamilyId, u32),
     Record,
@@ -118,6 +138,7 @@ pub struct SendTask {
 }
 
 type SendNext = Result<Next<()>, CallError>;
+type SendSpec = Result<ExecutionSpec, CallError>;
 
 impl SendTask {
     /// A first send carries the checked `spec`; a resend sends the stored request.
@@ -157,7 +178,7 @@ impl SendTask {
                     identity,
                     targets,
                 };
-                self.mark(config, submission)
+                self.rescreen(Box::new((config, submission)))
             }
             (None, _, Some(spec)) => {
                 let key = format!("plugin-work/{}", self.work_id);
@@ -170,6 +191,31 @@ impl SendTask {
             // A resend without a stored request has nothing to send.
             _ => Ok(Next::Done(())),
         }
+    }
+
+    /// A resend checks its stored request again on every input, paged ones read back here, so a
+    /// grant withdrawn since the first send stops it before any holder, this node too, admits it.
+    fn rescreen(&mut self, prepared: Box<(RealmConfigDocument, TaskSubmission)>) -> SendNext {
+        let Some(manifest) = prepared.1.request.input_pages.clone() else {
+            let spec = prepared.1.request.spec.clone();
+            return self.screen(prepared, spec);
+        };
+        let submission = prepared.1.identity.submission_id;
+        let load = LoadChainOperation::new(submission, manifest, Vec::new());
+        self.phase = SendPhase::Load(prepared);
+        Ok(Next::Call(IoCall::child(load)))
+    }
+
+    fn screen(
+        &mut self,
+        prepared: Box<(RealmConfigDocument, TaskSubmission)>,
+        spec: ExecutionSpec,
+    ) -> SendNext {
+        let request = &prepared.1.request;
+        let task = (&spec, request.created_by, request.ingress_node_id);
+        let screen = ScreenTask::new(Arc::new(prepared.0.clone()), task);
+        self.phase = SendPhase::Screen(prepared);
+        Ok(Next::Call(IoCall::child(screen)))
     }
 
     /// Every resolved input version on this node, link targets and expanded entries included, is
@@ -319,6 +365,24 @@ impl Operation for SendTask {
                     manifest.map_err(|error| CallError(unavailable(error.to_string())))?;
                 self.paged(prepared, manifest)
             }
+            SendPhase::Load(prepared) => {
+                let pages = result.child::<Vec<InputPage>, PageReadError>()?;
+                let pages = pages.map_err(|error| CallError(unavailable(error.to_string())))?;
+                let spec = expanded(&prepared.1.request, pages)?;
+                self.screen(prepared, spec)
+            }
+            // A refused resend goes out to no holder; the deadline later proves the outcome.
+            SendPhase::Screen(prepared) => match result.child::<PluginInstall, ScreenError>()? {
+                Ok(_) => {
+                    let (config, submission) = *prepared;
+                    self.mark(config, submission)
+                }
+                Err(ScreenError::Unavailable(reason)) => Err(CallError(unavailable(reason))),
+                Err(refused) => Err(CallError(HostError::new(
+                    ErrorKind::Denied,
+                    refused.to_string(),
+                ))),
+            },
             SendPhase::Mark(prepared) => {
                 let changed = result.child::<Changed, StoreError>()?.map_err(stored)?;
                 match changed.marked {
