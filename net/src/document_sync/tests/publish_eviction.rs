@@ -1,4 +1,5 @@
-//! Tests publish genesis rules and that an evicted event replays after a lost tie-break.
+//! Tests publish genesis rules, held later events and that an evicted event replays after a lost
+//! tie-break.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -167,6 +168,81 @@ async fn blocked_allows_ready() {
     assert!(
         service.has_topic(ready_topic).expect("ready topic lookup"),
         "ready record behind not-ready record must publish"
+    );
+}
+
+// An event that must retry holds back the later events of its topic, so none of them lands in the
+// oplog ahead of it; other topics still publish.
+#[tokio::test]
+async fn later_event_held() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([63; 32]);
+    let placement = PlacementRef::NIL;
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(63).await,
+        storage,
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let held_target = DocumentTarget::NodeUsage {
+        realm_id,
+        node_id: local_node,
+        group_id: None,
+    };
+    let ready_target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: local_node,
+    };
+    let held_topic = held_target.sync_topic_id(realm_id, &placement);
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(63, 3),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement,
+    };
+    let upsert = |time, target: &DocumentTarget, allow_genesis| DocumentSyncPublish::Upsert {
+        event_id: Ulid::from_parts(time, 4),
+        target: target.clone(),
+        bytes: b"usage".to_vec(),
+        change,
+        allow_genesis,
+    };
+
+    let published = service
+        .publish_documents(
+            vec![
+                upsert(1, &held_target, false),
+                upsert(2, &held_target, true),
+                upsert(3, &ready_target, true),
+            ],
+            Vec::new(),
+        )
+        .await;
+
+    match published {
+        DocumentNetEvent::DocumentsPartiallyPublished {
+            published_indices,
+            retry_indices,
+            ..
+        } => assert_eq!((published_indices, retry_indices), (vec![2], vec![0, 1])),
+        other => panic!("expected partial publish, got {other:?}"),
+    }
+    assert!(
+        !service.has_topic(held_topic).expect("held topic lookup"),
+        "the later event of the waiting topic must not append"
     );
 }
 
