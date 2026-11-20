@@ -28,6 +28,9 @@ use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::relay::{relay_get, relay_json, relayed_set};
 use crate::server::state::ServerState;
 
+/// A coordinator's refusal of a start because it keeps a run ordered after it.
+const SUPERSEDED: &str = "a coverage count run ordered after this one holds the bucket";
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CountStatus {
@@ -66,6 +69,9 @@ pub struct CoverageCountResponse {
     /// run; their objects are missing.
     #[serde(default)]
     pub unreached: Vec<String>,
+    /// Coordinators that kept a run ordered after this start and refused it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<String>,
 }
 
 /// Starts a count that joins a run; only a node relaying a distributed start names the run.
@@ -108,6 +114,7 @@ impl CoverageCountResponse {
             rules_changed: status == CountStatus::Finished
                 && count.is_some_and(|count| count.generation != generation),
             unreached: Vec::new(),
+            superseded: Vec::new(),
         }
     }
 }
@@ -131,9 +138,11 @@ impl CoverageCountResponse {
   count are not in it; start a new count to include them.
 - With `run`, only a count of that run answers; a count of another run reads as `missing`.
 - In a distributed bucket every coordinator counts the ranges it writes. This node asks each with
-  the caller's bearer token and adds their counts of the asked `run`, else of the newest run any
-  of them holds. `unreached` names those that did not answer or hold no count of that run. When
-  none answers, the call fails with 503."#,
+  the caller's bearer token and adds their counts of the asked `run`, else of the one run they
+  hold. `unreached` names those that did not answer or hold no count of that run. When none
+  answers, the call fails with 503.
+- Without `run`, coordinators holding different runs fail the call with 409, which names the
+  runs; read the count with the `run` its start returned."#,
     params(
         ("bucket" = String, Path, description = "Bucket name as used by the S3 surface"),
         CountQuery
@@ -158,6 +167,7 @@ impl CoverageCountResponse {
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
+        (status = 409, description = "The coordinators hold different runs", body = ErrorResponse),
         (status = 503, description = "A distributed bucket: no coordinator answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -198,6 +208,9 @@ pub async fn get_coverage_count(
 - A count that still runs is dropped and starts over.
 - In a distributed bucket this node mints one `run` and starts the count of it on every coordinator
   with the caller's bearer token; `unreached` names those that did not answer.
+- Run ids order the starts of a bucket. A node that holds a count of a run ordered after this one
+  keeps it and refuses the start; `superseded` names those coordinators, and when every node
+  that answered refused, the call fails with 409. A node that holds this run answers with it.
 - Only a node relaying a distributed start names the `run` in the body; any other caller that
   names one gets 400."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
@@ -226,6 +239,7 @@ pub async fn get_coverage_count(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
+        (status = 409, description = "A later run holds the bucket", body = ErrorResponse),
         (status = 503, description = "A distributed bucket: no coordinator answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -265,7 +279,7 @@ async fn count_route(
     let info = bucket_info(state, bucket).await?;
     relayed_set(&info, headers)?;
     let relayed = headers.contains_key(RELAY_HOP_HEADER);
-    // Nodes mint every run, so the newest run id is the latest start.
+    // Run ids order the starts, so a caller naming one could pass every later start.
     if start && run.is_some() && !relayed {
         return Err(ServerError::BadRequestReason(
             "only a node relaying a start names its run".to_string(),
@@ -292,6 +306,7 @@ async fn count_here(
             let started = drive(operation, &context).await;
             Some(started.map_err(|error| match error {
                 StartCountError::NoSuchBucket => ServerError::NotFound,
+                StartCountError::Superseded => ServerError::Conflict(SUPERSEDED.to_string()),
                 other => ServerError::InternalError(other.into()),
             })?)
         }
@@ -326,7 +341,7 @@ async fn count_spread(
         false => run,
     };
     let path = bucket_path(bucket, "coverage/count");
-    let (mut answers, mut unreached) = (Vec::new(), Vec::new());
+    let (mut answers, mut unreached, mut superseded) = (Vec::new(), Vec::new(), Vec::new());
     for forward in coordinators(state, binding).await? {
         let answer = if forward.node_id == state.get_node_id() {
             count_here(state, bucket, start, run).await
@@ -343,17 +358,26 @@ async fn count_spread(
         };
         match answer {
             Ok(answer) => answers.push((forward.node_id.to_string(), answer)),
+            Err(ServerError::Conflict(message)) if message == SUPERSEDED => {
+                superseded.push(forward.node_id.to_string());
+            }
             Err(error) => {
                 tracing::warn!(node = %forward.node_id, %error, "A coordinator did not count");
                 unreached.push(forward.node_id.to_string());
             }
         }
     }
-    join_counts(bucket, answers, unreached, run)
+    if answers.is_empty() && !superseded.is_empty() {
+        return Err(ServerError::Conflict(SUPERSEDED.to_string()));
+    }
+    let mut joined = join_counts(bucket, answers, unreached, run)?;
+    joined.superseded = superseded;
+    Ok(joined)
 }
 
-/// One count for the whole bucket of the `wanted` run, else of the newest: numbers add up and the
-/// least advanced status wins. Nodes without a count of that run count as unreached.
+/// One count for the whole bucket of the `wanted` run, else of the one run the coordinators hold:
+/// numbers add up and the least advanced status wins. Nodes without a count of that run count as
+/// unreached; different runs and no wanted one refuse the answer.
 fn join_counts(
     bucket: &str,
     mut answers: Vec<(String, CoverageCountResponse)>,
@@ -366,7 +390,14 @@ fn join_counts(
         ));
     }
     let runs: Vec<_> = answers.iter().map(|(_, answer)| answer.run).collect();
-    let run = current_run(wanted, &runs);
+    let run = current_run(wanted, &runs).map_err(|seen| {
+        let seen: Vec<String> = seen.iter().map(Ulid::to_string).collect();
+        ServerError::Conflict(format!(
+            "the coordinators hold different count runs ({}); read the count with the run its \
+             start returned",
+            seen.join(", ")
+        ))
+    })?;
     for index in other_runs(run, &runs).into_iter().rev() {
         let (node, _) = answers.remove(index);
         unreached.push(node);
@@ -405,6 +436,7 @@ fn join_counts(
         run,
         rules_changed: answers.iter().any(|answer| answer.rules_changed),
         unreached,
+        superseded: Vec::new(),
     })
 }
 
@@ -475,17 +507,28 @@ mod tests {
             answer("node-b", old),
         ];
 
-        let joined = join_counts("photos", answers.clone(), Vec::new(), None).expect("joined");
+        let current = Some(Ulid::from_parts(10, 1));
+        let joined = join_counts("photos", answers.clone(), Vec::new(), current).expect("joined");
         assert_eq!((joined.status, joined.observed), (CountStatus::Finished, 7));
-        assert_eq!(joined.run, Some(Ulid::from_parts(10, 1)));
         assert_eq!(joined.unreached, ["node-b"]);
 
-        let joined = join_counts("photos", answers, Vec::new(), Some(previous)).expect("joined");
+        let previous_run = Some(previous);
+        let joined = join_counts("photos", answers.clone(), Vec::new(), previous_run);
+        let joined = joined.expect("joined");
         assert_eq!(
             (joined.observed, joined.unreached),
             (4, vec!["node-a".to_string()])
         );
+
+        // Without an asked run, the answer names both runs instead of picking one of them.
+        let refused = join_counts("photos", answers, Vec::new(), None);
+        let Err(ServerError::Conflict(message)) = refused else {
+            panic!("different runs refuse an unasked read");
+        };
+        assert!(message.contains(&previous.to_string()));
+        assert!(message.contains(&Ulid::from_parts(10, 1).to_string()));
     }
+
     // Once a run is known, a coordinator without a count of it missed the start; it is unreached.
     #[test]
     fn missing_count_unreached() {
