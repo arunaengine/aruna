@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::shared::oidc::spawn_oidc_provider;
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::auth::{OidcValidator, handle_token};
 use aruna_api::auth::{RealmAuth, TokenAuth};
@@ -85,6 +85,8 @@ struct TestNode {
     realm_admin_id: UserId,
     net: NetHandle,
     server_task: JoinHandle<()>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 fn sign_oidc_token(
@@ -218,7 +220,7 @@ async fn spawn_node(
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(driver_ctx.clone());
+    let incoming = initialize_incoming_fixture(driver_ctx.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         driver_ctx.clone(),
@@ -346,6 +348,7 @@ async fn spawn_node(
         realm_admin_id,
         net: net_handle,
         server_task,
+        _incoming: incoming,
     }
 }
 

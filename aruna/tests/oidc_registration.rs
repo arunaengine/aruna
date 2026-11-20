@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::shared::oidc::spawn_oidc_provider;
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::auth::OidcValidator;
 use aruna_api::server::state::ServerState;
@@ -56,6 +56,8 @@ struct TestNode {
     base_url: String,
     net: NetHandle,
     server_task: JoinHandle<()>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 fn sign_oidc_token(
@@ -130,7 +132,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         compute_handle: None,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
@@ -224,6 +226,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         base_url: format!("http://{addr}"),
         net,
         server_task,
+        _incoming: incoming,
     }
 }
 

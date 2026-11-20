@@ -10,7 +10,7 @@ use aruna::bootstrap::{
     fetch_core_documents, prepare_core_documents, publish_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use aruna::inbound::initialize_incoming_fixture;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
 use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
@@ -181,6 +181,8 @@ pub(crate) struct SeedNode {
     server_task: JoinHandle<()>,
     s3_task: Option<S3ServerHandle>,
     ops_task: JoinHandle<()>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 impl SeedNode {
@@ -210,6 +212,8 @@ pub(crate) struct JoinerNode {
     pub(crate) s3: Option<S3Endpoint>,
     server_task: JoinHandle<()>,
     s3_task: Option<S3ServerHandle>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 impl JoinerNode {
@@ -817,7 +821,7 @@ async fn spawn_seed_at(
         Some(_) => NodeVaultKey::derive(&[13; 32]),
         None => NodeVaultKey::random(),
     };
-    let context = initialize_context(
+    let (context, incoming) = initialize_context(
         storage,
         net.clone(),
         full_storage_config.as_ref(),
@@ -936,6 +940,7 @@ async fn spawn_seed_at(
         server_task,
         s3_task,
         ops_task,
+        _incoming: incoming,
     })
 }
 
@@ -972,7 +977,7 @@ async fn spawn_joiner_mode(
     .await?;
     let full_storage_config =
         (mode == NodeServiceMode::Full).then(|| FullStorageConfig::from_config(&config));
-    let joiner_context = initialize_context(
+    let (joiner_context, joiner_incoming) = initialize_context(
         storage_handle,
         joiner_net.clone(),
         full_storage_config.as_ref(),
@@ -1088,6 +1093,7 @@ async fn spawn_joiner_mode(
         s3,
         server_task,
         s3_task,
+        _incoming: joiner_incoming,
     })
 }
 
@@ -1097,7 +1103,7 @@ async fn initialize_context(
     full_storage_config: Option<&FullStorageConfig>,
     compute: Option<Arc<ExecutorRegistry>>,
     vault: NodeVaultKey,
-) -> TestResult<Arc<DriverContext>> {
+) -> TestResult<(Arc<DriverContext>, Option<IncomingFixture>)> {
     storage_handle.open_vault(vault);
     let task_handle = TaskHandle::new();
     let graph_handle = if let Some(config) = full_storage_config {
@@ -1137,7 +1143,7 @@ async fn initialize_context(
         compute_handle: compute,
         outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
@@ -1146,7 +1152,7 @@ async fn initialize_context(
         &shutdown,
     )
     .await;
-    Ok(context)
+    Ok((context, incoming))
 }
 
 async fn announce_realm_presence(
