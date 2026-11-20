@@ -534,11 +534,13 @@ impl Operation for RunReplays {
 
     fn next(&mut self, answer: IoResult) -> Result<Next<(usize, bool)>, StoreError> {
         if let Some(scan) = self.scan.as_mut() {
-            let Some(rows) = scan.take(answer)? else {
+            // Only the keys of each page stay; the replay rows are read again page by page.
+            let (rows, more) = scan.page(answer)?;
+            self.keys.extend(rows.into_iter().map(|(key, _)| key));
+            if more {
                 return Ok(Next::Call(scan.ask()));
-            };
+            }
             self.scan = None;
-            self.keys = rows.into_iter().map(|(key, _)| key).collect();
             return Ok(self.next_replay());
         }
         let (rows, ended) = answer.child::<(usize, bool), StoreError>()??;
