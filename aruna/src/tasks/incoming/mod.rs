@@ -477,6 +477,13 @@ impl OperationsTaskHandler {
         }
     }
 
+    /// Arms the backend import pass at start, live even when its row cannot be stored, since
+    /// no restored wake runs the rules until a rule changes.
+    pub(super) async fn arm_backend_imports(&self) {
+        self.keep_retrying(TaskKey::RunBackendImports, Duration::ZERO)
+            .await;
+    }
+
     // Kicks the placement reconciler immediately (not persisted; it is re-derived
     // from the realm config at startup by `RestoreTopicsOperation`).
     async fn schedule_sync_placements(&self, realm_id: RealmId, node_id: aruna_core::id::NodeId) {

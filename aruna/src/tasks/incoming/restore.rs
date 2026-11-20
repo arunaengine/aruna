@@ -435,9 +435,7 @@ impl TaskQueues {
                 .reschedule_timer(TaskKey::MigrateCompression, Duration::ZERO)
                 .await;
             // The run computes every rule's next due time and re-arms itself.
-            handler
-                .reschedule_timer(TaskKey::RunBackendImports, Duration::ZERO)
-                .await;
+            handler.arm_backend_imports().await;
             // Each pass re-arms itself; a node without distributed buckets finds no accounts.
             handler
                 .reschedule_timer(TaskKey::MaintainRanges, Duration::ZERO)
@@ -467,7 +465,8 @@ impl OperationsTaskHandler {
             }
             _ => warn!(task_id = ?key, "Cannot publish registration without net handle or keys"),
         }
-        self.reschedule_timer(key, aruna_core::federation::PUBLISH_INTERVAL)
+        // The fired row is gone, so a refused rearm keeps a live renewal that stores it again.
+        self.keep_retrying(key, aruna_core::federation::PUBLISH_INTERVAL)
             .await;
     }
 }
