@@ -259,9 +259,35 @@ fn open_section(
     ))
 }
 
-/// Makes one Git entry below `root` and opens a file entry for its value; a key ending in `/` is
-/// a directory.
-fn git_file(root: &Path, key: &[u8]) -> Result<Option<File>, SnapshotError> {
+/// Where a Git entry's value goes: a file, or nowhere for a directory, whose value is empty.
+enum GitValue {
+    File(File),
+    Directory,
+}
+
+impl std::io::Write for GitValue {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => std::io::Write::write(file, bytes),
+            Self::Directory if bytes.is_empty() => Ok(0),
+            Self::Directory => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "a Git directory entry in the backup has a value",
+            )),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::File(file) => std::io::Write::flush(file),
+            Self::Directory => Ok(()),
+        }
+    }
+}
+
+/// Makes one Git entry below `root` and opens where its value goes; a key ending in `/` is a
+/// directory.
+fn git_file(root: &Path, key: &[u8]) -> Result<Option<GitValue>, SnapshotError> {
     let relative = std::str::from_utf8(key)
         .map_err(|_| SnapshotError::InvalidStructure("non UTF-8 Git path in backup"))?;
     let path = Path::new(relative);
@@ -271,12 +297,12 @@ fn git_file(root: &Path, key: &[u8]) -> Result<Option<File>, SnapshotError> {
     let path = root.join(path);
     if relative.ends_with('/') {
         std::fs::create_dir_all(path)?;
-        return Ok(None);
+        return Ok(Some(GitValue::Directory));
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    Ok(Some(File::create(path)?))
+    Ok(Some(GitValue::File(File::create(path)?)))
 }
 
 #[cfg(test)]
@@ -504,6 +530,21 @@ mod tests {
         restore_backup(&file, &target).unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    // A directory entry carries no bytes; one with a value is refused before it is buffered.
+    #[test]
+    fn git_directory_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = SnapshotWriter::new(Vec::new(), 11).unwrap();
+        writer.begin_keyspace(GIT_KEYSPACE).unwrap();
+        writer.entry(b"one.git/", b"unexpected").unwrap();
+        writer.end_keyspace().unwrap();
+        let file = dir.path().join("dir.backup");
+        std::fs::write(&file, writer.finish().unwrap().0).unwrap();
+        let restored = restore_backup(&file, &dir.path().join("restored"));
+        assert!(restored.is_err());
+        assert!(!staging_left(dir.path()));
     }
 
     #[test]
