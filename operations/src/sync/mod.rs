@@ -7,6 +7,7 @@ pub mod announce;
 pub mod document_outbox;
 pub mod evicted;
 pub mod notification_outbox;
+pub mod outbox_defer;
 pub mod outbox_record;
 pub mod reconcile;
 pub mod replicate_documents;

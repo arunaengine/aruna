@@ -7,6 +7,7 @@ use super::*;
 use crate::tasks::incoming::restore::start_task_queues;
 use aruna_clock::testing::poll_until;
 use aruna_drivers::testing::freeze_clock;
+use aruna_operations::sync::outbox_defer::DeferOutcome;
 
 #[test]
 fn admin_block_spans() {

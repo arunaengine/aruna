@@ -27,7 +27,7 @@ use aruna_tasks::shutdown::Shutdown;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// The unverified data link posting the next pass continues after; a restart begins again at
 /// the start.
@@ -166,6 +166,9 @@ use aruna_operations::s3::object::metadata::REFRESH_RETRY_AFTER;
 use aruna_operations::sync::document_outbox::{
     DeleteOutboxPlan, OutboxPagePlan, OutboxTailsOperation, OutboxTimerOperation,
 };
+use aruna_operations::sync::outbox_defer::{
+    DrainDeferState, DrainRecord, admin_origin, classify_deferred_record, partition_drain_records,
+};
 use aruna_operations::sync::outbox_record::OUTBOX_DRAIN_SIZE;
 use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::shard_placement::DEFER_RETRY_AFTER;
@@ -233,12 +236,6 @@ impl Default for OutboxLimits {
 }
 
 /// One drained outbox record with its resolved publish topic.
-type DrainRecord = (
-    Vec<u8>,
-    aruna_core::document::DocumentOutboxRecord,
-    irokle::TopicId,
-);
-
 pub(crate) struct OperationsTaskHandler {
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -326,18 +323,6 @@ struct DrainSyncOutcome {
     blocked_origins: Vec<aruna_core::id::NodeId>,
 }
 
-/// Per-invocation defer state. The block sets are seeded from the open rotation;
-/// `topic_exists` and `topic_held` deliberately are not, so holdership and
-/// genesis presence are re-read every invocation.
-#[derive(Default)]
-struct DrainDeferState {
-    topic_exists: HashMap<irokle::TopicId, bool>,
-    topic_held: HashMap<irokle::TopicId, bool>,
-    deferred_topics: HashSet<irokle::TopicId>,
-    blocked_origins: HashSet<aruna_core::id::NodeId>,
-    undeliverable_topics: HashSet<irokle::TopicId>,
-}
-
 type StuckRecord = (
     u64,
     DocumentTarget,
@@ -373,18 +358,6 @@ enum DrainPage {
     },
     Skip,
     Stop,
-}
-
-/// Whether a shard-classed record can ever publish from this node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeferOutcome {
-    /// The local node holds the bucket, so it may publish onto the bucket's topic
-    /// once the genesis is there (rank-0 creates it, every other holder pulls it).
-    Retry,
-    /// The local node holds none of the record's bucket. Topic membership is the
-    /// holder set, so it may neither mint the genesis nor join the topic: this
-    /// record can never publish from here, however long it waits.
-    Undeliverable,
 }
 
 impl OperationsTaskHandler {
