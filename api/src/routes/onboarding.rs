@@ -34,11 +34,11 @@ use aruna_operations::onboarding::finalize_bootstrap::{
 use aruna_operations::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
 };
-use aruna_operations::onboarding::list_secrets::{ListSecretsOperation, SecretPage};
+use aruna_operations::onboarding::expiry_page::ExpiryPageOperation;
 use aruna_operations::onboarding::read_secret::ReadSecretOperation;
 use aruna_operations::onboarding::reserve_secret::ReserveSecretError;
 use aruna_operations::realm::ensure_config::EnsureConfigError;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use base64::Engine;
@@ -52,7 +52,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
 use url::Url;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -139,6 +139,18 @@ pub struct RealmEndpointDoc {
 #[schema(as = ListOnboardingSecretsResponse)]
 pub struct ListSecretsResponse {
     pub secrets: Vec<OnboardingSecretSummary>,
+    /// Continues the list after this page; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// One page of the onboarding secret list.
+#[derive(Debug, Default, serde::Deserialize, IntoParams)]
+pub struct ListSecretsQuery {
+    /// The `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+    /// Secrets per page, 1 to 1000; 100 by default.
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -241,25 +253,20 @@ async fn enforce_enrollment_policies(
     .map_err(|_| ServerError::Forbidden)
 }
 
-/// One page of onboarding secrets after the record key `after`.
-async fn secret_page(
-    state: &Arc<ServerState>,
-    after: Option<byteview::ByteView>,
-) -> ServerResult<SecretPage> {
-    drive(ListSecretsOperation::new(after), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.into()))
-}
-
+/// Removes the expired secrets that no enrollment finishes, soonest expiry first; the expiry
+/// index ends the walk at the first secret that is still valid.
 async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
     let now = now_timestamp();
     let mut after = None;
     loop {
-        let page = secret_page(state, after).await?;
+        let page = drive(ExpiryPageOperation::new(after, 256), &state.get_ctx())
+            .await
+            .map_err(|err| ServerError::InternalError(err.into()))?;
         for secret in page.entries {
-            if secret.record.expires_at < now
-                && !matches!(&secret.state, OnboardingSecretState::Finalizing { .. })
-            {
+            if secret.record.expires_at >= now {
+                return Ok(());
+            }
+            if !matches!(&secret.state, OnboardingSecretState::Finalizing { .. }) {
                 drive(
                     DeleteSecretOperation::new(DeleteSecretInput {
                         enrollment_id: secret.record.enrollment_id,
@@ -473,7 +480,10 @@ node serves it, and every other node relays the call to one.
 **Behavior**
 - The secret value itself is never returned, because only its hash was kept when it was minted.
 - Expired secrets that are not mid-enrollment are discarded before the list is built.
+- The list comes in pages of `limit` secrets (1 to 1000, 100 by default); `next_cursor`
+  continues it, soonest expiry first across pages.
 - The list is this management node's own state, not a realm-wide fan-out."#,
+    params(ListSecretsQuery),
     responses(
         (
             status = 200,
@@ -506,27 +516,32 @@ node serves it, and every other node relays the call to one.
 pub async fn list_onboarding_secrets(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<ListSecretsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListSecretsResponse>)> {
     let _auth = authorize_onboarding_admin(&state, auth).await?;
-    prune_stale_secrets(&state).await?;
-    let (mut secrets, mut after) = (Vec::new(), None);
-    loop {
-        let page = secret_page(&state, after).await?;
-        secrets.extend(page.entries.into_iter().map(|entry| entry.record));
-        match page.next {
-            Some(next) => after = Some(next),
-            None => break,
+    let after = match query.cursor {
+        Some(text) => {
+            let key = aruna_core::cursor::decode(&text).map_err(|_| ServerError::BadRequest)?;
+            if !ExpiryPageOperation::index_key(&key) {
+                return Err(ServerError::BadRequest);
+            }
+            Some(byteview::ByteView::from(key))
         }
-    }
-    secrets.sort_by_key(|record| record.expires_at);
+        None => None,
+    };
+    prune_stale_secrets(&state).await?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let page = drive(ExpiryPageOperation::new(after, limit), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.into()))?;
 
     Ok((
         StatusCode::OK,
         Json(ListSecretsResponse {
-            secrets: secrets
-                .into_iter()
-                .map(OnboardingSecretSummary::from)
+            secrets: (page.entries.into_iter())
+                .map(|entry| OnboardingSecretSummary::from(entry.record))
                 .collect(),
+            next_cursor: page.next.map(aruna_core::cursor::encode),
         }),
     ))
 }

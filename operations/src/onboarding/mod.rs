@@ -5,6 +5,7 @@
 pub mod consume_secret;
 pub mod create_secret;
 pub mod delete_secret;
+pub mod expiry_page;
 pub mod finalize_bootstrap;
 pub mod inspect_secret;
 pub mod issue_ticket;
