@@ -14,9 +14,7 @@ use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind, LaunchIntent,
     PhysicalExecutionState, SubmissionId,
 };
-use aruna_core::structs::execution::job::membership::membership::membership::membership::{
-    Membership, membership,
-};
+use aruna_core::structs::execution::job::membership::{Membership, membership};
 use aruna_core::structs::execution::job::record_keys::{id_key, record_key};
 use aruna_core::structs::execution::job::record_rows::{PendingNeed, from_bytes};
 use aruna_core::structs::identity::group_delete::GroupWriteError;

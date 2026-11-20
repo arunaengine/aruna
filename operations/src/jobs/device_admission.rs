@@ -11,7 +11,7 @@ use aruna_core::compute::identity::BackendConfigRecord;
 use aruna_core::compute::offer::ExecutorOffer;
 use aruna_core::compute::{ExecutorKind, NetworkAccess};
 use aruna_core::operation::Operation;
-use aruna_core::scheduling::{RejectionVerdict, backend_verdict, hosts_session};
+use aruna_core::scheduling::eligibility::{RejectionVerdict, backend_verdict, hosts_session};
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::ExecutionSpec;
 use aruna_core::structs::execution::job::local::{JobError, JobRecord, LocalAdmission};
@@ -26,7 +26,8 @@ use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::workflow::DEFAULT_WALLTIME;
 use crate::jobs::workflow::compute::{compute_answer, compute_call};
 use crate::jobs::workflow::prepare::NETWORK_TAG_KEY;
-use crate::placement::policy::{LocalSubjectOperation, SubjectScanError};
+use crate::placement::policy::reconcile::LocalSubjectOperation;
+use crate::placement::policy::subject::SubjectScanError;
 use aruna_core::job_request::{effective_resources, session_of};
 
 /// The network a session run asks for; `None` for a run that is no session.

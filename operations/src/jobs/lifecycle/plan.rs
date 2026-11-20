@@ -9,6 +9,9 @@ use aruna_core::compute::{ExecutionTargetId, ExecutorCapability, NetworkAccess, 
 use aruna_core::id::NodeId;
 use aruna_core::job_request;
 use aruna_core::scheduling::ExecutionPlan;
+use aruna_core::scheduling::inputs::{
+    InputHolder, MAX_INPUT_HOLDERS, MAX_TARGET_SCAN, PlanRequest, ResolvedInput, TargetCandidate,
+};
 use aruna_core::scheduling::scan::Planner;
 use aruna_core::structs::execution::job::family::LogicalJobSpec;
 use aruna_core::structs::execution::job::input::{

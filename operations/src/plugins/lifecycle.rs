@@ -12,7 +12,7 @@ use aruna_core::id::NodeId;
 use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::plugin_installs::{InstallGuard, InstallState, PluginInstall, Widening};
 use aruna_core::plugins::PublishedPlugin;
-use aruna_core::reducer::InstallEntry;
+use aruna_core::reducer::targets::InstallEntry;
 use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};

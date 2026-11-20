@@ -13,7 +13,9 @@ use aruna_core::compute::quota::{
 use aruna_core::compute::{ExecutorAvailability, ResourceEnvelope};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::id::NodeId;
-use aruna_core::scheduling::{PlannedInput, RejectionVerdict, TargetScore};
+use aruna_core::scheduling::PlannedInput;
+use aruna_core::scheduling::eligibility::RejectionVerdict;
+use aruna_core::scheduling::inputs::TargetScore;
 use aruna_core::structs::execution::job::family::{
     LogicalJobSpec, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
