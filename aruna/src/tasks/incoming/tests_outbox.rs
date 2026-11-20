@@ -646,20 +646,14 @@ async fn rotation_streak() {
 
     for expected in 1..=OUTBOX_CONTINUATION_STREAK {
         handler.drain_sync_outbox().await;
-        assert_eq!(
-            handler.kept_rotation().continuations,
-            expected
-        );
+        assert_eq!(handler.kept_rotation().continuations, expected);
         assert_eq!(
             scheduled_after(&task_handle).await,
             OUTBOX_CONTINUATION_AFTER
         );
     }
     handler.drain_sync_outbox().await;
-    assert_eq!(
-        handler.kept_rotation().continuations,
-        0
-    );
+    assert_eq!(handler.kept_rotation().continuations, 0);
     assert_eq!(scheduled_after(&task_handle).await, DEFER_RETRY_AFTER);
     for _ in 0..4 {
         handler.drain_sync_outbox().await;
@@ -1297,4 +1291,3 @@ impl BoundaryHarness {
         shutdown_net(&self.net).await;
     }
 }
-

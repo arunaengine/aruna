@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::inbound_frames;
 use aruna_blob::native;
@@ -46,7 +45,7 @@ pub(crate) struct MetadataHeld {
     _budget: OwnedSemaphorePermit,
     _audit_slot: Option<OwnedSemaphorePermit>,
     /// An audit request keeps one deadline for every step after it was read.
-    pub(crate) audit: Option<Instant>,
+    pub(crate) audit: Option<tokio::time::Instant>,
 }
 
 /// Reads the request of one converted protocol in its framing; a refused or broken read is
@@ -158,7 +157,7 @@ pub(crate) async fn write_peer(
     input: &PeerInput,
     mut stream: BiStream,
     answer: Result<PeerAnswer, PeerFailure>,
-    audit: Option<Instant>,
+    audit: Option<tokio::time::Instant>,
 ) {
     let peer = input.peer;
     let written = match (input.alpn, answer) {

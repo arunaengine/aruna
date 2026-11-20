@@ -59,7 +59,8 @@ fn refuses_by_rule() {
         batch: Suitability::Refused,
         ..WorkloadSuitability::of_kind(&ExecutorKind::Docker)
     };
-    let cases: [(fn(&mut BackendCaps), RejectionVerdict); 2] = [
+    type Case = (fn(&mut BackendCaps), RejectionVerdict);
+    let cases: [Case; 2] = [
         (
             |caps| caps.groups = vec![Ulid::from_bytes([9; 16])],
             RejectionVerdict::GroupNotAllowed,

@@ -25,7 +25,7 @@ use aruna_operations::shard::recovery::RecoveryStatus;
 use aruna_operations::transfer::feed_walks::{FeedCursors, FeedLimits, FeedPassOperation};
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::application::{Service, ServiceExit};
 use crate::plugin_host::repair::spawn_repair;
@@ -138,6 +138,8 @@ pub(crate) enum BackgroundOutcome {
     Cancelled,
     /// A listener whose loss stops the node exited; the sequence stopped.
     RequiredListenerFailed(Service),
+    /// Stale execution state could not be discarded; no job work started.
+    DiscardFailed,
 }
 
 /// Runs the background start, applying steady-state supervision to any
@@ -170,11 +172,13 @@ pub(crate) async fn start(
     let mut core_documents = Some(documents);
     let mut task_queues = Some(task_queues);
     let mut completed_all_phases = true;
-    // A node offline longer than the job retention ends its executions before any job work.
+    // A node offline longer than the job retention ends its executions before any job work. A
+    // failed discard stops the start, so the next one decides again from the same contact row.
     let discard =
         aruna_operations::jobs::discard::DiscardOperation::new(driver_ctx.node_and_realm());
     if let Err(error) = drive(discard, &driver_ctx).await {
-        warn!(error = %error, "Failed to discard stale execution state; the next start retries");
+        error!(error = %error, "Failed to discard stale execution state; the start stops");
+        return BackgroundOutcome::DiscardFailed;
     }
 
     for phase in STARTUP_PHASES {
@@ -380,6 +384,41 @@ mod tests {
         let outcome = start(background, &stop, || None, |phase| executed.push(phase)).await;
 
         assert_eq!(outcome, BackgroundOutcome::Cancelled);
+        assert!(executed.is_empty());
+        assert!(!readiness.is_ready());
+    }
+
+    // A discard that fails stops the start before any phase, so neither job recovery nor the
+    // catch-up runs and the next start discards from the same contact row.
+    #[tokio::test]
+    async fn failed_discard_stops() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::events::StorageEvent;
+        let (background, _temp) = test_background().await;
+        let readiness = background.readiness.clone();
+        let written = (background.driver_ctx.storage_handle)
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE.to_string(),
+                key: byteview::ByteView::from(&b"unreadable"[..]),
+                value: byteview::ByteView::from(&b"not a reservation"[..]),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            written,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let mut executed = Vec::new();
+
+        let outcome = start(
+            background,
+            &tokio_util::sync::CancellationToken::new(),
+            || None,
+            |phase| executed.push(phase),
+        )
+        .await;
+
+        assert_eq!(outcome, BackgroundOutcome::DiscardFailed);
         assert!(executed.is_empty());
         assert!(!readiness.is_ready());
     }

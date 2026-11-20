@@ -504,6 +504,8 @@ async fn waits_for_pruning() {
 #[tokio::test]
 async fn replay_waits_pruning() {
     use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
+    use aruna_core::structs::execution::job::prune::FamilyTombstone;
+    use aruna_core::structs::execution::job::record_keys::family_prefix;
     let family = Family::new([6u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let first = admit(&ctx, &family, family.job_id).await;

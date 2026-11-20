@@ -14,17 +14,18 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::user::id::UserId;
 
-use super::admit_here::placement_failure;
+use super::admit::here::placement_failure;
 use super::advertised::{Advertised, AdvertisementsOperation};
 use super::forward::ForwardSubmissionOperation;
-use super::ids::{self, RequestIdentity, SubmissionRequest, SubmissionScope, store_workspace};
 use super::plan::missing_label;
 use super::resolve_inputs::{ResolveInputsOperation, ResolvedInputs};
 use super::submission_rules::{family_view, is_device, pin_outputs};
 use super::submit_external::IngressNode;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::submit::execution::validate_execution;
-use aruna_core::job_request::SubmitJobError;
+use aruna_core::job_request::{
+    self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError, store_workspace,
+};
 
 /// A plugin task's request, resolved at the receiver and not yet paged, with its identity and
 /// the nodes it goes to: this node when it holds the family, else the holders.
@@ -161,7 +162,7 @@ impl Operation for PrepareTaskJob {
         validate_execution(&mut self.spec, WorkspaceMode::None, None)?;
         store_workspace(&mut self.spec, WorkspaceMode::None, None)
             .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
-        self.labels = ids::required_labels(&self.spec)
+        self.labels = job_request::required_labels(&self.spec)
             .map_err(|error| SubmitJobError::InvalidWorkspace(error.to_string()))?;
         let read = GetConfigOperation::new(self.node.realm_id);
         Ok(Next::Call(IoCall::child(read)))

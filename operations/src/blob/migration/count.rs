@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{COUNT_QUEUE_KEYSPACE, COVERAGE_COUNT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
@@ -14,6 +15,7 @@ use aruna_core::structs::placement::coverage::CoverageCount;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 use super::drain::MIGRATION_CONTINUE;
 use super::shared::MigrationError;
@@ -60,22 +62,39 @@ fn decode_count(value: Option<Value>) -> Result<Option<CoverageCount>, Conversio
 }
 
 /// Replaces the bucket's saved count with one started at the run's time and wakes the migration
-/// task once the record committed.
+/// task once the record committed. The count joins `run`, or a run it mints when none is given.
 #[derive(Debug, PartialEq)]
 pub struct StartCountOperation {
     bucket: String,
     record: CoverageCount,
+    ids: IdMint,
     written: bool,
 }
 
 impl StartCountOperation {
-    pub fn new(bucket: String) -> Self {
+    pub fn new(bucket: String, run: Option<Ulid>) -> Self {
         Self {
             bucket,
-            record: CoverageCount::new(0),
+            record: CoverageCount {
+                run,
+                ..CoverageCount::new(0)
+            },
+            ids: IdMint::default(),
             written: false,
         }
     }
+}
+
+/// The positions of node counts from another run than the one a distributed count reports: the
+/// run its start gave, else the newest any node holds. A node without a count is in every run.
+pub fn other_runs(started: Option<Ulid>, runs: &[Option<Ulid>]) -> Vec<usize> {
+    let Some(current) = started.or_else(|| runs.iter().flatten().max().copied()) else {
+        return Vec::new();
+    };
+    (runs.iter().enumerate())
+        .filter(|(_, run)| run.is_some_and(|run| run != current))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 impl Operation for StartCountOperation {
@@ -86,11 +105,17 @@ impl Operation for StartCountOperation {
         TransactionMode::Write
     }
 
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
     fn stamp(&mut self, now_ms: u64) {
-        self.record = CoverageCount::new(now_ms);
+        self.record.started_at_ms = now_ms;
     }
 
     fn first(&mut self) -> Result<Next<CoverageCount>, StartCountError> {
+        let started = self.record.started_at_ms;
+        self.record.run = Some(self.record.run.unwrap_or_else(|| self.ids.mint(started)));
         Ok(Next::Call(read_row(
             S3_BUCKET_KEYSPACE,
             count_key(&self.bucket),
@@ -160,7 +185,12 @@ fn add_page(record: CoverageCount, report: &CoverageReport, now_ms: u64) -> Cove
     let fresh = record.cursor.is_none() && record.observed == 0;
     let mut record = match fresh || record.generation == report.generation {
         true => record,
-        false => return CoverageCount::new(record.started_at_ms),
+        false => {
+            return CoverageCount {
+                run: record.run,
+                ..CoverageCount::new(record.started_at_ms)
+            };
+        }
     };
     record.generation = report.generation;
     record.observed += report.observed as u64;

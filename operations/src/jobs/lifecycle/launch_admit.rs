@@ -15,10 +15,12 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, ExecutionSignEvent, LaunchDecline, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
+use aruna_core::job_request::session_of;
 use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
 use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
-use aruna_core::scheduling::{PlannedInput, backend_verdict, hosts_session};
+use aruna_core::scheduling::PlannedInput;
+use aruna_core::scheduling::eligibility::{backend_verdict, hosts_session};
 use aruna_core::structs::execution::job::family::{
     ExecutionClaim, ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobRecordBody,
     JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
@@ -26,9 +28,7 @@ use aruna_core::structs::execution::job::family::{
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{InputSource, JobPayload, tagged};
 use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
-use aruna_core::structs::execution::job::membership::membership::membership::membership::{
-    Membership, membership,
-};
+use aruna_core::structs::execution::job::membership::{Membership, membership};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use std::collections::BTreeMap;
@@ -39,7 +39,6 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::cancel::FlagRunOperation;
 use super::fetch::{FetchFamilyOperation, FetchedFamily};
-use super::ids::{session_of, workspace_of};
 use super::launch_checks::{CheckError, LaunchCheck, LaunchChecksOperation, Verdict};
 use super::membership::MembershipViewOperation;
 use super::outbox::schedule_outbox_drain;

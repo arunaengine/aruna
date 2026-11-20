@@ -14,9 +14,7 @@ use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKind, LaunchIntent,
     PhysicalExecutionState, SubmissionId,
 };
-use aruna_core::structs::execution::job::membership::membership::membership::membership::{
-    Membership, membership,
-};
+use aruna_core::structs::execution::job::membership::{Membership, membership};
 use aruna_core::structs::execution::job::record_keys::{id_key, record_key};
 use aruna_core::structs::execution::job::record_rows::{PendingNeed, from_bytes};
 use aruna_core::structs::identity::group_delete::GroupWriteError;
@@ -524,10 +522,8 @@ impl Operation for ServeRecordOperation {
                 let Ok(Some(view)) = result.child::<Option<WriterView>, IoError>()? else {
                     return self.fail(ServeError::Unavailable);
                 };
-                let launches = attached.iter().filter_map(launch_of);
-                let checked: Result<(), ServeError> = launches
-                    .map(|launch| scheduler_member(&view, launch))
-                    .collect();
+                let mut launches = attached.iter().filter_map(launch_of);
+                let checked = launches.try_for_each(|launch| scheduler_member(&view, launch));
                 match checked {
                     Ok(()) => self.append(*record, attached),
                     Err(error) => self.fail(error),

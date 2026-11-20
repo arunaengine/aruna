@@ -126,6 +126,8 @@ enum ForwardedStep {
     Pages(Box<RealmConfigDocument>),
     Device(Box<RealmConfigDocument>),
     Screen(Box<RealmConfigDocument>),
+    /// A plugin task's grants checked again on the inputs its pages brought.
+    Rescreen(Box<RealmConfigDocument>),
     Store(Box<(RealmConfigDocument, RequestIdentity)>),
     Admit,
 }
@@ -228,6 +230,14 @@ impl AdmitForwardedOperation {
             .retain(|input| input.source.is_inline());
         self.request.spec.inputs.extend(inputs);
         self.request.captured_inputs = captured;
+        // The first check saw only the inline inputs; the paged ones need their grants too.
+        if tagged(&self.request.spec).is_some() {
+            let request = &self.request;
+            let task = (&request.spec, request.created_by, request.ingress_node_id);
+            let screen = ScreenTask::new(std::sync::Arc::new(config.clone()), task);
+            self.step = ForwardedStep::Rescreen(Box::new(config));
+            return Ok(Next::Call(IoCall::child(screen)));
+        }
         self.normalize(config)
     }
 
@@ -375,6 +385,11 @@ impl Operation for AdmitForwardedOperation {
             ForwardedStep::Screen(config) => {
                 let install = result.child::<PluginInstall, ScreenError>()?;
                 self.screened(*config, install.map_err(screen_refusal)?)
+            }
+            ForwardedStep::Rescreen(config) => {
+                let install = result.child::<PluginInstall, ScreenError>()?;
+                install.map_err(screen_refusal)?;
+                self.normalize(*config)
             }
             ForwardedStep::Group(config) => match result.child::<bool, IoError>()? {
                 Ok(true) => self.load_pages(*config),
@@ -525,6 +540,41 @@ mod tests {
             answer(SubmitJobError::UnexpectedEvent("lost".to_string())),
             Err(SubmissionRefusal::Unavailable)
         );
+    }
+
+    // A plugin task's paged inputs pass the task check again once they are loaded, so a grant
+    // withdrawn since the sender prepared them refuses the submission before admission.
+    #[test]
+    fn paged_task_rescreened() {
+        use aruna_core::structs::execution::job::input::{PLUGIN_INSTALL_TAG, PLUGIN_WORK_TAG};
+        let config = Family::new([4; 32]).config;
+        let mut admit = operation(Some(local_ingress()));
+        let tags = &mut admit.request.spec.tags;
+        tags.insert(
+            PLUGIN_INSTALL_TAG.to_string(),
+            Ulid::from_parts(1, 1).to_string(),
+        );
+        tags.insert(
+            PLUGIN_WORK_TAG.to_string(),
+            Ulid::from_parts(2, 2).to_string(),
+        );
+        let next = admit.with_pages(config.clone(), Vec::new());
+        let request = &admit.request;
+        let task = (&request.spec, request.created_by, request.ingress_node_id);
+        let screen = ScreenTask::new(std::sync::Arc::new(config.clone()), task);
+        assert_eq!(next, Ok(Next::Call(IoCall::child(screen))));
+        assert_eq!(
+            admit.step,
+            ForwardedStep::Rescreen(Box::new(config.clone()))
+        );
+        let withdrawn = ScreenError::Refused("objects.read is not granted".to_string());
+        let reason = withdrawn.to_string();
+        let refused = admit.next(child(Err::<PluginInstall, _>(withdrawn)));
+        assert_eq!(refused, Err(SubmissionRefusal::Invalid { reason }));
+        // An ordinary job's pages need no task check.
+        let mut plain = operation(Some(local_ingress()));
+        let _ = plain.with_pages(config, Vec::new());
+        assert!(!matches!(plain.step, ForwardedStep::Rescreen(_)));
     }
 
     // Missing grant rows deny the write; a caller is never allowed by default.

@@ -46,9 +46,7 @@ fn family_report_fixture() -> FamilyReport {
         EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
         SubmissionId,
     };
-    use aruna_core::structs::execution::job::input::{
-        ExecutionSpec, SessionReportDetail, SessionReportRow,
-    };
+    use aruna_core::structs::execution::job::input::ExecutionSpec;
     use aruna_core::structs::execution::job::local::OutputObject;
     use aruna_core::structs::placement::record::PlacementRef;
 
@@ -296,6 +294,7 @@ fn report_row(entry_key: &str) -> ImportReportRow {
 
 #[test]
 fn decodes_session_report() {
+    use aruna_core::structs::execution::job::input::{SessionReportDetail, SessionReportRow};
     let row = SessionReportRow {
         entry_key: "input/0000".to_string(),
         detail: SessionReportDetail::Input {

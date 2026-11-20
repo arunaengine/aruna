@@ -178,11 +178,13 @@ impl PublishBatchesOperation {
                 self.out.published.extend(batch.record_keys.iter().cloned());
                 self.awaiting = Some(batch);
             }
-            Some(Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPartiallyPublished {
-                published_indices,
-                retry_indices,
-                error,
-            }))) => {
+            Some(Event::Net(NetEvent::DocumentSync(
+                DocumentNetEvent::DocumentsPartiallyPublished {
+                    published_indices,
+                    retry_indices,
+                    error,
+                },
+            ))) => {
                 warn!(
                     task_id = ?task_id,
                     published = published_indices.len(),
@@ -196,7 +198,9 @@ impl PublishBatchesOperation {
                 }
                 match batch.sync_subset(&published_indices) {
                     Some(published) if !published.record_keys.is_empty() => {
-                        self.out.published.extend(published.record_keys.iter().cloned());
+                        self.out
+                            .published
+                            .extend(published.record_keys.iter().cloned());
                         self.awaiting = Some(published);
                     }
                     Some(_) => {}
@@ -365,7 +369,10 @@ mod tests {
         let published = net(DocumentNetEvent::DocumentsPublished {
             targets: Vec::new(),
         });
-        assert!(matches!(run.next(published), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            run.next(published),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         let finished = FinishedBatch {
             deleted: true,
             ..FinishedBatch::default()

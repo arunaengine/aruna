@@ -10,12 +10,13 @@ use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::drive;
 use aruna_operations::blob::migration::count::{
-    ReadCountOperation, StartCountError, StartCountOperation,
+    ReadCountOperation, StartCountError, StartCountOperation, other_runs,
 };
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
+use ulid::Ulid;
 use utoipa::ToSchema;
 
 use super::coordinators::{bucket_path, coordinators};
@@ -54,11 +55,24 @@ pub struct CoverageCountResponse {
     /// Set once every node that answered finished its count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at_ms: Option<u64>,
+    /// The start this count belongs to; a distributed start gives every coordinator the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub run: Option<Ulid>,
     /// The bucket rules changed after the count compared against them.
     pub rules_changed: bool,
-    /// Nodes that write part of a distributed bucket and did not answer; their objects are missing.
+    /// Nodes that write part of a distributed bucket and did not answer, or hold a count of another
+    /// run; their objects are missing.
     #[serde(default)]
     pub unreached: Vec<String>,
+}
+
+/// Starts a count that joins a run; a node passes its run on when it starts a distributed count.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct StartCountRequest {
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub run: Option<Ulid>,
 }
 
 impl CoverageCountResponse {
@@ -81,6 +95,7 @@ impl CoverageCountResponse {
             reference_only: count_or(|count| count.reference_only),
             started_at_ms: count.as_ref().map(|count| count.started_at_ms),
             finished_at_ms: count.as_ref().and_then(|count| count.finished_at_ms),
+            run: count.as_ref().and_then(|count| count.run),
             rules_changed: status == CountStatus::Finished
                 && count.is_some_and(|count| count.generation != generation),
             unreached: Vec::new(),
@@ -106,8 +121,8 @@ impl CoverageCountResponse {
 - `rules_changed` is set when the bucket rules changed after a finished count. Writes after the
   count are not in it; start a new count to include them.
 - In a distributed bucket every coordinator counts the ranges it writes. This node asks each with
-  the caller's bearer token and adds their counts; `unreached` names those that did not answer.
-  When none answers, the call fails with 503."#,
+  the caller's bearer token and adds their counts of the newest `run`; `unreached` names those
+  that did not answer or hold a count of another run. When none answers, the call fails with 503."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     responses(
         (status = 200, description = "The saved count", body = CoverageCountResponse, example = json!({
@@ -122,6 +137,7 @@ impl CoverageCountResponse {
             "reference_only": 44999988,
             "started_at_ms": 1763370000000u64,
             "finished_at_ms": 1763373600000u64,
+            "run": "01JCNCTR0123456789ABCDEFGH",
             "rules_changed": false,
             "unreached": []
         })),
@@ -139,7 +155,7 @@ pub async fn get_coverage_count(
     Path(bucket): Path<String>,
     headers: HeaderMap,
 ) -> ServerResult<Json<CoverageCountResponse>> {
-    count_route(&state, auth, bearer.as_ref(), &bucket, &headers, false)
+    count_route(&state, auth, bearer.as_ref(), &bucket, &headers, None)
         .await
         .map(Json)
 }
@@ -157,8 +173,14 @@ pub async fn get_coverage_count(
 - The answer is the new count, with `status` `counting`. Read the count again to follow it.
 - A count that still runs is dropped and starts over.
 - In a distributed bucket this node starts the count on every coordinator with the caller's bearer
-  token; `unreached` names those that did not answer."#,
+  token and one `run`; `unreached` names those that did not answer or started another run.
+- A body `run` makes the count join that run; without one the count starts a new run."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
+    request_body(
+        content = StartCountRequest,
+        description = "Optional run to join",
+        example = json!({"run": "01JCNCTR0123456789ABCDEFGH"})
+    ),
     responses(
         (status = 202, description = "The count started", body = CoverageCountResponse, example = json!({
             "bucket": "datasets",
@@ -171,6 +193,7 @@ pub async fn get_coverage_count(
             "absent": 0,
             "reference_only": 0,
             "started_at_ms": 1763370000000u64,
+            "run": "01JCNCTR0123456789ABCDEFGH",
             "rules_changed": false,
             "unreached": []
         })),
@@ -187,19 +210,22 @@ pub async fn start_coverage_count(
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     headers: HeaderMap,
+    body: Option<Json<StartCountRequest>>,
 ) -> ServerResult<(StatusCode, Json<CoverageCountResponse>)> {
-    let answer = count_route(&state, auth, bearer.as_ref(), &bucket, &headers, true).await?;
+    let start = Some(body.and_then(|Json(request)| request.run));
+    let answer = count_route(&state, auth, bearer.as_ref(), &bucket, &headers, start).await?;
     Ok((StatusCode::ACCEPTED, Json(answer)))
 }
 
-/// Both routes: check the caller, then answer for this node or for every coordinator.
+/// Both routes: check the caller, then answer for this node or for every coordinator. `start`
+/// holds the run a new count joins, if any, when the caller starts one.
 async fn count_route(
     state: &ServerState,
     auth: AuthContext,
     bearer: Option<&ValidatedBearer>,
     bucket: &str,
     headers: &HeaderMap,
-    start: bool,
+    start: Option<Option<Ulid>>,
 ) -> ServerResult<CoverageCountResponse> {
     // Checked before the bucket is read, so a refused caller cannot tell which buckets exist.
     ensure_permission(
@@ -222,11 +248,11 @@ async fn count_route(
 async fn count_here(
     state: &ServerState,
     bucket: &str,
-    start: bool,
+    start: Option<Option<Ulid>>,
 ) -> ServerResult<CoverageCountResponse> {
     let context = state.get_ctx();
-    if start {
-        let operation = StartCountOperation::new(bucket.to_string());
+    if let Some(run) = start {
+        let operation = StartCountOperation::new(bucket.to_string(), run);
         drive(operation, &context)
             .await
             .map_err(|error| match error {
@@ -244,21 +270,22 @@ async fn count_here(
     ))
 }
 
-/// Asks every coordinator, this node directly, and adds up their counts.
+/// Asks every coordinator, this node directly, and adds up their counts. A start passes the run
+/// the first started count holds on to the others.
 async fn count_spread(
     state: &ServerState,
     bucket: &str,
     binding: &DistributionBinding,
     bearer: Option<&ValidatedBearer>,
-    start: bool,
+    mut start: Option<Option<Ulid>>,
 ) -> ServerResult<CoverageCountResponse> {
     let path = bucket_path(bucket, "coverage/count");
     let (mut answers, mut unreached) = (Vec::new(), Vec::new());
     for forward in coordinators(state, binding).await? {
         let answer = if forward.node_id == state.get_node_id() {
             count_here(state, bucket, start).await
-        } else if start {
-            relay_json(state, &forward, &path, bearer, &serde_json::json!({}))
+        } else if let Some(run) = start {
+            relay_json(state, &forward, &path, bearer, &StartCountRequest { run })
                 .await
                 .map(|(_, answer)| answer)
         } else {
@@ -269,22 +296,33 @@ async fn count_spread(
             }
         };
         match answer {
-            Ok(answer) => answers.push(answer),
+            Ok(answer) => {
+                start = start.map(|run| run.or(answer.run));
+                answers.push((forward.node_id.to_string(), answer));
+            }
             Err(error) => {
                 tracing::warn!(node = %forward.node_id, %error, "A coordinator did not count");
                 unreached.push(forward.node_id.to_string());
             }
         }
     }
-    join_counts(bucket, answers, unreached)
+    join_counts(bucket, answers, unreached, start.flatten())
 }
 
-/// One count for the whole bucket: numbers add up and the least advanced status wins.
+/// One count for the whole bucket of the run `started` names, else of the newest run: numbers add
+/// up and the least advanced status wins. Nodes holding another run count as unreached.
 fn join_counts(
     bucket: &str,
-    answers: Vec<CoverageCountResponse>,
-    unreached: Vec<String>,
+    mut answers: Vec<(String, CoverageCountResponse)>,
+    mut unreached: Vec<String>,
+    started: Option<Ulid>,
 ) -> ServerResult<CoverageCountResponse> {
+    let runs: Vec<_> = answers.iter().map(|(_, answer)| answer.run).collect();
+    for index in other_runs(started, &runs).into_iter().rev() {
+        let (node, _) = answers.remove(index);
+        unreached.push(node);
+    }
+    let answers: Vec<_> = answers.into_iter().map(|(_, answer)| answer).collect();
     if answers.is_empty() {
         return Err(ServerError::ServiceUnavailableReason(
             "no coordinator of the bucket answered".to_string(),
@@ -319,6 +357,7 @@ fn join_counts(
                     .max()
             })
             .flatten(),
+        run: answers.iter().find_map(|answer| answer.run),
         rules_changed: answers.iter().any(|answer| answer.rules_changed),
         unreached,
     })
@@ -334,8 +373,14 @@ mod tests {
             observed,
             gaps: 1,
             finished_at_ms,
+            run: Some(Ulid::from_parts(10, 1)),
             ..CoverageCount::new(10)
         }
+    }
+
+    fn answer(node: &str, count: CoverageCount) -> (String, CoverageCountResponse) {
+        let answer = CoverageCountResponse::of("photos", Some(count), 3);
+        (node.to_string(), answer)
     }
 
     #[test]
@@ -355,19 +400,45 @@ mod tests {
 
     #[test]
     fn joins_node_counts() {
-        let done = CoverageCountResponse::of("photos", Some(counted(5, Some(20))), 3);
-        let running = CoverageCountResponse::of("photos", Some(counted(7, None)), 3);
+        let done = answer("node-a", counted(5, Some(20)));
+        let running = answer("node-c", counted(7, None));
         let unreached = vec!["node-b".to_string()];
 
-        let joined =
-            join_counts("photos", vec![done.clone(), running], unreached.clone()).expect("joined");
+        let answers = vec![done.clone(), running];
+        let joined = join_counts("photos", answers, unreached.clone(), None).expect("joined");
         assert_eq!((joined.observed, joined.gaps), (12, 2));
         assert_eq!(joined.status, CountStatus::Counting);
         assert_eq!(joined.finished_at_ms, None);
         assert_eq!(joined.unreached, unreached);
 
-        let finished = join_counts("photos", vec![done.clone(), done], Vec::new()).expect("joined");
+        let answers = vec![done.clone(), done];
+        let finished = join_counts("photos", answers, Vec::new(), None).expect("joined");
         assert_eq!(finished.finished_at_ms, Some(20));
-        assert!(join_counts("photos", Vec::new(), Vec::new()).is_err());
+        assert!(join_counts("photos", Vec::new(), Vec::new(), None).is_err());
+    }
+
+    // A coordinator a start missed keeps its finished previous run; it must not pass for this one.
+    #[test]
+    fn drops_other_runs() {
+        let previous = Ulid::from_parts(5, 1);
+        let old = CoverageCount {
+            run: Some(previous),
+            ..counted(4, Some(9))
+        };
+        let answers = vec![
+            answer("node-a", counted(7, Some(20))),
+            answer("node-b", old),
+        ];
+
+        let joined = join_counts("photos", answers.clone(), Vec::new(), None).expect("joined");
+        assert_eq!((joined.status, joined.observed), (CountStatus::Finished, 7));
+        assert_eq!(joined.run, Some(Ulid::from_parts(10, 1)));
+        assert_eq!(joined.unreached, ["node-b"]);
+
+        let joined = join_counts("photos", answers, Vec::new(), Some(previous)).expect("joined");
+        assert_eq!(
+            (joined.observed, joined.unreached),
+            (4, vec!["node-a".to_string()])
+        );
     }
 }

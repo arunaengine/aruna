@@ -219,24 +219,6 @@ pub(crate) async fn build_registry(
     })
 }
 
-/// The API server of a Kubernetes compute entry, from its kubeconfig and context.
-#[cfg(feature = "kubernetes")]
-pub(crate) fn kube_server(
-    entry: &aruna_core::compute::backend::KubernetesEntry,
-) -> Result<String, String> {
-    aruna_compute::executor::kubernetes::api_server(
-        entry.kubeconfig.as_deref().map(std::path::Path::new),
-        entry.context.as_deref(),
-    )
-}
-
-#[cfg(not(feature = "kubernetes"))]
-pub(crate) fn kube_server(
-    _entry: &aruna_core::compute::backend::KubernetesEntry,
-) -> Result<String, String> {
-    Err("Kubernetes executor feature is not compiled".to_string())
-}
-
 fn compute_error_message(error: ComputeBuildError) -> String {
     match error {
         ComputeBuildError::Invalid(message)

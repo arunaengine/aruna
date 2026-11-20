@@ -421,7 +421,9 @@ fn sign_admin(
     if event.origin_node_id != key.public() {
         return Err("the admin event names another origin".to_string());
     }
-    let bytes = event.signing_bytes(placement).map_err(|error| error.to_string())?;
+    let bytes = event
+        .signing_bytes(placement)
+        .map_err(|error| error.to_string())?;
     Ok(key.sign(&bytes))
 }
 

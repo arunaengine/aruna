@@ -996,7 +996,7 @@ mod tests {
 
     /// A local API that answers each request by `reply` from its request line and keeps the
     /// lines it saw.
-    async fn serve(reply: fn(&str) -> (u16, String)) -> (String, Arc<Mutex<Vec<String>>>) {
+    async fn serve(reply: Reply) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1067,6 +1067,9 @@ mod tests {
         refusing(line, 404, "Not found")
     }
 
+    /// How the test server answers one request line: a status and a body.
+    type Reply = fn(&str) -> (u16, String);
+
     /// A refresh before the node's refresh window.
     fn early_refresh(line: &str) -> (u16, String) {
         refusing(line, 409, "session refresh is not available yet")
@@ -1080,7 +1083,7 @@ mod tests {
     #[tokio::test]
     async fn reacquires_refused_refresh() {
         // An expired or missing session is taken again; the old pair is not kept.
-        let replies: [fn(&str) -> (u16, String); 2] = [refused_refresh, missing_refresh];
+        let replies: [Reply; 2] = [refused_refresh, missing_refresh];
         for reply in replies {
             let (base, seen) = serve(reply).await;
             let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
@@ -1113,7 +1116,7 @@ mod tests {
     async fn keeps_live_session() {
         // An early or failed refresh keeps the held pair, which works until its expiry, and
         // takes no new session that could evict another transfer's.
-        let replies: [fn(&str) -> (u16, String); 2] = [early_refresh, failed_refresh];
+        let replies: [Reply; 2] = [early_refresh, failed_refresh];
         for reply in replies {
             let (base, seen) = serve(reply).await;
             let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);

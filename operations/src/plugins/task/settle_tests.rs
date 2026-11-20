@@ -96,6 +96,50 @@ fn settles_terminal_states() {
     assert_eq!(state(LogicalJobState::Failed), Some(FinalState::Failed));
     let cancelled = state(LogicalJobState::Cancelled);
     assert_eq!(cancelled, Some(FinalState::Cancelled));
+    assert_eq!(state(LogicalJobState::NotRun), Some(FinalState::Unknown));
+}
+
+// The settle pass reads the family as the task status does: a family this node's membership
+// view marks not run settles as unknown, and a partial read decides nothing.
+#[test]
+fn not_run_settled() {
+    let projection = JobProjection {
+        submission_id: family().submission_id,
+        request_digest: family().request_digest,
+        canonical_job_id: alias(),
+        aliases: vec![alias()],
+        state: LogicalJobState::NotRun,
+        canonical_execution_id: None,
+        executions: Vec::<ProjectedExecution>::new(),
+        outputs: OutputSet::new(Vec::new()).unwrap(),
+        cancel_requested: false,
+        expiry_reason: None,
+    };
+    let read = |truncated: bool| {
+        let projected = ProjectedFamily {
+            family: family(),
+            revision: 1,
+            projection: Some(projection.clone()),
+            truncated,
+            cached: false,
+        };
+        let mut dispatched = row(WorkState::Dispatched);
+        dispatched.job = Some(alias());
+        let (mut settle, _) = settle(dispatched, None, (5, InstallState::Active));
+        settle.phase = SettlePhase::Project;
+        let view: FamilyView = (projected, Family::new([4; 32]).spec());
+        let next = settle.next(child_result(Ok::<_, JobRouteError>(Some(view))));
+        (settle, next)
+    };
+    let (settled, next) = read(false);
+    assert!(is_child(&next));
+    assert_eq!(settled.phase, SettlePhase::Change);
+    let (_, partial) = read(true);
+    let waits = Settled {
+        changed: false,
+        followup: Followup::Nothing,
+    };
+    assert_eq!(partial, Ok(Next::Done(waits)));
 }
 
 fn row(state: WorkState) -> WorkRow {

@@ -1667,7 +1667,7 @@ mod tests {
                 ..DockerConfig::default()
             };
             let backend = Arc::new(DockerBackend::with_config(config).unwrap());
-            let registry = crate::ExecutorRegistry::new().with_backend("lab", backend);
+            let registry = crate::registry::ExecutorRegistry::new().with_backend("lab", backend);
             let home = registry.home_digest("lab").unwrap();
             (home, registry.config_digest("lab").unwrap())
         };

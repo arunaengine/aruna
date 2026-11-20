@@ -118,7 +118,7 @@ fn query_stores_closure() {
     let answer = MetadataAnswer {
         peer: family.target.public(),
         elapsed: Duration::ZERO,
-        result: Ok(encode_message(&reply).unwrap().into()),
+        result: Ok(encode_message(&reply).unwrap()),
     };
     let event = IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
         answer,

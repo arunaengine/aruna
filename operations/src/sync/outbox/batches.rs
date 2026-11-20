@@ -306,8 +306,12 @@ impl DrainInvocation {
     ) -> Option<Duration> {
         let outcome = &self.outcome;
         let defer = &mut self.defer;
-        defer.deferred_topics.extend(outcome.blocked_topics.iter().copied());
-        defer.blocked_origins.extend(outcome.blocked_origins.iter().copied());
+        defer
+            .deferred_topics
+            .extend(outcome.blocked_topics.iter().copied());
+        defer
+            .blocked_origins
+            .extend(outcome.blocked_origins.iter().copied());
         let unvisited = self.has_unvisited();
         let retry = self.outcome.retry_needed || self.read_failed;
         rotation.cursor = match self.reached_end {
@@ -325,7 +329,11 @@ impl DrainInvocation {
         totals.retry_invocations += usize::from(retry);
         totals.invocations = totals.invocations.saturating_add(1);
         if self.records > 0 {
-            self.summary(rotation.continuations, (unvisited, retry), (now_ms, elapsed));
+            self.summary(
+                rotation.continuations,
+                (unvisited, retry),
+                (now_ms, elapsed),
+            );
         }
         if retry {
             return rotation.finish_retry(self.reached_end);

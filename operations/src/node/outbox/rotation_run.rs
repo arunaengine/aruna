@@ -162,7 +162,9 @@ impl RotationRunOperation {
                 "Document sync outbox records are stuck: this node holds their buckets but their shard topic geneses have never arrived"
             );
         }
-        let wake = (invocation.config_drained).then_some(self.serving).flatten();
+        let wake = (invocation.config_drained)
+            .then_some(self.serving)
+            .flatten();
         self.invocation = Some(invocation);
         let Some((node_id, realm_id)) = wake else {
             return self.decide();

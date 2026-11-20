@@ -30,14 +30,14 @@ use super::super::rows::{StoreError, decode, read_call, unexpected, values};
 use super::change::{ChangeTask, Changed, SendOutcome, TaskChange};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::closure::{ASK_DEADLINE, AskClosureOperation};
+use crate::jobs::lifecycle::family_reads::{FamilyProjectionOperation, FamilyView};
 use crate::jobs::lifecycle::fetch::{FetchFamilyOperation, FetchedFamily};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::append::{
     AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
-use crate::jobs::records::project::{
-    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
-};
+use crate::jobs::records::project::ProjectedFamily;
+use crate::jobs::route::JobRouteError;
 use aruna_core::install_work::{ADMIT_WINDOW_MS, TaskRow, task_place};
 use aruna_core::install_work::{FinalState, Summary, WorkRow, WorkState};
 use aruna_core::job_request::{SubmissionScope, submission_of};
@@ -302,11 +302,9 @@ impl SettleTask {
     fn continue_after(&mut self, after: After) -> SettleNext {
         match after {
             After::Project(alias) => {
-                let project = ProjectFamilyOperation::new(ProjectFamilyConfig {
-                    family: FamilyRef::Alias(alias),
-                    now_ms: self.now_ms,
-                    rebuild: false,
-                });
+                // The same read as the task status: this node's membership view marks a family
+                // whose open executions all left as not run.
+                let project = FamilyProjectionOperation::new(alias, self.now_ms);
                 self.phase = SettlePhase::Project;
                 Ok(Next::Call(IoCall::child(project)))
             }
@@ -426,13 +424,16 @@ impl Operation for SettleTask {
             }
             SettlePhase::Project => {
                 // A partial projection or a family not finished yet waits for the next pass.
-                let projected = result.child::<ProjectedFamily, RecordStoreError>()?;
+                let projected = result.child::<Option<FamilyView>, JobRouteError>()?;
                 let summary = match projected {
-                    Ok(ProjectedFamily {
-                        truncated: false,
-                        projection: Some(projection),
-                        ..
-                    }) => final_of(&projection),
+                    Ok(Some((
+                        ProjectedFamily {
+                            truncated: false,
+                            projection: Some(projection),
+                            ..
+                        },
+                        _,
+                    ))) => final_of(&projection),
                     _ => None,
                 };
                 match summary {

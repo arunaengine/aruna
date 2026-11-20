@@ -28,7 +28,7 @@ use crate::jobs::prune::{
 };
 use aruna_core::install_work::{
     FinalState, Found, Identity, SendBoundary, Summary, WORK_INDEX, WORK_ROW, WorkKind, WorkLookup,
-    WorkRow, WorkState, index_key, row_key,
+    WorkRow, WorkState, index_key, row_key, task_key,
 };
 
 /// The row of a work under its key.
@@ -642,8 +642,8 @@ pub struct PruneWork {
 #[derive(Debug, PartialEq)]
 enum PrunePhase {
     Scanning(Scan),
-    /// Reads the run of each aged work; holds the index and row keys of each, in that order.
-    Runs(Vec<[Vec<u8>; 2]>),
+    /// Reads the run of each aged work; holds the keys of each: index, row and a task's row.
+    Runs(Vec<Vec<Vec<u8>>>),
     Deleting(usize),
 }
 
@@ -674,10 +674,11 @@ impl Operation for PruneWork {
                 let runs = all_values(answer)?;
                 let dropped: Vec<_> = (aged.into_iter().zip(runs))
                     .filter(|(_, run)| run.is_none())
-                    .flat_map(|(keys, _)| keys.map(|key| (PLUGIN_WORK_KEYSPACE, key)))
+                    .map(|(keys, _)| keys)
                     .collect();
-                self.phase = PrunePhase::Deleting(dropped.len() / 2);
-                Ok(Next::Call(delete_call(dropped)))
+                self.phase = PrunePhase::Deleting(dropped.len());
+                let keys = (dropped.into_iter().flatten()).map(|key| (PLUGIN_WORK_KEYSPACE, key));
+                Ok(Next::Call(delete_call(keys.collect())))
             }
             PrunePhase::Deleting(count) => {
                 done(answer)?;
@@ -687,8 +688,8 @@ impl Operation for PruneWork {
     }
 }
 
-/// The index and row keys of the works among `rows` nobody can ask for again once their run is
-/// gone, and the run key of each, in the same order.
+/// The keys of the works among `rows` nobody can ask for again once their run is gone, a task's
+/// task row with its work, and the run key of each, in the same order.
 fn aged_work(rows: Rows, now_ms: u64) -> Result<WorkRuns, StoreError> {
     let (mut aged, mut runs) = (Vec::new(), Vec::new());
     for (key, value) in rows {
@@ -704,12 +705,16 @@ fn aged_work(rows: Rows, now_ms: u64) -> Result<WorkRuns, StoreError> {
             continue;
         }
         runs.push((PLUGIN_RUNS_KEYSPACE, run_key(install_id, run_id)));
-        aged.push([index_key(install_id, row.work_id), key]);
+        let mut keys = vec![index_key(install_id, row.work_id), key];
+        if row.kind == WorkKind::Recipe {
+            keys.push(task_key(install_id, row.work_id));
+        }
+        aged.push(keys);
     }
     Ok((aged, runs))
 }
 
-type WorkRuns = (Vec<[Vec<u8>; 2]>, Vec<(&'static str, Vec<u8>)>);
+type WorkRuns = (Vec<Vec<Vec<u8>>>, Vec<(&'static str, Vec<u8>)>);
 
 /// At most `limit` works of an install after the work `after`, oldest first, and the id of the
 /// last one when more may follow.

@@ -8,8 +8,8 @@ use serde_json::json;
 use super::*;
 use crate::plugins::fixtures::{self, config_result, is_child, node};
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::test_support::queued;
 use crate::tests::records::local_ingress;
+use aruna_test_support::plugins::queued;
 
 fn scope() -> RunScope {
     RunScope {

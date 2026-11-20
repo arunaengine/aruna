@@ -279,7 +279,10 @@ impl DrainPageOperation {
             let mut peer_key = peers.clone();
             sort_node_ids(&mut peer_key);
             let entry = missing.entry(peer_key);
-            entry.or_insert_with(|| (peers, BTreeSet::new())).1.insert(*topic);
+            entry
+                .or_insert_with(|| (peers, BTreeSet::new()))
+                .1
+                .insert(*topic);
         }
         self.missing = (missing.into_values())
             .map(|(peers, topics)| (peers, topics.into_iter().collect()))
@@ -532,7 +535,6 @@ impl Operation for DrainPageOperation {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

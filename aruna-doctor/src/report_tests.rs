@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{JobRecords, build_report};
+use aruna_core::id::NodeId;
 use aruna_core::install_work::{
     Binding, Identity, WorkKind, WorkRow, WorkState, index_key, row_key,
 };
@@ -22,7 +23,7 @@ use aruna_core::structs::execution::job::local::{
 };
 use aruna_core::structs::execution::job::record_rows::{OutboxEntry, PendingNeed, PendingRecord};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
 use std::collections::BTreeMap;
 use std::path::Path;

@@ -28,7 +28,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::distribution::guard::{GuardError, authority_reads, write_authority};
 
 /// Upper bound on one page, so a scan can never walk a whole bucket at once.
-pub(super) const COVERAGE_PAGE_LIMIT: usize = 256;
+pub(crate) const COVERAGE_PAGE_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoverageScope {

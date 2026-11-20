@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::metadata::AuthToken;
@@ -25,13 +26,13 @@ use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_byt
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use tracing::warn;
 
 use super::super::records::{ReadEntry, RecordError};
 use super::super::rows::{StoreError, unexpected};
 use crate::jobs::lifecycle::cancel::{
-    CancelFamilyOperation, CancelLocalRunsOperation, PublishCancelOperation,
+    CancelFamilyOperation, CancelRunsOperation, PublishCancelOperation,
 };
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
@@ -107,7 +108,7 @@ impl CancelTask {
     }
 
     fn stop_local(&mut self) -> CancelNext {
-        let stop = CancelLocalRunsOperation::new(self.task.2, Some(self.serving()), self.now_ms);
+        let stop = CancelRunsOperation::new(self.task.2, Some(self.serving()), self.now_ms);
         self.phase = CancelPhase::Local;
         Ok(Next::Call(IoCall::child(stop)))
     }

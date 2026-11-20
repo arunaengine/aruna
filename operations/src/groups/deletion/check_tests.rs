@@ -196,8 +196,6 @@ async fn finished_jobs_pass() {
         JobPayload, RoCrateLimits,
     };
     use aruna_core::structs::execution::job::local::JobRecord;
-    use aruna_core::structs::execution::job::record_keys::record_key;
-    use aruna_core::structs::execution::job::record_rows::to_bytes;
     use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     let fixture = Fixture::new(&[1]).await;
@@ -266,6 +264,8 @@ async fn pruned_families_pass() {
     use crate::jobs::records::tests::prune::{index, pass, write as write_rows};
     use crate::tests::records::{Family, payload};
     use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
+    use aruna_core::structs::execution::job::record_keys::record_key;
+    use aruna_core::structs::execution::job::record_rows::to_bytes;
     let fixture = Fixture::new(&[1]).await;
     let group_id = payload().group_id;
     let family = Family::new([95u8; 32]);

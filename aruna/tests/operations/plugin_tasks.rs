@@ -20,16 +20,17 @@ use aruna_core::structs::execution::job::input::ExecutionSpec;
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::seed_bucket;
 use aruna_operations::jobs::lifecycle::family_reads::FamilyProjectionOperation;
 use aruna_operations::jobs::lifecycle::screen::ScreenTask;
 use aruna_operations::jobs::lifecycle::submit_external::IngressNode;
 use aruna_operations::jobs::node_inputs::ingress_node;
-use aruna_operations::plugins::calls::install_plugin;
-use aruna_operations::plugins::install::InstallRequest;
+use aruna_operations::plugins::install::{
+    InstallCaller, InstallPrepared, InstallRequest, PrepareInstall,
+};
 use aruna_operations::plugins::marks::{MARKED, Mark, mark_row};
 use aruna_operations::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use aruna_operations::plugins::rows::{decode, encode};
-use aruna_operations::plugins::store::Txn;
 use aruna_operations::plugins::task::cancel::CancelTask;
 use aruna_operations::plugins::task::pass::SettleTasks;
 use aruna_operations::plugins::task::send::SendTask;
@@ -37,8 +38,9 @@ use aruna_operations::plugins::task::spec::{TaskIo, task_spec};
 use aruna_operations::plugins::work::calls::JobRow;
 use aruna_operations::plugins::work::reserve;
 use aruna_operations::s3::object::put::PutObjectOperation;
-use aruna_operations::testing_objects::{put_config, seed_bucket};
+use aruna_operations::testing_objects::put_config;
 use aruna_plugin_types::recipe::Recipe;
+use aruna_test_support::plugins::rows::Txn;
 use serde_json::json;
 use ulid::Ulid;
 
@@ -112,7 +114,16 @@ async fn installed() -> TestResult<(Topology, PluginInstall)> {
         secrets: BTreeMap::new(),
     };
     let (actor, auth) = (realm.actor(node), realm.auth_context());
-    let install = install_plugin(node.context.as_ref(), &actor, &auth, &request).await;
+    let place = (actor.realm_id, Some(node.node_id()));
+    let prepare = PrepareInstall::new(&auth, place, &request);
+    let prepared = drive(prepare, node.context.as_ref()).await;
+    let prepared = prepared.map_err(|error| format!("install: {error}"))?;
+    let caller = InstallCaller::new(&actor, &auth, unix_timestamp_millis());
+    let install = drive(
+        InstallPrepared::new(caller, prepared),
+        node.context.as_ref(),
+    )
+    .await;
     let install = install.map_err(|error| format!("install: {error}"))?;
     let id = install.install_id;
     let label = "the install never reached every node";
