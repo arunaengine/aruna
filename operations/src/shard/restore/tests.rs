@@ -6,7 +6,7 @@ use crate::tests::shard::flat_config;
 use std::sync::Arc;
 
 use super::*;
-use crate::shard::restore_plan::{
+use crate::shard::restore::plan::{
     RESTORE_CHUNK_TOPICS, RESTORE_TOPIC_COUNT, RESTORE_UNIT_BUDGET, shared_topic_peers,
 };
 use aruna_core::calls::ChildOutcome;

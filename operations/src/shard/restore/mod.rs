@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod plan;
+
 use std::collections::{BTreeSet, VecDeque};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
@@ -17,7 +19,7 @@ use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::shard::genesis::{EnsureGenesisOperation, ResolveTopicsOperation, ResolvedTopics};
 use crate::shard::pull::PullTopicsOperation;
 use crate::shard::recovery::{RecoveryError, RecoveryStop};
-use crate::shard::restore_plan::{
+use crate::shard::restore::plan::{
     RestoreKind, RestoreRange, RestoreShardSummary, RestoreUnit, RestoreUnitOutcome, ShardGroup,
     ShardRestoreCursor, ShardRestorePass, bind_restore_plan, plan_shard_groups, restore_range,
 };
@@ -713,5 +715,5 @@ impl Operation for PreparePolicyOperation {
 }
 
 #[cfg(test)]
-#[path = "restore_tests.rs"]
+#[path = "tests.rs"]
 mod tests;
