@@ -748,14 +748,14 @@ pub enum MetadataTransportMessage {
         admit_by: u64,
     },
     SubmissionClaimAnswered {
-        answer: aruna_core::jobs::ClosureAnswer,
+        answer: crate::jobs::ClosureAnswer,
     },
     /// A holder asks a launch's target whether it ever accepted the signed launch it carries.
     QueryLaunchClosure {
         launch: Box<LaunchFrame>,
     },
     LaunchClosureAnswered {
-        answer: aruna_core::jobs::LaunchClosureAnswer,
+        answer: crate::jobs::LaunchClosureAnswer,
     },
 }
 

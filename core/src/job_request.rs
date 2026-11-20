@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn inline_changes_digest() {
         // The bytes are part of the request, so other bytes are another request.
-        use aruna_core::structs::execution::job::input::{InputMode, InputSelection, InputSource};
+        use crate::structs::execution::job::input::{InputMode, InputSelection, InputSource};
         let request = |bytes: &[u8]| {
             let mut spec = session_spec();
             spec.inputs.push(InputSelection {
@@ -474,7 +474,7 @@ mod tests {
                 description: None,
             });
             SubmissionRequest {
-                created_by: UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32])),
+                created_by: UserId::nil(crate::structs::identity::realm::RealmId([1; 32])),
                 spec,
                 scope: SubmissionScope::Keyed("plugin-work/1".to_string()),
                 retention_ms: 1,

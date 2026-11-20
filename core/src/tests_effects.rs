@@ -3,20 +3,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::compute::ExecutionTargetId;
-use crate::structs::execution::job::family::JobRecordEnvelope;
+use crate::structs::execution::job::family::{
+    ExecutionOutputRecord, ExecutionReceipt, JobFamilyRecord, JobRecordEnvelope, LaunchIntent,
+    OutputSet, SubmissionId,
+};
+use crate::structs::execution::job::identity::JobId;
+use crate::structs::execution::job::local::OutputObject;
 use crate::structs::identity::realm::RealmId;
 use ulid::Ulid;
 
 /// Test fixture shared with the event frames: one signed output record whose
 /// encoded size grows with the output count and key width.
 pub(crate) fn sized_envelope(objects: usize, key_bytes: usize) -> JobRecordEnvelope {
-    use crate::structs::execution::job::family::{
-        ExecutionOutputRecord, ExecutionReceipt, JobFamilyRecord, LaunchIntent, OutputSet,
-        SubmissionId,
-    };
-    use crate::structs::execution::job::identity::JobId;
-    use crate::structs::execution::job::local::OutputObject;
-
     let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
     let execution_id = Ulid::from_bytes([7u8; 16]);
     let outputs = (0..objects)

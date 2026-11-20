@@ -1412,9 +1412,7 @@ async fn zenodo_deposit() {
 async fn map_reads() {
     // The reads below a bucket path and a sample sheet go to one task; its outputs are linked to
     // the dataset and its report's numbers recorded, or left out without a report.
-    let Some(example) = example("map-reads").await else {
-        return;
-    };
+    let example = example("map-reads").await;
     let settings = json!({ "results": "results" });
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7" }));

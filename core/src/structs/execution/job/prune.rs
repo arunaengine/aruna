@@ -10,7 +10,8 @@ use ulid::Ulid;
 use super::family::{CLOCK_MARGIN_MS, JobFamilyRecord, JobRecordEnvelope, LogicalJobState};
 use super::identity::{JobId, RETENTION_MS};
 use super::membership::NotRun;
-use crate::{NodeId, UserId};
+use crate::id::NodeId;
+use crate::user::id::UserId;
 
 /// How long tombstones and pending rows are kept; it is also the bound of spec freshness.
 pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;

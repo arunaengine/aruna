@@ -455,7 +455,7 @@ impl AdminDocumentState {
     /// What the realm config holds at one install's path, deletions and conflicts included,
     /// which [`Self::materialized_installs`] leaves out.
     pub fn install_entry(&self, install_id: &ulid::Ulid) -> InstallEntry {
-        let path = crate::reducer::plugin_install_path(install_id);
+        let path = crate::reducer::paths::plugin_install_path(install_id);
         let parse = |value: &Option<String>| {
             (value.as_deref()).and_then(|value| serde_json::from_str(value).ok())
         };

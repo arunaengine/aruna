@@ -227,6 +227,7 @@ pub struct WorkLookup {
 
 /// What a lookup needs next, or the row it found.
 #[derive(Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Found {
     Ask(IoCall),
     Row(Option<(Vec<u8>, WorkRow)>),
