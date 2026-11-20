@@ -13,11 +13,11 @@ use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_REISSUE_KEYSPACE, ABE_REKEY_KEYSPACE, AUTH_KEYSPACE,
     BACKEND_IMPORT_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_CREATION_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
-    BUCKET_KEY_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE, IMPORT_DISCOVERY_KEYSPACE,
-    IMPORT_REMOVAL_KEYSPACE, KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE, MIGRATION_AHEAD_KEYSPACE,
-    NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE,
-    RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE,
-    UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
+    BUCKET_KEY_KEYSPACE, COUNT_QUEUE_KEYSPACE, COVERAGE_COUNT_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+    IMPORT_DISCOVERY_KEYSPACE, IMPORT_REMOVAL_KEYSPACE, KEY_COPY_KEYSPACE, LINKED_JOB_KEYSPACE,
+    MIGRATION_AHEAD_KEYSPACE, NODE_VAULT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE,
+    RELATIONSHIP_OUT_KEYSPACE, RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE, UPLOAD_INVENTORY_KEYSPACE, UPLOAD_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
 use aruna_core::node::vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -436,6 +436,9 @@ impl DeleteBucketOperation {
             (RENAME_TOTAL_KEYSPACE.to_string(), bucket.clone().into()),
             (MIGRATION_AHEAD_KEYSPACE.to_string(), bucket.clone().into()),
             (LINKED_JOB_KEYSPACE.to_string(), bucket.clone().into()),
+            // A bucket created again under this name starts without its predecessor's count.
+            (COVERAGE_COUNT_KEYSPACE.to_string(), bucket.clone().into()),
+            (COUNT_QUEUE_KEYSPACE.to_string(), bucket.clone().into()),
             (BUCKET_CREATION_KEYSPACE.to_string(), bucket.into()),
             (
                 USAGE_STATS_KEYSPACE.to_string(),
@@ -787,6 +790,18 @@ mod link_tests {
             panic!("expected the end of the delete");
         };
         (writes, deletes, calls)
+    }
+
+    // The coverage count and its queue entry go with the bucket, so a bucket created again under
+    // the name never reports its predecessor's totals.
+    #[test]
+    fn drops_coverage_count() {
+        let (_, deletes, _) = delete("keep");
+        for space in [COVERAGE_COUNT_KEYSPACE, COUNT_QUEUE_KEYSPACE] {
+            let dropped = (deletes.iter())
+                .any(|(key_space, key)| key_space == space && &key[..] == b"x");
+            assert!(dropped, "{space} keeps the deleted bucket's row");
+        }
     }
 
     /// Members of the serving realm each get one bucket deletion record, drained after commit.
