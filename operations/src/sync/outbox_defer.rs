@@ -140,3 +140,7 @@ pub fn admin_origin(record: &DocumentOutboxRecord) -> Option<NodeId> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "outbox_defer_tests.rs"]
+mod tests;
