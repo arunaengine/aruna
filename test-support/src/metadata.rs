@@ -18,7 +18,7 @@ use aruna_operations::metadata::prune_queue::{
     GraphDrainResult, MetadataGraphError, PruneBatchOperation, TombstoneProcessingResult,
     TombstonesOperation, jobs_queued,
 };
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 
 /// Runs one pass of the metadata materialization drain, as the drain task does.
 pub async fn process_materialization_batch(
@@ -96,8 +96,12 @@ pub fn refusing(real: StorageHandle, key_space: &'static str) -> StorageHandle {
                 .expect("proxy runtime builds");
             while let Ok((effect, response, ..)) = receiver.recv() {
                 let touched = match &effect {
-                    StorageEffect::Write { key_space: space, .. }
-                    | StorageEffect::Delete { key_space: space, .. } => space == key_space,
+                    StorageEffect::Write {
+                        key_space: space, ..
+                    }
+                    | StorageEffect::Delete {
+                        key_space: space, ..
+                    } => space == key_space,
                     StorageEffect::BatchWrite { writes, .. } => {
                         writes.iter().any(|(space, ..)| space == key_space)
                     }

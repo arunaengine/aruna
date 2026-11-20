@@ -1031,7 +1031,11 @@ pub(crate) mod tests {
                 let mut row = large.to_bytes().to_vec();
                 row.push(seed);
                 let row = ByteView::from(row);
-                (STAGING_QUEUE_KEYSPACE.to_string(), row, ByteView::from(Vec::new()))
+                (
+                    STAGING_QUEUE_KEYSPACE.to_string(),
+                    row,
+                    ByteView::from(Vec::new()),
+                )
             })
             .collect();
         storage

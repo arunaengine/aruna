@@ -133,7 +133,8 @@ fn rebuild_keeps_holders() {
     assert_eq!(emit.state, EmitState::Forward(node_id(3)));
 
     let mut left = retrying();
-    left.next(child::<_, GetConfigError>(Ok(single_server()))).unwrap();
+    left.next(child::<_, GetConfigError>(Ok(single_server())))
+        .unwrap();
     assert_eq!(left.next(empty()), Ok(Next::Done(Vec::new())));
 
     let mut unread = retrying();

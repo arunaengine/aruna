@@ -194,9 +194,9 @@ mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
     use aruna_core::storage_entries::{capture_key, document_job_key};
-    use aruna_core::types::Value;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::types::Value;
 
     const DOCUMENT: Ulid = Ulid::from_parts(1, 1);
     const EVENT: Ulid = Ulid::from_parts(2, 2);

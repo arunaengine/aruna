@@ -357,7 +357,10 @@ mod tests {
         after.next(failed).unwrap();
         assert_eq!(after.stage, SyncStage::Wake);
         let unscheduled = child(Err::<(), _>(MetadataProjectionError::PlacementFenced));
-        assert!(matches!(after.next(unscheduled), Ok(Next::Call(IoCall::Child(_)))));
+        assert!(matches!(
+            after.next(unscheduled),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
         assert_eq!(after.stage, SyncStage::Prune);
         let pruned = child(Ok::<_, MetadataGraphError>(
             TombstoneProcessingResult::default(),
@@ -412,7 +415,10 @@ mod tests {
         let key = id.to_bytes().to_vec();
         let row = aruna_drivers::testing::read_value(&storage, APPLIED_SYNC_KEYSPACE, key).await;
         let applied = AppliedSync::from_bytes(row.expect("row stored").as_ref()).unwrap();
-        assert_eq!((applied.next, applied.result), (AppliedStep::Metadata, result));
+        assert_eq!(
+            (applied.next, applied.result),
+            (AppliedStep::Metadata, result)
+        );
     }
 
     #[test]
