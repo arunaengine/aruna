@@ -29,6 +29,7 @@ use crate::blob::migration::drain::ProcessMigrationsOperation;
 use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
 use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
+use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::node::applied_drain::AppliedDrainOperation;
@@ -44,6 +45,7 @@ use crate::notifications::serve::{InboxRequest, ServeInboxOperation, WatchEvents
 use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
+use crate::plugins::work::PruneKeepingWork;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
 
@@ -164,6 +166,7 @@ pub enum TimerOperation {
     DrainRefreshQueue(DrainRefreshOperation),
     DrainCaptures(CaptureDrainOperation),
     SettleJobTerminals(SettleTerminalsOperation),
+    PruneJobs(PruneKeepingWork),
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -222,6 +225,7 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::SettleJobTerminals => Some(TimerOperation::SettleJobTerminals(
             SettleTerminalsOperation::new(input.facts.serving, input.now_ms),
         )),
+        TaskKey::PruneJobs => Some(TimerOperation::PruneJobs(PruneKeepingWork::new(JOB_PRUNE_PAGE))),
         _ => None,
     }
 }
@@ -245,6 +249,7 @@ macro_rules! each_timer {
             TimerOperation::DrainRefreshQueue($operation) => $body,
             TimerOperation::DrainCaptures($operation) => $body,
             TimerOperation::SettleJobTerminals($operation) => $body,
+            TimerOperation::PruneJobs($operation) => $body,
         }
     };
 }
@@ -480,6 +485,23 @@ impl TimerRun for SettleTerminalsOperation {
             true
         });
         Ok(TimerPlan::from(pending.then_some(SETTLE_RETRY_AFTER)))
+    }
+}
+
+impl TimerRun for PruneKeepingWork {
+    /// More due jobs run at once; otherwise the next due job runs at its time, at most after the
+    /// poll interval. A failed run retries soon.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let outcome = result.map_err(|error| TimerFailure {
+            retry_after: PRUNE_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        let poll = |due: Duration| due.min(PRUNE_POLL_AFTER);
+        let after = match outcome.has_more {
+            true => Duration::ZERO,
+            false => outcome.next_due_after.map_or(PRUNE_POLL_AFTER, poll),
+        };
+        Ok(TimerPlan::from(Some(after)))
     }
 }
 
@@ -753,6 +775,7 @@ impl Operation for PeerOperation {
 mod tests {
     use super::*;
     use crate::blob::hidden::HiddenSweepOutcome;
+    use crate::jobs::prune::JobPruneOutcome;
     use crate::jobs::lifecycle::LifecycleError;
     use crate::s3::object::metadata::ReferenceRefreshError;
     use crate::s3::object::metadata_drain::ReferenceDrainResult;
@@ -873,6 +896,26 @@ mod tests {
         assert_eq!(SettleTerminalsOperation::rearm(Err(error)), retry);
         let settled = SettleTerminalsOperation::rearm(Ok(false));
         assert_eq!(settled, Ok(TimerPlan::default()));
+    }
+
+    #[test]
+    fn job_prune_plans() {
+        // More due jobs run at once, a later one at its time but within the poll interval.
+        let outcome = |has_more, next_due_after| JobPruneOutcome {
+            has_more,
+            next_due_after,
+            ..JobPruneOutcome::default()
+        };
+        let more = PruneKeepingWork::rearm(Ok(outcome(true, None))).unwrap();
+        assert_eq!(more.after, Some(Duration::ZERO));
+        let idle = PruneKeepingWork::rearm(Ok(outcome(false, None))).unwrap();
+        assert_eq!(idle.after, Some(PRUNE_POLL_AFTER));
+        let far = Some(PRUNE_POLL_AFTER * 2);
+        let capped = PruneKeepingWork::rearm(Ok(outcome(false, far))).unwrap();
+        assert_eq!(capped.after, Some(PRUNE_POLL_AFTER));
+        let error = crate::jobs::prune::PruneError("boom".to_string());
+        let failed = PruneKeepingWork::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, PRUNE_RETRY_AFTER);
     }
 
     #[test]

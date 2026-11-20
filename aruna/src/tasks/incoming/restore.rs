@@ -863,22 +863,6 @@ impl OperationsTaskHandler {
         }
     }
 
-    pub(super) async fn prune_jobs(&self) {
-        let prune = PruneKeepingWork::new(JOB_PRUNE_PAGE);
-        let after = match drive(prune, &self.context).await {
-            Ok(outcome) if outcome.has_more => Duration::ZERO,
-            Ok(outcome) => outcome
-                .next_due_after
-                .unwrap_or(PRUNE_POLL_AFTER)
-                .min(PRUNE_POLL_AFTER),
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PruneJobs, error = %error, "Failed to prune jobs");
-                PRUNE_RETRY_AFTER
-            }
-        };
-        self.reschedule_timer(TaskKey::PruneJobs, after).await;
-    }
-
     pub(super) async fn drain_blob_reclaim(&self) {
         let key = TaskKey::DrainReclaimQueue;
         let memory = self.kept_memory(&key);
