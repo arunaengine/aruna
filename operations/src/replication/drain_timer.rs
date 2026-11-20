@@ -111,10 +111,16 @@ mod tests {
     fn drain_cursors_kept() {
         let more = run(b"kept", Ok(drained(true, b"left")));
         assert_eq!(more.after, Some(Duration::ZERO));
-        assert_eq!(more.memory.catch_up.set_after.as_deref(), Some(&b"left"[..]));
+        assert_eq!(
+            more.memory.catch_up.set_after.as_deref(),
+            Some(&b"left"[..])
+        );
         let error = BlobQueueError::Storage(StorageError::KeyNotFound);
         let failed = run(b"kept", Err(error));
         assert_eq!(failed.after, Some(REPLICATION_RETRY_AFTER));
-        assert_eq!(failed.memory.catch_up.set_after.as_deref(), Some(&b"kept"[..]));
+        assert_eq!(
+            failed.memory.catch_up.set_after.as_deref(),
+            Some(&b"kept"[..])
+        );
     }
 }

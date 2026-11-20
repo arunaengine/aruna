@@ -1342,7 +1342,11 @@ mod tests {
         let fixture = initialize_incoming_fixture(context.clone()).expect("net handle installs");
         let handler = fixture.handler.clone();
         drop(fixture);
-        assert_eq!(handler.strong_count(), 0, "the net handle let the handler go");
+        assert_eq!(
+            handler.strong_count(),
+            0,
+            "the net handle let the handler go"
+        );
         net.shutdown().await;
     }
 

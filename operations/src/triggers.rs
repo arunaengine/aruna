@@ -272,7 +272,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             let ids = input.facts.serving;
             let routing = input.routing.clone();
             let node = GitNode { ids, routing };
-            Some(TimerOperation::DrainCaptures(CaptureDrainOperation::new(node)))
+            Some(TimerOperation::DrainCaptures(CaptureDrainOperation::new(
+                node,
+            )))
         }
         TaskKey::SettleJobTerminals => Some(TimerOperation::SettleJobTerminals(
             SettleTerminalsOperation::new(input.facts.serving, input.now_ms),
@@ -1026,7 +1028,10 @@ mod tests {
     fn capture_drain_plans() {
         // The drain's own delay is kept; a failed drain retries after the capture delay.
         let after = Some(Duration::from_secs(5));
-        assert_eq!(CaptureDrainOperation::rearm(Ok(after)), Ok(TimerPlan::from(after)));
+        assert_eq!(
+            CaptureDrainOperation::rearm(Ok(after)),
+            Ok(TimerPlan::from(after))
+        );
         let failed = CaptureDrainOperation::rearm(Err(IoError::Unfinished));
         assert_eq!(failed.unwrap_err().retry_after, CAPTURE_RETRY_AFTER);
     }
@@ -1111,7 +1116,10 @@ mod tests {
     #[test]
     fn replication_key_named() {
         let operation = timer_operation(&TaskKey::DrainReplicationQueue, &input());
-        assert!(matches!(operation, Some(TimerOperation::DrainReplicationQueue(_))));
+        assert!(matches!(
+            operation,
+            Some(TimerOperation::DrainReplicationQueue(_))
+        ));
     }
 
     #[test]
