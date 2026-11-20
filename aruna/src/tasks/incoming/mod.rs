@@ -779,9 +779,7 @@ impl OperationsTaskHandler {
             TaskKey::DrainSyncOutbox => Box::pin(async move {
                 self.drain_sync_outbox().await;
             }),
-            TaskKey::PublishUsageSnapshots => Box::pin(async move {
-                self.publish_usage_snapshots().await;
-            }),
+            TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
             TaskKey::PublishNodeInfo => Box::pin(async move {
                 self.publish_node_info().await;
             }),

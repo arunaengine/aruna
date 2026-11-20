@@ -462,32 +462,6 @@ impl TaskQueues {
 }
 
 impl OperationsTaskHandler {
-    pub(super) async fn publish_usage_snapshots(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(task_id = ?TaskKey::PublishUsageSnapshots, "Cannot publish usage snapshots without net handle");
-            return;
-        };
-        let node_id = net_handle.node_id();
-        let realm_id = *net_handle.realm_id();
-        let publish = aruna_operations::node::usage_publish::PublishUsageOperation::new(
-            (node_id, realm_id),
-            Some(realm_id),
-            false,
-            true,
-        );
-        match drive(publish, &self.context).await {
-            Ok(_) => {}
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
-                self.reschedule_timer(
-                    TaskKey::PublishUsageSnapshots,
-                    aruna_operations::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE,
-                )
-                .await;
-            }
-        }
-    }
-
     pub(super) async fn publish_node_info(&self) {
         if let Some(net_handle) = self.context.net_handle.as_ref() {
             let node_id = net_handle.node_id();

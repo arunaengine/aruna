@@ -83,7 +83,7 @@ impl PublishedUsage {
 }
 
 /// The groups and global scope one publish reports.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct UsageScope {
     global: bool,
     groups: BTreeSet<GroupId>,
@@ -266,7 +266,7 @@ fn snapshot_rows(
     Ok(writes)
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum PublishStep {
     Markers,
     Counters,
@@ -285,7 +285,7 @@ type PublishTurn = Result<Next<PublishedUsage>, UsagePublishError>;
 /// Rebuilds this node's snapshots from live counters and replicates them: dirty mode refreshes
 /// marked groups, full mode all groups plus the global. Markers clear only after replication (and
 /// with `refresh` the realm summary), never if re-dirtied; a later failure marks a retry.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PublishUsageOperation {
     node_id: NodeId,
     realm_id: RealmId,

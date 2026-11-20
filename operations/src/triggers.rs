@@ -35,6 +35,7 @@ use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
+use crate::node::usage_publish::PublishUsageOperation;
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::holder::HolderRead;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
@@ -50,6 +51,7 @@ use crate::replication::mirror_repair::drain::DrainRepairsOperation;
 use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::s3::object::metadata_drain::DrainRefreshOperation;
+use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 
 /// What a timer keeps on this node between its runs, in memory only: its attempts since the last
 /// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
@@ -170,6 +172,7 @@ pub enum TimerOperation {
     SettleJobTerminals(SettleTerminalsOperation),
     PruneJobs(PruneKeepingWork),
     DrainMirrorRepair(DrainRepairsOperation),
+    PublishUsageSnapshots(PublishUsageOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -266,6 +269,14 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
             Some(node_id) => TimerOperation::DrainMirrorRepair(DrainRepairsOperation::new(node_id)),
             None => TimerOperation::Wait(WaitOperation::after(Some(REPAIR_RETRY_AFTER))),
         }),
+        TaskKey::PublishUsageSnapshots => Some(match input.facts.serving {
+            Some((node_id, realm_id)) => {
+                let keys = (node_id, realm_id);
+                let publish = PublishUsageOperation::new(keys, Some(realm_id), false, true);
+                TimerOperation::PublishUsageSnapshots(publish)
+            }
+            None => TimerOperation::Wait(WaitOperation::after(None)),
+        }),
         _ => None,
     }
 }
@@ -291,6 +302,7 @@ macro_rules! each_timer {
             TimerOperation::SettleJobTerminals($operation) => $body,
             TimerOperation::PruneJobs($operation) => $body,
             TimerOperation::DrainMirrorRepair($operation) => $body,
+            TimerOperation::PublishUsageSnapshots($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -568,6 +580,17 @@ impl TimerRun for WaitOperation {
     }
 }
 
+impl TimerRun for PublishUsageOperation {
+    /// A published run waits for the next change; a failed one runs again after the debounce.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(|error| TimerFailure {
+            retry_after: SNAPSHOT_PUBLISH_DEBOUNCE,
+            reason: error.to_string(),
+        })?;
+        Ok(TimerPlan::default())
+    }
+}
+
 impl TimerRun for PruneNotificationsOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         match result {
@@ -838,6 +861,7 @@ impl Operation for PeerOperation {
 mod tests {
     use super::*;
     use crate::blob::hidden::HiddenSweepOutcome;
+    use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
     use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
     use crate::jobs::prune::JobPruneOutcome;
     use crate::jobs::lifecycle::LifecycleError;
@@ -997,6 +1021,18 @@ mod tests {
         let error = SyncMirrorError::Mirror("boom".to_string());
         let failed = DrainRepairsOperation::rearm(Err(error));
         assert_eq!(failed.unwrap_err().retry_after, REPAIR_RETRY_AFTER);
+    }
+
+    #[test]
+    fn usage_publish_plans() {
+        // A published run waits for the next change; a failure retries after the debounce.
+        let published = PublishUsageOperation::rearm(Ok(PublishedUsage::default()));
+        assert_eq!(published, Ok(TimerPlan::default()));
+        let error = UsagePublishError::Failed("boom".to_string());
+        let failed = PublishUsageOperation::rearm(Err(error));
+        assert_eq!(failed.unwrap_err().retry_after, SNAPSHOT_PUBLISH_DEBOUNCE);
+        let mut idle = timer_operation(&TaskKey::PublishUsageSnapshots, &input()).unwrap();
+        assert_eq!(idle.first(), Ok(Next::Done(TimerPlan::default())));
     }
 
     #[test]
