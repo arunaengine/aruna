@@ -289,19 +289,29 @@ impl DocumentSyncService {
             // publish onto a genesis-less shard defers the outbox record.
             let may_create_topic = !target.uses_shard_topic();
             let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
+            let key = event_key(topic_id, &event)?;
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let op = match self.publish_event_op(
-                oplog,
-                topic_id,
-                actor_id,
-                envelope,
-                sync_peers,
-                allow_genesis,
-                may_create_topic,
-                &mut fast_path,
-                &mut fallback,
-            ) {
+            // Held from the check to the record, so no other publish appends the event between.
+            let _lock = self.publish_lock(topic_id);
+            // A publish repeated after a restart finds the op it became on the current lineage.
+            let published = match self.published_op(topic_id, actor_id, &key)? {
+                Some(op) => Ok(op),
+                None => self
+                    .publish_event_op(
+                        oplog,
+                        topic_id,
+                        actor_id,
+                        envelope,
+                        sync_peers,
+                        allow_genesis,
+                        may_create_topic,
+                        &mut fast_path,
+                        &mut fallback,
+                    )
+                    .and_then(|op| self.keep_published(&key, &op).map(|()| op)),
+            };
+            let op = match published {
                 Ok(op) => op,
                 Err(NetError::TopicNotReady(topic)) => {
                     outcome.retry_indices.push(index);

@@ -48,12 +48,14 @@ mod eviction;
 mod inbound;
 mod peers;
 mod publish;
+mod published;
 pub(crate) mod reconcile;
 pub(crate) mod storage;
 mod sync;
 mod topics;
 
 use self::cursor::*;
+use self::published::*;
 
 const PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 const OUTBOUND_PEER_LIMIT: usize = 8;
@@ -264,6 +266,9 @@ pub struct DocumentSyncService {
     net: Arc<::irokle::net::IrohNet<::irokle::FjallStorage>>,
     db: fjall::OptimisticTxDatabase,
     fanout_cursors: fjall::OptimisticTxKeyspace,
+    /// The oplog op each local publish became, so a repeated publish appends nothing.
+    published: fjall::OptimisticTxKeyspace,
+    publish_locks: Arc<Vec<Mutex<()>>>,
     persist_policy: FjallPersistPolicy,
     pub(crate) storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
@@ -352,6 +357,9 @@ impl DocumentSyncService {
         let fanout_cursors = db
             .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let published = db
+            .keyspace(PUBLISHED_KEYSPACE, fjall::KeyspaceCreateOptions::default)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let node = ::irokle::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
             .with_peer_whitelist(default_peers.clone())
@@ -386,6 +394,8 @@ impl DocumentSyncService {
             net,
             db,
             fanout_cursors,
+            published,
+            publish_locks: Arc::new((0..PUBLISH_LOCKS).map(|_| Mutex::new(())).collect()),
             persist_policy,
             storage,
             default_peers: Arc::new(RwLock::new(default_peers.clone())),
