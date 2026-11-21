@@ -33,7 +33,7 @@ const RUST: [(&str, &str); 10] = library!("src":
 /// The versions the Rust library depends on; a test checks them against the workspace's.
 const SERDE: &str = "1.0.229";
 const SERDE_JSON: &str = "1.0.152";
-const WIT_BINDGEN: &str = "0.61.1";
+const WIT_BINDGEN: &str = "0.63.0";
 
 /// Writes the crate `aruna-plugin` with a standalone manifest to `.aruna/rust/aruna-plugin/` and
 /// the contract to `.aruna/rust/wit/`, the layout its bindings expect.
