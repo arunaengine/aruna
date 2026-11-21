@@ -1304,7 +1304,8 @@ async fn holding<F: Future>(scope: Option<HoldScope>, effects: F) -> F::Output {
     }
 }
 
-/// The lock of a scope no backend owns; it lives as long as the process.
+/// The lock of a scope no backend owns. A lock only the table still references guards nothing,
+/// so a new scope first drops those, which keeps per-install scopes from piling up.
 fn local_hold(scope: HoldScope) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     type Holds = std::collections::HashMap<HoldScope, std::sync::Arc<tokio::sync::Mutex<()>>>;
     static HOLDS: std::sync::LazyLock<std::sync::Mutex<Holds>> =
@@ -1312,6 +1313,9 @@ fn local_hold(scope: HoldScope) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     let mut holds = HOLDS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !holds.contains_key(&scope) {
+        holds.retain(|_, lock| std::sync::Arc::strong_count(lock) > 1);
+    }
     holds.entry(scope).or_default().clone()
 }
 
@@ -3470,6 +3474,16 @@ mod test {
         );
         assert_eq!(*log.lock().unwrap(), ["holder"]);
         holder_task.abort();
+    }
+
+    #[test]
+    fn unused_holds_dropped() {
+        // An install scope nobody holds leaves the table once another scope is taken.
+        let first = HoldScope::PluginInstall(ulid::Ulid::from_bytes([41u8; 16]));
+        let released = std::sync::Arc::downgrade(&local_hold(first));
+        let other = local_hold(HoldScope::PluginInstall(ulid::Ulid::from_bytes([42u8; 16])));
+        assert!(released.upgrade().is_none());
+        drop(other);
     }
 
     #[tokio::test]
