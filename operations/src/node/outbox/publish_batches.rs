@@ -196,12 +196,9 @@ impl PublishBatchesOperation {
     /// retry and keep their own domains blocked.
     fn without_blocked(&mut self, batch: DrainSubBatch) -> Option<DrainSubBatch> {
         let outcome = &self.out.outcome;
+        // A successor rides only a topic that holds every wait of its origin.
         let waits_elsewhere = |origin: NodeId, topic: TopicId| {
-            let waits = outcome
-                .sync_waits
-                .iter()
-                .filter(|(waiting, _)| *waiting == origin);
-            waits.clone().next().is_some() && !waits.clone().any(|(_, on)| *on == topic)
+            (outcome.sync_waits.iter()).any(|(waiting, on)| *waiting == origin && *on != topic)
         };
         let blocked = |index: usize| {
             let topic = batch.topics.get(index);
@@ -606,6 +603,30 @@ mod tests {
             panic!("the later batch is held");
         };
         assert_eq!(done.published, vec![kept(b"one", b"one")]);
+        assert!(done.outcome.retry_needed);
+    }
+
+    // A successor on one waiting topic is held while its origin also waits on another topic.
+    #[test]
+    fn split_waits_held() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let (mut first, mut second) = (batch(b"one"), batch(b"one"));
+        (first.origins, second.origins) = (vec![Some(origin)], vec![Some(origin)]);
+        second.record_keys = vec![b"later".to_vec()];
+        let mut run = PublishBatchesOperation::new(serving(), vec![first, second]);
+        run.first().unwrap();
+        let published = net(DocumentNetEvent::DocumentsPublished {
+            targets: Vec::new(),
+        });
+        run.next(published).unwrap();
+        let mut finished = FinishedBatch::default();
+        finished.outcome.retry_needed = true;
+        let waits = [TopicId::hash(b"one"), TopicId::hash(b"two")];
+        finished.outcome.sync_waits = waits.map(|topic| (origin, topic)).to_vec();
+        let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
+        let Ok(Next::Done(done)) = run.next(synced) else {
+            panic!("the successor is held");
+        };
         assert!(done.outcome.retry_needed);
     }
 

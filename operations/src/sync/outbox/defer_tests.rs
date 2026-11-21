@@ -201,6 +201,21 @@ fn sync_wait_topics() {
     assert_eq!(keys(&deferred), vec![b"second".to_vec(), b"third".to_vec()]);
 }
 
+// An origin waiting on two topics publishes on neither: the sync of one cannot carry the
+// earlier record on the other.
+#[test]
+fn split_waits_hold() {
+    let origin = node(4);
+    let (first, second) = (TopicId::hash(b"first-wait"), TopicId::hash(b"second-wait"));
+    let mut defer = DrainDeferState::default();
+    add_waits(&mut defer.sync_waits, &[(origin, first), (origin, second)]);
+    let records = vec![(b"later".to_vec(), admin_record(origin, 3), first)];
+    let (to_publish, deferred, _) =
+        partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
+    assert!(to_publish.is_empty());
+    assert_eq!(deferred.len(), 1);
+}
+
 #[test]
 fn topic_block_spans() {
     let topic = TopicId::hash(b"blocked-topic-pages");
