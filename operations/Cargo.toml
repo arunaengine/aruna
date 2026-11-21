@@ -12,7 +12,7 @@ rust-version.workspace = true
 
 [features]
 # Pure test fixtures for the tests of other crates; only dev-dependencies enable it.
-test-hooks = []
+test-hooks = ["aruna-core/test-hooks"]
 
 [dependencies]
 aruna-core = { workspace = true }
