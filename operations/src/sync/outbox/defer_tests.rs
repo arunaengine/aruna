@@ -207,7 +207,10 @@ fn later_relays_ordered() {
 #[test]
 fn deferred_row_stops() {
     let origin = node(4);
-    let (remote, local) = (TopicId::hash(b"remote-shard"), TopicId::hash(b"local-shard"));
+    let (remote, local) = (
+        TopicId::hash(b"remote-shard"),
+        TopicId::hash(b"local-shard"),
+    );
     let records = vec![
         (b"admin/1".to_vec(), admin_record(origin, 1), remote),
         (b"admin/2".to_vec(), admin_record(origin, 2), local),
@@ -223,7 +226,10 @@ fn deferred_row_stops() {
     };
     assert!(to_publish.is_empty() && deferred.is_empty());
     assert_eq!(keys(&undeliverable), vec![b"admin/1".to_vec()]);
-    assert_eq!(keys(&unread), vec![b"admin/2".to_vec(), b"admin/3".to_vec()]);
+    assert_eq!(
+        keys(&unread),
+        vec![b"admin/2".to_vec(), b"admin/3".to_vec()]
+    );
     assert!(!defer.blocked_origins.contains(&origin));
 }
 

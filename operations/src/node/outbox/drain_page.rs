@@ -759,11 +759,19 @@ mod tests {
                 kept_origins: kept,
                 ..RelayedRecords::default()
             };
-            let answer = run.next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(relayed))));
+            let answer = run.next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(
+                relayed,
+            ))));
             let invocation = &run.page.as_ref().unwrap().invocation;
-            assert_eq!(invocation.defer.blocked_origins.contains(&origin), !publishes);
+            assert_eq!(
+                invocation.defer.blocked_origins.contains(&origin),
+                !publishes
+            );
             assert_eq!(invocation.deferred, usize::from(!publishes));
-            assert_eq!(matches!(answer, Ok(Next::Call(IoCall::Group(_)))), publishes);
+            assert_eq!(
+                matches!(answer, Ok(Next::Call(IoCall::Group(_)))),
+                publishes
+            );
         }
     }
 

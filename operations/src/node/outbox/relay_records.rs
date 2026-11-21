@@ -150,6 +150,10 @@ impl RelayRecordsOperation {
             _ => None,
         };
         let Some(event) = event.filter(|_| !holders.is_empty()) else {
+            // No holder resolves yet: later relays of its origin and shard wait, and a drain
+            // comes back for it even when it is the last row.
+            self.out.retry = true;
+            self.hold(&record);
             self.left(record);
             return None;
         };
@@ -506,5 +510,21 @@ mod tests {
         };
         assert_eq!((out.left, out.held), (1, 1));
         assert_eq!(out.held_origins, vec![node(), other]);
+    }
+
+    // A record whose shard resolves no holder stays, asks for another drain, and holds a later
+    // relay of its origin to another shard.
+    #[test]
+    fn holderless_relay_holds() {
+        let mut first = signed_record(b"admin/1", node());
+        first.1.placement.strategy_id = Ulid::from_bytes([8; 16]);
+        let mut second = signed_record(b"admin/2", node());
+        second.2 = TopicId::hash(b"other");
+        let records = vec![first, second];
+        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(holder_config())), records);
+        let Ok(Next::Done(out)) = run.first() else {
+            panic!("the later relay is not attempted");
+        };
+        assert_eq!((out.left, out.held, out.retry), (1, 1, true));
     }
 }
