@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::backoff::capped_backoff;
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
@@ -14,6 +15,7 @@ use aruna_storage::task_timers::{
     NO_ADMISSION, hold_change, persist_task_effect, read_timer, timer_has_row, write_owned,
 };
 use aruna_tasks::TaskHandle;
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::clock::next_entropy;
@@ -100,7 +102,7 @@ async fn arm_stored(
 async fn apply_change(
     storage: &StorageHandle,
     task_handle: Option<&TaskHandle>,
-    effect: TaskEffect,
+    mut effect: TaskEffect,
     keep_live: bool,
 ) -> Event {
     let admission = next_admission();
@@ -121,7 +123,7 @@ async fn apply_change(
             return event;
         };
         let written = if plan.holder == Some(admission) {
-            write_settled(storage, key, *after, admission).await
+            write_settled(storage, key, *after, admission, keep_live).await
         } else {
             own_row(storage, key, *after, plan.holder).await
         };
@@ -153,10 +155,16 @@ async fn apply_change(
         return event;
     }
     if timer_has_row(&effect) {
-        let written = match &effect {
-            TaskEffect::ResetTimer { key, after } => write_settled(storage, key, *after, admission)
-                .await
-                .map_err(|error| error.to_string()),
+        let written = match &mut effect {
+            TaskEffect::ResetTimer { key, after } => {
+                // The scheduler keeps the deadline the row stores, however late the write ends.
+                let deadline = Instant::now().checked_add(*after);
+                let written = write_settled(storage, key, *after, admission, keep_live).await;
+                if let Some(deadline) = deadline {
+                    *after = deadline.saturating_duration_since(Instant::now());
+                }
+                written.map_err(|error| error.to_string())
+            }
             _ => persist_task_effect(storage, &effect).await,
         };
         if let Err(message) = written {
@@ -191,20 +199,29 @@ async fn own_row(
 
 /// [`write_owned`] whose unanswered write is settled by rereading the row, which storage serves
 /// only after the write: the row of `admission` proves it committed, so only a refusal fails.
+/// A `keep_live` write is tried once, as its wake is armed with `admission` anyway.
 async fn write_settled(
     storage: &StorageHandle,
     key: &TaskKey,
     after: Duration,
     admission: u64,
+    keep_live: bool,
 ) -> Result<(), StorageError> {
     let written = write_owned(storage, key, after, admission).await;
-    if written != Err(StorageError::Timeout) {
+    if keep_live || written != Err(StorageError::Timeout) {
         return written;
     }
+    let mut refused = 0;
     loop {
         match read_timer(storage, key).await {
             Ok(Some(row)) if row.admission == admission => return Ok(()),
-            Err(StorageError::Timeout) => continue,
+            Err(StorageError::Timeout) => {}
+            // A read refused before it reached storage says nothing about the write.
+            Err(StorageError::QueueFull) => {
+                let (base, cap) = (Duration::from_millis(25), Duration::from_secs(1));
+                tokio::time::sleep(capped_backoff(base, cap, refused, 0)).await;
+                refused = refused.saturating_add(1);
+            }
             _ => return written,
         }
     }
