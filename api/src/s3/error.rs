@@ -232,20 +232,33 @@ fn bucket_key_error(error: &BucketKeyError) -> S3Error {
 /// A reference source that cannot be headed answers as `HeadObject` does.
 fn head_source_error(error: HeadSourceError) -> S3Error {
     match error {
-        HeadSourceError::Resolve(
-            SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound,
-        ) => s3_error!(
+        HeadSourceError::Resolve(error) => source_resolution_error(error),
+        HeadSourceError::Staging(error) => staging_source_error(error),
+        err => internal_error(err),
+    }
+}
+
+/// A reference source that cannot be resolved now is a retryable 503.
+fn source_resolution_error(error: SourceResolutionError) -> S3Error {
+    match error {
+        SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => s3_error!(
             ServiceUnavailable,
             "Reference source is currently unavailable"
         ),
-        HeadSourceError::Staging(StagingSourceError::NotFound) => {
+        err => internal_error(err),
+    }
+}
+
+/// A lost reference source is 404, a refused one 403, and any other failure a retryable 503.
+fn staging_source_error(error: StagingSourceError) -> S3Error {
+    match error {
+        StagingSourceError::NotFound => {
             s3_error!(NoSuchKey, "The referenced source object does not exist.")
         }
-        HeadSourceError::Staging(StagingSourceError::AccessDenied) => {
+        StagingSourceError::AccessDenied => {
             s3_error!(AccessDenied, "Access to the referenced source was denied.")
         }
-        HeadSourceError::Staging(err) => s3_error!(ServiceUnavailable, "{}", err),
-        err => internal_error(err),
+        err => s3_error!(ServiceUnavailable, "{}", err),
     }
 }
 
@@ -727,24 +740,8 @@ impl IntoS3Error for GetObjectError {
             GetObjectError::InvalidRange => {
                 s3_error!(InvalidRange, "The requested range is not satisfiable.")
             }
-            GetObjectError::ResolveReferenceError(error) => match error {
-                SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => {
-                    s3_error!(
-                        ServiceUnavailable,
-                        "Reference source is currently unavailable"
-                    )
-                }
-                err => internal_error(err),
-            },
-            GetObjectError::StagingSourceError(error) => match error {
-                StagingSourceError::NotFound => {
-                    s3_error!(NoSuchKey, "The referenced source object does not exist.")
-                }
-                StagingSourceError::AccessDenied => {
-                    s3_error!(AccessDenied, "Access to the referenced source was denied.")
-                }
-                err => s3_error!(ServiceUnavailable, "{}", err),
-            },
+            GetObjectError::ResolveReferenceError(error) => source_resolution_error(error),
+            GetObjectError::StagingSourceError(error) => staging_source_error(error),
             err => internal_error(err),
         }
     }
@@ -792,24 +789,8 @@ impl IntoS3Error for HeadObjectError {
             HeadObjectError::NoSuchVersion => missing_version_error(),
             HeadObjectError::DeleteMarker => delete_marker_error(),
             HeadObjectError::NoSuchKey => missing_key_error(),
-            HeadObjectError::ResolveReferenceError(error) => match error {
-                SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => {
-                    s3_error!(
-                        ServiceUnavailable,
-                        "Reference source is currently unavailable"
-                    )
-                }
-                err => internal_error(err),
-            },
-            HeadObjectError::StagingSourceError(error) => match error {
-                StagingSourceError::NotFound => {
-                    s3_error!(NoSuchKey, "The referenced source object does not exist.")
-                }
-                StagingSourceError::AccessDenied => {
-                    s3_error!(AccessDenied, "Access to the referenced source was denied.")
-                }
-                err => s3_error!(ServiceUnavailable, "{}", err),
-            },
+            HeadObjectError::ResolveReferenceError(error) => source_resolution_error(error),
+            HeadObjectError::StagingSourceError(error) => staging_source_error(error),
             err => internal_error(err),
         }
     }
@@ -1172,7 +1153,7 @@ mod tests {
         );
     }
 
-    // HEAD and GET of one reference answer a source failure alike: lost is 404, refused is 403,
+    // HEAD, GET and a reference copy answer a source failure alike: lost is 404, refused is 403,
     // and an outage or a changing source is a retryable 503.
     #[test]
     fn reference_failures_agree() {
@@ -1192,18 +1173,26 @@ mod tests {
             S3ErrorCode::ServiceUnavailable,
             S3ErrorCode::ServiceUnavailable,
         ];
-        let pairs = failures().into_iter().zip(failures()).zip(expected);
-        for ((get, head), code) in pairs {
+        let copied = |error| CopyObjectError::Reference(MaterializeReferenceError::Head(error));
+        let pairs = failures().into_iter().zip(failures()).zip(failures());
+        for (((get, head), copy), code) in pairs.zip(expected) {
             let get = GetObjectError::StagingSourceError(get).into_s3_error();
             let head = HeadObjectError::StagingSourceError(head).into_s3_error();
-            assert_eq!((get.code(), head.code()), (&code, &code));
+            let copy = copied(HeadSourceError::Staging(copy)).into_s3_error();
+            assert_eq!(
+                (get.code(), head.code(), copy.code()),
+                (&code, &code, &code)
+            );
             assert_eq!(get.status_code(), head.status_code());
+            assert_eq!(get.status_code(), copy.status_code());
         }
         let resolve = || SourceResolutionError::ResolveFailed;
         let get = GetObjectError::ResolveReferenceError(resolve()).into_s3_error();
         let head = HeadObjectError::ResolveReferenceError(resolve()).into_s3_error();
+        let copy = copied(HeadSourceError::Resolve(resolve())).into_s3_error();
         assert_eq!(get.code(), &S3ErrorCode::ServiceUnavailable);
         assert_eq!(head.code(), get.code());
+        assert_eq!(copy.code(), get.code());
     }
 
     #[test]
