@@ -20,6 +20,7 @@ use aruna_core::document::{
     DocumentEvent, DocumentEvictedDocument, DocumentNetEvent, DocumentOutboxEvent,
     DocumentSyncPublish,
 };
+use aruna_core::document_apply::cursor::AppliedCursor;
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -35,7 +36,6 @@ use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};

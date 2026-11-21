@@ -16,23 +16,15 @@ pub(in crate::document_sync) fn applied_cursor_clock(
     genesis: ::irokle::OpId,
     stored: Option<Value>,
 ) -> Result<::irokle::ActorClock> {
-    let Some(cursor) = stored
-        .and_then(|value| postcard::from_bytes::<AppliedCursor>(value.as_ref()).ok())
-        .filter(|cursor| cursor.lineage == genesis)
-    else {
+    let Some(cursor) = AppliedCursor::decode(stored.as_deref(), genesis) else {
         return Ok(::irokle::ActorClock::default());
     };
-    for (actor_id, actor_seq) in cursor.clock.iter() {
-        if *actor_seq == 0 {
-            continue;
-        }
-        let current = storage
-            .actor_index(&topic_id, actor_id, *actor_seq)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        if current.is_none() || current.as_ref() != cursor.marks.get(actor_id) {
-            debug!(%topic_id, %actor_id, "Discarding a document sync cursor whose history was rebuilt");
-            return Ok(::irokle::ActorClock::default());
-        }
+    if !cursor
+        .stands(|actor_id, actor_seq| storage.actor_index(&topic_id, actor_id, actor_seq))
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+    {
+        debug!(%topic_id, "Discarding a document sync cursor whose history was rebuilt");
+        return Ok(::irokle::ActorClock::default());
     }
     Ok(cursor.clock)
 }
@@ -45,25 +37,19 @@ pub(in crate::document_sync) fn applied_cursor_value(
     genesis: ::irokle::OpId,
     clock: &::irokle::ActorClock,
 ) -> Result<ByteView> {
-    let mut marks = BTreeMap::new();
-    for (actor_id, actor_seq) in clock.iter() {
-        if *actor_seq == 0 {
-            continue;
-        }
-        if let Some(op_id) = storage
-            .actor_index(&topic_id, actor_id, *actor_seq)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?
-        {
-            marks.insert(*actor_id, op_id);
-        }
-    }
-    postcard::to_allocvec(&AppliedCursor {
-        lineage: genesis,
-        clock: clock.clone(),
-        marks,
-    })
-    .map(ByteView::from)
-    .map_err(|error| NetError::Bootstrap(error.to_string()))
+    let held = |actor_id: &::irokle::ActorId, actor_seq| {
+        storage.actor_index(&topic_id, actor_id, actor_seq)
+    };
+    let cursor = AppliedCursor::marked(genesis, clock.clone(), held)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    cursor_bytes(&cursor)
+}
+
+/// The stored form of `cursor`.
+pub(in crate::document_sync) fn cursor_bytes(cursor: &AppliedCursor) -> Result<ByteView> {
+    postcard::to_allocvec(cursor)
+        .map(ByteView::from)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
 pub(in crate::document_sync) fn fanout_cursor_value(
@@ -347,16 +333,6 @@ pub(in crate::document_sync) fn peer_endpoint_addr(peer_id: PeerId) -> Result<ir
     let endpoint_id = iroh::EndpointId::from_bytes(peer_id.as_bytes())
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     Ok(iroh::EndpointAddr::from(endpoint_id))
-}
-
-/// An applied-ops cursor with the history it describes: the genesis it was built
-/// from and the op at each actor position. A chain replacement or orphan rebuild
-/// renumbers sequences, so a position alone is never evidence its op stands.
-#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct AppliedCursor {
-    pub(in crate::document_sync) lineage: ::irokle::OpId,
-    pub(crate) clock: ::irokle::ActorClock,
-    pub(in crate::document_sync) marks: BTreeMap<::irokle::ActorId, ::irokle::OpId>,
 }
 
 const FANOUT_CURSOR_LEN: usize = ::irokle::OpId::LEN + std::mem::size_of::<u64>();
