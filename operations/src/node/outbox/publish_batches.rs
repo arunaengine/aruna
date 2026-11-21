@@ -248,16 +248,13 @@ impl PublishBatchesOperation {
         };
         let entries = batch.record_keys.len();
         batch.stamps.resize(entries, RowStamp::default());
-        let mut filled = Vec::new();
+        // A lineage sampled after the append may postdate a tie-break that dropped it, so it
+        // guards the finish but is no evidence a later drain may rely on.
         for (index, stamp) in batch.stamps.iter_mut().enumerate() {
             let topic = batch.topics.get(index);
             if stamp.lineage.is_none() {
                 stamp.lineage = topic.and_then(|topic| current.get(topic).copied().flatten());
-                filled.extend(stamp.lineage.map(|_| index));
             }
-        }
-        if let Some(filled) = batch.sync_subset(&filled) {
-            self.out.published.extend(evidence(&filled));
         }
         self.advance()
     }
@@ -553,7 +550,7 @@ mod tests {
     }
 
     // A record published onto a topic its publish created has no lineage before the publish; the
-    // run learns it before the sync, so the finish can delete the row and a retry can rely on it.
+    // run learns it before the sync for the finish, but keeps no evidence a retry relies on.
     #[test]
     fn missing_lineage_filled() {
         let mut first = batch(b"one");
@@ -574,7 +571,7 @@ mod tests {
         let Ok(Next::Done(done)) = run.next(IoResult::Child(ChildOutcome::new(synced))) else {
             panic!("the batch finishes");
         };
-        assert_eq!(done.published, vec![kept(b"one", b"one")]);
+        assert!(done.published.is_empty());
     }
 
     // A batch sharing an admin origin with the one before it waits for that sync instead of

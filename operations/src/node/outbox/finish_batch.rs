@@ -32,6 +32,9 @@ use crate::sync::outbox::cleanup::{DeleteUnchanged, lineage_call, lineages};
 pub struct FinishedBatch {
     pub outcome: DrainSyncOutcome,
     pub deleted: Vec<Vec<u8>>,
+    /// Positions of the records whose topic left, or may have left, the lineage they were
+    /// published on: their publication is lost and later records wait for its replacement.
+    pub lost: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -56,6 +59,8 @@ pub struct FinishBatchOperation {
     guards: Vec<(TopicId, RowStamp)>,
     topics: Vec<TopicId>,
     attempted: usize,
+    /// Whether the records stay for a retry, so the lineage check only finds the lost ones.
+    retrying: bool,
     requested: Vec<DocumentTarget>,
     synced: Option<Event>,
     applied: Vec<DocumentTarget>,
@@ -86,6 +91,7 @@ impl FinishBatchOperation {
             guards: Vec::new(),
             topics: Vec::new(),
             attempted: 0,
+            retrying: false,
             requested,
             synced: Some(synced),
             applied: Vec::new(),
@@ -93,6 +99,7 @@ impl FinishBatchOperation {
             finished: FinishedBatch {
                 outcome,
                 deleted: Vec::new(),
+                lost: Vec::new(),
             },
             step: FinishStep::Usage,
             started_ms: 0,
@@ -132,6 +139,13 @@ impl FinishBatchOperation {
         self.done()
     }
 
+    /// Keeps the records for a retry, after learning which of them left their lineage.
+    fn retry_lineages(&mut self) -> FinishTurn {
+        self.finished.outcome.retry_needed = true;
+        self.retrying = true;
+        self.check_lineages()
+    }
+
     fn interest(&mut self) -> FinishTurn {
         match self.serving {
             Some((_, realm_id)) => {
@@ -153,6 +167,9 @@ impl FinishBatchOperation {
         topics.sort();
         topics.dedup();
         let Some(call) = lineage_call(&topics) else {
+            if self.retrying {
+                return self.done();
+            }
             let rows = self
                 .record_keys
                 .iter()
@@ -178,10 +195,12 @@ impl FinishBatchOperation {
             };
             // Only a known lineage that still matches lets the record go; an unknown one waits.
             let now = current.get(topic).copied().flatten();
-            match now.is_some() && now == stamp.lineage {
-                true => rows.push((key.clone(), stamp.digest)),
-                false => self.finished.outcome.retry_needed = true,
+            if now.is_some() && now == stamp.lineage {
+                rows.push((key.clone(), stamp.digest));
+                continue;
             }
+            self.finished.outcome.retry_needed = true;
+            self.finished.lost.push(index);
         }
         Ok(rows)
     }
@@ -241,15 +260,15 @@ impl Operation for FinishBatchOperation {
             }))) => targets,
             Some(Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. }))) => {
                 warn!(task_id = ?task_id, error = %error, "Failed to sync document batch");
-                return self.retry();
+                return self.retry_lineages();
             }
             Some(Event::Net(NetEvent::Error(error))) => {
                 warn!(task_id = ?task_id, error = ?error, "Failed to sync document batch");
-                return self.retry();
+                return self.retry_lineages();
             }
             other => {
                 warn!(task_id = ?task_id, event = ?other, "Unexpected document sync batch result");
-                return self.retry();
+                return self.retry_lineages();
             }
         };
         self.refresh = targets.clone();
@@ -297,13 +316,16 @@ impl Operation for FinishBatchOperation {
                 if !settled {
                     let task_id = TaskKey::DrainSyncOutbox;
                     warn!(task_id = ?task_id, "Metadata follow-ups of an outbox drain wait");
-                    return self.retry();
+                    return self.retry_lineages();
                 }
                 self.check_lineages()
             }
             FinishStep::Lineage => {
                 let rows = self.held_rows(result)?;
-                self.delete(rows)
+                match self.retrying {
+                    true => self.done(),
+                    false => self.delete(rows),
+                }
             }
             FinishStep::Delete => {
                 let deleted = result.child::<Vec<Vec<u8>>, ApplyError>()?;
@@ -383,6 +405,31 @@ mod tests {
         assert_eq!(finished.outcome.deleted, 1);
     }
 
+    // A failed sync of a record whose topic moved to another lineage reports it lost, so its
+    // successors do not take the same-topic exception.
+    #[test]
+    fn failed_moved_lost() {
+        let error = DocumentNetEvent::Error {
+            target: None,
+            error: "broken".to_string(),
+        };
+        let stamp = RowStamp {
+            lineage: Some([1; 32]),
+            digest: None,
+        };
+        let synced = Event::Net(NetEvent::DocumentSync(error));
+        let mut run = finish(synced).guarded(vec![(TopicId::hash(b"topic"), stamp)]);
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Group(_)))));
+        let root = Event::Net(NetEvent::Shard(Box::new(ShardNetEvent::Root(Ok([2; 32])))));
+        let results = vec![GroupResult::Done(Box::new(root))];
+        let Ok(Next::Done(finished)) = run.next(IoResult::Group(GroupEvent::Finished { results }))
+        else {
+            panic!("a failed sync finishes after its lineage check");
+        };
+        assert!(finished.outcome.retry_needed && finished.deleted.is_empty());
+        assert_eq!(finished.lost, vec![0]);
+    }
+
     // A record whose topic moved to another lineage since its publication is not deleted: the
     // synced chain may lack it, so it waits for the next drain to publish it again.
     #[test]
@@ -406,6 +453,7 @@ mod tests {
             panic!("the batch finishes");
         };
         assert!(finished.deleted.is_empty() && finished.outcome.retry_needed);
+        assert_eq!(finished.lost, vec![0]);
     }
 
     // A record whose topic lineage cannot be learned now is not deleted either, also when its
