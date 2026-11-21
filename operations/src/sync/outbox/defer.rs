@@ -102,6 +102,10 @@ pub fn partition_drain_records(
                 undeliverable.push((record_key, record, topic));
                 continue;
             }
+            // Once a record of the origin waits here, no later one relays past it.
+            if let Some(origin) = admin_origin(&record) {
+                relaying.remove(&origin);
+            }
             defer.deferred_topics.insert(topic);
             deferred.push((record_key, record, topic));
             continue;
@@ -221,7 +225,7 @@ pub fn hold_relays(
         }
     }
     let (mut now, mut held) = (Vec::new(), Vec::new());
-    let mut held_topics = HashSet::new();
+    let (mut held_topics, mut held_origins) = (HashSet::new(), HashSet::new());
     for relay in undeliverable {
         let (key, record, topic) = &relay;
         let Some(origin) = admin_origin(record) else {
@@ -231,13 +235,14 @@ pub fn hold_relays(
         let after_publish = first_publish
             .get(&origin)
             .is_some_and(|first| key.as_slice() > *first);
-        if !after_publish && !held_topics.contains(topic) {
+        if !after_publish && !held_topics.contains(topic) && !held_origins.contains(&origin) {
             now.push(relay);
             continue;
         }
-        // A held relay holds its destination topic too, here and on the next pages, so no relay
-        // of another origin reaches that shard first.
+        // A held relay holds its destination topic and origin too, here and on the next pages,
+        // so no relay of another origin reaches that shard first, nor one of its own elsewhere.
         held_topics.insert(*topic);
+        held_origins.insert(origin);
         defer.deferred_topics.insert(*topic);
         defer.blocked_origins.insert(origin);
         held.push(relay);

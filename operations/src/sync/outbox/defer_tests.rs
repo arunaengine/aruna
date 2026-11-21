@@ -202,6 +202,52 @@ fn later_relays_ordered() {
     assert_eq!(keys, vec![b"admin/1".to_vec(), b"admin/2".to_vec()]);
 }
 
+// A record of a relaying origin that waits here stops the later relays of that origin, so none
+// reaches a holder before it.
+#[test]
+fn deferred_row_stops() {
+    let origin = node(4);
+    let (remote, local) = (TopicId::hash(b"remote-shard"), TopicId::hash(b"local-shard"));
+    let records = vec![
+        (b"admin/1".to_vec(), admin_record(origin, 1), remote),
+        (b"admin/2".to_vec(), admin_record(origin, 2), local),
+        (b"admin/3".to_vec(), admin_record(origin, 3), remote),
+    ];
+    let mut defer = DrainDeferState::default();
+    defer.topic_held.insert(remote, false);
+    defer.topic_held.insert(local, true);
+    let (to_publish, deferred, undeliverable) =
+        partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
+    let keys = |records: &[DrainRecord]| -> Vec<Vec<u8>> {
+        records.iter().map(|(key, ..)| key.clone()).collect()
+    };
+    assert!(to_publish.is_empty());
+    assert_eq!(keys(&undeliverable), vec![b"admin/1".to_vec()]);
+    assert_eq!(keys(&deferred), vec![b"admin/2".to_vec(), b"admin/3".to_vec()]);
+}
+
+// A relay held behind another origin on its shard holds its own origin's later relays to other
+// shards too.
+#[test]
+fn held_origin_relays() {
+    let (first, second) = (node(4), node(5));
+    let (published, shard, other) = (
+        TopicId::hash(b"published"),
+        TopicId::hash(b"shard"),
+        TopicId::hash(b"other-shard"),
+    );
+    let to_publish = [(b"admin/1".to_vec(), admin_record(first, 1), published)];
+    let undeliverable = vec![
+        (b"admin/2".to_vec(), admin_record(first, 2), shard),
+        (b"admin/3".to_vec(), admin_record(second, 1), shard),
+        (b"admin/4".to_vec(), admin_record(second, 2), other),
+    ];
+    let mut defer = DrainDeferState::default();
+    let (now, held) = hold_relays(&to_publish, undeliverable, &mut defer);
+    assert!(now.is_empty());
+    assert_eq!(held.len(), 3);
+}
+
 // A relay waits while an earlier record of its origin still publishes on this page; a relay of
 // another origin to another shard runs.
 #[test]
