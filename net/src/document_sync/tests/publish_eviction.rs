@@ -349,7 +349,7 @@ async fn later_event_held() {
 }
 
 // An admin event held by its waiting topic holds its origin too, so a later event of that origin
-// on a ready topic stays behind it; another origin still publishes there.
+// on a ready topic stays behind it and holds that topic; another origin elsewhere still publishes.
 #[tokio::test]
 async fn held_topic_origin() {
     let (_storage_dir, storage) = test_storage();
@@ -371,12 +371,13 @@ async fn held_topic_origin() {
         strategy_id: Ulid::from_parts(81, 7),
         shard,
     };
-    let (held_shard, ready_shard) = (shard(1), shard(2));
+    let (held_shard, ready_shard, other_shard) = (shard(1), shard(2), shard(3));
     let user_id = UserId::local(Ulid::from_parts(81, 1), realm_id);
     let topic = |placement| DocumentTarget::User { user_id }.sync_topic_id(realm_id, &placement);
-    assert_ne!(topic(held_shard), topic(ready_shard));
+    let topics = [topic(held_shard), topic(ready_shard), topic(other_shard)];
+    assert!(topics[0] != topics[1] && topics[1] != topics[2] && topics[0] != topics[2]);
     service
-        .ensure_sync_topics(&[topic(held_shard), topic(ready_shard)], Vec::new())
+        .ensure_sync_topics(&topics, Vec::new())
         .expect("shard topic genesis");
     let admin = |seed: u8, origin_seq: u64, placement: PlacementRef, signed: bool| {
         let event = test_admin_event(
@@ -404,7 +405,7 @@ async fn held_topic_origin() {
         admin(4, 1, held_shard, false),
         admin(2, 1, held_shard, true),
         admin(2, 2, ready_shard, true),
-        admin(3, 1, ready_shard, true),
+        admin(3, 1, other_shard, true),
     ];
     match service.publish_documents(documents, Vec::new()).await {
         DocumentNetEvent::DocumentsPartiallyPublished {
