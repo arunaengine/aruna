@@ -62,6 +62,7 @@ enum TaskCommand {
         key: TaskKey,
         after: Duration,
         stamp: Option<u64>,
+        mode: Shorten,
         /// The event, and the admission whose wake holds the key: this one when it armed, else
         /// the earlier one it kept.
         response: oneshot::Sender<(TaskEvent, Option<u64>)>,
@@ -97,6 +98,17 @@ enum TaskCommand {
     RegisteredDrainWaiters {
         response: oneshot::Sender<usize>,
     },
+}
+
+/// What a shorten does with the wake of its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shorten {
+    /// Arms the earlier wake.
+    Arm,
+    /// Only answers what arming would do.
+    Plan,
+    /// Arms; a kept earlier wake takes over the row `stamp` owns, so its firing deletes it.
+    Claim,
 }
 
 /// Outcome of draining the scheduler's timer handlers on shutdown. This is the
@@ -401,7 +413,7 @@ impl SchedulerState {
         &mut self,
         (key, stamp): (TaskKey, Option<u64>),
         after: Duration,
-        now: Instant,
+        (now, mode): (Instant, Shorten),
     ) -> (TaskEvent, Option<u64>) {
         let Some(requested_deadline) = now.checked_add(after) else {
             let message = "timer deadline overflow".to_string();
@@ -410,16 +422,25 @@ impl SchedulerState {
         };
 
         // A wake that came due while its key ran fires again right after the run, earliest of all.
-        if let Some(&pending) = self.refire_requested.get(&key) {
-            let after = Duration::ZERO;
-            return (TaskEvent::TimerScheduled { key, after }, pending);
+        let kept = match self.refire_requested.get_mut(&key) {
+            Some(pending) => Some((Duration::ZERO, pending)),
+            None => (self.timers_by_key.get_mut(&key))
+                .filter(|existing| existing.deadline <= requested_deadline)
+                .map(|existing| {
+                    (
+                        existing.deadline.saturating_duration_since(now),
+                        &mut existing.stamp,
+                    )
+                }),
+        };
+        if let Some((after, holder)) = kept {
+            if mode == Shorten::Claim {
+                *holder = stamp;
+            }
+            return (TaskEvent::TimerScheduled { key, after }, *holder);
         }
-
-        if let Some(existing) = self.timers_by_key.get(&key)
-            && existing.deadline <= requested_deadline
-        {
-            let after = existing.deadline.saturating_duration_since(now);
-            return (TaskEvent::TimerScheduled { key, after }, existing.stamp);
+        if mode == Shorten::Plan {
+            return (TaskEvent::TimerScheduled { key, after }, stamp);
         }
 
         let Some(id) = self.allocate_timer_id(requested_deadline) else {
@@ -588,9 +609,10 @@ impl SchedulerState {
                 key,
                 after,
                 stamp,
+                mode,
                 response,
             } => {
-                let _ = response.send(self.shorten_timer((key, stamp), after, now));
+                let _ = response.send(self.shorten_timer((key, stamp), after, (now, mode)));
             }
             TaskCommand::ScheduleIdleTimer {
                 key,
@@ -824,7 +846,7 @@ impl TaskHandle {
         &self,
         key: TaskKey,
         after: Duration,
-        stamp: Option<u64>,
+        (stamp, mode): (Option<u64>, Shorten),
     ) -> (TaskEvent, Option<u64>) {
         let command_key = key.clone();
         let (response, result) = oneshot::channel();
@@ -832,6 +854,7 @@ impl TaskHandle {
             key,
             after,
             stamp,
+            mode,
             response,
         };
         if self.command_tx.send(command).await.is_err() {
@@ -848,7 +871,36 @@ impl TaskHandle {
         after: Duration,
         stamp: u64,
     ) -> (Event, Option<u64>) {
-        let (event, holder) = self.shorten_timer(key, after, Some(stamp)).await;
+        let (event, holder) = self
+            .shorten_timer(key, after, (Some(stamp), Shorten::Arm))
+            .await;
+        (Event::Task(event), holder)
+    }
+
+    /// Answers what [`TaskHandle::shorten_owned`] would, without arming or changing any wake.
+    pub async fn plan_shorten(
+        &self,
+        key: TaskKey,
+        after: Duration,
+        stamp: u64,
+    ) -> (Event, Option<u64>) {
+        let (event, holder) = self
+            .shorten_timer(key, after, (Some(stamp), Shorten::Plan))
+            .await;
+        (Event::Task(event), holder)
+    }
+
+    /// [`TaskHandle::shorten_owned`] once the row of `stamp` is stored: an earlier wake that
+    /// holds the key now owns that row, so its firing deletes it.
+    pub async fn claim_shorten(
+        &self,
+        key: TaskKey,
+        after: Duration,
+        stamp: u64,
+    ) -> (Event, Option<u64>) {
+        let (event, holder) = self
+            .shorten_timer(key, after, (Some(stamp), Shorten::Claim))
+            .await;
         (Event::Task(event), holder)
     }
 
@@ -858,7 +910,9 @@ impl TaskHandle {
         let event = match effect {
             TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after, stamp).await,
             TaskEffect::ShortenTimer { key, after } => {
-                self.shorten_timer(key, after, stamp).await.0
+                self.shorten_timer(key, after, (stamp, Shorten::Arm))
+                    .await
+                    .0
             }
             other => return self.send_effect(Effect::Task(other)).await,
         };
@@ -1057,7 +1111,7 @@ impl Handle for TaskHandle {
                         self.reset_timer(key, after, None).await
                     }
                     TaskEffect::ShortenTimer { key, after } => {
-                        self.shorten_timer(key, after, None).await.0
+                        self.shorten_timer(key, after, (None, Shorten::Arm)).await.0
                     }
                     TaskEffect::ScheduleIdleTimer { key, after } => {
                         self.schedule_idle_timer(key, after).await
@@ -2367,13 +2421,47 @@ mod decision_tests {
         let start = Instant::now();
         let key = key();
         state.refire_requested.insert(key.clone(), Some(5));
-        let (event, holder) =
-            state.shorten_timer((key.clone(), Some(6)), Duration::from_secs(30), start);
+        let (event, holder) = state.shorten_timer(
+            (key.clone(), Some(6)),
+            Duration::from_secs(30),
+            (start, Shorten::Arm),
+        );
         let expected = TaskEvent::TimerScheduled {
             key: key.clone(),
             after: Duration::ZERO,
         };
         assert_eq!((event, holder), (expected, Some(5)));
+        assert!(!state.timers_by_key.contains_key(&key));
+    }
+
+    // A planned shorten answers the wake it would arm and leaves the armed one as it is.
+    #[test]
+    fn plan_arms_nothing() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.reset_timer((key.clone(), Some(4)), Duration::from_secs(60), start);
+        let planned = (start, Shorten::Plan);
+        let (_, holder) =
+            state.shorten_timer((key.clone(), Some(6)), Duration::from_secs(5), planned);
+        assert_eq!(holder, Some(6));
+        let entry = state.timers_by_key.get(&key).expect("the wake stays");
+        let later = start + Duration::from_secs(60);
+        assert_eq!((entry.deadline, entry.stamp), (later, Some(4)));
+    }
+
+    // A claim kept by an earlier wake hands that wake the claimed row, so its firing deletes it.
+    #[test]
+    fn claim_adopts_row() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.refire_requested.insert(key.clone(), Some(5));
+        let claimed = (start, Shorten::Claim);
+        let (_, holder) =
+            state.shorten_timer((key.clone(), Some(6)), Duration::from_secs(30), claimed);
+        assert_eq!(holder, Some(6));
+        assert_eq!(state.refire_requested.get(&key), Some(&Some(6)));
         assert!(!state.timers_by_key.contains_key(&key));
     }
 
@@ -2384,13 +2472,21 @@ mod decision_tests {
         let key = key();
         state.reset_timer((key.clone(), None), Duration::from_secs(10), start);
 
-        state.shorten_timer((key.clone(), None), Duration::from_secs(30), start);
+        state.shorten_timer(
+            (key.clone(), None),
+            Duration::from_secs(30),
+            (start, Shorten::Arm),
+        );
         assert_eq!(
             state.timers_by_key.get(&key).unwrap().deadline,
             start + Duration::from_secs(10),
             "a later request keeps the existing deadline"
         );
-        state.shorten_timer((key.clone(), None), Duration::from_secs(5), start);
+        state.shorten_timer(
+            (key.clone(), None),
+            Duration::from_secs(5),
+            (start, Shorten::Arm),
+        );
         assert_eq!(
             state.timers_by_key.get(&key).unwrap().deadline,
             start + Duration::from_secs(5),
