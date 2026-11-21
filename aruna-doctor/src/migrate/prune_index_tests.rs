@@ -3,7 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
+use aruna_core::keyspaces::{
+    FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+};
 use aruna_core::structs::execution::job::family::{
     JobFamilyRecord, JobRecordEnvelope, SubmissionClaim,
 };
@@ -72,4 +74,40 @@ fn schedules_unindexed_families() {
     let again = migrate_output(path.to_str().unwrap()).unwrap();
     assert_eq!(again.families_scheduled, 0);
     assert_eq!(read(&path, FAMILY_PRUNE_KEYSPACE), index);
+}
+
+// Families past one batch are all scheduled, and a family with rows in two keyspaces only once.
+#[test]
+fn schedules_in_batches() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = OptimisticTxDatabase::builder(temp.path().join("db"))
+        .open()
+        .unwrap();
+    let names = [
+        FAMILY_RECORD_KEYSPACE,
+        FAMILY_PENDING_KEYSPACE,
+        FAMILY_CONFLICT_KEYSPACE,
+    ];
+    let [records, pending, conflicts] =
+        names.map(|name| db.keyspace(name, KeyspaceCreateOptions::default).unwrap());
+    let families = BATCH_FAMILIES + 1;
+    let mut txn = db.write_tx().unwrap();
+    for seed in 0..families as u16 {
+        let mut key = [0u8; FAMILY_BYTES + 1];
+        key[..2].copy_from_slice(&seed.to_be_bytes());
+        txn.insert(records.clone(), key.to_vec(), Vec::new());
+        key[FAMILY_BYTES] = 1;
+        txn.insert(records.clone(), key.to_vec(), Vec::new());
+        txn.insert(pending.clone(), key.to_vec(), Vec::new());
+    }
+    txn.commit().unwrap().unwrap();
+    let spaces = [&records, &pending, &conflicts];
+
+    assert_eq!(missing_index(&db, spaces, 5).unwrap(), families);
+
+    let index = db
+        .keyspace(FAMILY_PRUNE_KEYSPACE, KeyspaceCreateOptions::default)
+        .unwrap();
+    assert_eq!(db.read_tx().iter(&index).count(), 2 * families);
+    assert_eq!(missing_index(&db, spaces, 5).unwrap(), 0);
 }
