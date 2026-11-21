@@ -601,3 +601,51 @@ fn deletes_unnamed_documents() {
     }
     assert_eq!(kept(PLAN_EXPLAIN_KEYSPACE), [new_key]);
 }
+
+// A job of that release other than an execution only gains the local admission it lacks and
+// stays with its index rows, as on a node that ran alpha.159; a second run changes nothing.
+#[test]
+fn keeps_other_jobs() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("db");
+    let job_id = JobId::from_bytes([41u8; 16]);
+    let for_job = JobId::from_bytes([42u8; 16]);
+    let payload = JobPayload::WriteRunCrate { for_job };
+    let record = JobRecord::new(
+        job_id,
+        payload,
+        user(),
+        secret().public(),
+        1_000,
+        1_000,
+        None,
+    );
+    let mut keys = Vec::new();
+    for (keyspace, key, value) in job_insert_entries(&record).unwrap() {
+        // That release stored no local admission, the job record's last field.
+        let value = match keyspace == JOB_KEYSPACE {
+            true => value[..value.len() - 1].to_vec(),
+            false => value.to_vec(),
+        };
+        write(&path, &keyspace, vec![(key.as_ref(), value)]);
+        keys.push((keyspace, key.to_vec()));
+    }
+
+    let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+    assert_eq!(output.jobs_rewritten, 1);
+    assert!(
+        output.old_runs_deleted.is_empty(),
+        "{:?}",
+        output.old_runs_deleted
+    );
+    for (keyspace, key) in &keys {
+        let rows = read(&path, keyspace);
+        let row = rows.get(key).expect("the job's row stays");
+        if keyspace == JOB_KEYSPACE {
+            assert_eq!(JobRecord::from_bytes(row).unwrap(), record);
+        }
+    }
+    let again = migrate_output(path.to_str().unwrap()).unwrap();
+    assert_eq!(again.jobs_rewritten, 0);
+}

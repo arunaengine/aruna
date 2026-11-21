@@ -224,7 +224,10 @@ impl Removal {
                 JobPayload::WriteRunCrate { for_job } => self.jobs.contains(for_job),
                 _ => false,
             };
-            let unnamed = compute::old_job(&stored).is_some();
+            // An execution of that release goes with its family, which cannot be re-signed;
+            // any other job only gains the fields it lacks and stays.
+            let execution = matches!(record.payload, JobPayload::Execution(_));
+            let unnamed = execution && compute::old_job(&stored).is_some();
             if unnamed
                 || parent
                 || self.jobs.contains(&record.job_id)
