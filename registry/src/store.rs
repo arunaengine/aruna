@@ -26,6 +26,8 @@ pub const MAX_FUTURE_SECS: u64 = 300;
 /// Listing index ranks: approved realms list before listed ones.
 const APPROVED_RANK: u8 = 0;
 const LISTED_RANK: u8 = 1;
+/// The mark of a finished listing backfill, which a legitimately empty listing cannot show.
+const LISTING_MARK: &[u8] = b"listing";
 
 /// The listing index key of a realm: its rank, then its realm id.
 fn listing_key(rank: u8, realm_id: &RealmId) -> Vec<u8> {
@@ -93,6 +95,8 @@ pub struct Store {
     totals: Keyspace,
     /// One row per realm with an entry the public listing shows, ranked approved first.
     listing: Keyspace,
+    /// Marks of one-time store upgrades that finished.
+    marks: Keyspace,
     /// Serializes the issue-time check with the write that follows it.
     writer: Mutex<()>,
 }
@@ -107,6 +111,7 @@ impl Store {
         let names = db.keyspace("names", KeyspaceCreateOptions::default)?;
         let totals = db.keyspace("totals", KeyspaceCreateOptions::default)?;
         let listing = db.keyspace("listing", KeyspaceCreateOptions::default)?;
+        let marks = db.keyspace("marks", KeyspaceCreateOptions::default)?;
         let store = Self {
             db,
             entries,
@@ -116,6 +121,7 @@ impl Store {
             names,
             totals,
             listing,
+            marks,
             writer: Mutex::new(()),
         };
         store.fill_listing()?;
@@ -123,12 +129,13 @@ impl Store {
     }
 
     /// Writes the listing rows of a store an earlier release wrote without them. Every write
-    /// keeps the index, so an index with a row is complete and costs one read here.
+    /// keeps the index, so an index with a row or a backfill mark is complete.
     fn fill_listing(&self) -> Result<(), StoreError> {
-        if !self.listing.is_empty()? {
+        if !self.listing.is_empty()? || self.marks.contains_key(LISTING_MARK)? {
             return Ok(());
         }
         let mut batch = self.db.batch();
+        batch.insert(&self.marks, LISTING_MARK, Vec::<u8>::new());
         for item in self.entries.iter() {
             let (key, _) = item.into_inner()?;
             let realm = <[u8; 32]>::try_from(key.as_ref()).map_err(|_| StoreError::NotFound)?;
@@ -711,11 +718,12 @@ pub(crate) mod tests {
             ..AdminState::default()
         };
         store.update_admin(&hidden.0, state, "test", 100).unwrap();
-        // The earlier release wrote no listing rows.
+        // The earlier release wrote no listing rows and no backfill mark.
         store
             .listing
             .remove(listing_key(LISTED_RANK, &listed.0))
             .unwrap();
+        store.marks.remove(LISTING_MARK).unwrap();
         assert!(store.listing_page(100, None, 10).unwrap().0.is_empty());
         drop(store);
 
@@ -727,6 +735,28 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(realms, [listed.0]);
         }
+    }
+
+    // A listing that is empty after its backfill stays as the writes keep it: opening the store
+    // again does not scan the entries, so a state no write placed gains no row.
+    #[test]
+    fn fills_listing_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let realm = seeded_entry(5, 100);
+        store.register(&realm.0, &realm.1, 100).unwrap();
+        let hidden = AdminState {
+            status: RealmStatus::Hidden,
+            ..AdminState::default()
+        };
+        store.update_admin(&realm.0, hidden, "test", 100).unwrap();
+        // A listed state no write placed in the index, which only a scan would find.
+        let listed = postcard::to_allocvec(&AdminState::default()).unwrap();
+        store.admin.insert(realm.0.as_bytes(), listed).unwrap();
+        drop(store);
+
+        let store = Store::open(dir.path()).unwrap();
+        assert!(store.listing.is_empty().unwrap());
     }
 
     /// A registration of the realm whose management key has `seed`.
