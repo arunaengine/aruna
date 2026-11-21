@@ -558,6 +558,29 @@ mod tests {
         assert_eq!(plan.and_then(|plan| plan.holder), Some(1), "no second wake");
     }
 
+    // A caller that goes away after its row write committed still leaves one live wake, owned by
+    // the row's admission.
+    #[tokio::test]
+    async fn cancelled_caller_armed() {
+        let task_handle = TaskHandle::new();
+        let (store, arrived, release) = gated_store(0);
+        let key = gated_key();
+        let caller = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+        arrived.notified().await;
+        caller.abort();
+        let cancelled = caller.await.expect_err("the caller is cancelled");
+        assert!(cancelled.is_cancelled());
+        release.send(()).expect("the write waits");
+        // The change lock is free once the handoff ended.
+        drop(hold_timer(&key).await);
+        let row = read_timer(&store, &key).await.expect("reads");
+        let row = row.expect("the row is stored");
+        let (_, plan) = task_handle
+            .plan_shorten(key, Duration::from_secs(120), 1)
+            .await;
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(row.admission));
+    }
+
     // Two resets with the same deadline are two admissions: the first one's firing leaves the
     // row the second one wrote.
     #[tokio::test]

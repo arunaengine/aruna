@@ -34,8 +34,17 @@ pub async fn change_timer(
     keep_live: bool,
 ) -> Event {
     // The row and the scheduler see changes of one key in the same order.
-    let _held = hold_change(&effect).await;
-    apply_change(storage, task_handle, effect, keep_live).await
+    let held = hold_change(&effect).await;
+    if !timer_has_row(&effect) {
+        return apply_change(storage, task_handle, effect, keep_live).await;
+    }
+    let (storage, task_handle) = (storage.clone(), task_handle.cloned());
+    let key = task_effect_key(&effect);
+    finish_owned(key, async move {
+        let _held = held;
+        apply_change(&storage, task_handle.as_ref(), effect, keep_live).await
+    })
+    .await
 }
 
 /// Arms a timer's stored due time, which may be earlier, with the admission that owns its row,
@@ -46,7 +55,22 @@ pub async fn arm_unless_stored(
     task_handle: &TaskHandle,
     effect: TaskEffect,
 ) -> Event {
-    let _held = hold_change(&effect).await;
+    let held = hold_change(&effect).await;
+    let (storage, task_handle) = (storage.clone(), task_handle.clone());
+    let key = task_effect_key(&effect);
+    finish_owned(key, async move {
+        let _held = held;
+        arm_stored(&storage, &task_handle, effect).await
+    })
+    .await
+}
+
+/// [`arm_unless_stored`] once its caller holds the key's change lock.
+async fn arm_stored(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    effect: TaskEffect,
+) -> Event {
     if let TaskEffect::ShortenTimer { key, after } = &effect {
         let admission = match read_timer(storage, key).await {
             Ok(Some(row)) => {
@@ -162,6 +186,18 @@ async fn own_row(
         return Ok(());
     }
     write_owned(storage, key, after, holder).await
+}
+
+/// Runs a timer handoff on its own task, so a caller that stops waiting cannot leave a stored row
+/// without its live wake; the caller's own timeout only ends its wait.
+async fn finish_owned(
+    key: Option<TaskKey>,
+    handoff: impl Future<Output = Event> + Send + 'static,
+) -> Event {
+    tokio::spawn(handoff).await.unwrap_or_else(|error| {
+        let message = error.to_string();
+        Event::Task(TaskEvent::Error { key, message })
+    })
 }
 
 /// The error of a timer change on a node without a task handle.
