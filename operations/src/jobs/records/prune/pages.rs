@@ -12,7 +12,7 @@ use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
 };
-use aruna_core::structs::execution::job::pages::PageManifest;
+use aruna_core::structs::execution::job::pages::{InputPage, PageManifest};
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::execution::job::rows::JobDeletes;
@@ -23,23 +23,73 @@ use crate::jobs::records::pages::{page_key, stored_page};
 
 /// One chain of pages being walked, and whether the pruned family names it.
 #[derive(Debug, PartialEq)]
-struct Chain {
+pub struct Chain {
     own: bool,
     manifest: PageManifest,
     digests: Vec<[u8; 32]>,
     next: Option<[u8; 32]>,
 }
 
-/// The page deletes of one pruned family, at most a page of them. Each own chain is listed from
-/// its tail to its head, so the pages a batch leaves stay reachable from their manifest.
+impl Chain {
+    pub fn new(manifest: PageManifest, own: bool) -> Self {
+        let next = (manifest.pages > 0).then_some(manifest.first);
+        Self {
+            own,
+            manifest,
+            digests: Vec::new(),
+            next,
+        }
+    }
+
+    /// The digest of the page to read next, while the manifest names more.
+    pub fn pending(&self) -> Option<[u8; 32]> {
+        let left = self.digests.len() < self.manifest.pages as usize;
+        self.next.filter(|_| left)
+    }
+
+    /// Notes the page read under `pending`. A missing page ends its chain; what is left of it is
+    /// unreachable already.
+    pub fn read(&mut self, page: Option<&InputPage>) {
+        if let (Some(digest), Some(page)) = (self.next.take(), page) {
+            self.digests.push(digest);
+            self.next = page.next;
+        }
+    }
+}
+
+/// The walked chains of one submission: the pruned family's own pages and the pages others name.
+#[derive(Debug, Default, PartialEq)]
+pub struct PageOwners {
+    own: Vec<[u8; 32]>,
+    kept: BTreeSet<[u8; 32]>,
+}
+
+impl PageOwners {
+    /// Adds a walked chain. Own chains go tail first, so the pages a partial delete leaves stay
+    /// reachable from their manifest.
+    pub fn add(&mut self, chain: Chain) {
+        match chain.own {
+            true => self.own.extend(chain.digests.into_iter().rev()),
+            false => self.kept.extend(chain.digests),
+        }
+    }
+
+    /// The pages only the pruned family names, each once.
+    pub fn owned(&self) -> impl Iterator<Item = &[u8; 32]> {
+        let mut seen = BTreeSet::new();
+        (self.own.iter())
+            .filter(move |digest| !self.kept.contains(*digest) && seen.insert(**digest))
+    }
+}
+
+/// The page deletes of one pruned family, at most a page of them.
 #[derive(Debug, PartialEq)]
 pub struct PrunePagesOperation {
     family: JobFamilyId,
     chains: VecDeque<PageManifest>,
     owners: VecDeque<bool>,
     walking: Option<Chain>,
-    own: Vec<[u8; 32]>,
-    kept: BTreeSet<[u8; 32]>,
+    walked: PageOwners,
     scanned: bool,
 }
 
@@ -52,8 +102,7 @@ impl PrunePagesOperation {
             chains: VecDeque::new(),
             owners: VecDeque::new(),
             walking: None,
-            own: Vec::new(),
-            kept: BTreeSet::new(),
+            walked: PageOwners::default(),
             scanned: false,
         }
     }
@@ -70,34 +119,22 @@ impl PrunePagesOperation {
     /// Reads the next page of the chain being walked, or starts the next chain.
     fn walk(&mut self) -> PagesNext {
         if let Some(chain) = self.walking.as_mut() {
-            let left = chain.digests.len() < chain.manifest.pages as usize;
-            if let Some(digest) = chain.next.filter(|_| left) {
+            if let Some(digest) = chain.pending() {
                 let key = page_key(&self.family.submission_id, &digest);
                 return Ok(Next::Call(read_row(INPUT_PAGE_KEYSPACE, key)));
             }
             let chain = self.walking.take().ok_or(IoError::Unfinished)?;
-            match chain.own {
-                true => self.own.extend(chain.digests.into_iter().rev()),
-                false => self.kept.extend(chain.digests),
-            }
+            self.walked.add(chain);
         }
         if let (Some(manifest), Some(own)) = (self.chains.pop_front(), self.owners.pop_front()) {
-            let first = (manifest.pages > 0).then_some(manifest.first);
-            self.walking = Some(Chain {
-                own,
-                manifest,
-                digests: Vec::new(),
-                next: first,
-            });
+            self.walking = Some(Chain::new(manifest, own));
             return self.walk();
         }
         Ok(Next::Done(self.deletes()))
     }
 
     fn deletes(&self) -> JobDeletes {
-        let mut seen = BTreeSet::new();
-        (self.own.iter())
-            .filter(|digest| !self.kept.contains(*digest) && seen.insert(**digest))
+        (self.walked.owned())
             .take(FAMILY_PRUNE_PAGE)
             .map(|digest| {
                 let key = page_key(&self.family.submission_id, digest);
@@ -118,14 +155,14 @@ impl Operation for PrunePagesOperation {
     fn next(&mut self, result: IoResult) -> PagesNext {
         if self.scanned {
             let chain = self.walking.as_mut().ok_or(IoError::Unfinished)?;
-            let digest = chain.next.take().ok_or(IoError::Unfinished)?;
-            // A missing page ends its chain; what is left of it is unreachable already.
-            if let Some(row) = result.value()? {
-                let page =
-                    stored_page(&row, &digest).map_err(|e| PruneError::Read(e.to_string()))?;
-                chain.digests.push(digest);
-                chain.next = page.next;
-            }
+            let digest = chain.pending().ok_or(IoError::Unfinished)?;
+            let page = match result.value()? {
+                Some(row) => {
+                    Some(stored_page(&row, &digest).map_err(|e| PruneError::Read(e.to_string()))?)
+                }
+                None => None,
+            };
+            chain.read(page.as_ref());
             return self.walk();
         }
         let IoResult::Page { rows, next } = result else {
@@ -154,7 +191,7 @@ impl Operation for PrunePagesOperation {
 #[cfg(test)]
 mod tests {
     use aruna_core::structs::execution::job::family::SubmissionId;
-    use aruna_core::structs::execution::job::pages::{InputPage, PageEntries};
+    use aruna_core::structs::execution::job::pages::PageEntries;
     use aruna_core::types::Value;
 
     use super::*;
