@@ -330,7 +330,13 @@ async fn metadata_round_trip() -> TestResult<()> {
 
         let output = dir.path().join("export.json");
         let output_text = output.to_string_lossy().to_string();
-        cli(&config, &["meta", "export", &id, "-o", &output_text]).await?;
+        // A search hit can come before the graph is marked materialized, which export needs.
+        shared::wait_until("the crate export", shared::WAIT_CAP, || async {
+            cli(&config, &["meta", "export", &id, "-o", &output_text])
+                .await
+                .is_ok()
+        })
+        .await?;
         let exported: Value = serde_json::from_slice(&std::fs::read(&output)?)?;
         let names: Vec<&str> = exported["@graph"]
             .as_array()
