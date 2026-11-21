@@ -426,7 +426,10 @@ impl DrainPageOperation {
         }
         self.started_ms = self.now_ms;
         let waits = (self.invocation()?.defer.sync_waits.iter())
-            .flat_map(|(origin, on)| on.iter().map(|(topic, lineage)| (*origin, *topic, *lineage)))
+            .flat_map(|(origin, on)| {
+                on.iter()
+                    .map(|(topic, lineage)| (*origin, *topic, *lineage))
+            })
             .collect();
         let publish = PublishBatchesOperation::new(self.serving, subbatches).waiting(waits);
         self.ask(PageStep::Publish, publish)

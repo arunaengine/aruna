@@ -244,7 +244,10 @@ fn split_waits_hold() {
     let origin = node(4);
     let (first, second) = (TopicId::hash(b"first-wait"), TopicId::hash(b"second-wait"));
     let mut defer = DrainDeferState::default();
-    add_waits(&mut defer.sync_waits, &[(origin, first, [1; 32]), (origin, second, [1; 32])]);
+    add_waits(
+        &mut defer.sync_waits,
+        &[(origin, first, [1; 32]), (origin, second, [1; 32])],
+    );
     let records = vec![(b"later".to_vec(), admin_record(origin, 3), first)];
     let (to_publish, deferred, _) =
         partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
