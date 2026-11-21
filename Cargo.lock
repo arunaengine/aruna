@@ -6950,6 +6950,7 @@ dependencies = [
  "oxrdf",
  "oxrdfio",
  "oxsdatatypes",
+ "rand 0.8.8",
  "rand 0.9.5",
  "rustc-hash",
  "siphasher",
@@ -7006,9 +7007,9 @@ dependencies = [
  "oxilangtag",
  "oxiri 0.2.11",
  "oxsdatatypes",
- "rand 0.9.5",
+ "rand 0.8.8",
  "serde",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
 ]
 
@@ -9610,11 +9611,11 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "oxsdatatypes",
- "rand 0.9.5",
+ "rand 0.8.8",
  "regex",
  "rustc-hash",
  "sha1",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "sparesults",
  "spargebra",
  "sparopt",
@@ -9631,7 +9632,7 @@ dependencies = [
  "oxiri 0.2.11",
  "oxrdf",
  "peg",
- "rand 0.9.5",
+ "rand 0.8.8",
  "thiserror 2.0.21",
 ]
 
@@ -9642,7 +9643,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c1d1327a49bef5f6f294a2ddcf01635c5449a0654e9a35d3f50d7a45e4ecc78"
 dependencies = [
  "oxrdf",
- "rand 0.9.5",
+ "rand 0.8.8",
  "spargebra",
 ]
 
