@@ -8,7 +8,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::coverage::CoverageCount;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_drivers::driver::drive;
+use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::blob::migration::count::{
     MintRunOperation, ReadCountOperation, StartCountError, StartCountOperation, current_run,
     other_runs,
@@ -209,8 +209,11 @@ pub async fn get_coverage_count(
 - In a distributed bucket this node mints one `run` and starts the count of it on every coordinator
   with the caller's bearer token; `unreached` names those that did not answer.
 - Run ids order the starts of a bucket. A node that holds a count of a run ordered after this one
-  keeps it and refuses the start; `superseded` names those coordinators, and when every node
-  that answered refused, the call fails with 409. A node that holds this run answers with it.
+  keeps it and refuses the start; `superseded` names those coordinators. A node that holds this
+  run answers with it, and a start that lost a concurrent commit runs again with the same run.
+- When no node took the start, the call fails with 409 and a `missing` answer that names the
+  tried `run`, the `superseded` nodes and the `unreached` ones whose outcome is unknown; one of
+  those may have started the run, so poll it.
 - Only a node relaying a distributed start names the `run` in the body; any other caller that
   names one gets 400."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
@@ -239,7 +242,7 @@ pub async fn get_coverage_count(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
-        (status = 409, description = "A later run holds the bucket", body = ErrorResponse),
+        (status = 409, description = "No node took the start", body = CoverageCountResponse),
         (status = 503, description = "A distributed bucket: no coordinator answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -254,7 +257,37 @@ pub async fn start_coverage_count(
 ) -> ServerResult<(StatusCode, Json<CoverageCountResponse>)> {
     let run = body.and_then(|Json(request)| request.run);
     let answer = count_route(&state, auth, bearer.as_ref(), &bucket, &headers, true, run).await?;
-    Ok((StatusCode::ACCEPTED, Json(answer)))
+    Ok((start_status(&answer), Json(answer)))
+}
+
+/// 409 when no coordinator took the start, so the answer holds no count; 202 otherwise.
+fn start_status(answer: &CoverageCountResponse) -> StatusCode {
+    match answer.status == CountStatus::Missing && !answer.superseded.is_empty() {
+        true => StatusCode::CONFLICT,
+        false => StatusCode::ACCEPTED,
+    }
+}
+
+/// The answer to a start no coordinator took: the run it tried, the coordinators that hold a later
+/// one, and those whose outcome is unknown.
+fn refused_start(
+    bucket: &str,
+    run: Option<Ulid>,
+    superseded: Vec<String>,
+    unreached: Vec<String>,
+) -> CoverageCountResponse {
+    CoverageCountResponse {
+        run,
+        unreached,
+        superseded,
+        ..CoverageCountResponse::of(bucket, None, 0)
+    }
+}
+
+/// A run this node mints for a start, kept for every retry of it.
+async fn mint_run(state: &ServerState) -> ServerResult<Ulid> {
+    let minted = drive(MintRunOperation::default(), &state.get_ctx()).await;
+    minted.map_err(|error| ServerError::InternalError(error.into()))
 }
 
 /// Both routes: check the caller, then answer for this node or for every coordinator. A start
@@ -285,9 +318,21 @@ async fn count_route(
             "only a node relaying a start names its run".to_string(),
         ));
     }
-    match info.distribution.as_ref().filter(|_| !relayed) {
+    let run = match (start, run) {
+        (true, None) => Some(mint_run(state).await?),
+        _ => run,
+    };
+    let answer = match info.distribution.as_ref().filter(|_| !relayed) {
         Some(binding) => count_spread(state, bucket, binding, bearer, start, run).await,
         None => count_here(state, bucket, start, run).await,
+    };
+    match answer {
+        // A relaying node reads the refusal from the error; any other caller gets the tried run.
+        Err(ServerError::Conflict(message)) if message == SUPERSEDED && !relayed => {
+            let here = vec![state.get_node_id().to_string()];
+            Ok(refused_start(bucket, run, here, Vec::new()))
+        }
+        other => other,
     }
 }
 
@@ -302,8 +347,10 @@ async fn count_here(
     let context = state.get_ctx();
     let count = match start {
         true => {
-            let operation = StartCountOperation::new(bucket.to_string(), run);
-            let started = drive(operation, &context).await;
+            // A lost commit runs again with the same run, which then meets the count that won.
+            let build = || StartCountOperation::new(bucket.to_string(), run);
+            let seed = run.map(|run| run.to_bytes()).unwrap_or_default();
+            let started = drive_retry(build, &context, &seed).await;
             Some(started.map_err(|error| match error {
                 StartCountError::NoSuchBucket => ServerError::NotFound,
                 StartCountError::Superseded => ServerError::Conflict(SUPERSEDED.to_string()),
@@ -323,8 +370,8 @@ async fn count_here(
     ))
 }
 
-/// Asks every coordinator, this node directly, and adds up their counts of `run`. A start mints
-/// the run before the first coordinator starts, so all of them start the same.
+/// Asks every coordinator, this node directly, and adds up their counts of `run`. A start comes
+/// with the run minted before the first coordinator starts, so all of them start the same.
 async fn count_spread(
     state: &ServerState,
     bucket: &str,
@@ -333,13 +380,6 @@ async fn count_spread(
     start: bool,
     run: Option<Ulid>,
 ) -> ServerResult<CoverageCountResponse> {
-    let run = match start {
-        true => {
-            let minted = drive(MintRunOperation::default(), &state.get_ctx()).await;
-            Some(minted.map_err(|error| ServerError::InternalError(error.into()))?)
-        }
-        false => run,
-    };
     let path = bucket_path(bucket, "coverage/count");
     let (mut answers, mut unreached, mut superseded) = (Vec::new(), Vec::new(), Vec::new());
     for forward in coordinators(state, binding).await? {
@@ -368,7 +408,7 @@ async fn count_spread(
         }
     }
     if answers.is_empty() && !superseded.is_empty() {
-        return Err(ServerError::Conflict(SUPERSEDED.to_string()));
+        return Ok(refused_start(bucket, run, superseded, unreached));
     }
     let mut joined = join_counts(bucket, answers, unreached, run)?;
     joined.superseded = superseded;
@@ -527,6 +567,21 @@ mod tests {
         };
         assert!(message.contains(&previous.to_string()));
         assert!(message.contains(&Ulid::from_parts(10, 1).to_string()));
+    }
+
+    // A start no coordinator took still names its run and where each coordinator stands, so the
+    // caller can poll a run that a coordinator without an answer may have started.
+    #[test]
+    fn refused_start_named() {
+        let run = Some(Ulid::from_parts(9, 9));
+        let (refused, unknown) = (vec!["node-a".to_string()], vec!["node-b".to_string()]);
+        let answer = refused_start("photos", run, refused.clone(), unknown.clone());
+        assert_eq!(start_status(&answer), StatusCode::CONFLICT);
+        assert_eq!((answer.run, answer.status), (run, CountStatus::Missing));
+        assert_eq!((answer.superseded, answer.unreached), (refused, unknown));
+
+        let started = CoverageCountResponse::of("photos", Some(counted(0, None)), 3);
+        assert_eq!(start_status(&started), StatusCode::ACCEPTED);
     }
 
     // Once a run is known, a coordinator without a count of it missed the start; it is unreached.

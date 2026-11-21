@@ -124,6 +124,15 @@ fn start_order_kept() {
     assert!(matches!(replaced, Ok(Next::Call(IoCall::Write(_)))));
 }
 
+// A start that lost its commit to a concurrent one is a conflict, so the route's retry runs it
+// again with the same run and the order rule meets the count that won.
+#[test]
+fn lost_commit_retries() {
+    let conflict = StartCountError::from(IoError::Conflict);
+    assert!(<StartCountOperation as Operation>::is_conflict(&conflict));
+    assert!(!<StartCountOperation as Operation>::is_conflict(&StartCountError::Superseded));
+}
+
 // A coordinator a start missed holds its previous run or no count; either leaves the answer.
 #[test]
 fn other_runs_dropped() {
