@@ -197,7 +197,10 @@ impl PublishBatchesOperation {
     fn without_blocked(&mut self, batch: DrainSubBatch) -> Option<DrainSubBatch> {
         let outcome = &self.out.outcome;
         let waits_elsewhere = |origin: NodeId, topic: TopicId| {
-            let waits = outcome.sync_waits.iter().filter(|(waiting, _)| *waiting == origin);
+            let waits = outcome
+                .sync_waits
+                .iter()
+                .filter(|(waiting, _)| *waiting == origin);
             waits.clone().next().is_some() && !waits.clone().any(|(_, on)| *on == topic)
         };
         let blocked = |index: usize| {
@@ -594,7 +597,10 @@ mod tests {
         assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        finished.outcome.sync_waits.push((origin, TopicId::hash(b"one")));
+        finished
+            .outcome
+            .sync_waits
+            .push((origin, TopicId::hash(b"one")));
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("the later batch is held");
@@ -620,7 +626,10 @@ mod tests {
         assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        finished.outcome.sync_waits.push((origin, TopicId::hash(b"one")));
+        finished
+            .outcome
+            .sync_waits
+            .push((origin, TopicId::hash(b"one")));
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let publish = run.next(synced);
         assert!(matches!(publish, Ok(Next::Call(IoCall::Effect(_)))));
