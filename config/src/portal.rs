@@ -345,24 +345,24 @@ fn lock_install(previous: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
-/// Creates the recovery directory `previous` exclusively; another directory there stays.
+/// Publishes the marked recovery directory `previous` whole with one rename of a staged copy, so
+/// an interrupted claim leaves no unmarked directory there; another directory there stays.
 fn claim_backup(previous: &Path) -> Result<(), PortalArtifactError> {
     if owned_backup(previous) {
         fs::remove_dir_all(previous)?;
     }
-    if let Err(error) = fs::create_dir(previous) {
-        return Err(match error.kind() {
-            io::ErrorKind::AlreadyExists => {
-                PortalArtifactError::InvalidPortalDirectory(previous.to_path_buf())
-            }
+    let taken = || PortalArtifactError::InvalidPortalDirectory(previous.to_path_buf());
+    if fs::symlink_metadata(previous).is_ok() {
+        return Err(taken());
+    }
+    let staged = TempInstallDir::create(&install_parent(previous)?)?;
+    fs::File::create_new(staged.path().join(BACKUP_MARKER))?;
+    staged
+        .persist(previous)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty => taken(),
             _ => error.into(),
-        });
-    }
-    if let Err(error) = fs::File::create_new(previous.join(BACKUP_MARKER)) {
-        let _ = fs::remove_dir(previous);
-        return Err(error.into());
-    }
-    Ok(())
+        })
 }
 
 /// Swaps the new portal into `target` in one step; the old one is left at `staged`. A file
@@ -956,6 +956,31 @@ mod tests {
         fs::remove_dir_all(&previous).unwrap();
         drop(locked);
         second.join().unwrap().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("index.html")).unwrap(),
+            "new"
+        );
+        assert!(!previous.exists());
+    }
+
+    // A claim interrupted before its marker leaves only its staging directory, so the next
+    // replacement still claims the recovery directory.
+    #[test]
+    fn interrupted_claim_recovers() {
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        let previous = previous_install(&target).unwrap();
+        write_portal(&target, "old");
+        std::mem::forget(TempInstallDir::create(tempdir.path()).unwrap());
+        let staged = tempdir.path().join("staged");
+        write_portal(&staged, "new");
+        let staged = TempInstallDir {
+            path: staged,
+            cleanup: true,
+        };
+
+        replace_portable(staged, &target, &previous).unwrap();
 
         assert_eq!(
             fs::read_to_string(target.join("index.html")).unwrap(),
