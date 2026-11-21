@@ -246,7 +246,21 @@ pub async fn get_coverage_count(
         (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
-        (status = 409, description = "No node took the start", body = CoverageCountResponse),
+        (status = 409, description = "No node took the start", body = CoverageCountResponse, example = json!({
+            "bucket": "datasets",
+            "status": "missing",
+            "observed": 0,
+            "deleted": 0,
+            "gaps": 0,
+            "registered": 0,
+            "quarantined": 0,
+            "absent": 0,
+            "reference_only": 0,
+            "run": "01JCNCTR0123456789ABCDEFGH",
+            "rules_changed": false,
+            "unreached": [],
+            "superseded": ["node-b"]
+        })),
         (status = 503, description = "A distributed bucket: no coordinator answered", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
