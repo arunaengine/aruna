@@ -87,8 +87,9 @@ async fn apply_change(
         let Some(task_handle) = task_handle else {
             return refused_handle();
         };
+        // The row is written before a new wake is armed, so a refused row arms nothing.
         let (event, holder) = task_handle
-            .shorten_owned(key.clone(), *after, admission)
+            .plan_shorten(key.clone(), *after, admission)
             .await;
         let written = match &event {
             Event::Task(TaskEvent::TimerScheduled { after, .. }) if holder == Some(admission) => {
@@ -97,14 +98,22 @@ async fn apply_change(
             Event::Task(TaskEvent::TimerScheduled { after, .. }) => {
                 own_row(storage, key, *after, holder).await
             }
-            _ => Ok(()),
+            _ => return event,
         };
-        if let Err(message) = written {
+        if let Err(message) = &written {
             warn!(key = ?key, %message, "Timer kept in memory only");
             if !keep_live {
-                return refused(message);
+                return refused(message.clone());
             }
         }
+        if holder != Some(admission) {
+            return event;
+        }
+        let (key, after) = (key.clone(), *after);
+        let (event, _) = match written {
+            Ok(()) => task_handle.claim_shorten(key, after, admission).await,
+            Err(_) => task_handle.shorten_owned(key, after, admission).await,
+        };
         return event;
     }
     if timer_has_row(&effect) {

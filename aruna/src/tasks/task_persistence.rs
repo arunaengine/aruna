@@ -368,6 +368,62 @@ mod tests {
         assert_eq!(read_timer(&storage, &key).await.expect("reads"), before);
     }
 
+    /// A durable shorten of `key` to five seconds on a storage that refuses timer rows.
+    async fn refused_shorten(storage: &StorageHandle, task_handle: &TaskHandle, key: &TaskKey) {
+        let refusing = aruna_test_support::metadata::refusing(storage.clone(), TASK_TIMER_KEYSPACE);
+        let shorten = TaskEffect::ShortenTimer {
+            key: key.clone(),
+            after: Duration::from_secs(5),
+        };
+        let event = change_timer(&refusing, Some(task_handle), shorten, false).await;
+        assert!(matches!(event, Event::Task(TaskEvent::Error { .. })));
+    }
+
+    // A shorten whose row is refused arms no wake, so nothing fires for the refused change.
+    #[tokio::test]
+    async fn refused_shorten_unarmed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        refused_shorten(&storage, &task_handle, &key).await;
+        let probe = Duration::from_secs(60);
+        let (_, holder) = task_handle.plan_shorten(key.clone(), probe, 1).await;
+        assert_eq!(holder, Some(1), "no wake holds the key");
+        assert_eq!(read_timer(&storage, &key).await.expect("reads"), None);
+    }
+
+    // A refused shorten keeps the later wake armed before and its row, so its firing cleans up.
+    #[tokio::test]
+    async fn refused_shorten_kept() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let task_handle = TaskHandle::new();
+        let key = TaskKey::PublishRegistration;
+        let armed = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        change_timer(&storage, Some(&task_handle), armed, false).await;
+        let before = read_timer(&storage, &key).await.expect("reads");
+        let before = before.expect("the armed wake owns a row");
+        refused_shorten(&storage, &task_handle, &key).await;
+        let probe = Duration::from_secs(120);
+        let (event, holder) = task_handle.plan_shorten(key.clone(), probe, 1).await;
+        assert_eq!(holder, Some(before.admission));
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = event else {
+            panic!("the armed wake is answered");
+        };
+        assert!(
+            after > Duration::from_secs(5),
+            "the wake keeps its deadline"
+        );
+        let row = read_timer(&storage, &key).await.expect("reads");
+        assert_eq!(row, Some(before));
+    }
+
     // Two resets with the same deadline are two admissions: the first one's firing leaves the
     // row the second one wrote.
     #[tokio::test]
