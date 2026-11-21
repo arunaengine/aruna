@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
 use aruna_storage::storage::handle::StorageHandle;
@@ -120,14 +121,14 @@ async fn apply_change(
             return event;
         };
         let written = if plan.holder == Some(admission) {
-            write_owned(storage, key, *after, admission).await
+            write_settled(storage, key, *after, admission).await
         } else {
             own_row(storage, key, *after, plan.holder).await
         };
         if let Err(message) = &written {
             warn!(key = ?key, %message, "Timer kept in memory only");
             if !keep_live {
-                return refused(message.clone());
+                return refused(message.to_string());
             }
         }
         if plan.holder != Some(admission) {
@@ -153,9 +154,9 @@ async fn apply_change(
     }
     if timer_has_row(&effect) {
         let written = match &effect {
-            TaskEffect::ResetTimer { key, after } => {
-                write_owned(storage, key, *after, admission).await
-            }
+            TaskEffect::ResetTimer { key, after } => write_settled(storage, key, *after, admission)
+                .await
+                .map_err(|error| error.to_string()),
             _ => persist_task_effect(storage, &effect).await,
         };
         if let Err(message) = written {
@@ -178,7 +179,7 @@ async fn own_row(
     key: &TaskKey,
     after: Duration,
     holder: Option<u64>,
-) -> Result<(), String> {
+) -> Result<(), StorageError> {
     let holder = holder.unwrap_or(NO_ADMISSION);
     let due = unix_timestamp_millis().saturating_add(after.as_millis() as u64);
     let row = read_timer(storage, key).await?;
@@ -186,6 +187,27 @@ async fn own_row(
         return Ok(());
     }
     write_owned(storage, key, after, holder).await
+}
+
+/// [`write_owned`] whose unanswered write is settled by rereading the row, which storage serves
+/// only after the write: the row of `admission` proves it committed, so only a refusal fails.
+async fn write_settled(
+    storage: &StorageHandle,
+    key: &TaskKey,
+    after: Duration,
+    admission: u64,
+) -> Result<(), StorageError> {
+    let written = write_owned(storage, key, after, admission).await;
+    if written != Err(StorageError::Timeout) {
+        return written;
+    }
+    loop {
+        match read_timer(storage, key).await {
+            Ok(Some(row)) if row.admission == admission => return Ok(()),
+            Err(StorageError::Timeout) => continue,
+            _ => return written,
+        }
+    }
 }
 
 /// Runs a timer handoff on its own task, so a caller that stops waiting cannot leave a stored row

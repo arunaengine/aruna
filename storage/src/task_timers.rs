@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
 use aruna_core::task::{PersistedTaskTimer, TaskEffect, TaskKey};
@@ -63,7 +64,8 @@ pub async fn persist_task_effect(
     }
     match effect {
         TaskEffect::ResetTimer { key, after } => {
-            write_owned(storage, key, *after, NO_ADMISSION).await
+            let written = write_owned(storage, key, *after, NO_ADMISSION).await;
+            written.map_err(|error| error.to_string())
         }
         TaskEffect::ShortenTimer { key, after } => shorten_timer(storage, key, *after).await,
         TaskEffect::CancelTimer { key } => delete_timer(storage, key).await,
@@ -89,8 +91,8 @@ pub async fn write_owned(
     key: &TaskKey,
     after: Duration,
     admission: u64,
-) -> Result<(), String> {
-    let due_unix_millis = due_at_millis(after)?;
+) -> Result<(), StorageError> {
+    let due_unix_millis = due_at_millis(after).map_err(StorageError::WriteError)?;
     let record = PersistedTaskTimer {
         key: key.clone(),
         due_unix_millis,
@@ -169,47 +171,61 @@ async fn shorten_timer(
     after: Duration,
 ) -> Result<(), String> {
     let requested_due_at = due_at_millis(after)?;
-    match read_timer(storage, key).await? {
+    match read_timer(storage, key)
+        .await
+        .map_err(|error| error.to_string())?
+    {
         Some(existing) if existing.due_unix_millis <= requested_due_at => Ok(()),
-        _ => write_owned(storage, key, after, NO_ADMISSION).await,
+        _ => write_owned(storage, key, after, NO_ADMISSION)
+            .await
+            .map_err(|error| error.to_string()),
     }
 }
 
 pub async fn read_timer(
     storage: &StorageHandle,
     key: &TaskKey,
-) -> Result<Option<PersistedTaskTimer>, String> {
+) -> Result<Option<PersistedTaskTimer>, StorageError> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
-            key: task_storage_key(key)?,
+            key: task_storage_key(key).map_err(StorageError::ReadError)?,
             txn_id: None,
         })
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(|error| error.to_string()))
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+            .map(|bytes| postcard::from_bytes(&bytes))
+            .transpose()
+            .map_err(|error| StorageError::ReadError(error.to_string())),
+        Event::Storage(StorageEvent::Error { error }) => Err(error),
+        other => Err(StorageError::ReadError(format!(
+            "unexpected storage event: {other:?}"
+        ))),
     }
 }
 
-async fn write_record(storage: &StorageHandle, record: &PersistedTaskTimer) -> Result<(), String> {
+async fn write_record(
+    storage: &StorageHandle,
+    record: &PersistedTaskTimer,
+) -> Result<(), StorageError> {
     match storage
         .send_storage_effect(StorageEffect::Write {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
-            key: task_storage_key(&record.key)?,
+            key: task_storage_key(&record.key).map_err(StorageError::WriteError)?,
             value: ByteView::from(
-                postcard::to_allocvec(record).map_err(|error| error.to_string())?,
+                postcard::to_allocvec(record)
+                    .map_err(|error| StorageError::WriteError(error.to_string()))?,
             ),
             txn_id: None,
         })
         .await
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        Event::Storage(StorageEvent::Error { error }) => Err(error),
+        other => Err(StorageError::WriteError(format!(
+            "unexpected storage event: {other:?}"
+        ))),
     }
 }
 
