@@ -476,13 +476,23 @@ async fn swap_in(spool: &Path, kept: &Path, target: &Path) -> Result<(), PlaceEr
 
 #[cfg(windows)]
 async fn swap_in(spool: &Path, kept: &Path, target: &Path) -> Result<(), PlaceError> {
-    let Err(error) = replace_file(target, spool, kept) else {
-        return Ok(());
-    };
-    if kept.exists() && rescue_displaced(kept, target).await.is_err() {
-        return Err(PlaceError::Kept(kept.to_path_buf()));
+    match replace_file(target, spool, kept) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(undo_replace(kept, target, error.to_string()).await),
     }
-    Err(PlaceError::Failed(error.to_string()))
+}
+
+/// Undoes a failed replace. A partial one (Windows error 1177) left the owner's
+/// file at `kept` and the target vacant, so it goes back there or beside a later save.
+#[cfg(any(windows, test))]
+async fn undo_replace(kept: &Path, target: &Path, error: String) -> PlaceError {
+    if !kept.exists() {
+        return PlaceError::Failed(error);
+    }
+    match put_back(kept, target).await {
+        PlaceError::Kept(path) => PlaceError::Kept(path),
+        _ => PlaceError::Failed(error),
+    }
 }
 
 /// The identity of the live file at `target` while it is still the published
@@ -1093,6 +1103,46 @@ mod tests {
                 .unwrap()
                 .count(),
             0
+        );
+    }
+
+    // A partial replace (Windows error 1177) left the owner's file at the backup
+    // name and the target vacant: the file goes back to the target, not beside it.
+    #[tokio::test]
+    async fn restores_partial_replace() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let target = root.path().join("note.txt");
+        let spool = reserved_file(&path, SPOOL_DIR).await.unwrap();
+        tokio::fs::write(&spool, b"incoming").await.unwrap();
+        let kept = reserved_file(&path, KEPT_DIR).await.unwrap();
+        tokio::fs::write(&kept, b"owner edit").await.unwrap();
+
+        let refusal = undo_replace(&kept, &target, "partial".to_string()).await;
+        assert!(matches!(refusal, PlaceError::Failed(_)));
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"owner edit");
+        assert!(!kept.exists());
+        assert_eq!(
+            listed_paths(root.path()).await,
+            vec!["note.txt".to_string()]
+        );
+    }
+
+    // A replace that failed before moving anything leaves the owner's file alone.
+    #[tokio::test]
+    async fn keeps_unmoved_target() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let target = root.path().join("note.txt");
+        tokio::fs::write(&target, b"owner edit").await.unwrap();
+        let kept = reserved_file(&path, KEPT_DIR).await.unwrap();
+
+        let refusal = undo_replace(&kept, &target, "refused".to_string()).await;
+        assert!(matches!(refusal, PlaceError::Failed(_)));
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"owner edit");
+        assert_eq!(
+            listed_paths(root.path()).await,
+            vec!["note.txt".to_string()]
         );
     }
 
