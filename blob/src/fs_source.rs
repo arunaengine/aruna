@@ -29,6 +29,10 @@ pub(crate) const RESERVED_DIR: &str = ".aruna";
 /// files and never one the owner happens to have named like a spool.
 pub(crate) const SPOOL_DIR: &str = ".aruna/tmp";
 
+/// Directory a guarded write moves the owner's displaced file into. No sweep
+/// reads it, so those bytes are removed only once they are known to be disposable.
+pub(crate) const KEPT_DIR: &str = ".aruna/kept";
+
 /// How long a spool file is left alone. A sweep runs on every folder check and
 /// a write may be streaming into the directory at that moment, so only a file
 /// old enough that no write can still be holding it is a leftover.
