@@ -23,11 +23,13 @@ use crate::forward::transport::ForwardError;
 use crate::sync::document_outbox::DeleteOutboxPlan;
 use crate::sync::outbox::defer::DrainRecord;
 
-/// Which records left this node's custody and how many stay undeliverable in the outbox.
+/// Which records left this node's custody and how many stay undeliverable in the outbox, and
+/// whether a relay or its cleanup failed, so the drain runs again.
 #[derive(Debug, Default, PartialEq)]
 pub struct RelayedRecords {
     pub relayed: Vec<Vec<u8>>,
     pub left: usize,
+    pub retry: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -185,6 +187,7 @@ impl Operation for RelayRecordsOperation {
         if self.step == RelayStep::Delete {
             if let Err(error) = result.child::<(), ApplyError>()? {
                 warn!(%error, "Failed to delete relayed admin outbox records");
+                self.out.retry = true;
             }
             return Ok(Next::Done(std::mem::take(&mut self.out)));
         }
@@ -204,6 +207,7 @@ impl Operation for RelayRecordsOperation {
                 }
                 Err(error) => {
                     warn!(%error, "Cannot sign an admin event for relay");
+                    self.out.retry = true;
                     self.left(record);
                 }
             }
@@ -228,6 +232,7 @@ impl Operation for RelayRecordsOperation {
                     %error,
                     "No holder accepted a relayed admin outbox record"
                 );
+                self.out.retry = true;
                 self.left(record);
             }
         }
@@ -298,6 +303,7 @@ mod tests {
         let left = RelayedRecords {
             relayed: Vec::new(),
             left: 1,
+            retry: true,
         };
         assert_eq!(
             run.next(IoResult::Event(Box::new(refused))),
@@ -312,7 +318,50 @@ mod tests {
         let left = RelayedRecords {
             relayed: Vec::new(),
             left: 1,
+            retry: false,
         };
         assert_eq!(run.first(), Ok(Next::Done(left)));
+    }
+
+    // A relay no holder accepted leaves the record and asks for another drain, so the record
+    // keeps a retry when it is the last one in the outbox.
+    #[test]
+    fn failed_relay_retries() {
+        use aruna_core::calls::ChildOutcome;
+        use aruna_core::structs::identity::realm::RealmNodeKind;
+        use aruna_core::structs::placement::record::PlacementStrategy;
+
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([9; 16]),
+            shard: 0,
+        };
+        let mut config = RealmConfigDocument::new(RealmId([3; 32]), Vec::new(), 2);
+        config.strategies = vec![PlacementStrategy {
+            strategy_id: placement.strategy_id,
+            name: "default".to_string(),
+            replica_count: None,
+            distinct_locations: false,
+            affinity: Vec::new(),
+            shard_count: 1,
+        }];
+        config.default_strategy_id = Some(placement.strategy_id);
+        let holder = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        config.ensure_node(holder, RealmNodeKind::Server);
+        config.snapshot_candidate_map();
+        let mut record = admin_record();
+        record.1.placement = placement;
+        if let DocumentOutboxEvent::AdminOperation { origin_signature, .. } = &mut record.1.event {
+            *origin_signature = Some(iroh::SecretKey::from_bytes(&[1; 32]).sign(b"event"));
+        }
+        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(config)), vec![record]);
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let refused = Err::<(), _>(ForwardError::Unavailable);
+        let left = RelayedRecords {
+            relayed: Vec::new(),
+            left: 1,
+            retry: true,
+        };
+        let answer = run.next(IoResult::Child(ChildOutcome::new(refused)));
+        assert_eq!(answer, Ok(Next::Done(left)));
     }
 }

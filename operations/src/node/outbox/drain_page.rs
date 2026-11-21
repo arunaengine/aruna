@@ -549,9 +549,16 @@ impl Operation for DrainPageOperation {
                 self.partition(existing)
             }
             PageStep::Relay => {
+                let invocation = self.invocation()?;
                 match result.child::<RelayedRecords, IoError>()? {
-                    Ok(relayed) => self.invocation()?.undeliverable += relayed.left,
-                    Err(error) => warn!(%error, "Relaying undeliverable outbox records broke off"),
+                    Ok(relayed) => {
+                        invocation.undeliverable += relayed.left;
+                        invocation.outcome.retry_needed |= relayed.retry;
+                    }
+                    Err(error) => {
+                        warn!(%error, "Relaying undeliverable outbox records broke off");
+                        invocation.outcome.retry_needed = true;
+                    }
                 }
                 self.publish()
             }
@@ -652,5 +659,25 @@ mod tests {
         assert_eq!(page.end, PageEnd::Skip);
         assert_eq!((page.invocation.pages, page.invocation.scanned), (1, 8));
         assert_eq!(page.invocation.records, 0);
+    }
+
+    // A failed relay, or a relay run that broke off, marks the page for a retry, so the last
+    // undeliverable record keeps a drain timer.
+    #[test]
+    fn failed_relay_retries() {
+        let failed = RelayedRecords {
+            relayed: Vec::new(),
+            left: 1,
+            retry: true,
+        };
+        let broken = Err::<RelayedRecords, _>(IoError::Unfinished);
+        for answer in [ChildOutcome::new(Ok::<_, IoError>(failed)), ChildOutcome::new(broken)] {
+            let mut run = page();
+            run.step = PageStep::Relay;
+            let Ok(Next::Done(page)) = run.next(IoResult::Child(answer)) else {
+                panic!("the page ends after its relays");
+            };
+            assert!(page.invocation.outcome.retry_needed);
+        }
     }
 }
