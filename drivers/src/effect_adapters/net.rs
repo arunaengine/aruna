@@ -416,6 +416,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             NetEffect::SignDeletePlan(_) => {
                 Event::Net(NetEvent::DeletePlanSigned(Err(UNAVAILABLE.to_string())))
             }
+            NetEffect::SignCountRelay(_) => {
+                Event::Net(NetEvent::CountRelaySigned(Err(UNAVAILABLE.to_string())))
+            }
             NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
                 SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),

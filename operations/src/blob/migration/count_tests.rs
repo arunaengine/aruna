@@ -133,6 +133,25 @@ fn lost_commit_retries() {
     assert!(!<StartCountOperation as Operation>::is_conflict(&StartCountError::Superseded));
 }
 
+// A distributed start asks this node's key for one signature over its relay.
+#[test]
+fn signs_count_relay() {
+    let relay = CountRelay {
+        bucket: "photos".to_string(),
+        set_id: Ulid::from_parts(1, 1),
+        run: Ulid::from_parts(2, 2),
+    };
+    let mut sign = SignRelayOperation::new(relay.clone());
+    let Ok(Next::Call(IoCall::Effect(effect))) = sign.first() else {
+        panic!("the signing effect is asked for");
+    };
+    assert_eq!(*effect, Effect::Net(NetEffect::SignCountRelay(Box::new(relay))));
+    let signature = iroh::SecretKey::from_bytes(&[7; 32]).sign(b"relay");
+    let signed = Event::Net(NetEvent::CountRelaySigned(Ok(signature)));
+    let answer = sign.next(IoResult::Event(Box::new(signed)));
+    assert_eq!(answer, Ok(Next::Done(signature)));
+}
+
 // A coordinator a start missed holds its previous run or no count; either leaves the answer.
 #[test]
 fn other_runs_dropped() {

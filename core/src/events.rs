@@ -552,6 +552,8 @@ pub enum NetEvent {
     ConfigCatchUp(CatchUpEvent),
     /// This node's signature over a group deletion plan.
     DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
+    /// This node's signature over a count relay.
+    CountRelaySigned(Result<iroh::Signature, String>),
     /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
@@ -1117,6 +1119,7 @@ impl Event {
                     MissingTopicPeers,
                     ConfigCatchUp,
                     DeletePlanSigned,
+                    CountRelaySigned,
                     Notification,
                     InboxWoken,
                     PeerContacts,

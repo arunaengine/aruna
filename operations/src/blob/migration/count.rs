@@ -7,12 +7,14 @@ use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{COUNT_QUEUE_KEYSPACE, COVERAGE_COUNT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
-use aruna_core::structs::placement::coverage::CoverageCount;
+use aruna_core::structs::placement::coverage::{CountRelay, CoverageCount};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
@@ -41,6 +43,8 @@ pub enum StartCountError {
     NoSuchBucket,
     #[error("a coverage count run ordered after this one holds the bucket")]
     Superseded,
+    #[error("this node did not sign the count relay: {0}")]
+    Unsigned(String),
     #[error("the coverage count did not start: {0}")]
     Io(IoError),
 }
@@ -139,6 +143,41 @@ impl Operation for MintRunOperation {
 
     fn next(&mut self, _result: IoResult) -> Result<Next<Ulid>, StartCountError> {
         Err(StartCountError::Io(IoError::Unfinished))
+    }
+}
+
+/// Signs this node's start of a count run for the other members of a distributed bucket.
+#[derive(Debug, PartialEq)]
+pub struct SignRelayOperation {
+    relay: Option<CountRelay>,
+}
+
+impl SignRelayOperation {
+    pub fn new(relay: CountRelay) -> Self {
+        Self { relay: Some(relay) }
+    }
+}
+
+impl Operation for SignRelayOperation {
+    type Output = iroh::Signature;
+    type Error = StartCountError;
+
+    fn first(&mut self) -> Result<Next<iroh::Signature>, StartCountError> {
+        let relay = (self.relay.take()).ok_or(StartCountError::Io(IoError::Unfinished))?;
+        let sign = Effect::Net(NetEffect::SignCountRelay(Box::new(relay)));
+        Ok(Next::Call(IoCall::Effect(Box::new(sign))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<iroh::Signature>, StartCountError> {
+        match result.event()? {
+            Event::Net(NetEvent::CountRelaySigned(signed)) => {
+                Ok(Next::Done(signed.map_err(StartCountError::Unsigned)?))
+            }
+            other => Err(StartCountError::Unsigned(format!(
+                "unexpected signing answer {}",
+                other.label()
+            ))),
+        }
     }
 }
 

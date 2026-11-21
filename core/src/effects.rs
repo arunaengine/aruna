@@ -926,6 +926,9 @@ pub enum NetEffect {
     /// Signs this node's statement that it is ready for a group deletion plan; answers
     /// `NetEvent::DeletePlanSigned`.
     SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),
+    /// Signs this node's start of a count run on the other members of a distributed bucket;
+    /// answers `NetEvent::CountRelaySigned`.
+    SignCountRelay(Box<crate::structs::placement::coverage::CountRelay>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
     /// Records one suppressed watch delivery in this node's watch metrics.

@@ -6,6 +6,7 @@
 use aruna_core::events::{PolicySignEvent, VaultSignEvent};
 use aruna_core::structs::identity::group_delete::{GroupDeletePlan, GroupDeleteProof};
 use aruna_core::structs::identity::user::vault::VaultRecords;
+use aruna_core::structs::placement::coverage::CountRelay;
 use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
 
 /// Signs one publication claim. A claim naming another publisher is refused, so no operation can
@@ -30,6 +31,15 @@ pub(crate) fn sign_delete_plan(
         node_id: key.public(),
         signature: key.sign(&bytes),
     })
+}
+
+/// This node's signature over its start of a count run on the other members of a bucket.
+pub(crate) fn sign_count_relay(
+    key: &iroh::SecretKey,
+    relay: &CountRelay,
+) -> Result<iroh::Signature, String> {
+    let bytes = relay.signing_bytes().map_err(|error| error.to_string())?;
+    Ok(key.sign(&bytes))
 }
 
 /// Signs records this node publishes. A record naming another node stays unsigned and fails the
