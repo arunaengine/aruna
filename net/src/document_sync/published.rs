@@ -48,6 +48,27 @@ impl DocumentSyncService {
         self.publish_locks[lock].lock()
     }
 
+    /// The lineage root `op` is stored on, read with its actor index entry from one snapshot;
+    /// `None` once that entry holds no such op, as after a genesis tie-break removed it.
+    pub(in crate::document_sync) fn appended_lineage(
+        &self,
+        op: &::irokle::Op,
+    ) -> Result<Option<[u8; 32]>> {
+        let body = &op.signed.body;
+        let (peer, actors) = (self.node.peer_id(), BTreeSet::new());
+        let read = |snapshot: &dyn ::irokle::storage::SnapshotRead| -> ::irokle::Result<_> {
+            let Some(view) = snapshot.request_view(&body.topic_id, &peer, &actors)? else {
+                return Ok(None);
+            };
+            let after = body.actor_seq.saturating_sub(1);
+            let indexed = snapshot.actor_range(&body.topic_id, &body.actor_id, after, 1)?;
+            let holds = indexed.first() == Some(&(body.actor_seq, op.id))
+                && snapshot.get_position(&op.id)?.is_some();
+            Ok(holds.then(|| crate::shard_manifest::lineage_root(&view.genesis)))
+        };
+        self.node.storage().read_snapshot(read).map_err(failed)
+    }
+
     /// The op on the current lineage this node published the event under `key` as. A recorded op
     /// a genesis tie-break removed is gone, so the event is published again.
     pub(in crate::document_sync) fn published_op(

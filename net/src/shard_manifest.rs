@@ -451,10 +451,7 @@ pub(crate) fn frontier_root(
         .topic_state(&topic)
         .map_err(|error| format!("failed to read shard topic state: {error}"))?
         .ok_or_else(|| "shard topic has no genesis".to_string())?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"aruna-shard-frontier-root-v1");
-    hasher.update(state.genesis.as_bytes());
-    hasher.update(&(frontier.iter().count() as u64).to_be_bytes());
+    let mut hasher = root_hasher(&state.genesis, frontier.iter().count() as u64);
     for (actor_id, actor_seq) in frontier.iter() {
         let op_id = storage
             .actor_index(&topic, actor_id, *actor_seq)
@@ -469,6 +466,19 @@ pub(crate) fn frontier_root(
         hasher.update(op_id.as_bytes());
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+/// The lineage root of a topic with `genesis`: the root of its empty frontier.
+pub(crate) fn lineage_root(genesis: &irokle::OpId) -> [u8; 32] {
+    *root_hasher(genesis, 0).finalize().as_bytes()
+}
+
+fn root_hasher(genesis: &irokle::OpId, positions: u64) -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-shard-frontier-root-v1");
+    hasher.update(genesis.as_bytes());
+    hasher.update(&positions.to_be_bytes());
+    hasher
 }
 
 async fn read_response_before(

@@ -343,12 +343,13 @@ impl DocumentSyncService {
                 }
                 Err(error) => return Err(error),
             };
-            // Read under the publish lock, so a tie-break after it shows as a lineage change.
-            let empty = ::irokle::ActorClock::default();
-            match crate::shard_manifest::frontier_root(self.node.storage(), topic_id, &empty) {
-                Ok(lineage) => {
+            // Read under the publish lock, so a tie-break after it shows as a lineage change; an
+            // unknown lineage keeps the row and holds its domains at the finish.
+            match self.appended_lineage(&op) {
+                Ok(Some(lineage)) => {
                     outcome.lineages.insert(index, lineage);
                 }
+                Ok(None) => warn!(%topic_id, "A published event left its lineage before the read"),
                 Err(error) => warn!(%topic_id, %error, "Cannot read the lineage of a publish"),
             }
             outcome.published_indices.push(index);

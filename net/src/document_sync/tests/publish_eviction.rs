@@ -462,6 +462,17 @@ async fn lost_eviction_replays() {
         "the loser's publish must leave a cursor covering its own chain"
     );
 
+    // The loser's own event reports the lineage it was appended on only while that chain stands.
+    let (_, own_id) = (loser_node.storage().actor_tip(&topic_id, &loser_actor))
+        .expect("own tip reads")
+        .expect("own tip");
+    let own = (loser_node.storage().get_op(&own_id))
+        .expect("own op reads")
+        .expect("own op");
+    let losing_root = crate::shard_manifest::lineage_root(&genesis(loser_node));
+    let appended = loser.appended_lineage(&own).expect("lineage reads");
+    assert_eq!(appended, Some(losing_root));
+
     let winner_ops =
         ::irokle::oplog::topological(winner_node.storage(), &topic_id).expect("winner ops");
     let (_ack, evictions) = loser_node
@@ -478,6 +489,11 @@ async fn lost_eviction_replays() {
     // exactly the state a crash or a failed delete leaves behind.
     loser.decode_eviction(evictions.into_iter().next().expect("one eviction"));
     let winning_genesis = genesis(loser_node);
+    assert_eq!(
+        loser.appended_lineage(&own).expect("lineage reads"),
+        None,
+        "an evicted event must not report the winning lineage"
+    );
     assert!(
         loser
             .storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id),)
