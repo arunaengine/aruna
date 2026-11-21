@@ -30,20 +30,22 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use ulid::Ulid;
 
 const HTTP_TIMEOUT_SECS: u64 = 5;
 const CONNECT_TIMEOUT_SECS: u64 = 2;
 const CACHE_TTL_SECS: u64 = 300;
-/// An unknown key id refetches the provider keys at most this often, so forged ids cannot
-/// turn every request into calls to the provider.
-const KEY_REFRESH_COOLDOWN_SECS: u64 = 30;
+/// An unknown key id refetches the provider keys at most this often after any provider call,
+/// failed or not, so forged ids or an outage cannot turn every request into provider calls.
+const REFRESH_COOLDOWN_SECS: u64 = 30;
 
 #[derive(Debug)]
 pub struct OidcValidator {
     client: reqwest::Client,
     provider_metadata_cache: RwLock<HashMap<String, CachedProviderMetadata>>,
+    /// Per discovery URL, the end of its last provider call. Holding the slot runs the only call.
+    refresh_slots: Mutex<HashMap<String, Arc<Mutex<Option<Instant>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +127,7 @@ impl OidcValidator {
                 .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
                 .build()?,
             provider_metadata_cache: RwLock::new(HashMap::new()),
+            refresh_slots: Mutex::new(HashMap::new()),
         })
     }
 
@@ -187,26 +190,44 @@ impl OidcValidator {
         })
     }
 
+    /// Returns usable cached metadata, else fetches it with one call per provider at a time.
+    /// `stale` is the fetch time of cached metadata that lacked the wanted key.
     async fn get_provider_metadata(
         &self,
         provider: &OidcProviderConfig,
-        refresh: bool,
+        stale: Option<Instant>,
     ) -> Result<CachedProviderMetadata, OidcError> {
-        if !refresh {
-            let ttl = Duration::from_secs(CACHE_TTL_SECS);
-            if let Some(metadata) = self
-                .provider_metadata_cache
-                .read()
-                .await
-                .get(&provider.discovery_url)
-                .filter(|metadata| metadata.fetched_at.elapsed() < ttl)
-                .cloned()
-            {
-                return Ok(metadata);
-            }
+        let usable = |metadata: &CachedProviderMetadata| match stale {
+            None => metadata.fetched_at.elapsed() < Duration::from_secs(CACHE_TTL_SECS),
+            Some(seen) => metadata.fetched_at > seen,
+        };
+        if let Some(metadata) = self.cached_metadata(provider, &usable).await {
+            return Ok(metadata);
         }
-
-        let metadata = self.fetch_provider_metadata(provider).await?;
+        let asked_at = Instant::now();
+        let slot = self
+            .refresh_slots
+            .lock()
+            .await
+            .entry(provider.discovery_url.clone())
+            .or_default()
+            .clone();
+        let mut attempted_at = slot.lock().await;
+        if let Some(metadata) = self.cached_metadata(provider, &usable).await {
+            return Ok(metadata);
+        }
+        // A load shares the failure of a call that ended while it waited; a key refresh waits
+        // out the cooldown after every call.
+        let shared = attempted_at.is_some_and(|at| match stale {
+            None => at >= asked_at,
+            Some(_) => at.elapsed() < Duration::from_secs(REFRESH_COOLDOWN_SECS),
+        });
+        if shared {
+            return Err(OidcError::SigningNotFound);
+        }
+        let fetched = self.fetch_provider_metadata(provider).await;
+        *attempted_at = Some(Instant::now());
+        let metadata = fetched?;
         self.provider_metadata_cache
             .write()
             .await
@@ -214,13 +235,27 @@ impl OidcValidator {
         Ok(metadata)
     }
 
+    async fn cached_metadata(
+        &self,
+        provider: &OidcProviderConfig,
+        usable: &impl Fn(&CachedProviderMetadata) -> bool,
+    ) -> Option<CachedProviderMetadata> {
+        self.provider_metadata_cache
+            .read()
+            .await
+            .get(&provider.discovery_url)
+            .filter(|metadata| usable(metadata))
+            .cloned()
+    }
+
     async fn decoding_key_for(
         &self,
         provider: &OidcProviderConfig,
         kid: &str,
     ) -> Result<DecodingKey, OidcError> {
-        for refresh in [false, true] {
-            let metadata = self.get_provider_metadata(provider, refresh).await?;
+        let mut stale = None;
+        for _ in 0..2 {
+            let metadata = self.get_provider_metadata(provider, stale).await?;
             if metadata.issuer != provider.issuer {
                 return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
                     jsonwebtoken::errors::ErrorKind::InvalidIssuer,
@@ -230,9 +265,10 @@ impl OidcValidator {
             if let Some(jwk) = jwks.find(kid) {
                 return DecodingKey::from_jwk(jwk).map_err(Into::into);
             }
-            if metadata.fetched_at.elapsed() < Duration::from_secs(KEY_REFRESH_COOLDOWN_SECS) {
+            if metadata.fetched_at.elapsed() < Duration::from_secs(REFRESH_COOLDOWN_SECS) {
                 break;
             }
+            stale = Some(metadata.fetched_at);
         }
 
         Err(OidcError::SigningNotFound)
@@ -741,7 +777,7 @@ pub(crate) fn blob_permission_path(
 #[cfg(test)]
 mod test {
     use crate::auth::{
-        CACHE_TTL_SECS, KEY_REFRESH_COOLDOWN_SECS, OidcValidator, blob_permission_path,
+        CACHE_TTL_SECS, OidcValidator, REFRESH_COOLDOWN_SECS, blob_permission_path,
         extract_auth_context, extract_auth_parts, handle_token, map_authorize_error,
     };
     use crate::error::{OidcError, ServerError, TokenError};
@@ -786,7 +822,7 @@ mod test {
     use std::time::{Duration, Instant};
     use tempfile::env::temp_dir;
     use tokio::net::TcpListener;
-    use tokio::sync::RwLock;
+    use tokio::sync::{Notify, RwLock};
     use ulid::Ulid;
 
     #[test]
@@ -856,13 +892,19 @@ mod test {
         jwks: Arc<RwLock<serde_json::Value>>,
         discovery_requests: Arc<AtomicUsize>,
         jwks_requests: Arc<AtomicUsize>,
+        gate: Arc<RwLock<()>>,
+        entered: Arc<Notify>,
     }
 
+    /// A null `jwks` answers 503. A held `gate` write guard keeps key answers pending, and
+    /// `entered` signals each key request that reached the gate.
     #[derive(Clone)]
     struct OidcServerMetrics {
         discovery_requests: Arc<AtomicUsize>,
         jwks_requests: Arc<AtomicUsize>,
         jwks: Arc<RwLock<serde_json::Value>>,
+        gate: Arc<RwLock<()>>,
+        entered: Arc<Notify>,
     }
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -895,9 +937,17 @@ mod test {
         }))
     }
 
-    async fn oidc_jwks(State(state): State<OidcServerState>) -> Json<serde_json::Value> {
+    async fn oidc_jwks(
+        State(state): State<OidcServerState>,
+    ) -> Result<Json<serde_json::Value>, http::StatusCode> {
         state.jwks_requests.fetch_add(1, Ordering::Relaxed);
-        Json(state.jwks.read().await.clone())
+        state.entered.notify_one();
+        let _open = state.gate.read().await;
+        let jwks = state.jwks.read().await.clone();
+        match jwks.is_null() {
+            true => Err(http::StatusCode::SERVICE_UNAVAILABLE),
+            false => Ok(Json(jwks)),
+        }
     }
 
     async fn spawn_oidc_provider(
@@ -917,12 +967,16 @@ mod test {
         let discovery_requests = Arc::new(AtomicUsize::new(0));
         let jwks_requests = Arc::new(AtomicUsize::new(0));
         let jwks = Arc::new(RwLock::new(jwks));
+        let gate = Arc::new(RwLock::new(()));
+        let entered = Arc::new(Notify::new());
         let state = OidcServerState {
             issuer: issuer.to_string(),
             jwks_uri: jwks_uri.clone(),
             jwks: jwks.clone(),
             discovery_requests: discovery_requests.clone(),
             jwks_requests: jwks_requests.clone(),
+            gate: gate.clone(),
+            entered: entered.clone(),
         };
         let router = Router::new()
             .route("/.well-known/openid-configuration", get(oidc_discovery))
@@ -938,6 +992,8 @@ mod test {
                 discovery_requests,
                 jwks_requests,
                 jwks,
+                gate,
+                entered,
             },
             task,
         )
@@ -1427,16 +1483,7 @@ mod test {
         );
         validator.validate(&provider, &old_token).await.unwrap();
         // The rotation is seen once the refresh cooldown has passed.
-        let cooled_at = Instant::now()
-            .checked_sub(Duration::from_secs(KEY_REFRESH_COOLDOWN_SECS + 1))
-            .unwrap();
-        validator
-            .provider_metadata_cache
-            .write()
-            .await
-            .get_mut(&provider.discovery_url)
-            .unwrap()
-            .fetched_at = cooled_at;
+        cool_down(&validator, &provider.discovery_url).await;
 
         *metrics.jwks.write().await = eddsa_jwk(new_kid, &new_signing_key);
 
@@ -1460,7 +1507,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn unknown_kid_cools_down() {
+    async fn forged_key_throttled() {
         // A forged key id right after a fetch is refused without calling the provider again.
         let issuer = "https://issuer.example";
         let audience = "aruna-api";
@@ -1493,6 +1540,128 @@ mod test {
         }
         assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 1);
+
+        task.abort();
+    }
+
+    /// Moves the last fetch and the last provider call of a provider past the refresh cooldown.
+    async fn cool_down(validator: &OidcValidator, discovery_url: &str) {
+        let cooled_at = Instant::now()
+            .checked_sub(Duration::from_secs(REFRESH_COOLDOWN_SECS + 1))
+            .unwrap();
+        let mut cache = validator.provider_metadata_cache.write().await;
+        if let Some(metadata) = cache.get_mut(discovery_url) {
+            metadata.fetched_at = cooled_at;
+        }
+        let slots = validator.refresh_slots.lock().await;
+        *slots.get(discovery_url).unwrap().lock().await = Some(cooled_at);
+    }
+
+    #[tokio::test]
+    async fn overlapping_loads_coalesce() {
+        // Logins that overlap one pending key answer share it instead of calling the provider.
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (discovery_url, _jwks_uri, metrics, task) =
+            spawn_oidc_provider(issuer, kid, eddsa_jwk(kid, &signing_key)).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let validator = OidcValidator::new().unwrap();
+        let token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-1",
+            kid,
+            &signing_key,
+            Algorithm::EdDSA,
+            None,
+        );
+        let held = metrics.gate.clone().write_owned().await;
+        let release = async {
+            metrics.entered.notified().await;
+            drop(held);
+        };
+        let (first, second, third, ()) = tokio::join!(
+            validator.validate(&provider, &token),
+            validator.validate(&provider, &token),
+            validator.validate(&provider, &token),
+            release,
+        );
+        for identity in [first, second, third] {
+            assert_eq!(identity.unwrap().subject_id, "subject-1");
+        }
+        assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 1);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_cools() {
+        // A failed key refresh starts the cooldown and keeps the cached keys, then a later
+        // refresh calls the provider again.
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let new_kid = "new-key";
+        let signing_key = generate_signing_key();
+        let new_signing_key = generate_signing_key();
+        let (discovery_url, _jwks_uri, metrics, task) =
+            spawn_oidc_provider(issuer, kid, eddsa_jwk(kid, &signing_key)).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let validator = OidcValidator::new().unwrap();
+        let token = |kid, signing_key| {
+            sign_oidc_token(
+                issuer,
+                audience,
+                "subject-1",
+                kid,
+                signing_key,
+                Algorithm::EdDSA,
+                None,
+            )
+        };
+        let calls = || {
+            (
+                metrics.discovery_requests.load(Ordering::Relaxed),
+                metrics.jwks_requests.load(Ordering::Relaxed),
+            )
+        };
+        let rotated = token(new_kid, &new_signing_key);
+        validator
+            .validate(&provider, &token(kid, &signing_key))
+            .await
+            .unwrap();
+        cool_down(&validator, &provider.discovery_url).await;
+        *metrics.jwks.write().await = serde_json::Value::Null;
+
+        let failed = validator.validate(&provider, &rotated).await;
+        assert!(matches!(failed, Err(OidcError::Http(_))));
+        assert_eq!(calls(), (2, 2));
+        let cooling = validator.validate(&provider, &rotated).await;
+        assert!(matches!(cooling, Err(OidcError::SigningNotFound)));
+        let cached = validator
+            .validate(&provider, &token(kid, &signing_key))
+            .await;
+        assert_eq!(cached.unwrap().subject_id, "subject-1");
+        assert_eq!(calls(), (2, 2));
+
+        *metrics.jwks.write().await = eddsa_jwk(new_kid, &new_signing_key);
+        cool_down(&validator, &provider.discovery_url).await;
+        let identity = validator.validate(&provider, &rotated).await.unwrap();
+        assert_eq!(identity.subject_id, "subject-1");
+        assert_eq!(calls(), (3, 3));
 
         task.abort();
     }
