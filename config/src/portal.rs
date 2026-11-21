@@ -17,6 +17,11 @@ use thiserror::Error;
 
 const MANIFEST_FILE: &str = "portal-manifest.json";
 const CHECKSUM_FILE: &str = "aruna-portal-dist.tar.gz.sha256";
+/// Bounds of one portal download, so a stalled or oversized answer cannot hang or exhaust a node.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const MAX_ARTIFACT_BYTES: usize = 256 << 20;
+const MAX_CHECKSUM_BYTES: usize = 4 << 10;
 
 pub async fn update_artifact(
     config: PortalArtifactConfig,
@@ -57,14 +62,18 @@ async fn download_and_install(
         .artifact_url
         .clone()
         .ok_or(PortalArtifactError::MissingArtifactUrl)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(DOWNLOAD_TIMEOUT)
+        .build()?;
     let checksum_file =
-        download_checksum_file(&artifact_url, config.artifact_sha256.as_deref()).await?;
+        download_checksum_file(&client, &artifact_url, config.artifact_sha256.as_deref()).await?;
 
-    let response = reqwest::get(&artifact_url).await?;
+    let response = client.get(&artifact_url).send().await?;
     if !response.status().is_success() {
         return Err(PortalArtifactError::HttpStatus(response.status().as_u16()));
     }
-    let bytes = response.bytes().await?;
+    let bytes = read_capped(response, MAX_ARTIFACT_BYTES).await?;
     verify_sha256(&bytes, &checksum_file.checksum)?;
     let fetched_at = current_timestamp();
 
@@ -75,18 +84,19 @@ async fn download_and_install(
 }
 
 async fn download_checksum_file(
+    client: &reqwest::Client,
     artifact_url: &str,
     pinned_checksum: Option<&str>,
 ) -> Result<DownloadedChecksumFile, PortalArtifactError> {
     let checksum_url = format!("{artifact_url}.sha256");
-    let response = reqwest::get(&checksum_url).await?;
+    let response = client.get(&checksum_url).send().await?;
     if !response.status().is_success() {
         return Err(PortalArtifactError::ChecksumHttpStatus(
             response.status().as_u16(),
         ));
     }
 
-    let bytes = response.bytes().await?.to_vec();
+    let bytes = read_capped(response, MAX_CHECKSUM_BYTES).await?;
     let checksum = parse_checksum_file(&bytes)?;
     if let Some(pinned_checksum) = pinned_checksum.map(str::to_ascii_lowercase)
         && checksum != pinned_checksum
@@ -98,6 +108,21 @@ async fn download_checksum_file(
     }
 
     Ok(DownloadedChecksumFile { bytes, checksum })
+}
+
+/// The body of `response`, refused once it passes `limit` bytes.
+async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, PortalArtifactError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(PortalArtifactError::TooLarge(limit));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn install_verified_artifact(
@@ -116,8 +141,17 @@ fn install_verified_artifact(
     let manifest = read_manifest(temp_dir.path())?;
     write_checksum_file(temp_dir.path(), &checksum_file.bytes)?;
 
-    replace_existing_path(&portal_dir)?;
-    temp_dir.persist(&portal_dir)?;
+    // The old portal stays until the new one is in place, and comes back if that fails.
+    let previous = set_aside_existing(&portal_dir)?;
+    if let Err(error) = temp_dir.persist(&portal_dir) {
+        if let Some(previous) = &previous {
+            let _ = fs::rename(previous, &portal_dir);
+        }
+        return Err(error.into());
+    }
+    if let Some(previous) = previous {
+        let _ = fs::remove_dir_all(previous);
+    }
 
     Ok(status_from_parts(
         config,
@@ -244,12 +278,20 @@ fn validate_install_target(path: &Path) -> Result<(), PortalArtifactError> {
     Ok(())
 }
 
-fn replace_existing_path(path: &Path) -> Result<(), PortalArtifactError> {
+/// Moves an installed portal at `path` aside and answers where it went; anything else there is
+/// refused.
+fn set_aside_existing(path: &Path) -> Result<Option<PathBuf>, PortalArtifactError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => {
             if can_replace_dir(path)? {
-                fs::remove_dir_all(path)?;
-                Ok(())
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let name = format!(".portal-previous-{}-{nanos}", std::process::id());
+                let aside = path.with_file_name(name);
+                fs::rename(path, &aside)?;
+                Ok(Some(aside))
             } else {
                 Err(PortalArtifactError::InvalidPortalDirectory(
                     path.to_path_buf(),
@@ -259,7 +301,7 @@ fn replace_existing_path(path: &Path) -> Result<(), PortalArtifactError> {
         Ok(_) => Err(PortalArtifactError::InvalidPortalDirectory(
             path.to_path_buf(),
         )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
@@ -496,6 +538,8 @@ pub enum PortalArtifactError {
     ArchiveLink(String),
     #[error("portal artifact is missing index.html")]
     MissingIndexHtml,
+    #[error("portal download is larger than {0} bytes")]
+    TooLarge(usize),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -510,7 +554,7 @@ pub enum PortalArtifactError {
 mod tests {
     use super::{
         CHECKSUM_FILE, PortalArtifactError, install_parent, installed_status, portal_dir,
-        replace_existing_path, safe_archive_path, unpack_archive, verify_sha256,
+        safe_archive_path, set_aside_existing, unpack_archive, verify_sha256,
     };
     use crate::PortalArtifactConfig;
     use flate2::Compression;
@@ -598,7 +642,7 @@ mod tests {
         fs::write(&target, "important data").unwrap();
 
         assert!(matches!(
-            replace_existing_path(&target),
+            set_aside_existing(&target),
             Err(PortalArtifactError::InvalidPortalDirectory(_))
         ));
         assert_eq!(fs::read_to_string(&target).unwrap(), "important data");
@@ -612,7 +656,7 @@ mod tests {
         fs::write(target.join("important.txt"), "important data").unwrap();
 
         assert!(matches!(
-            replace_existing_path(&target),
+            set_aside_existing(&target),
             Err(PortalArtifactError::InvalidPortalDirectory(_))
         ));
         assert_eq!(
@@ -627,8 +671,9 @@ mod tests {
         let empty = tempdir.path().join("empty-portal");
         fs::create_dir_all(&empty).unwrap();
 
-        replace_existing_path(&empty).unwrap();
+        let aside = set_aside_existing(&empty).unwrap().unwrap();
         assert!(!empty.exists());
+        assert!(aside.is_dir());
 
         let installed = tempdir.path().join("installed-portal");
         fs::create_dir_all(&installed).unwrap();
@@ -639,8 +684,10 @@ mod tests {
         )
         .unwrap();
 
-        replace_existing_path(&installed).unwrap();
+        let aside = set_aside_existing(&installed).unwrap().unwrap();
         assert!(!installed.exists());
+        assert!(aside.join("index.html").is_file());
+        assert_eq!(set_aside_existing(&installed).unwrap(), None);
     }
 
     #[test]
