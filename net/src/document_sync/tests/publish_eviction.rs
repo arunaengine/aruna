@@ -259,9 +259,15 @@ async fn moved_lineage_held() {
         allow_genesis: true,
     };
     let first = service.publish_documents(vec![upsert(1)], Vec::new()).await;
-    assert!(matches!(first, DocumentNetEvent::DocumentsPublished { .. }));
-    let current = service.current_lineage(topic_id).expect("lineage reads");
-    assert!(current.is_some());
+    let DocumentNetEvent::DocumentsPublished { lineages, .. } = first else {
+        panic!("the first event publishes: {first:?}");
+    };
+    let current = lineages.first().copied().flatten();
+    let genesis = (service.node().storage().topic_state(&topic_id))
+        .expect("topic state reads")
+        .expect("the publish created the topic")
+        .genesis;
+    assert_eq!(current, Some(crate::shard_manifest::lineage_root(&genesis)));
 
     let moved = vec![Some([0; 32]), None];
     let held = (service.publish_expecting(vec![upsert(2), upsert(3)], Vec::new(), moved)).await;

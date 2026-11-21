@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::shard_manifest::lineage_root;
 
 /// The lineage an appended event may be reported on: the one read after the append, `None` when
 /// the event left it, the read failed, or it differs from the lineage the event was `bound` to.
@@ -363,58 +364,32 @@ impl DocumentSyncService {
             let _lock = self.publish_lock(topic_id);
             // A successor bound to a lineage appends only while its topic still has it.
             let bound = bound_lineage(expected.get(index).copied().flatten(), &confirmed, topic_id);
-            if let Some(expected) = bound
-                && self.current_lineage(topic_id)? != Some(expected)
-            {
-                outcome.retry_indices.push(index);
-                (outcome.retry_error).get_or_insert_with(|| "Topic lineage changed".to_string());
-                held_topics.insert(topic_id);
-                held_origins.extend(origin);
-                continue;
-            }
-            // A publish repeated after a restart finds the op it became on the current lineage.
+            // A publish repeated after a restart finds the op it became on the current lineage; a
+            // new one appends only on the bound lineage, which Irokle checks inside its turn.
             let published = match self.published_op(topic_id, actor_id, &key)? {
-                Some(op) => Ok(op),
+                Some(op) => self.found_lineage(op, bound, &key),
                 None => self
                     .publish_event_op(
                         oplog,
-                        topic_id,
-                        actor_id,
-                        envelope,
+                        (topic_id, actor_id, envelope),
                         sync_peers,
-                        allow_genesis,
-                        may_create_topic,
-                        &mut fast_path,
-                        &mut fallback,
+                        (allow_genesis, may_create_topic, bound),
+                        (&mut fast_path, &mut fallback),
                     )
-                    .and_then(|op| self.keep_published(&key, &op).map(|()| op)),
+                    .and_then(|(op, lineage)| {
+                        self.keep_published(&key, &op).map(|()| (op, lineage))
+                    }),
             };
-            let op = match published {
-                Ok(op) => op,
-                Err(NetError::TopicNotReady(topic)) => {
+            let (op, lineage) = match published {
+                Ok(published) => published,
+                Err(error @ (NetError::TopicNotReady(_) | NetError::LineageMoved(_))) => {
                     outcome.retry_indices.push(index);
-                    outcome
-                        .retry_error
-                        .get_or_insert_with(|| NetError::TopicNotReady(topic).to_string());
+                    outcome.retry_error.get_or_insert_with(|| error.to_string());
                     held_topics.insert(topic_id);
                     held_origins.extend(origin);
                     continue;
                 }
                 Err(error) => return Err(error),
-            };
-            // Read under the publish lock, so a tie-break after it shows as a lineage change. An
-            // event without that evidence, or moved off its bound lineage by a received history,
-            // retries and holds both its domains; it appends again after the earlier events.
-            let Some(lineage) = confirmed_lineage(self.appended_lineage(&op), bound) else {
-                if let Err(error) = self.forget_published(&key) {
-                    warn!(%topic_id, %error, "Cannot forget a moved publish");
-                }
-                outcome.retry_indices.push(index);
-                let error = || "Published event left its lineage".to_string();
-                outcome.retry_error.get_or_insert_with(error);
-                held_topics.insert(topic_id);
-                held_origins.extend(origin);
-                continue;
             };
             confirmed.entry(topic_id).or_insert(lineage);
             outcome.lineages.insert(index, lineage);
@@ -469,19 +444,16 @@ impl DocumentSyncService {
         Ok(iroh::Signature::from_bytes(&signature.to_bytes()))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Appends the event and answers its op with the lineage it was appended on. With a `bound`
+    /// lineage it appends only while the topic keeps it, else it fails with `LineageMoved`.
     pub(in crate::document_sync) fn publish_event_op(
         &self,
         oplog: &Oplog<::irokle::FjallStorage>,
-        topic_id: ::irokle::TopicId,
-        actor_id: ::irokle::ActorId,
-        envelope: EventEnvelope,
+        (topic_id, actor_id, envelope): (::irokle::TopicId, ::irokle::ActorId, EventEnvelope),
         sync_peers: &BTreeSet<PeerId>,
-        allow_genesis: bool,
-        may_create_topic: bool,
-        fast_path: &mut usize,
-        fallback: &mut usize,
-    ) -> Result<::irokle::Op> {
+        (allow_genesis, may_create_topic, bound): (bool, bool, Option<[u8; 32]>),
+        (fast_path, fallback): (&mut usize, &mut usize),
+    ) -> Result<(::irokle::Op, [u8; 32])> {
         let topic_missing = self
             .node
             .storage()
@@ -499,6 +471,9 @@ impl DocumentSyncService {
             if !allow_genesis {
                 return Err(NetError::TopicNotReady(topic_id.to_string()));
             }
+            if bound.is_some() {
+                return Err(NetError::LineageMoved(topic_id.to_string()));
+            }
             // Fast path for brand-new topics: genesis and first event in one
             // transaction; a lost genesis race falls back to the two-step flow.
             let genesis = TopicGenesis {
@@ -513,10 +488,10 @@ impl DocumentSyncService {
                 envelope.clone(),
                 self.node.signer(),
             ) {
-                Ok((_, event_op)) => {
+                Ok((genesis_op, event_op)) => {
                     *fast_path += 1;
                     self.net.schedule_topic_recheck(topic_id)?;
-                    return Ok(event_op);
+                    return Ok((event_op, lineage_root(&genesis_op.id)));
                 }
                 Err(error) => {
                     *fallback += 1;
@@ -527,9 +502,43 @@ impl DocumentSyncService {
         if may_create_topic {
             self.ensure_topic(topic_id, sync_peers, allow_genesis)?;
         }
-        oplog
-            .create_event_op(topic_id, actor_id, envelope, self.node.signer())
-            .map_err(|error| NetError::Bootstrap(error.to_string()))
+        let state = (self.node.storage().topic_state(&topic_id))
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let Some(genesis) = state.map(|state| state.genesis) else {
+            return Err(NetError::TopicNotReady(topic_id.to_string()));
+        };
+        let lineage = lineage_root(&genesis);
+        let moved = || NetError::LineageMoved(topic_id.to_string());
+        if bound.is_some_and(|bound| bound != lineage) {
+            return Err(moved());
+        }
+        // Irokle checks the genesis inside the topic's admission turn, against the state the
+        // append commits on, so a history received meanwhile refuses the append.
+        let op = oplog
+            .create_event_on(topic_id, actor_id, envelope, self.node.signer(), genesis)
+            .map_err(|error| match error {
+                ::irokle::Error::GenesisMoved => moved(),
+                error => NetError::Bootstrap(error.to_string()),
+            })?;
+        Ok((op, lineage))
+    }
+
+    /// The lineage of an op an earlier publish became, read with its actor index entry; one off
+    /// its `bound` lineage or the current one is forgotten, so the event appends again in order.
+    fn found_lineage(
+        &self,
+        op: ::irokle::Op,
+        bound: Option<[u8; 32]>,
+        key: &[u8],
+    ) -> Result<(::irokle::Op, [u8; 32])> {
+        let topic_id = op.signed.body.topic_id;
+        if let Some(lineage) = confirmed_lineage(self.appended_lineage(&op), bound) {
+            return Ok((op, lineage));
+        }
+        if let Err(error) = self.forget_published(key) {
+            warn!(%topic_id, %error, "Cannot forget a moved publish");
+        }
+        Err(NetError::LineageMoved(topic_id.to_string()))
     }
 
     /// Marks locally published ops as applied by advancing the per-topic

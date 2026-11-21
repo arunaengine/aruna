@@ -39,6 +39,11 @@ pub enum NetError {
     #[error("Document sync topic {0} not ready")]
     TopicNotReady(String),
 
+    /// A publish bound to one lineage found its topic on another. Retryable: the entry waits
+    /// behind the earlier events of that lineage.
+    #[error("Document sync topic {0} moved off the expected lineage")]
+    LineageMoved(String),
+
     /// The local node may not originate or relay this event under its own
     /// publisher capability. Permanent: receivers would reject the envelope.
     #[error("Publisher unauthorized: {0}")]

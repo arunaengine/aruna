@@ -595,16 +595,12 @@ impl DocumentSyncService {
             type_id: DocumentEvent::TYPE_ID.to_string(),
             payload: payload.into(),
         };
-        let op = self.publish_event_op(
+        let (op, _) = self.publish_event_op(
             &oplog,
-            topic_id,
-            actor_id,
-            envelope,
+            (topic_id, actor_id, envelope),
             &BTreeSet::new(),
-            true,
-            true,
-            &mut 0,
-            &mut 0,
+            (true, true, None),
+            (&mut 0, &mut 0),
         )?;
         self.flush_database()?;
         Ok(SyncQuarantineIdentity {
