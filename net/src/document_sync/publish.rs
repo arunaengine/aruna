@@ -551,6 +551,8 @@ impl DocumentSyncService {
         if published.is_empty() {
             return Ok(());
         }
+        // The cursor read and write must not interleave with a reconcile or an eviction.
+        let _reconcile_guard = self.reconcile_lock.lock().await;
         let mut writes = Vec::with_capacity(published.len());
         for (topic_id, clock) in published {
             // A tie-break between the publish and this write leaves the ops on a

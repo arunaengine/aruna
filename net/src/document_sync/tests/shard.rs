@@ -382,6 +382,65 @@ async fn shard_membership_exact() {
     service.shutdown().await;
 }
 
+/// A published cursor advance holds the reconcile lock through its write, so it
+/// cannot overwrite a cursor that a reconcile or an eviction writes meanwhile.
+#[test]
+fn advance_holds_reconcile() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime builds");
+    runtime.block_on(async {
+        let (_dir, storage) = test_storage();
+        let doc = tempfile::tempdir().expect("document sync dir");
+        let service = DocumentSyncService::open_with_policy(
+            test_endpoint(86).await,
+            storage,
+            doc.path().join("document-sync"),
+            &[node(87)],
+            vec![Alpn::DocumentSync.as_bytes().to_vec()],
+            ::irokle::net::IrohRuntimeConfig::default(),
+            FjallPersistPolicy::Buffer,
+            restart_realm(),
+        )
+        .expect("document sync service opens");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (occupied, ready) = tokio::sync::oneshot::channel();
+        let occupier = tokio::task::spawn_blocking(move || {
+            occupied
+                .send(())
+                .expect("test waits for the blocking thread");
+            let _ = held.recv();
+        });
+        ready.await.expect("blocking thread occupied");
+        let advance = tokio::spawn({
+            let service = service.clone();
+            async move {
+                let published =
+                    BTreeMap::from([(restart_topic(), ::irokle::ActorClock::default())]);
+                service.advance_topic_cursors(published).await
+            }
+        });
+        let mut locked = false;
+        for _ in 0..10_000 {
+            if service.reconcile_lock.try_lock().is_err() {
+                locked = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(locked, "the cursor advance never took the reconcile lock");
+        release.send(()).expect("blocking thread waits");
+        occupier.await.expect("blocking thread ends");
+        advance
+            .await
+            .expect("advance task ends")
+            .expect("cursor advance succeeds");
+        service.shutdown().await;
+    });
+}
+
 /// A cancelled reconcile keeps the reconcile lock until its queued control writes
 /// end, so a newer reconcile cannot run before them and be overwritten.
 #[test]
