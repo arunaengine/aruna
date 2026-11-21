@@ -23,6 +23,9 @@ use crate::fs_source::{
 enum PlaceError {
     Refused(LocalFileRefusal),
     Failed(String),
+    /// The owner's displaced bytes could not be put aside and stay at this path,
+    /// which must survive the cleanup of a failed write.
+    Kept(PathBuf),
 }
 
 /// One fully written temporary file, and the identity of the bytes it holds.
@@ -126,12 +129,19 @@ async fn finish_write(
                 message: "the published file is not the one that was written".to_string(),
             },
         },
-        Err(error) => {
+        Err(PlaceError::Kept(path)) => LocalFileEvent::Error {
+            message: format!(
+                "the displaced local file could not be put aside and was kept at {}",
+                path.display()
+            ),
+        },
+        Err(PlaceError::Refused(reason)) => {
             let _ = tokio::fs::remove_file(&spooled.path).await;
-            match error {
-                PlaceError::Refused(reason) => LocalFileEvent::Refused { reason },
-                PlaceError::Failed(message) => LocalFileEvent::Error { message },
-            }
+            LocalFileEvent::Refused { reason }
+        }
+        Err(PlaceError::Failed(message)) => {
+            let _ = tokio::fs::remove_file(&spooled.path).await;
+            LocalFileEvent::Error { message }
         }
     }
 }
@@ -212,6 +222,10 @@ pub(crate) async fn move_aside(root: &str, relative: &str, guard: &WriteGuard) -
             Err(PlaceError::Refused(LocalFileRefusal::Exists)) => continue,
             Err(PlaceError::Refused(reason)) => return LocalFileEvent::Refused { reason },
             Err(PlaceError::Failed(message)) => return LocalFileEvent::Error { message },
+            Err(PlaceError::Kept(path)) => {
+                let message = format!("the file was kept at {}", path.display());
+                return LocalFileEvent::Error { message };
+            }
         }
     }
     LocalFileEvent::Refused {
@@ -452,7 +466,7 @@ async fn exchange_guarded(
         // own instead of being left where the incoming version belongs.
         Err(_) => match rescue_displaced(spool, target).await {
             Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
-            Err(error) => Err(error),
+            Err(_) => Err(PlaceError::Kept(spool.to_path_buf())),
         },
     }
 }
@@ -488,7 +502,7 @@ async fn exchange_guarded(
         Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
         Err(_) => match rescue_displaced(&backup, target).await {
             Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
-            Err(error) => Err(error),
+            Err(_) => Err(PlaceError::Kept(backup)),
         },
     }
 }
@@ -701,6 +715,28 @@ mod tests {
     async fn identity(path: &Path) -> (String, [u8; 32]) {
         let (fingerprint, blake3, _) = hash_stable(path).await.expect("file must hash");
         (fingerprint, blake3)
+    }
+
+    // A displaced owner file that could not be put aside survives the cleanup.
+    #[tokio::test]
+    async fn keeps_unrescued_file() {
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("displaced");
+        tokio::fs::write(&kept, b"owner edit").await.unwrap();
+        let spooled = Spooled {
+            path: kept.clone(),
+            blake3: [0; 32],
+            size: 10,
+        };
+        let placed = Err(PlaceError::Kept(kept.clone()));
+        let event = finish_write(spooled, placed, &root.path().join("target"), |_, _| {
+            LocalFileEvent::Error {
+                message: "not published".to_string(),
+            }
+        })
+        .await;
+        assert!(matches!(event, LocalFileEvent::Error { .. }));
+        assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
     }
 
     #[tokio::test]
