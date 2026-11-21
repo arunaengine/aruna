@@ -62,7 +62,9 @@ fn evidence(batch: &DrainSubBatch) -> Vec<(Vec<u8>, Publication)> {
 /// Binds each entry of `batch` to the lineage its publish found or appended it on, which its
 /// evidence and its finish guard then hold; an unreported lineage is unknown.
 fn appended_on(mut batch: DrainSubBatch, lineages: &[Option<[u8; 32]>]) -> DrainSubBatch {
-    batch.stamps.resize(batch.record_keys.len(), RowStamp::default());
+    batch
+        .stamps
+        .resize(batch.record_keys.len(), RowStamp::default());
     for (index, stamp) in batch.stamps.iter_mut().enumerate() {
         stamp.lineage = lineages.get(index).copied().flatten();
     }
@@ -497,7 +499,15 @@ mod tests {
             realm_id: RealmId::from_bytes([3; 32]),
         };
         let event = DocumentOutboxEvent::Delete { change };
-        new_identified_record(event_id, actor, target, Vec::new(), event, PlacementRef::NIL, false)
+        new_identified_record(
+            event_id,
+            actor,
+            target,
+            Vec::new(),
+            event,
+            PlacementRef::NIL,
+            false,
+        )
     }
 
     /// What the run keeps of the publication of the record `name` from [`batch`].
@@ -585,16 +595,25 @@ mod tests {
             metadata_graph_tombstones: Vec::new(),
         };
         let synced = Event::Net(NetEvent::DocumentSync(reconciled));
-        let (keys, outcome) = ((vec![b"one".to_vec()], Vec::new()), DrainSyncOutcome::default());
+        let (keys, outcome) = (
+            (vec![b"one".to_vec()], Vec::new()),
+            DrainSyncOutcome::default(),
+        );
         let generation = ulid::Ulid::from_parts(1, 1);
         let mut finish = FinishBatchOperation::new(None, generation, keys, synced, outcome)
             .guarded(vec![(topic, awaiting.stamp(0))]);
         finish.first().unwrap();
-        finish.next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(())))).unwrap();
-        finish.next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(true)))).unwrap();
+        finish
+            .next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(()))))
+            .unwrap();
+        finish
+            .next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(true))))
+            .unwrap();
         let root = Event::Net(NetEvent::Shard(Box::new(ShardNetEvent::Root(Ok(moved)))));
         let results = vec![GroupResult::Done(Box::new(root))];
-        finish.next(IoResult::Group(GroupEvent::Finished { results })).unwrap();
+        finish
+            .next(IoResult::Group(GroupEvent::Finished { results }))
+            .unwrap();
         let none = Ok::<Vec<Vec<u8>>, ApplyError>(Vec::new());
         let Ok(Next::Done(finished)) = finish.next(IoResult::Child(ChildOutcome::new(none))) else {
             panic!("the finish keeps the row");

@@ -350,7 +350,10 @@ mod tests {
         config.snapshot_candidate_map();
         let mut record = admin_record();
         record.1.placement = placement;
-        if let DocumentOutboxEvent::AdminOperation { origin_signature, .. } = &mut record.1.event {
+        if let DocumentOutboxEvent::AdminOperation {
+            origin_signature, ..
+        } = &mut record.1.event
+        {
             *origin_signature = Some(iroh::SecretKey::from_bytes(&[1; 32]).sign(b"event"));
         }
         let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(config)), vec![record]);

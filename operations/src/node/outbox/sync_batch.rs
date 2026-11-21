@@ -171,7 +171,8 @@ mod tests {
         let mut run = SyncBatchOperation::new(serving, Ulid::from_parts(1, 1), batch());
         run.first().unwrap();
         let synced = Ok::<_, ApplyError>(DocumentReconcileResult::default());
-        run.next(IoResult::Child(ChildOutcome::new(synced))).unwrap();
+        run.next(IoResult::Child(ChildOutcome::new(synced)))
+            .unwrap();
         let mut finished = FinishedBatch::default();
         (finished.outcome.retry_needed, finished.lost) = (true, vec![0]);
         let finished = Ok::<_, IoError>(finished);

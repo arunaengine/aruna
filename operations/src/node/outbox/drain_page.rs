@@ -671,7 +671,10 @@ mod tests {
             retry: true,
         };
         let broken = Err::<RelayedRecords, _>(IoError::Unfinished);
-        for answer in [ChildOutcome::new(Ok::<_, IoError>(failed)), ChildOutcome::new(broken)] {
+        for answer in [
+            ChildOutcome::new(Ok::<_, IoError>(failed)),
+            ChildOutcome::new(broken),
+        ] {
             let mut run = page();
             run.step = PageStep::Relay;
             let Ok(Next::Done(page)) = run.next(IoResult::Child(answer)) else {

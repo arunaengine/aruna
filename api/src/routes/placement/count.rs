@@ -682,9 +682,16 @@ mod tests {
 
         let outsider = iroh::SecretKey::from_bytes(&[8; 32]);
         let mut forged = relayed_by(&outsider, &relay);
-        forged.insert(RELAY_HOP_HEADER, member.public().to_string().parse().unwrap());
+        forged.insert(
+            RELAY_HOP_HEADER,
+            member.public().to_string().parse().unwrap(),
+        );
         assert!(!relay_signed(&relay, &forged, &members));
-        assert!(!relay_signed(&relay, &relayed_by(&outsider, &relay), &members));
+        assert!(!relay_signed(
+            &relay,
+            &relayed_by(&outsider, &relay),
+            &members
+        ));
 
         let moved = CountRelay {
             run: Ulid::from_parts(3, 3),

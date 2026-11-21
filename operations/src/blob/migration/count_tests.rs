@@ -130,7 +130,9 @@ fn start_order_kept() {
 fn lost_commit_retries() {
     let conflict = StartCountError::from(IoError::Conflict);
     assert!(<StartCountOperation as Operation>::is_conflict(&conflict));
-    assert!(!<StartCountOperation as Operation>::is_conflict(&StartCountError::Superseded));
+    assert!(!<StartCountOperation as Operation>::is_conflict(
+        &StartCountError::Superseded
+    ));
 }
 
 // A distributed start asks this node's key for one signature over its relay.
@@ -145,7 +147,10 @@ fn signs_count_relay() {
     let Ok(Next::Call(IoCall::Effect(effect))) = sign.first() else {
         panic!("the signing effect is asked for");
     };
-    assert_eq!(*effect, Effect::Net(NetEffect::SignCountRelay(Box::new(relay))));
+    assert_eq!(
+        *effect,
+        Effect::Net(NetEffect::SignCountRelay(Box::new(relay)))
+    );
     let signature = iroh::SecretKey::from_bytes(&[7; 32]).sign(b"relay");
     let signed = Event::Net(NetEvent::CountRelaySigned(Ok(signature)));
     let answer = sign.next(IoResult::Event(Box::new(signed)));
