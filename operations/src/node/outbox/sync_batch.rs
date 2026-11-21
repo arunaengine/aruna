@@ -177,7 +177,8 @@ mod tests {
         let mut run = SyncBatchOperation::new(serving, Ulid::from_parts(1, 1), plain);
         run.first().unwrap();
         let failed = Err::<DocumentReconcileResult, _>(ApplyError::Failed("down".to_string()));
-        run.next(IoResult::Child(ChildOutcome::new(failed))).unwrap();
+        run.next(IoResult::Child(ChildOutcome::new(failed)))
+            .unwrap();
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
         let finished = Ok::<_, IoError>(finished);

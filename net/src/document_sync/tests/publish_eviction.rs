@@ -189,7 +189,10 @@ fn unknown_lineage_retries() {
 fn moved_append_retries() {
     use crate::document_sync::publish::confirmed_lineage;
     assert_eq!(confirmed_lineage(Ok(Some([2; 32])), Some([1; 32])), None);
-    assert_eq!(confirmed_lineage(Ok(Some([1; 32])), Some([1; 32])), Some([1; 32]));
+    assert_eq!(
+        confirmed_lineage(Ok(Some([1; 32])), Some([1; 32])),
+        Some([1; 32])
+    );
 }
 
 // An event bound to a lineage appends only while its topic still has that lineage; otherwise it
