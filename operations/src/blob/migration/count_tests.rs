@@ -157,6 +157,47 @@ fn signs_count_relay() {
     assert_eq!(answer, Ok(Next::Done(signature)));
 }
 
+/// A member bucket row of `incarnation` in the set the relay was verified for.
+fn member_row(incarnation: u128) -> (DistributionBinding, IoResult) {
+    use aruna_core::structs::storage::format::Compression;
+    let binding = DistributionBinding {
+        set_id: Ulid::from_bytes([3; 16]),
+        member_id: Ulid::from_bytes([4; 16]),
+        incarnation,
+        revision: Default::default(),
+    };
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([6; 16]),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(binding.clone()),
+    };
+    let row = IoResult::Values(vec![Some(info.to_bytes().unwrap().into()), None]);
+    (binding, row)
+}
+
+// The bucket was deleted and made again under its name after the relay was verified: the old
+// run finds another incarnation in the write transaction and leaves the new bucket alone.
+#[test]
+fn replaced_bucket_untouched() {
+    let (verified, _) = member_row(5);
+    let (_, recreated) = member_row(6);
+    let run = Some(Ulid::from_parts(9, 1));
+    let mut start = StartCountOperation::new("photos".to_string(), run).bound_to(verified);
+    start.first().unwrap();
+    assert_eq!(start.next(recreated), Err(StartCountError::NoSuchBucket));
+
+    let (verified, same) = member_row(5);
+    let mut start = StartCountOperation::new("photos".to_string(), run).bound_to(verified);
+    start.first().unwrap();
+    assert!(matches!(start.next(same), Ok(Next::Call(IoCall::Write(_)))));
+}
+
 // A coordinator a start missed holds its previous run or no count; either leaves the answer.
 #[test]
 fn other_runs_dropped() {

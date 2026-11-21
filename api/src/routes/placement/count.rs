@@ -388,7 +388,7 @@ async fn count_route(
     };
     let answer = match info.distribution.as_ref().filter(|_| !relayed) {
         Some(binding) => count_spread(state, bucket, binding, bearer, start, run).await,
-        None => count_here(state, bucket, start, run).await,
+        None => count_here(state, bucket, info.distribution.as_ref(), start, run).await,
     };
     match answer {
         // A relaying node reads the refusal from the error; any other caller gets the tried run.
@@ -401,10 +401,11 @@ async fn count_route(
 }
 
 /// This node's saved count of `run`, or the count a start of it wrote, which a later start
-/// cannot replace in the answer.
+/// cannot replace in the answer. A start holds to the `binding` the bucket was checked with.
 async fn count_here(
     state: &ServerState,
     bucket: &str,
+    binding: Option<&DistributionBinding>,
     start: bool,
     run: Option<Ulid>,
 ) -> ServerResult<CoverageCountResponse> {
@@ -412,7 +413,13 @@ async fn count_here(
     let count = match start {
         true => {
             // A lost commit runs again with the same run, which then meets the count that won.
-            let build = || StartCountOperation::new(bucket.to_string(), run);
+            let build = || {
+                let operation = StartCountOperation::new(bucket.to_string(), run);
+                match binding {
+                    Some(binding) => operation.bound_to(binding.clone()),
+                    None => operation,
+                }
+            };
             let seed = run.map(|run| run.to_bytes()).unwrap_or_default();
             let started = drive_retry(build, &context, &seed).await;
             Some(started.map_err(|error| match error {
@@ -452,7 +459,7 @@ async fn count_spread(
     let (mut answers, mut unreached, mut superseded) = (Vec::new(), Vec::new(), Vec::new());
     for forward in coordinators(state, binding).await? {
         let answer = if forward.node_id == state.get_node_id() {
-            count_here(state, bucket, start, run).await
+            count_here(state, bucket, Some(binding), start, run).await
         } else if start {
             let request = StartCountRequest { run };
             relay_json_with(state, &forward, &path, bearer, &request, signed.clone())
