@@ -246,6 +246,93 @@ async fn later_event_held() {
     );
 }
 
+// An admin event held by its waiting topic holds its origin too, so a later event of that origin
+// on a ready topic stays behind it; another origin still publishes there.
+#[tokio::test]
+async fn held_topic_origin() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([81; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(81).await,
+        storage,
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let placement = PlacementRef {
+        strategy_id: Ulid::from_parts(81, 7),
+        shard: 1,
+    };
+    let held_user = UserId::local(Ulid::from_parts(81, 1), realm_id);
+    let ready_user = UserId::local(Ulid::from_parts(81, 2), realm_id);
+    let ready_target = DocumentTarget::User {
+        user_id: ready_user,
+    };
+    let ready_topic = ready_target.sync_topic_id(realm_id, &placement);
+    service
+        .ensure_sync_topics(&[ready_topic], Vec::new())
+        .expect("ready topic genesis");
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(81, 3),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement,
+    };
+    let waiting = DocumentSyncPublish::Upsert {
+        event_id: Ulid::from_parts(81, 4),
+        target: DocumentTarget::User { user_id: held_user },
+        bytes: b"user".to_vec(),
+        change,
+        allow_genesis: false,
+    };
+    let admin = |seed: u8, origin_seq: u64, user_id: UserId| {
+        let event = test_admin_event(
+            Ulid::from_parts(81, u128::from(seed) * 10 + u128::from(origin_seq)),
+            AdminDocumentTarget::User { user_id },
+            &test_actor(seed, user_id, realm_id),
+            origin_seq,
+            AdminDocumentOperation::UserNameSet {
+                name: format!("name-{seed}-{origin_seq}"),
+            },
+        );
+        let origin_signature = Some(sign_as_origin(&event, &placement));
+        DocumentSyncPublish::AdminOperation {
+            target: DocumentTarget::User { user_id },
+            event: Box::new(event),
+            placement,
+            allow_genesis: true,
+            origin_signature,
+        }
+    };
+
+    let documents = vec![
+        waiting,
+        admin(2, 1, held_user),
+        admin(2, 2, ready_user),
+        admin(3, 1, ready_user),
+    ];
+    match service.publish_documents(documents, Vec::new()).await {
+        DocumentNetEvent::DocumentsPartiallyPublished {
+            published_indices,
+            retry_indices,
+            ..
+        } => assert_eq!((published_indices, retry_indices), (vec![3], vec![0, 1, 2])),
+        other => panic!("expected partial publish, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn lost_eviction_replays() {
     let (_dir_a, storage_a) = test_storage();

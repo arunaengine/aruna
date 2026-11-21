@@ -159,6 +159,23 @@ fn shared_topic_blocked() {
     assert!(defer.blocked_origins.contains(&origin));
 }
 
+// A record held by its blocked origin holds its topic, so a later record of another writer on
+// that topic stays behind it.
+#[test]
+fn held_origin_topic() {
+    let (origin, topic) = (node(4), TopicId::hash(b"held-topic"));
+    let mut defer = DrainDeferState::default();
+    defer.blocked_origins.insert(origin);
+    let records = vec![
+        (b"admin".to_vec(), admin_record(origin, 1), topic),
+        (b"later".to_vec(), shard_topic_record(2), topic),
+    ];
+    let (to_publish, deferred, _) =
+        partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
+    assert!(to_publish.is_empty());
+    assert_eq!(deferred.len(), 2);
+}
+
 // A relay waits while an earlier record of its origin still publishes on this page; a relay of
 // another origin runs.
 #[test]

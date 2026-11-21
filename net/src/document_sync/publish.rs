@@ -299,6 +299,9 @@ impl DocumentSyncService {
             let may_create_topic = !target.uses_shard_topic();
             let held_origin = origin.is_some_and(|origin| held_origins.contains(&origin));
             if held_topics.contains(&topic_id) || held_origin {
+                // A held entry holds both its domains for the entries after it.
+                held_topics.insert(topic_id);
+                held_origins.extend(origin);
                 outcome.retry_indices.push(index);
                 continue;
             }

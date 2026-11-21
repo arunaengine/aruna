@@ -195,27 +195,26 @@ impl PublishBatchesOperation {
     /// blocked, or whose origin waits for a sync on another topic: they stay in the outbox for a
     /// retry and keep their own domains blocked.
     fn without_blocked(&mut self, batch: DrainSubBatch) -> Option<DrainSubBatch> {
-        let outcome = &self.out.outcome;
-        // A successor rides only a topic that holds every wait of its origin.
-        let waits_elsewhere = |origin: NodeId, topic: TopicId| {
-            (outcome.sync_waits.iter()).any(|(waiting, on)| *waiting == origin && *on != topic)
-        };
-        let blocked = |index: usize| {
-            let topic = batch.topics.get(index);
+        let mut kept = Vec::with_capacity(batch.record_keys.len());
+        for (index, &topic) in batch.topics.iter().enumerate() {
             let origin = batch.origins.get(index).copied().flatten();
-            topic.is_some_and(|topic| outcome.blocked_topics.contains(topic))
+            let outcome = &self.out.outcome;
+            // A successor rides only a topic that holds every wait of its origin.
+            let waits_elsewhere = |origin: NodeId| {
+                (outcome.sync_waits.iter()).any(|(waiting, on)| *waiting == origin && *on != topic)
+            };
+            let held = outcome.blocked_topics.contains(&topic)
                 || origin.is_some_and(|origin| outcome.blocked_origins.contains(&origin))
-                || origin
-                    .zip(topic.copied())
-                    .is_some_and(|(origin, topic)| waits_elsewhere(origin, topic))
-        };
-        let (held, kept): (Vec<usize>, Vec<usize>) =
-            (0..batch.record_keys.len()).partition(|&index| blocked(index));
-        if held.is_empty() {
-            return Some(batch);
+                || origin.is_some_and(waits_elsewhere);
+            if !held {
+                kept.push(index);
+                continue;
+            }
+            // A held row blocks its domains before the next row is examined.
+            self.block((vec![topic], origin.into_iter().collect()));
         }
-        if let Some(held) = batch.sync_subset(&held) {
-            self.block(held.ordering_domains());
+        if kept.len() == batch.record_keys.len() {
+            return Some(batch);
         }
         (!kept.is_empty()).then(|| batch.select(&kept)).flatten()
     }
@@ -628,6 +627,38 @@ mod tests {
             panic!("the successor is held");
         };
         assert!(done.outcome.retry_needed);
+    }
+
+    // A row held by its origin's wait on another topic blocks that origin for the later rows
+    // of the same batch, so a same-topic successor of that origin stays behind it.
+    #[test]
+    fn held_row_blocks() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let mut first = batch(b"one");
+        first.origins = vec![Some(origin)];
+        let (mut second, mut later) = (batch(b"two"), batch(b"one"));
+        later.record_keys = vec![b"later".to_vec()];
+        second.documents.append(&mut later.documents);
+        second.topics.append(&mut later.topics);
+        second.origins = vec![Some(origin), Some(origin)];
+        second.targets.append(&mut later.targets);
+        second.record_keys.append(&mut later.record_keys);
+        second.stamps.append(&mut later.stamps);
+        let mut run = PublishBatchesOperation::new(serving(), vec![first, second]);
+        run.first().unwrap();
+        let published = net(DocumentNetEvent::DocumentsPublished {
+            targets: Vec::new(),
+        });
+        run.next(published).unwrap();
+        let mut finished = FinishedBatch::default();
+        finished.outcome.retry_needed = true;
+        finished.outcome.sync_waits = vec![(origin, TopicId::hash(b"one"))];
+        let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
+        let Ok(Next::Done(done)) = run.next(synced) else {
+            panic!("both rows of the second batch are held");
+        };
+        assert!(done.outcome.blocked_topics.contains(&TopicId::hash(b"two")));
+        assert!(done.outcome.blocked_origins.contains(&origin));
     }
 
     // A failed sync holds no later record on its own topic: the record is in the oplog, and the
