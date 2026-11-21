@@ -1286,6 +1286,7 @@ async fn seed_config_topic(
                     origin_signature: None,
                 }],
                 peers: Vec::new(),
+                expected: Vec::new(),
             },
         )))
         .await

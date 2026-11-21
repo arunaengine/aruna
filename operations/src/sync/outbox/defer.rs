@@ -29,14 +29,17 @@ pub struct DrainDeferState {
 }
 
 /// Admin origins whose already published records must sync again, with the topics those records
-/// ride. A later record of such an origin goes out only while every wait of the origin is on its
-/// own topic, whose sync carries the earlier records in order; otherwise it waits.
-pub type SyncWaits = HashMap<NodeId, HashSet<TopicId>>;
+/// ride and the lineage each had. A later record of such an origin goes out only while every wait
+/// of the origin is on its own topic, still on that lineage, whose sync carries the earlier ones.
+pub type SyncWaits = HashMap<NodeId, HashSet<(TopicId, [u8; 32])>>;
 
-/// Adds the origin and topic of each record whose sync must retry to `waits`.
-pub fn add_waits(waits: &mut SyncWaits, pairs: &[(NodeId, TopicId)]) {
-    for (origin, topic) in pairs {
-        waits.entry(*origin).or_default().insert(*topic);
+/// An admin origin, a topic its published record must sync again on, and the topic's lineage.
+pub type SyncWait = (NodeId, TopicId, [u8; 32]);
+
+/// Adds the wait of each record whose sync must retry to `waits`.
+pub fn add_waits(waits: &mut SyncWaits, pairs: &[SyncWait]) {
+    for (origin, topic, lineage) in pairs {
+        waits.entry(*origin).or_default().insert((*topic, *lineage));
     }
 }
 
@@ -102,7 +105,7 @@ pub fn partition_drain_records(
             && defer
                 .sync_waits
                 .get(&origin)
-                .is_some_and(|topics| topics.iter().any(|waiting| *waiting != topic))
+                .is_some_and(|topics| topics.iter().any(|(waiting, _)| *waiting != topic))
         {
             defer.blocked_origins.insert(origin);
             defer.deferred_topics.insert(topic);

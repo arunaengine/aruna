@@ -10,11 +10,22 @@ impl DocumentSyncService {
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
     ) -> DocumentNetEvent {
+        self.publish_expecting(documents, peers, Vec::new()).await
+    }
+
+    /// Publishes `documents`; one whose topic no longer has the lineage `expected` names at its
+    /// position retries, and holds its topic and origin for the later ones.
+    pub async fn publish_expecting(
+        &self,
+        documents: Vec<DocumentSyncPublish>,
+        peers: Vec<NodeId>,
+        expected: Vec<Option<[u8; 32]>>,
+    ) -> DocumentNetEvent {
         let targets = documents
             .iter()
             .map(|document| document.target().clone())
             .collect::<Vec<_>>();
-        match self.publish_events(documents, peers).await {
+        match self.publish_events(documents, peers, expected).await {
             Ok(outcome) if outcome.retry_indices.is_empty() => {
                 let lineages = outcome.lineage_list(targets.len());
                 DocumentNetEvent::DocumentsPublished { targets, lineages }
@@ -195,6 +206,7 @@ impl DocumentSyncService {
         &self,
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
+        expected: Vec<Option<[u8; 32]>>,
     ) -> Result<PublishEventsOutcome> {
         if documents.is_empty() {
             return Ok(PublishEventsOutcome::default());
@@ -203,7 +215,7 @@ impl DocumentSyncService {
         self.allow_sync_peers(&sync_peers)?;
         let service = self.clone();
         let mut outcome = tokio::task::spawn_blocking(move || {
-            service.publish_events_blocking(documents, &sync_peers)
+            service.publish_events_blocking(documents, &sync_peers, &expected)
         })
         .await
         .map_err(|error| NetError::Bootstrap(error.to_string()))??;
@@ -217,6 +229,7 @@ impl DocumentSyncService {
         &self,
         documents: Vec<DocumentSyncPublish>,
         sync_peers: &BTreeSet<PeerId>,
+        expected: &[Option<[u8; 32]>],
     ) -> Result<PublishEventsOutcome> {
         let publish_started = Instant::now();
         let document_count = documents.len();
@@ -313,6 +326,16 @@ impl DocumentSyncService {
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             // Held from the check to the record, so no other publish appends the event between.
             let _lock = self.publish_lock(topic_id);
+            // A successor bound to a lineage appends only while its topic still has it.
+            if let Some(expected) = expected.get(index).copied().flatten()
+                && self.current_lineage(topic_id)? != Some(expected)
+            {
+                outcome.retry_indices.push(index);
+                (outcome.retry_error).get_or_insert_with(|| "Topic lineage changed".to_string());
+                held_topics.insert(topic_id);
+                held_origins.extend(origin);
+                continue;
+            }
             // A publish repeated after a restart finds the op it became on the current lineage.
             let published = match self.published_op(topic_id, actor_id, &key)? {
                 Some(op) => Ok(op),

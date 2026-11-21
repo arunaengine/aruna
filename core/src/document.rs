@@ -877,9 +877,12 @@ impl DocumentEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentEffect {
+    /// `expected` names, by document position, the lineage root a topic must still have for
+    /// its event to append; a document on a moved topic retries.
     PublishDocuments {
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
+        expected: Vec<Option<[u8; 32]>>,
     },
     SyncDocument {
         topic: irokle::TopicId,

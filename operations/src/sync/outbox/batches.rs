@@ -16,7 +16,7 @@ use irokle::TopicId;
 use tracing::info;
 use ulid::Ulid;
 
-use super::defer::{DrainDeferState, DrainRecord, add_waits, admin_origin};
+use super::defer::{DrainDeferState, DrainRecord, SyncWait, add_waits, admin_origin};
 use super::record::OUTBOX_DRAIN_SIZE;
 use super::rotation::OutboxRotation;
 use crate::sync::shard_placement::{DEFER_RETRY_AFTER, sort_node_ids};
@@ -258,8 +258,8 @@ pub struct DrainSyncOutcome {
     /// Ordering domains to block for the rest of the rotation.
     pub blocked_topics: Vec<TopicId>,
     pub blocked_origins: Vec<NodeId>,
-    /// The admin origin and topic of each published record whose sync must retry.
-    pub sync_waits: Vec<(NodeId, TopicId)>,
+    /// The wait of each published record whose sync must retry.
+    pub sync_waits: Vec<SyncWait>,
 }
 
 impl DrainSyncOutcome {

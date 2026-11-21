@@ -172,6 +172,64 @@ async fn blocked_allows_ready() {
     );
 }
 
+// An event bound to a lineage appends only while its topic still has that lineage; otherwise it
+// retries and holds its topic for the later events.
+#[tokio::test]
+async fn moved_lineage_held() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([82; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(82).await,
+        storage,
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: local_node,
+    };
+    let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(82, 3),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement: PlacementRef::NIL,
+    };
+    let upsert = |time| DocumentSyncPublish::Upsert {
+        event_id: Ulid::from_parts(time, 4),
+        target: target.clone(),
+        bytes: b"interest".to_vec(),
+        change,
+        allow_genesis: true,
+    };
+    let first = service.publish_documents(vec![upsert(1)], Vec::new()).await;
+    assert!(matches!(first, DocumentNetEvent::DocumentsPublished { .. }));
+    let current = service.current_lineage(topic_id).expect("lineage reads");
+    assert!(current.is_some());
+
+    let moved = vec![Some([0; 32]), None];
+    let held = (service.publish_expecting(vec![upsert(2), upsert(3)], Vec::new(), moved)).await;
+    assert!(
+        matches!(held, DocumentNetEvent::Error { .. }),
+        "an event on a moved lineage and the later one must retry: {held:?}"
+    );
+    let kept = (service.publish_expecting(vec![upsert(2)], Vec::new(), vec![current])).await;
+    assert!(matches!(kept, DocumentNetEvent::DocumentsPublished { .. }));
+}
+
 // An event that must retry holds back the later events of its topic, so none of them lands in the
 // oplog ahead of it; other topics still publish.
 #[tokio::test]

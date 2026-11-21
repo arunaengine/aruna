@@ -22,6 +22,7 @@ use crate::node::outbox::finish_batch::FinishedBatch;
 use crate::node::outbox::sync_batch::SyncBatchOperation;
 use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome, RowStamp};
 use crate::sync::outbox::cleanup::Publication;
+use crate::sync::outbox::defer::SyncWait;
 
 /// What publishing the sub-batches left: the sync outcome, the time the publishes took, the
 /// records this run published with the lineage their topic had, and those it deleted.
@@ -111,6 +112,8 @@ pub struct PublishBatchesOperation {
     syncing: Option<Syncing>,
     window_publish: Option<Option<Event>>,
     window_sync: Option<Option<Result<FinishedBatch, IoError>>>,
+    /// Waits earlier pages left, beside those this run's syncs add to its outcome.
+    waits: Vec<SyncWait>,
     out: PublishedBatches,
     step: PublishStep,
     ids: IdMint,
@@ -119,6 +122,12 @@ pub struct PublishBatchesOperation {
 }
 
 impl PublishBatchesOperation {
+    /// Holds the entries of an origin with `waits` from earlier pages as this run's own do.
+    pub fn waiting(mut self, waits: Vec<SyncWait>) -> Self {
+        self.waits = waits;
+        self
+    }
+
     pub fn new(serving: (NodeId, RealmId), batches: Vec<DrainSubBatch>) -> Self {
         Self {
             serving,
@@ -128,6 +137,7 @@ impl PublishBatchesOperation {
             syncing: None,
             window_publish: None,
             window_sync: None,
+            waits: Vec::new(),
             out: PublishedBatches::default(),
             step: PublishStep::Sync,
             ids: IdMint::default(),
@@ -165,8 +175,12 @@ impl PublishBatchesOperation {
                 continue;
             };
             let documents = std::mem::take(&mut batch.documents);
-            let peers = batch.peers.clone();
-            let publish = DocumentEffect::PublishDocuments { documents, peers };
+            let (peers, expected) = (batch.peers.clone(), self.expected(&batch));
+            let publish = DocumentEffect::PublishDocuments {
+                documents,
+                peers,
+                expected,
+            };
             let publish = Effect::Net(NetEffect::DocumentSync(publish));
             self.publishing = Some(batch);
             self.started_ms = self.now_ms;
@@ -194,10 +208,15 @@ impl PublishBatchesOperation {
         let mut kept = Vec::with_capacity(batch.record_keys.len());
         for (index, &topic) in batch.topics.iter().enumerate() {
             let origin = batch.origins.get(index).copied().flatten();
+            let stamped = batch.stamp(index).lineage;
             let outcome = &self.out.outcome;
-            // A successor rides only a topic that holds every wait of its origin.
+            // A successor rides only a topic that holds every wait of its origin, on the lineage
+            // that wait was verified on.
+            let mut waits = self.waits.iter().chain(&outcome.sync_waits);
             let waits_elsewhere = |origin: NodeId| {
-                (outcome.sync_waits.iter()).any(|(waiting, on)| *waiting == origin && *on != topic)
+                waits.any(|(waiting, on, lineage)| {
+                    *waiting == origin && (*on != topic || stamped != Some(*lineage))
+                })
             };
             let held = outcome.blocked_topics.contains(&topic)
                 || origin.is_some_and(|origin| outcome.blocked_origins.contains(&origin))
@@ -213,6 +232,21 @@ impl PublishBatchesOperation {
             return Some(batch);
         }
         (!kept.is_empty()).then(|| batch.select(&kept)).flatten()
+    }
+
+    /// The lineage each entry's topic must still have when it appends: that of the wait its
+    /// origin holds on the topic, so a successor never lands on a replaced history.
+    fn expected(&self, batch: &DrainSubBatch) -> Vec<Option<[u8; 32]>> {
+        let waits: Vec<&SyncWait> = (self.waits.iter())
+            .chain(&self.out.outcome.sync_waits)
+            .collect();
+        let expected = |index: usize| {
+            let topic = batch.topics.get(index)?;
+            let origin = batch.origins.get(index).copied().flatten()?;
+            let wait = waits.iter().find(|(waiting, on, _)| *waiting == origin && on == topic);
+            wait.map(|(.., lineage)| *lineage)
+        };
+        (0..batch.record_keys.len()).map(expected).collect()
     }
 
     fn sync_batch(&mut self, batch: DrainSubBatch) -> SyncBatchOperation {
@@ -641,10 +675,8 @@ mod tests {
         assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        finished
-            .outcome
-            .sync_waits
-            .push((origin, TopicId::hash(b"one")));
+        let wait = (origin, TopicId::hash(b"one"), lineage(b"one"));
+        finished.outcome.sync_waits.push(wait);
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("the later batch is held");
@@ -667,7 +699,8 @@ mod tests {
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
         let waits = [TopicId::hash(b"one"), TopicId::hash(b"two")];
-        finished.outcome.sync_waits = waits.map(|topic| (origin, topic)).to_vec();
+        let waits = waits.map(|topic| (origin, topic, lineage(b"one")));
+        finished.outcome.sync_waits = waits.to_vec();
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("the successor is held");
@@ -696,7 +729,7 @@ mod tests {
         run.next(published).unwrap();
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        finished.outcome.sync_waits = vec![(origin, TopicId::hash(b"one"))];
+        finished.outcome.sync_waits = vec![(origin, TopicId::hash(b"one"), lineage(b"one"))];
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("both rows of the second batch are held");
@@ -720,13 +753,35 @@ mod tests {
         assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        finished
-            .outcome
-            .sync_waits
-            .push((origin, TopicId::hash(b"one")));
+        let wait = (origin, TopicId::hash(b"one"), lineage(b"one"));
+        finished.outcome.sync_waits.push(wait);
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
-        let publish = run.next(synced);
-        assert!(matches!(publish, Ok(Next::Call(IoCall::Effect(_)))));
+        let Ok(Next::Call(IoCall::Effect(effect))) = run.next(synced) else {
+            panic!("the successor publishes");
+        };
+        let Effect::Net(NetEffect::DocumentSync(DocumentEffect::PublishDocuments {
+            expected, ..
+        })) = *effect
+        else {
+            panic!("expected a publish");
+        };
+        assert_eq!(expected, vec![Some(lineage(b"one"))]);
+    }
+
+    // A wait an earlier page verified on one lineage holds a same-topic successor once the drain
+    // reads another lineage for the topic; both its domains then hold.
+    #[test]
+    fn moved_wait_holds() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let mut later = batch(b"one");
+        later.origins = vec![Some(origin)];
+        let wait = (origin, TopicId::hash(b"one"), [9; 32]);
+        let mut run = PublishBatchesOperation::new(serving(), vec![later]).waiting(vec![wait]);
+        let Ok(Next::Done(done)) = run.first() else {
+            panic!("the successor is held");
+        };
+        assert!(done.outcome.blocked_topics.contains(&TopicId::hash(b"one")));
+        assert!(done.outcome.blocked_origins.contains(&origin));
     }
 
     // An entry the adapter published after a retried entry of its topic stays in the oplog but

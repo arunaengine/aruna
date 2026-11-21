@@ -28,8 +28,8 @@ pub struct SyncBatchOperation {
     serving: (NodeId, RealmId),
     generation: Ulid,
     batch: Option<DrainSubBatch>,
-    /// Each record's topic and admin origin, in the order of the record keys.
-    entries: Vec<(TopicId, Option<NodeId>)>,
+    /// Each record's topic, admin origin and stamped lineage, in the order of the record keys.
+    entries: Vec<(TopicId, Option<NodeId>, Option<[u8; 32]>)>,
     finishing: bool,
     started_ms: u64,
     now_ms: u64,
@@ -40,11 +40,10 @@ impl SyncBatchOperation {
         Self {
             serving,
             generation,
-            entries: batch
-                .topics
-                .iter()
-                .copied()
+            entries: (batch.topics.iter().copied())
                 .zip(batch.origins.iter().copied())
+                .enumerate()
+                .map(|(index, (topic, origin))| (topic, origin, batch.stamp(index).lineage))
                 .collect(),
             batch: Some(batch),
             finishing: false,
@@ -76,16 +75,21 @@ impl Operation for SyncBatchOperation {
     fn next(&mut self, result: IoResult) -> SyncTurn {
         if self.finishing {
             let mut finished = result.child::<FinishedBatch, IoError>()??;
-            // A record in the oplog lets a later record of its topic go out, as that sync carries
-            // it in order; one off the current lineage is lost and holds its topic and origin.
+            // A record in the oplog lets a later record of its topic go out on the lineage the
+            // finish verified, as that sync carries it in order; a lost record holds both domains.
             if finished.outcome.retry_needed {
-                for (index, &(topic, origin)) in self.entries.iter().enumerate() {
+                for (index, &(topic, origin, lineage)) in self.entries.iter().enumerate() {
                     let outcome = &mut finished.outcome;
-                    if finished.lost.contains(&index) {
-                        outcome.blocked_topics.push(topic);
-                        outcome.blocked_origins.extend(origin);
-                    } else if let Some(origin) = origin {
-                        outcome.sync_waits.push((origin, topic));
+                    let lost = finished.lost.contains(&index);
+                    match (origin, lineage) {
+                        (Some(origin), Some(lineage)) if !lost => {
+                            outcome.sync_waits.push((origin, topic, lineage));
+                        }
+                        (None, _) if !lost => {}
+                        (origin, _) => {
+                            outcome.blocked_topics.push(topic);
+                            outcome.blocked_origins.extend(origin);
+                        }
                     }
                 }
             }
@@ -104,7 +108,7 @@ impl Operation for SyncBatchOperation {
         };
         // Each record's topic and stamp, in the order of the record keys.
         let stamps = (0..batch.record_keys.len()).map(|index| batch.stamp(index));
-        let topics = self.entries.iter().map(|(topic, _)| *topic);
+        let topics = self.entries.iter().map(|(topic, ..)| *topic);
         let guards = topics.zip(stamps).collect();
         let finished = (batch.record_keys, batch.targets);
         let finish = FinishBatchOperation::new(
@@ -125,6 +129,8 @@ mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
 
+    use crate::sync::outbox::batches::RowStamp;
+
     fn batch() -> DrainSubBatch {
         let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
         DrainSubBatch {
@@ -134,11 +140,15 @@ mod tests {
             origins: vec![Some(peer)],
             targets: Vec::new(),
             record_keys: vec![b"record".to_vec()],
-            stamps: Vec::new(),
+            stamps: vec![RowStamp {
+                lineage: Some([5; 32]),
+                digest: None,
+            }],
         }
     }
 
-    // A finished batch that must retry blocks no topic: its admin origins wait on other topics.
+    // A finished batch that must retry blocks no topic: its admin origins wait on other topics,
+    // and on its own only while it keeps the lineage the record was stamped with.
     #[test]
     fn retried_batch_waits() {
         let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
@@ -156,10 +166,8 @@ mod tests {
         };
         assert!(done.outcome.blocked_topics.is_empty() && done.outcome.blocked_origins.is_empty());
         let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        assert_eq!(
-            done.outcome.sync_waits,
-            vec![(peer, TopicId::hash(b"topic"))]
-        );
+        let wait = (peer, TopicId::hash(b"topic"), [5; 32]);
+        assert_eq!(done.outcome.sync_waits, vec![wait]);
     }
 
     // A record the finish found off its lineage is no longer in the oplog: it blocks its topic

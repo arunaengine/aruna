@@ -1342,6 +1342,7 @@ async fn publish_to_peer(
                     allow_genesis: true,
                 }],
                 peers: vec![peer],
+                expected: Vec::new(),
             },
         )))
         .await

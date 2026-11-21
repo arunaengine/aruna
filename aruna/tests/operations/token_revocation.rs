@@ -315,6 +315,7 @@ async fn seed_sync_topic(
                     origin_signature: None,
                 }],
                 peers: Vec::new(),
+                expected: Vec::new(),
             },
         )))
         .await

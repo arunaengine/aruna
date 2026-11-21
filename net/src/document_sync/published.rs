@@ -69,6 +69,15 @@ impl DocumentSyncService {
         self.node.storage().read_snapshot(read).map_err(failed)
     }
 
+    /// The lineage root `topic_id` has now, `None` without a genesis.
+    pub(in crate::document_sync) fn current_lineage(
+        &self,
+        topic_id: ::irokle::TopicId,
+    ) -> Result<Option<[u8; 32]>> {
+        let state = self.node.storage().topic_state(&topic_id).map_err(failed)?;
+        Ok(state.map(|state| crate::shard_manifest::lineage_root(&state.genesis)))
+    }
+
     /// The op on the current lineage this node published the event under `key` as. A recorded op
     /// a genesis tie-break removed is gone, so the event is published again.
     pub(in crate::document_sync) fn published_op(

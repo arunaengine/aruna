@@ -191,6 +191,7 @@ async fn capacity_blocks_releases() {
                     allow_genesis: true,
                 }],
                 peers: Vec::new(),
+                expected: Vec::new(),
             },
         )))
         .await;
