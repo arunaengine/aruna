@@ -502,7 +502,11 @@ async fn swap_back(kept: &Path, target: &Path) -> PlaceError {
         Ok(copy) => copy,
         Err(_) => return PlaceError::Kept(kept.to_path_buf()),
     };
-    if exchange(&copy, target).is_err() {
+    // A directory or link a local tool put at the target stays, the owner's file beside it.
+    let is_file = tokio::fs::symlink_metadata(target)
+        .await
+        .is_ok_and(|entry| entry.is_file());
+    if !is_file || exchange(&copy, target).is_err() {
         // A vacant target takes the owner's file back; a taken one keeps its save.
         let _ = place_new(&copy, target);
     }
@@ -1080,6 +1084,46 @@ mod tests {
             PlaceError::Refused(LocalFileRefusal::Drifted)
         ));
         assert_rolled_back(root.path(), b"incoming").await;
+    }
+
+    // A populated directory a local tool put at the target keeps its place and its
+    // children; the owner's file waits beside it as a visible copy.
+    #[tokio::test]
+    async fn keeps_replaced_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let (target, kept) = swapped_folder(&path).await;
+        tokio::fs::rename(&target, root.path().join("download.txt"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(&target).await.unwrap();
+        tokio::fs::write(target.join("child.txt"), b"child")
+            .await
+            .unwrap();
+
+        let refusal = swap_back(&kept, &target).await;
+        assert!(matches!(
+            refusal,
+            PlaceError::Refused(LocalFileRefusal::Drifted)
+        ));
+        assert_eq!(
+            tokio::fs::read(target.join("child.txt")).await.unwrap(),
+            b"child"
+        );
+        assert_eq!(
+            listed_bytes(root.path()).await,
+            vec![
+                b"child".to_vec(),
+                b"first save".to_vec(),
+                b"incoming".to_vec()
+            ]
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join(KEPT_DIR))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     // A partial replace (Windows error 1177) left the owner's file at the backup
