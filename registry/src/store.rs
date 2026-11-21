@@ -709,7 +709,10 @@ pub(crate) mod tests {
         };
         store.update_admin(&hidden.0, state, "test", 100).unwrap();
         // The earlier release wrote no listing rows.
-        store.listing.remove(listing_key(LISTED_RANK, &listed.0)).unwrap();
+        store
+            .listing
+            .remove(listing_key(LISTED_RANK, &listed.0))
+            .unwrap();
         assert!(store.listing_page(100, None, 10).unwrap().0.is_empty());
         drop(store);
 
