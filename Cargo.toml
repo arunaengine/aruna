@@ -176,7 +176,7 @@ lettre = { version = "0.11.23", default-features = false, features = [
     "tokio1-rustls",
     "webpki-roots",
 ] }
-lru = "0.18.5"
+lru = "0.19.1"
 md5 = "0.8.1"
 mime = "0.3.17"
 nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
