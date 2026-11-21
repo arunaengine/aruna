@@ -389,7 +389,10 @@ mod tests {
         config.ensure_node(holder, RealmNodeKind::Server);
         // The origins of the relayed records, which this config admits.
         config.ensure_node(node(), RealmNodeKind::Server);
-        config.ensure_node(iroh::SecretKey::from_bytes(&[5; 32]).public(), RealmNodeKind::Server);
+        config.ensure_node(
+            iroh::SecretKey::from_bytes(&[5; 32]).public(),
+            RealmNodeKind::Server,
+        );
         config.snapshot_candidate_map();
         config
     }

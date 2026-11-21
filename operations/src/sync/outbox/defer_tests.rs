@@ -181,7 +181,10 @@ fn held_origin_topic() {
 #[test]
 fn later_relays_ordered() {
     let origin = node(4);
-    let (first, second) = (TopicId::hash(b"first-shard"), TopicId::hash(b"second-shard"));
+    let (first, second) = (
+        TopicId::hash(b"first-shard"),
+        TopicId::hash(b"second-shard"),
+    );
     let records = vec![
         (b"admin/1".to_vec(), admin_record(origin, 1), first),
         (b"admin/2".to_vec(), admin_record(origin, 2), second),
@@ -269,7 +272,10 @@ fn split_waits_hold() {
     let mut defer = DrainDeferState::default();
     add_waits(
         &mut defer.sync_waits,
-        &[(Some(origin), first, [1; 32]), (Some(origin), second, [1; 32])],
+        &[
+            (Some(origin), first, [1; 32]),
+            (Some(origin), second, [1; 32]),
+        ],
     );
     let records = vec![(b"later".to_vec(), admin_record(origin, 3), first)];
     let (to_publish, deferred, _) =
