@@ -494,9 +494,8 @@ async fn undo_replace(kept: &Path, target: &Path, error: String) -> PlaceError {
 }
 
 /// Rolls back a replace whose displaced owner file at `kept` drifted. The owner's
-/// file first takes a visible copy name, then one exchange puts it back at the
-/// target and leaves the live file under that name, so nothing is hidden or lost.
-#[cfg(not(windows))]
+/// file first takes a visible copy name, then one swap puts it back at the target
+/// and leaves the live file under a visible copy name, so nothing is hidden or lost.
 async fn swap_back(kept: &Path, target: &Path) -> PlaceError {
     let copy = match rescue_displaced(kept, target).await {
         Ok(copy) => copy,
@@ -506,29 +505,30 @@ async fn swap_back(kept: &Path, target: &Path) -> PlaceError {
     let is_file = tokio::fs::symlink_metadata(target)
         .await
         .is_ok_and(|entry| entry.is_file());
-    if !is_file || exchange(&copy, target).is_err() {
+    if !is_file || swap_copy(&copy, target).is_err() {
         // A vacant target takes the owner's file back; a taken one keeps its save.
         let _ = place_new(&copy, target);
     }
     PlaceError::Refused(LocalFileRefusal::Drifted)
 }
 
-/// Rolls back a replace whose displaced owner file at `kept` drifted. One replace
-/// puts it back at the target, and the live file it displaces goes beside it.
+/// Swaps the owner's file at `copy` with the live file at `target` in one step.
+#[cfg(not(windows))]
+fn swap_copy(copy: &Path, target: &Path) -> Result<(), PlaceError> {
+    exchange(copy, target)
+}
+
+/// Replaces the target with the owner's file at `copy`; the live file leaves under a
+/// free copy name beside it, so a partial replace (error 1177) also hides nothing.
 #[cfg(windows)]
-async fn swap_back(kept: &Path, target: &Path) -> PlaceError {
-    let backup = kept.with_file_name(Ulid::generate().to_string());
-    match replace_file(target, kept, &backup) {
-        Ok(()) => keep_displaced(&backup, target).await,
-        Err(error) => {
-            let undone = undo_replace(&backup, target, error.to_string()).await;
-            let restored = put_back(kept, target).await;
-            match undone {
-                PlaceError::Kept(path) => PlaceError::Kept(path),
-                _ => restored,
-            }
-        }
-    }
+fn swap_copy(copy: &Path, target: &Path) -> Result<(), PlaceError> {
+    let Some(backup) = copy_paths(target)?.find(|path| {
+        std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    }) else {
+        return Err(PlaceError::Failed("no free copy name".to_string()));
+    };
+    replace_file(target, copy, &backup).map_err(|error| PlaceError::Failed(error.to_string()))
 }
 
 /// Puts the owner's file back at the vacant target. A save that took the name
@@ -608,15 +608,7 @@ fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> std::io::Re
 /// Puts displaced bytes beside the target under a free conflict copy name and
 /// answers that path, so they stay on the owner's disk under a findable name.
 async fn rescue_displaced(spool: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
-    let Some(parent) = target.parent() else {
-        return Err(PlaceError::Failed(
-            "the target has no directory".to_string(),
-        ));
-    };
-    let relative = target.to_string_lossy().to_string();
-    let stamp = conflict_stamp(aruna_clock::unix_timestamp_millis());
-    for attempt in 1..=MAX_COPY_ATTEMPTS {
-        let candidate = parent.join(copy_name(&relative, &stamp, attempt));
+    for candidate in copy_paths(target)? {
         if place_new(spool, &candidate).is_ok() {
             return Ok(candidate);
         }
@@ -624,6 +616,19 @@ async fn rescue_displaced(spool: &Path, target: &Path) -> Result<PathBuf, PlaceE
     Err(PlaceError::Failed(
         "the displaced file could not be put aside".to_string(),
     ))
+}
+
+/// The conflict copy names beside the target, in the order a copy tries them.
+fn copy_paths(target: &Path) -> Result<impl Iterator<Item = PathBuf>, PlaceError> {
+    let Some(parent) = target.parent().map(Path::to_path_buf) else {
+        return Err(PlaceError::Failed(
+            "the target has no directory".to_string(),
+        ));
+    };
+    let relative = target.to_string_lossy().to_string();
+    let stamp = conflict_stamp(aruna_clock::unix_timestamp_millis());
+    Ok((1..=MAX_COPY_ATTEMPTS)
+        .map(move |attempt| parent.join(copy_name(&relative, &stamp, attempt))))
 }
 
 /// Hashes one file and refuses the result when the file changed while it was
@@ -1124,6 +1129,41 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    // Each state a Windows rollback passes through, where a process exit can stop it:
+    // the rescued owner file, a partial replace (error 1177), and a full replace.
+    #[tokio::test]
+    async fn shows_replace_states() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let (target, kept) = swapped_folder(&path).await;
+        let both = vec![b"first save".to_vec(), b"incoming".to_vec()];
+        let Ok(copy) = rescue_displaced(&kept, &target).await else {
+            panic!("the owner's file was not rescued");
+        };
+        let Some(backup) = copy_paths(&target)
+            .ok()
+            .and_then(|mut paths| paths.find(|path| !path.exists()))
+        else {
+            panic!("no free copy name");
+        };
+        for step in [None, Some((&target, &backup)), Some((&copy, &target))] {
+            if let Some((from, to)) = step {
+                tokio::fs::rename(from, to).await.unwrap();
+            }
+            crate::fs_source::check_local(&access(root.path(), ""))
+                .await
+                .unwrap();
+            assert_eq!(listed_bytes(root.path()).await, both);
+            assert_eq!(
+                std::fs::read_dir(root.path().join(KEPT_DIR))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        assert_rolled_back(root.path(), b"incoming").await;
     }
 
     // A partial replace (Windows error 1177) left the owner's file at the backup
